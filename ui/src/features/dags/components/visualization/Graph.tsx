@@ -11,7 +11,9 @@ import {
   ArrowDownUp,
   ArrowRightLeft,
   Expand,
+  FileDown,
   GitGraph,
+  ImageDown,
   Maximize2,
   RotateCcw,
   ZoomIn,
@@ -20,6 +22,10 @@ import {
 import React, { useState } from 'react';
 import { components, NodeStatus } from '../../../../api/v1/schema';
 import Mermaid from '@/components/ui/mermaid';
+import { exportGraphPng, exportGraphSvg } from './exportGraph';
+import { I18nProps } from '@/i18n/I18nProps';
+import { I18nText } from '@/i18n/I18nText';
+import { useI18n } from '@/i18n/I18nProvider';
 
 /**
  * Escapes special characters in labels for safe Mermaid syntax interpolation.
@@ -63,30 +69,28 @@ type Props = {
   onDoubleClickNode?: onClickNode;
   /** Callback for node right-click events */
   onRightClickNode?: onRightClickNode;
-  /** Whether to show status icons */
-  showIcons?: boolean;
-  /** Whether to animate running nodes */
-  animate?: boolean;
   /** Whether the graph is currently displayed in an expanded modal view */
   isExpandedView?: boolean;
   /** Custom height for the graph container */
   height?: string | number;
+  /** DAG name used for export filenames */
+  name?: string;
 };
 
 const GRAPH_STATUS_STROKES = {
-  none: '#5f6368',
-  running: '#43a047',
-  retrying: '#e37400',
-  done: '#166534',
-  error: '#d93025',
-  cancel: '#d946ef',
-  skipped: '#5f6368',
-  partial: '#e37400',
-  waiting: '#e37400',
-  rejected: '#d93025',
+  none: '#8a8d99',
+  running: '#7c6ef4',
+  retrying: '#d9a03c',
+  done: '#22c55e',
+  error: '#ef5350',
+  cancel: '#c084fc',
+  skipped: '#8a8d99',
+  partial: '#d9a03c',
+  waiting: '#d9a03c',
+  rejected: '#ef5350',
 } as const;
 
-const GRAPH_SUCCESS_LINK_STROKE = '#5f8f64';
+const GRAPH_SUCCESS_LINK_STROKE = '#3fa76b';
 const GRAPH_RENDERED_NODE_SHAPE_SELECTOR =
   'rect, polygon, path, circle, ellipse';
 
@@ -131,9 +135,9 @@ function Graph({
   selectOnClick = false,
   onDoubleClickNode,
   onRightClickNode,
-  showIcons = true,
   isExpandedView = false,
   height,
+  name,
 }: Props): React.JSX.Element {
   const [scale, setScale] = useState(isExpandedView ? 0.8 : 1);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -156,6 +160,21 @@ function Graph({
   /** Reset zoom to default */
   const resetZoom = () => {
     setScale(1);
+  };
+
+  const handleExport = (format: 'png' | 'svg') => {
+    // Scope to the mermaid wrapper; the control bar renders its own icon SVGs.
+    const svg =
+      containerRef.current?.querySelector<SVGSVGElement>('.mermaid svg');
+    if (!svg) {
+      return;
+    }
+    const baseName = name || 'dag';
+    if (format === 'svg') {
+      exportGraphSvg(svg, baseName);
+    } else {
+      exportGraphPng(svg, baseName);
+    }
   };
 
   /** Fit graph to container - zoom out to show entire graph */
@@ -315,7 +334,7 @@ function Graph({
             // Dashed line for error state
             dat.push(`${depId} -.- ${id};`);
             linkStyles.push(
-              `linkStyle ${linkIndex} stroke:#c4726a,stroke-width:1.8px,stroke-dasharray:3`
+              `linkStyle ${linkIndex} stroke:#ef5350,stroke-width:1.8px,stroke-dasharray:3`
             );
           } else if (status === NodeStatus.Success) {
             // Solid line with success color
@@ -327,7 +346,7 @@ function Graph({
             // Default connection style
             dat.push(`${depId} --> ${id};`);
             linkStyles.push(
-              `linkStyle ${linkIndex} stroke:#6b635a,stroke-width:1px`
+              `linkStyle ${linkIndex} stroke:#62656f,stroke-width:1px`
             );
           }
           linkIndex++;
@@ -351,8 +370,8 @@ function Graph({
 
     // Define node styles for different states
     // Use theme-appropriate colors for light/dark modes
-    const nodeFill = isDarkMode ? '#161a3d' : '#ffffff'; // --card for dark, white for light
-    const nodeColor = isDarkMode ? '#f1f5f9' : '#0f1129'; // --foreground for dark, --background for light
+    const nodeFill = isDarkMode ? '#12141b' : '#fbfaf6'; // --card per mode
+    const nodeColor = isDarkMode ? '#f2f1ec' : '#14161b'; // --foreground per mode
 
     // Unified status colors
     dat.push(
@@ -395,7 +414,7 @@ function Graph({
     });
 
     return dat.join('\n');
-  }, [steps, onClickNode, flowchart, showIcons, isDarkMode]);
+  }, [steps, type, onClickNode, flowchart, isDarkMode]);
 
   return (
     <div
@@ -406,88 +425,128 @@ function Graph({
       ref={containerRef}
     >
       <div className="absolute inset-x-2 top-2 z-10 max-w-[calc(100%-1rem)] overflow-x-auto rounded-md border border-border/50 bg-card shadow-sm sm:left-auto sm:right-4">
-        <ToggleGroup
-          aria-label="Graph controls"
-          className="min-w-max border-0 bg-transparent"
-        >
-          {onChangeFlowchart && (
-            <>
+        <I18nProps>
+          <ToggleGroup
+            aria-label="Graph controls"
+            className="min-w-max border-0 bg-transparent"
+          >
+            {onChangeFlowchart && (
+              <>
+                <I18nProps>
+                  <ToggleButton
+                    value="LR"
+                    groupValue={flowchart}
+                    onClick={() => onChangeFlowchart('LR')}
+                    aria-label="Horizontal layout"
+                    position="first"
+                    className={graphControlButtonClass}
+                  >
+                    <ArrowRightLeft className="h-4 w-4" />
+                  </ToggleButton>
+                </I18nProps>
+                <I18nProps>
+                  <ToggleButton
+                    value="TD"
+                    groupValue={flowchart}
+                    onClick={() => onChangeFlowchart('TD')}
+                    aria-label="Vertical layout"
+                    position="middle"
+                    className={graphControlButtonClass}
+                  >
+                    <ArrowDownUp className="h-4 w-4" />
+                  </ToggleButton>
+                </I18nProps>
+                <div className="h-6 w-px shrink-0 self-center bg-border" />
+              </>
+            )}
+
+            <I18nProps>
               <ToggleButton
-                value="LR"
-                groupValue={flowchart}
-                onClick={() => onChangeFlowchart('LR')}
-                aria-label="Horizontal layout"
-                position="first"
+                value="zoomin"
+                onClick={() => zoomIn()}
+                aria-label="Zoom in"
+                position={onChangeFlowchart ? 'middle' : 'first'}
                 className={graphControlButtonClass}
               >
-                <ArrowRightLeft className="h-4 w-4" />
+                <ZoomIn className="h-4 w-4" />
               </ToggleButton>
+            </I18nProps>
+            <I18nProps>
               <ToggleButton
-                value="TD"
-                groupValue={flowchart}
-                onClick={() => onChangeFlowchart('TD')}
-                aria-label="Vertical layout"
+                value="zoomout"
+                onClick={() => zoomOut()}
+                aria-label="Zoom out"
                 position="middle"
                 className={graphControlButtonClass}
               >
-                <ArrowDownUp className="h-4 w-4" />
+                <ZoomOut className="h-4 w-4" />
               </ToggleButton>
-              <div className="h-6 w-px shrink-0 self-center bg-border" />
-            </>
-          )}
-
-          <ToggleButton
-            value="zoomin"
-            onClick={() => zoomIn()}
-            aria-label="Zoom in"
-            position={onChangeFlowchart ? 'middle' : 'first'}
-            className={graphControlButtonClass}
-          >
-            <ZoomIn className="h-4 w-4" />
-          </ToggleButton>
-          <ToggleButton
-            value="zoomout"
-            onClick={() => zoomOut()}
-            aria-label="Zoom out"
-            position="middle"
-            className={graphControlButtonClass}
-          >
-            <ZoomOut className="h-4 w-4" />
-          </ToggleButton>
-          <ToggleButton
-            value="fit"
-            onClick={() => fitToScreen()}
-            aria-label="Fit to screen"
-            position="middle"
-            className={graphControlButtonClass}
-          >
-            <Maximize2 className="h-4 w-4" />
-          </ToggleButton>
-          <ToggleButton
-            value="reset"
-            onClick={() => resetZoom()}
-            aria-label="Reset zoom"
-            position="middle"
-            className={graphControlButtonClass}
-          >
-            <RotateCcw className="h-4 w-4" />
-          </ToggleButton>
-
-          {!isExpandedView && (
-            <>
-              <div className="h-6 w-px shrink-0 self-center bg-border" />
+            </I18nProps>
+            <I18nProps>
               <ToggleButton
-                value="expand"
-                onClick={() => setIsModalOpen(true)}
-                aria-label="Expand graph"
-                position="last"
+                value="fit"
+                onClick={() => fitToScreen()}
+                aria-label="Fit to screen"
+                position="middle"
                 className={graphControlButtonClass}
               >
-                <Expand className="h-4 w-4" />
+                <Maximize2 className="h-4 w-4" />
               </ToggleButton>
-            </>
-          )}
-        </ToggleGroup>
+            </I18nProps>
+            <I18nProps>
+              <ToggleButton
+                value="reset"
+                onClick={() => resetZoom()}
+                aria-label="Reset zoom"
+                position="middle"
+                className={graphControlButtonClass}
+              >
+                <RotateCcw className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+
+            <div className="h-6 w-px shrink-0 self-center bg-border" />
+            <I18nProps>
+              <ToggleButton
+                value="export-png"
+                onClick={() => handleExport('png')}
+                aria-label="Export as PNG"
+                position="middle"
+                className={graphControlButtonClass}
+              >
+                <ImageDown className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+            <I18nProps>
+              <ToggleButton
+                value="export-svg"
+                onClick={() => handleExport('svg')}
+                aria-label="Export as SVG"
+                position={isExpandedView ? 'last' : 'middle'}
+                className={graphControlButtonClass}
+              >
+                <FileDown className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+
+            {!isExpandedView && (
+              <>
+                <div className="h-6 w-px shrink-0 self-center bg-border" />
+                <I18nProps>
+                  <ToggleButton
+                    value="expand"
+                    onClick={() => setIsModalOpen(true)}
+                    aria-label="Expand graph"
+                    position="last"
+                    className={graphControlButtonClass}
+                  >
+                    <Expand className="h-4 w-4" />
+                  </ToggleButton>
+                </I18nProps>
+              </>
+            )}
+          </ToggleGroup>
+        </I18nProps>
       </div>
 
       <div
@@ -525,7 +584,7 @@ function Graph({
             <DialogHeader className="flex-shrink-0 mb-2">
               <DialogTitle className="flex items-center gap-2 text-xl font-semibold">
                 <GitGraph className="h-5 w-5 text-primary" />
-                Visual Graph
+                <I18nText text={'Visual Graph'} />
               </DialogTitle>
             </DialogHeader>
             <div className="flex-1 min-h-0 bg-surface rounded-xl p-1 shadow-inner border border-border/20">
@@ -538,7 +597,7 @@ function Graph({
                 selectOnClick={selectOnClick}
                 onDoubleClickNode={onDoubleClickNode}
                 onRightClickNode={onRightClickNode}
-                showIcons={showIcons}
+                name={name}
                 isExpandedView={true}
               />
             </div>
@@ -595,6 +654,7 @@ function GraphFallback({
   onDoubleClickNode,
   onRightClickNode,
 }: GraphFallbackProps): React.JSX.Element | null {
+  const { ts } = useI18n();
   const clickTimeoutsRef = React.useRef<
     Map<string, ReturnType<typeof setTimeout>>
   >(new Map());
@@ -676,39 +736,41 @@ function GraphFallback({
     !!onRightClickNode;
 
   return (
-    <div
-      aria-label="Workflow graph"
-      className="min-w-full p-6 pr-24"
-      data-testid="graph-fallback"
-      role="list"
-    >
-      <div className="flex flex-wrap items-start gap-3">
-        {nodes.map((node) => (
-          <div key={node.id} role="listitem">
-            {hasInteraction ? (
-              <button
-                aria-label={`Inspect ${node.name}`}
-                className={fallbackNodeClassName(node.status, true)}
-                onClick={() => handleClick(node.id)}
-                onContextMenu={(event) => handleRightClick(event, node.id)}
-                onDoubleClick={() => handleDoubleClick(node.id)}
-                title={node.name}
-                type="button"
-              >
-                <FallbackNodeContent node={node} />
-              </button>
-            ) : (
-              <div
-                className={fallbackNodeClassName(node.status, false)}
-                title={node.name}
-              >
-                <FallbackNodeContent node={node} />
-              </div>
-            )}
-          </div>
-        ))}
+    <I18nProps>
+      <div
+        aria-label="Workflow graph"
+        className="min-w-full p-6 pr-24"
+        data-testid="graph-fallback"
+        role="list"
+      >
+        <div className="flex flex-wrap items-start gap-3">
+          {nodes.map((node) => (
+            <div key={node.id} role="listitem">
+              {hasInteraction ? (
+                <button
+                  aria-label={ts('Inspect {name}', { name: node.name })}
+                  className={fallbackNodeClassName(node.status, true)}
+                  onClick={() => handleClick(node.id)}
+                  onContextMenu={(event) => handleRightClick(event, node.id)}
+                  onDoubleClick={() => handleDoubleClick(node.id)}
+                  title={node.name}
+                  type="button"
+                >
+                  <FallbackNodeContent node={node} />
+                </button>
+              ) : (
+                <div
+                  className={fallbackNodeClassName(node.status, false)}
+                  title={node.name}
+                >
+                  <FallbackNodeContent node={node} />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
-    </div>
+    </I18nProps>
   );
 }
 
@@ -767,7 +829,7 @@ function fallbackStatusBorderClassName(status: NodeStatus): string {
     case NodeStatus.Success:
       return 'border-l-4 border-l-success';
     case NodeStatus.Running:
-      return 'border-l-4 border-l-[#43a047]';
+      return 'border-l-4 border-l-[var(--status-running)]';
     case NodeStatus.Retrying:
     case NodeStatus.Waiting:
     case NodeStatus.PartialSuccess:
@@ -787,7 +849,7 @@ function fallbackStatusDotClassName(status: NodeStatus): string {
     case NodeStatus.Success:
       return 'bg-success';
     case NodeStatus.Running:
-      return 'bg-[#43a047] animate-pulse';
+      return 'bg-[var(--status-running)] animate-pulse';
     case NodeStatus.Retrying:
     case NodeStatus.Waiting:
     case NodeStatus.PartialSuccess:

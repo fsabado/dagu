@@ -7,15 +7,19 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"maps"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // EvalBool evaluates the given value with the variables within the execution context
@@ -28,7 +32,7 @@ func EvalBool(ctx context.Context, value any) (bool, error) {
 // with the variables within the execution context.
 func EvalObject[T any](ctx context.Context, obj T) (T, error) {
 	env := GetEnv(ctx)
-	resolver := resolverFromEnv(env)
+	resolver := resolverFromEnv(ctx, env)
 	got, err := resolver.Object(ctx, obj, cmnvalue.WorkflowObjectField("object"))
 	if err != nil {
 		return obj, err
@@ -40,31 +44,82 @@ func EvalObject[T any](ctx context.Context, obj T) (T, error) {
 	return val, nil
 }
 
-func resolverFromEnv(env Env) cmnvalue.Resolver {
+// resolverFromEnv builds a resolver that reports preserved strict step-output
+// references. Use resolverWithoutNotices for phases where an unresolved
+// reference is expected.
+func resolverFromEnv(ctx context.Context, env Env) cmnvalue.Resolver {
+	return newResolver(env, cmnvalue.WithValueReferenceNotices(
+		stepOutputNoticeLogger{ctx: ctx, reported: env.reportedRefs},
+	))
+}
+
+// resolverWithoutNotices builds a resolver for phases that accept an unresolved
+// reference, so deferring one does not warn about a value that resolves later.
+func resolverWithoutNotices(env Env) cmnvalue.Resolver {
+	return newResolver(env)
+}
+
+// newResolver builds a resolver over the scopes reachable from env.
+func newResolver(env Env, opts ...cmnvalue.ResolverOption) cmnvalue.Resolver {
 	var consts cmnvalue.Values
 	var params cmnvalue.Values
+	var paramsJSON string
 	var paramDeclarations cmnvalue.Values
 	if env.DAG != nil {
 		consts = cmnvalue.Values(env.DAG.Consts)
 		params = env.DAG.ParamValues()
+		paramsJSON = env.DAG.ParamsJSON
 		paramDeclarations = env.DAG.ParamDeclarations()
 	}
 	scope := cmnvalue.RuntimeScope{
 		Consts:         consts,
 		Params:         params,
+		ParamsJSON:     paramsJSON,
 		Env:            env.Scope,
 		Steps:          env.StepMap,
 		Foreach:        env.Foreach,
+		Inputs:         env.Inputs,
+		Outputs:        env.Outputs,
 		BuiltinContext: builtinContextFromEnv(env),
 	}
-	return cmnvalue.NewResolver(cmnvalue.StaticScope{Consts: consts, Params: paramDeclarations}, scope)
+	return cmnvalue.NewResolver(
+		cmnvalue.StaticScope{Consts: consts, Params: paramDeclarations},
+		scope,
+		opts...,
+	)
+}
+
+// stepOutputNoticeLogger warns when a strict step-output reference survives value
+// resolution. Without it a run only shows the shell error caused by the
+// reference text reaching the command unchanged.
+type stepOutputNoticeLogger struct {
+	ctx      context.Context
+	reported map[string]struct{}
+}
+
+func (l stepOutputNoticeLogger) Report(notice cmnvalue.ValueReferenceNotice) {
+	if notice.Message == "" || !cmnvalue.IsStepOutputReferenceToken(notice.Token) {
+		return
+	}
+	if l.reported != nil {
+		key := notice.FieldPath + "\x00" + notice.Token
+		if _, seen := l.reported[key]; seen {
+			return
+		}
+		l.reported[key] = struct{}{}
+	}
+	var fields []slog.Attr
+	if notice.Reason != "" {
+		fields = append(fields, tag.Reason(string(notice.Reason)))
+	}
+	logger.Warn(l.ctx, notice.Message, fields...)
 }
 
 func builtinContextFromEnv(env Env) cmnvalue.BuiltinContext {
 	return builtinContextFromDAGContext(env.Context, env.Scope, env.Step)
 }
 
-func builtinContextFromDAGContext(rCtx Context, scope *cmnvalue.EnvScope, step core.Step) cmnvalue.BuiltinContext {
+func builtinContextFromDAGContext(rCtx Context, scope *cmnvalue.EnvScope, step ir.Step) cmnvalue.BuiltinContext {
 	values := make(map[string]string)
 	addBuiltinContextValue(values, "context.dag.name", dagName(rCtx))
 	addBuiltinContextValue(values, "context.run.id", rCtx.DAGRunID)
@@ -79,18 +134,19 @@ func builtinContextFromDAGContext(rCtx Context, scope *cmnvalue.EnvScope, step c
 	addBuiltinContextValue(values, "context.step.name", step.Name)
 	addBuiltinContextValue(values, "context.trigger.type", rCtx.TriggerType.String())
 	addBuiltinContextValue(values, "context.trigger.actor", rCtx.TriggerActor)
-	addBuiltinContextEnvValue(values, "context.run.status", scope, exec.EnvKeyDAGRunStatus)
-	addBuiltinContextEnvValue(values, "context.paths.log_file", scope, exec.EnvKeyDAGRunLogFile)
-	addBuiltinContextEnvValue(values, "context.paths.work_dir", scope, exec.EnvKeyDAGRunWorkDir)
-	addBuiltinContextEnvValue(values, "context.paths.artifacts_dir", scope, exec.EnvKeyDAGRunArtifactsDir)
-	addBuiltinContextEnvValue(values, "context.paths.docs_dir", scope, exec.EnvKeyDAGDocsDir)
-	addBuiltinContextEnvValue(values, "context.paths.step_stdout_file", scope, exec.EnvKeyDAGRunStepStdoutFile)
-	addBuiltinContextEnvValue(values, "context.paths.step_stderr_file", scope, exec.EnvKeyDAGRunStepStderrFile)
-	addBuiltinContextEnvValue(values, "context.paths.step_output_file", scope, exec.EnvKeyDAGUOutputFile)
+	addBuiltinContextEnvValue(values, "context.run.status", scope, runenv.EnvKeyDAGRunStatus)
+	addBuiltinContextEnvValue(values, "context.paths.log_file", scope, runenv.EnvKeyDAGRunLogFile)
+	addBuiltinContextEnvValue(values, "context.paths.work_dir", scope, runenv.EnvKeyDAGRunWorkDir)
+	addBuiltinContextEnvValue(values, "context.paths.artifacts_dir", scope, runenv.EnvKeyDAGRunArtifactsDir)
+	addBuiltinContextEnvValue(values, "context.paths.wiki_dir", scope, runenv.EnvKeyDAGWikiDir)
+	addBuiltinContextEnvValue(values, "context.paths.docs_dir", scope, runenv.EnvKeyDAGDocsDir)
+	addBuiltinContextEnvValue(values, "context.paths.step_stdout_file", scope, runenv.EnvKeyDAGRunStepStdoutFile)
+	addBuiltinContextEnvValue(values, "context.paths.step_stderr_file", scope, runenv.EnvKeyDAGRunStepStderrFile)
+	addBuiltinContextEnvValue(values, "context.paths.step_output_file", scope, runenv.EnvKeyDAGUOutputFile)
 	addBuiltinContextValue(values, "context.profile.name", rCtx.ProfileName)
 	addBuiltinContextValue(values, "context.profile.resolved_at", rCtx.ProfileResolvedAt)
-	addBuiltinContextEnvValue(values, "context.pushback.iteration", scope, exec.EnvKeyDAGPushBackIteration)
-	addBuiltinContextEnvValue(values, "context.pushback.previous_stdout_file", scope, exec.EnvKeyDAGPushBackPreviousStdoutFile)
+	addBuiltinContextEnvValue(values, "context.pushback.iteration", scope, runenv.EnvKeyDAGPushBackIteration)
+	addBuiltinContextEnvValue(values, "context.pushback.previous_stdout_file", scope, runenv.EnvKeyDAGPushBackPreviousStdoutFile)
 	return cmnvalue.NewBuiltinContext(values)
 }
 
@@ -130,33 +186,33 @@ func addBuiltinContextEnvValue(values map[string]string, path string, scope *cmn
 }
 
 func resolveRuntimeString(ctx context.Context, raw string, field cmnvalue.Field) (string, error) {
-	return resolverFromEnv(GetEnv(ctx)).String(ctx, raw, field)
+	return resolverFromEnv(ctx, GetEnv(ctx)).String(ctx, raw, field)
 }
 
 func resolveRuntimeObject(ctx context.Context, obj any, field cmnvalue.Field) (any, error) {
-	return resolverFromEnv(GetEnv(ctx)).Object(ctx, obj, field)
+	return resolverFromEnv(ctx, GetEnv(ctx)).Object(ctx, obj, field)
 }
 
 func resolveRuntimeInt(ctx context.Context, raw string, field cmnvalue.Field) (int, error) {
-	return resolverFromEnv(GetEnv(ctx)).Int(ctx, raw, field)
+	return resolverFromEnv(ctx, GetEnv(ctx)).Int(ctx, raw, field)
 }
 
 func resolveWithEnvScope(ctx context.Context, env Env, scope *cmnvalue.EnvScope, raw string, field cmnvalue.Field) (string, error) {
 	copy := env
 	copy.Scope = scope
-	return resolverFromEnv(copy).String(ctx, raw, field)
+	return resolverFromEnv(ctx, copy).String(ctx, raw, field)
 }
 
 // ValueResolver returns a semantic value resolver for the runtime environment in ctx.
 func ValueResolver(ctx context.Context) cmnvalue.Resolver {
-	return resolverFromEnv(GetEnv(ctx))
+	return resolverFromEnv(ctx, GetEnv(ctx))
 }
 
 // ValueResolverWithScope returns a semantic value resolver using scope as the runtime env scope.
 func ValueResolverWithScope(ctx context.Context, scope *cmnvalue.EnvScope) cmnvalue.Resolver {
 	env := GetEnv(ctx)
 	env.Scope = scope
-	return resolverFromEnv(env)
+	return resolverFromEnv(ctx, env)
 }
 
 // ResolveString resolves raw with the semantic field in the runtime environment.

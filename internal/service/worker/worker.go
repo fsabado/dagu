@@ -8,20 +8,24 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/backoff"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/builtin/sql"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/healthcheck"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/opencodehost"
+	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/sql"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/healthcheck"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
 // Worker represents a worker instance that polls for tasks from the coordinator.
@@ -31,6 +35,7 @@ type Worker struct {
 	coordinatorCli coordinator.Client
 	handler        TaskHandler
 	labels         map[string]string
+	labelErr       error
 	cfg            *config.Config
 
 	// For tracking poller states and heartbeats
@@ -49,13 +54,14 @@ type Worker struct {
 	// For global PostgreSQL connection pool
 	poolManager  *sql.GlobalPoolManager
 	healthServer *healthcheck.Server
+	openCodeHost *opencodehost.Host
 
 	afterTaskAckHook func(context.Context, *coordinatorv1.Task) bool
 }
 
 type runningTaskState struct {
 	task                 *coordinatorv1.RunningTask
-	owner                exec.HostInfo
+	owner                serviceregistry.HostInfo
 	lastOwnerHeartbeatAt time.Time
 }
 
@@ -68,7 +74,7 @@ var errTaskClaimRejectedBeforeExecution = errors.New("task claim rejected before
 
 const (
 	ownerRunHeartbeatCallTimeout = 10 * time.Second
-	ownerHeartbeatTimeout        = exec.DefaultStaleLeaseThreshold
+	ownerHeartbeatTimeout        = dagrun.DefaultStaleLeaseThreshold
 )
 
 // SetHandler sets a custom task executor for testing or custom execution logic
@@ -103,25 +109,33 @@ func NewWorker(
 	}
 
 	healthPort := 0
+	openCodeConfig := config.OpenCodeConfig{Executable: "opencode"}
 	if cfg != nil {
 		healthPort = cfg.Worker.HealthPort
+		openCodeConfig = cfg.OpenCode
 	}
+	labels, labelErr := workerLabels(labels)
 
 	return &Worker{
 		id:             workerID,
 		maxActiveRuns:  maxActiveRuns,
 		coordinatorCli: coordinatorClient,
 		labels:         labels,
+		labelErr:       labelErr,
 		cfg:            cfg,
 		runningTasks:   make(map[string]*runningTaskState),
 		pollerTasks:    make(map[string]string),
 		cancelFuncs:    make(map[string]context.CancelFunc),
 		healthServer:   healthcheck.NewServer("worker", healthPort),
+		openCodeHost:   opencodehost.New(context.Background(), openCodeConfig),
 	}
 }
 
 // Start begins the worker's operation, launching multiple polling goroutines.
 func (w *Worker) Start(ctx context.Context) (err error) {
+	if w.labelErr != nil {
+		return w.labelErr
+	}
 	logger.Info(ctx, "Starting worker",
 		tag.WorkerID(w.id),
 		tag.MaxConcurrency(w.maxActiveRuns))
@@ -133,6 +147,7 @@ func (w *Worker) Start(ctx context.Context) (err error) {
 	// Create an internal context that can be cancelled by Stop()
 	// This context is cancelled when either the parent context is done OR Stop() is called
 	internalCtx, cancel := context.WithCancel(ctx)
+	internalCtx = opencodehost.WithHost(internalCtx, w.openCodeHost)
 	w.stopCancel = cancel
 	w.stopDone = make(chan struct{})
 
@@ -160,6 +175,9 @@ func (w *Worker) Start(ctx context.Context) (err error) {
 
 		if w.healthServer != nil {
 			_ = w.healthServer.Stop(cleanupCtx)
+		}
+		if hostErr := w.openCodeHost.Close(cleanupCtx); hostErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to stop OpenCode host: %w", hostErr))
 		}
 		if w.poolManager != nil {
 			_ = w.poolManager.Close()
@@ -199,6 +217,9 @@ func (w *Worker) Start(ctx context.Context) (err error) {
 	wg.Go(func() {
 		w.sendRunHeartbeats(internalCtx)
 	})
+	wg.Go(func() {
+		w.cleanupAgentSessions(internalCtx)
+	})
 
 	// Wait for all goroutines to complete, then signal done
 	go func() {
@@ -210,6 +231,112 @@ func (w *Worker) Start(ctx context.Context) (err error) {
 	<-w.stopDone
 
 	return nil
+}
+
+func workerLabels(configured map[string]string) (map[string]string, error) {
+	labels := maps.Clone(configured)
+	if labels == nil {
+		labels = make(map[string]string, 2)
+	}
+	for _, platform := range []struct {
+		key   string
+		value string
+	}{
+		{key: "os", value: runtime.GOOS},
+		{key: "arch", value: runtime.GOARCH},
+	} {
+		if configuredValue, ok := labels[platform.key]; ok && configuredValue != platform.value {
+			return nil, fmt.Errorf(
+				"worker label %q conflicts with built-in platform value %q",
+				platform.key,
+				platform.value,
+			)
+		}
+		labels[platform.key] = platform.value
+	}
+	return labels, nil
+}
+
+func (w *Worker) cleanupAgentSessions(ctx context.Context) {
+	client, ok := w.coordinatorCli.(coordinator.AgentSessionCleanupClient)
+	if !ok {
+		return
+	}
+	for {
+		claimCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		resp, err := client.ClaimAgentSessionCleanup(claimCtx, &coordinatorv1.ClaimAgentSessionCleanupRequest{WorkerId: w.id})
+		cancel()
+		if err != nil {
+			logger.Debug(ctx, "Failed to claim agent session cleanup", tag.WorkerID(w.id), tag.Error(err))
+			if !waitForAgentSessionCleanup(ctx, 30*time.Second) {
+				return
+			}
+			continue
+		}
+		if resp == nil || !resp.Found {
+			if !waitForAgentSessionCleanup(ctx, 5*time.Second) {
+				return
+			}
+			continue
+		}
+
+		var cleanupErr error
+		if resp.Provider != "opencode" {
+			cleanupErr = fmt.Errorf("unsupported managed agent provider %q", resp.Provider)
+		} else {
+			hostConfig, hostErr := w.openCodeHost.Ensure()
+			if hostErr != nil {
+				cleanupErr = hostErr
+			} else {
+				cleanupErr = opencodehost.DeleteSession(ctx, hostConfig, resp.Directory, resp.SessionId)
+			}
+		}
+
+		message := ""
+		if cleanupErr != nil {
+			message = cleanupErrorMessage(cleanupErr)
+		}
+		owner := serviceregistry.HostInfo{
+			ID: resp.OwnerCoordinatorId, Host: resp.OwnerCoordinatorHost, Port: int(resp.OwnerCoordinatorPort),
+		}
+		completeCtx, completeCancel := context.WithTimeout(ctx, 15*time.Second)
+		_, completeErr := client.CompleteAgentSessionCleanupTo(completeCtx, owner, &coordinatorv1.CompleteAgentSessionCleanupRequest{
+			WorkerId: w.id, JobId: resp.JobId, ClaimToken: resp.ClaimToken, Error: message,
+		})
+		completeCancel()
+		if completeErr != nil {
+			logger.Warn(ctx, "Failed to update agent session cleanup claim", tag.WorkerID(w.id), tag.Error(completeErr))
+			continue
+		}
+		if cleanupErr != nil {
+			logger.Warn(ctx, "Agent session cleanup failed", tag.WorkerID(w.id), tag.Error(cleanupErr))
+			continue
+		}
+		logger.Info(ctx, "Removed retained agent session",
+			tag.WorkerID(w.id), slog.String("provider", resp.Provider), slog.String("session-id", resp.SessionId))
+	}
+}
+
+func waitForAgentSessionCleanup(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func cleanupErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	if len(message) > 1024 {
+		message = message[:1024]
+	}
+	return message
 }
 
 // Stop gracefully shuts down the worker.
@@ -259,6 +386,9 @@ func (w *Worker) Stop(ctx context.Context) error {
 			if stopErr := w.healthServer.Stop(ctx); stopErr != nil && err == nil {
 				err = fmt.Errorf("failed to stop worker health check server: %w", stopErr)
 			}
+		}
+		if hostErr := w.openCodeHost.Close(ctx); hostErr != nil && err == nil {
+			err = fmt.Errorf("failed to stop OpenCode host: %w", hostErr)
 		}
 	})
 
@@ -386,7 +516,7 @@ func (t *trackingHandler) Handle(ctx context.Context, task *coordinatorv1.Task) 
 	return t.handler.Handle(taskCtx, task)
 }
 
-func (w *Worker) validateClaimedTask(ctx context.Context, owner exec.HostInfo, task *coordinatorv1.RunningTask) (bool, error) {
+func (w *Worker) validateClaimedTask(ctx context.Context, owner serviceregistry.HostInfo, task *coordinatorv1.RunningTask) (bool, error) {
 	if task == nil || task.AttemptKey == "" || owner.Host == "" {
 		return false, nil
 	}
@@ -486,7 +616,7 @@ func (w *Worker) sendRunHeartbeats(ctx context.Context) {
 
 func (w *Worker) sendOwnerRunHeartbeats(ctx context.Context) {
 	type ownerGroup struct {
-		owner exec.HostInfo
+		owner serviceregistry.HostInfo
 		tasks []*coordinatorv1.RunningTask
 	}
 
@@ -497,7 +627,7 @@ func (w *Worker) sendOwnerRunHeartbeats(ctx context.Context) {
 		if state == nil || state.task == nil || state.owner.Host == "" {
 			continue
 		}
-		key := fmt.Sprintf("%s|%s|%d", state.owner.ID, state.owner.Host, state.owner.Port)
+		key := fmt.Sprintf("%s|%d", state.owner.Host, state.owner.Port)
 		group := groups[key]
 		if group == nil {
 			group = &ownerGroup{owner: state.owner}
@@ -543,7 +673,7 @@ func (w *Worker) markOwnerHeartbeatSuccess(tasks []*coordinatorv1.RunningTask, o
 	}
 }
 
-func (w *Worker) cancelTasksForOwnerTimeout(ctx context.Context, owner exec.HostInfo, tasks []*coordinatorv1.RunningTask, lastSeen map[string]time.Time) {
+func (w *Worker) cancelTasksForOwnerTimeout(ctx context.Context, owner serviceregistry.HostInfo, tasks []*coordinatorv1.RunningTask, lastSeen map[string]time.Time) {
 	now := time.Now().UTC()
 	var timedOut []*coordinatorv1.CancelledRun
 	for _, task := range tasks {

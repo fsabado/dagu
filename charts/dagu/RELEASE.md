@@ -7,7 +7,12 @@ Install the chart with:
 ```bash
 helm repo add dagu https://dagucloud.github.io/dagu
 helm repo update
-helm install dagu dagu/dagu --set persistence.storageClass=<your-rwx-storage-class>
+helm upgrade --install dagu dagu/dagu \
+  --namespace dagu \
+  --create-namespace \
+  --wait
 ```
+
+The default standalone mode uses `ReadWriteOnce` access with the cluster's default StorageClass. Distributed installations can opt into separate workers and `ReadWriteMany` storage.
 
 Application releases use separate `vX.Y.Z` tags.

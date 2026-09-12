@@ -9,21 +9,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/stretchr/testify/require"
 )
 
 type stubServiceRegistry struct{}
 
-func (stubServiceRegistry) Register(context.Context, exec.ServiceName, exec.HostInfo) error {
+func (stubServiceRegistry) Register(context.Context, serviceregistry.ServiceName, serviceregistry.HostInfo) error {
 	return nil
 }
 func (stubServiceRegistry) Unregister(context.Context) {}
-func (stubServiceRegistry) GetServiceMembers(context.Context, exec.ServiceName) ([]exec.HostInfo, error) {
+func (stubServiceRegistry) GetServiceMembers(context.Context, serviceregistry.ServiceName) ([]serviceregistry.HostInfo, error) {
 	return nil, nil
 }
-func (stubServiceRegistry) UpdateStatus(context.Context, exec.ServiceName, exec.ServiceStatus) error {
+func (stubServiceRegistry) UpdateStatus(context.Context, serviceregistry.ServiceName, serviceregistry.ServiceStatus) error {
 	return nil
 }
 
@@ -98,8 +98,8 @@ func TestClientCacheUsesDerivedKeyForEmptyCoordinatorIDs(t *testing.T) {
 		clients: make(map[string]*client),
 	}
 
-	member1 := exec.HostInfo{Host: "127.0.0.1", Port: 1234}
-	member2 := exec.HostInfo{Host: "127.0.0.1", Port: 5678}
+	member1 := serviceregistry.HostInfo{Host: "127.0.0.1", Port: 1234}
+	member2 := serviceregistry.HostInfo{Host: "127.0.0.1", Port: 5678}
 
 	client1, err := cli.getOrCreateClient(member1)
 	require.NoError(t, err)
@@ -111,12 +111,26 @@ func TestClientCacheUsesDerivedKeyForEmptyCoordinatorIDs(t *testing.T) {
 	require.Len(t, cli.clients, 2)
 	require.Contains(t, cli.clients, coordinatorMemberKey(member1))
 	require.Contains(t, cli.clients, coordinatorMemberKey(member2))
+	require.NoError(t, cli.Cleanup(t.Context()))
+}
 
-	cli.removeClient(member1)
+func TestClientCacheUsesAdvertisedEndpointAcrossCoordinatorProcesses(t *testing.T) {
+	t.Parallel()
+
+	cli := &clientImpl{
+		config:  DefaultConfig(),
+		clients: make(map[string]*client),
+	}
+	endpoint := serviceregistry.HostInfo{ID: "coord-a", Host: "coordinator", Port: 50055}
+	replacement := endpoint
+	replacement.ID = "coord-b"
+
+	first, err := cli.getOrCreateClient(endpoint)
+	require.NoError(t, err)
+	second, err := cli.getOrCreateClient(replacement)
+	require.NoError(t, err)
+
+	require.Same(t, first, second)
 	require.Len(t, cli.clients, 1)
-	require.NotContains(t, cli.clients, coordinatorMemberKey(member1))
-	require.Contains(t, cli.clients, coordinatorMemberKey(member2))
-
-	cli.removeClient(member2)
-	require.Empty(t, cli.clients)
+	require.NoError(t, cli.Cleanup(t.Context()))
 }

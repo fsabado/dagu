@@ -69,6 +69,9 @@ import React, {
   useMemo,
   useState,
 } from 'react';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { I18nTemplate } from '@/i18n/I18nTemplate';
 
 type SecretResponse = components['schemas']['SecretResponse'];
 type CreateSecretRequest = components['schemas']['CreateSecretRequest'];
@@ -87,9 +90,10 @@ const PROVIDER_LABELS: Record<SecretProviderType, string> = {
   [SecretProviderType.dagu_managed]: 'Dagu Managed',
   [SecretProviderType.vault]: 'Vault',
   [SecretProviderType.kubernetes]: 'Kubernetes',
-  [SecretProviderType.gcp_secret_manager]: 'Google Secret Manager',
-  [SecretProviderType.aws_secrets_manager]: 'AWS Secrets Manager',
-  [SecretProviderType.azure_key_vault]: 'Azure Key Vault',
+  [SecretProviderType.gcp]: 'Google Secret Manager',
+  [SecretProviderType.aws]: 'AWS Secrets Manager',
+  [SecretProviderType.azure]: 'Azure Key Vault',
+  [SecretProviderType.alibaba]: 'Alibaba Cloud KMS',
 };
 
 const PROVIDERS = Object.values(SecretProviderType);
@@ -107,7 +111,7 @@ function providerOptionLabel(provider: SecretProviderType): React.ReactElement {
       <span>{PROVIDER_LABELS[provider]}</span>
       {isRequestBased && (
         <Badge variant="outline" className="h-4 px-1.5 text-[10px]">
-          By request
+          <I18nText text={'By request'} />
         </Badge>
       )}
     </span>
@@ -164,7 +168,14 @@ function errorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-export default function SecretsPage(): React.ReactNode {
+function isProfileBackingSecret(secret: SecretResponse): boolean {
+  return (
+    secret.ref.startsWith('runtime-profiles/') ||
+    secret.ref.startsWith('runtime-profile-defaults/')
+  );
+}
+
+export function SecretRefsSection(): React.ReactNode {
   const client = useClient();
   const appBarContext = useContext(AppBarContext);
   const remoteNode = appBarContext.selectedRemoteNode || 'local';
@@ -194,10 +205,6 @@ export default function SecretsPage(): React.ReactNode {
   const [actionSecretId, setActionSecretId] = useState<string | null>(null);
 
   useEffect(() => {
-    appBarContext.setTitle('Secrets');
-  }, [appBarContext]);
-
-  useEffect(() => {
     setSelectedScope(workspaceSelectionScope);
   }, [workspaceSelectionScope]);
 
@@ -214,7 +221,9 @@ export default function SecretsPage(): React.ReactNode {
     })
   );
 
-  const secrets = data?.secrets || [];
+  const secrets = (data?.secrets || []).filter(
+    (secret) => !isProfileBackingSecret(secret)
+  );
 
   const reload = useCallback(() => {
     void mutate();
@@ -279,21 +288,39 @@ export default function SecretsPage(): React.ReactNode {
   }
 
   return (
-    <div className="flex h-full min-h-0 max-w-7xl flex-col gap-4 overflow-auto">
-      <div className="flex items-center justify-between gap-3">
+    <section
+      id="secret-refs"
+      aria-labelledby="secret-refs-heading"
+      className="flex h-full min-h-0 flex-col gap-4 overflow-hidden"
+    >
+      <div className="flex shrink-0 items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold">Secrets</h1>
+          <h2 id="secret-refs-heading" className="text-base font-semibold">
+            <I18nText text={'DAG Secret Refs'} />
+          </h2>
           <p className="text-sm text-muted-foreground">
-            Manage secret refs and values.
+            <I18nTemplate
+              text="Individual secrets that DAGs reference with {reference}."
+              values={{
+                reference: <code className="text-xs">secrets[].ref</code>,
+              }}
+            />
           </p>
         </div>
         <div className="flex items-center gap-2">
           <Select value={selectedScope} onValueChange={setSelectedScope}>
-            <SelectTrigger className="h-7 w-[180px]" aria-label="Secret scope">
-              <SelectValue />
-            </SelectTrigger>
+            <I18nProps>
+              <SelectTrigger
+                className="h-7 w-[180px]"
+                aria-label="Secret scope"
+              >
+                <SelectValue />
+              </SelectTrigger>
+            </I18nProps>
             <SelectContent>
-              <SelectItem value={SECRET_GLOBAL_SCOPE}>Global</SelectItem>
+              <SelectItem value={SECRET_GLOBAL_SCOPE}>
+                <I18nText text={'Global'} />
+              </SelectItem>
               {(appBarContext.workspaces ?? []).map((workspace) => (
                 <SelectItem key={workspace.id} value={workspace.name}>
                   {workspace.name}
@@ -311,31 +338,41 @@ export default function SecretsPage(): React.ReactNode {
             }}
           >
             <Plus className="mr-1.5 h-4 w-4" />
-            Add Secret
+            <I18nText text={'Add Secret Ref'} />
           </Button>
         </div>
       </div>
 
       {error && (
-        <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+        <div className="shrink-0 rounded-md bg-destructive/10 p-3 text-sm text-destructive">
           {error}
         </div>
       )}
       {success && (
-        <div className="rounded-md bg-success/10 p-3 text-sm text-success">
+        <div className="shrink-0 rounded-md bg-success/10 p-3 text-sm text-success">
           {success}
         </div>
       )}
 
-      <div className="card-obsidian min-h-0 overflow-auto">
+      <div className="card-obsidian min-h-0 flex-1 !overflow-auto">
         <Table className="text-xs">
           <TableHeader>
             <TableRow>
-              <TableHead className="w-[320px]">Ref</TableHead>
-              <TableHead className="w-[180px]">Provider</TableHead>
-              <TableHead className="w-[110px]">Status</TableHead>
-              <TableHead className="w-[90px]">Version</TableHead>
-              <TableHead className="w-[170px]">Rotated</TableHead>
+              <TableHead className="w-[320px]">
+                <I18nText text={'Ref'} />
+              </TableHead>
+              <TableHead className="w-[180px]">
+                <I18nText text={'Provider'} />
+              </TableHead>
+              <TableHead className="w-[110px]">
+                <I18nText text={'Status'} />
+              </TableHead>
+              <TableHead className="w-[90px]">
+                <I18nText text={'Version'} />
+              </TableHead>
+              <TableHead className="w-[170px]">
+                <I18nText text={'Rotated'} />
+              </TableHead>
               <TableHead className="w-[80px]"></TableHead>
             </TableRow>
           </TableHeader>
@@ -346,7 +383,11 @@ export default function SecretsPage(): React.ReactNode {
                   colSpan={6}
                   className="py-8 text-center text-muted-foreground"
                 >
-                  You do not have permission to access this secret scope.
+                  <I18nText
+                    text={
+                      'You do not have permission to access this secret scope.'
+                    }
+                  />
                 </TableCell>
               </TableRow>
             ) : isLoading ? (
@@ -355,7 +396,7 @@ export default function SecretsPage(): React.ReactNode {
                   colSpan={6}
                   className="py-8 text-center text-muted-foreground"
                 >
-                  Loading secrets...
+                  <I18nText text={'Loading secret refs...'} />
                 </TableCell>
               </TableRow>
             ) : secrets.length === 0 ? (
@@ -364,7 +405,7 @@ export default function SecretsPage(): React.ReactNode {
                   colSpan={6}
                   className="py-8 text-center text-muted-foreground"
                 >
-                  No secrets found.
+                  <I18nText text={'No secret refs found.'} />
                 </TableCell>
               </TableRow>
             ) : (
@@ -400,13 +441,17 @@ export default function SecretsPage(): React.ReactNode {
                         v{secret.currentVersion}
                       </code>
                     ) : (
-                      <span className="text-muted-foreground">None</span>
+                      <span className="text-muted-foreground">
+                        <I18nText text={'None'} />
+                      </span>
                     )}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {secret.lastRotatedAt
-                      ? dayjs(secret.lastRotatedAt).format('MMM D, YYYY HH:mm')
-                      : 'Never'}
+                    {secret.lastRotatedAt ? (
+                      dayjs(secret.lastRotatedAt).format('MMM D, YYYY HH:mm')
+                    ) : (
+                      <I18nText text={'Never'} />
+                    )}
                   </TableCell>
                   <TableCell>
                     <DropdownMenu>
@@ -432,7 +477,7 @@ export default function SecretsPage(): React.ReactNode {
                           }}
                         >
                           <Pencil className="mr-2 h-4 w-4" />
-                          Edit
+                          <I18nText text={'Edit'} />
                         </DropdownMenuItem>
                         {secret.providerType ===
                           SecretProviderType.dagu_managed && (
@@ -440,21 +485,23 @@ export default function SecretsPage(): React.ReactNode {
                             onClick={() => setRotatingSecret(secret)}
                           >
                             <RefreshCw className="mr-2 h-4 w-4" />
-                            Rotate
+                            <I18nText text={'Rotate'} />
                           </DropdownMenuItem>
                         )}
                         <DropdownMenuItem onClick={() => toggleStatus(secret)}>
                           <Power className="mr-2 h-4 w-4" />
-                          {secret.status === SecretStatus.active
-                            ? 'Disable'
-                            : 'Enable'}
+                          {secret.status === SecretStatus.active ? (
+                            <I18nText text={'Disable'} />
+                          ) : (
+                            <I18nText text={'Enable'} />
+                          )}
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           className="text-destructive"
                           onClick={() => setDeletingSecret(secret)}
                         >
                           <Trash2 className="mr-2 h-4 w-4" />
-                          Delete
+                          <I18nText text={'Delete'} />
                         </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -496,18 +543,27 @@ export default function SecretsPage(): React.ReactNode {
         }}
       />
 
-      <ConfirmModal
-        title="Delete Secret"
-        buttonText="Delete"
-        visible={!!deletingSecret}
-        dismissModal={() => setDeletingSecret(null)}
-        onSubmit={deleteSecret}
-      >
-        <span className="text-sm text-muted-foreground">
-          {deletingSecret ? `Delete ${deletingSecret.ref}?` : ''}
-        </span>
-      </ConfirmModal>
-    </div>
+      <I18nProps>
+        <ConfirmModal
+          title="Delete Secret Ref"
+          buttonText="Delete"
+          visible={!!deletingSecret}
+          dismissModal={() => setDeletingSecret(null)}
+          onSubmit={deleteSecret}
+        >
+          <span className="text-sm text-muted-foreground">
+            {deletingSecret ? (
+              <I18nText
+                text="Delete {name}?"
+                values={{ name: deletingSecret.ref }}
+              />
+            ) : (
+              ''
+            )}
+          </span>
+        </ConfirmModal>
+      </I18nProps>
+    </section>
   );
 }
 
@@ -610,7 +666,13 @@ function SecretFormDialog({
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>{isEditing ? 'Edit Secret' : 'Add Secret'}</DialogTitle>
+          <DialogTitle>
+            {isEditing ? (
+              <I18nText text={'Edit Secret Ref'} />
+            ) : (
+              <I18nText text={'Add Secret Ref'} />
+            )}
+          </DialogTitle>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="mt-2 space-y-4">
@@ -621,7 +683,9 @@ function SecretFormDialog({
           )}
 
           <div className="space-y-1.5">
-            <Label htmlFor="secret-provider">Provider</Label>
+            <Label htmlFor="secret-provider">
+              <I18nText text={'Provider'} />
+            </Label>
             <Select
               value={form.providerType}
               disabled={isEditing}
@@ -652,14 +716,16 @@ function SecretFormDialog({
             </Select>
             {!isEditing && (
               <p className="text-xs text-muted-foreground">
-                External providers are available by request.{' '}
+                <I18nText
+                  text={'External providers are available by request.'}
+                />{' '}
                 <a
                   href={EXTERNAL_SECRET_REQUEST_URL}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex items-center font-medium text-primary underline-offset-4 hover:underline"
                 >
-                  Request access
+                  <I18nText text={'Request access'} />
                   <ExternalLink className="ml-1 h-3 w-3" aria-hidden />
                 </a>
               </p>
@@ -667,23 +733,32 @@ function SecretFormDialog({
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="secret-ref">Ref</Label>
-            <Input
-              id="secret-ref"
-              value={form.ref}
-              disabled={isEditing}
-              onChange={(event) =>
-                setForm((current) => ({ ...current, ref: event.target.value }))
-              }
-              placeholder="prod/db-password"
-              autoComplete="off"
-              className="h-9"
-            />
+            <Label htmlFor="secret-ref">
+              <I18nText text={'Ref'} />
+            </Label>
+            <I18nProps>
+              <Input
+                id="secret-ref"
+                value={form.ref}
+                disabled={isEditing}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    ref: event.target.value,
+                  }))
+                }
+                placeholder="prod/db-password"
+                autoComplete="off"
+                className="h-9"
+              />
+            </I18nProps>
           </div>
 
           {isDaguManaged && !isEditing ? (
             <div className="space-y-1.5">
-              <Label htmlFor="secret-value">Value</Label>
+              <Label htmlFor="secret-value">
+                <I18nText text={'Value'} />
+              </Label>
               <Input
                 id="secret-value"
                 value={form.value}
@@ -703,7 +778,9 @@ function SecretFormDialog({
           {!isDaguManaged ? (
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-1.5">
-                <Label htmlFor="secret-provider-connection">Connection</Label>
+                <Label htmlFor="secret-provider-connection">
+                  <I18nText text={'Connection'} />
+                </Label>
                 <Input
                   id="secret-provider-connection"
                   value={form.providerConnectionId}
@@ -718,7 +795,9 @@ function SecretFormDialog({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="secret-provider-ref">Provider Ref</Label>
+                <Label htmlFor="secret-provider-ref">
+                  <I18nText text={'Provider Ref'} />
+                </Label>
                 <Input
                   id="secret-provider-ref"
                   value={form.providerRef}
@@ -736,7 +815,9 @@ function SecretFormDialog({
           ) : null}
 
           <div className="space-y-1.5">
-            <Label htmlFor="secret-description">Description</Label>
+            <Label htmlFor="secret-description">
+              <I18nText text={'Description'} />
+            </Label>
             <Textarea
               id="secret-description"
               value={form.description}
@@ -752,11 +833,11 @@ function SecretFormDialog({
 
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={onClose}>
-              Cancel
+              <I18nText text={'Cancel'} />
             </Button>
             <Button type="submit" disabled={isSaving}>
               {isSaving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Save
+              <I18nText text={'Save'} />
             </Button>
           </DialogFooter>
         </form>
@@ -819,7 +900,9 @@ function RotateSecretDialog({
     <Dialog open={!!secret} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Rotate Secret</DialogTitle>
+          <DialogTitle>
+            <I18nText text={'Rotate Secret'} />
+          </DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="mt-2 space-y-4">
           {error && (
@@ -828,7 +911,9 @@ function RotateSecretDialog({
             </div>
           )}
           <div className="space-y-1.5">
-            <Label htmlFor="rotate-secret-value">Value</Label>
+            <Label htmlFor="rotate-secret-value">
+              <I18nText text={'Value'} />
+            </Label>
             <Input
               id="rotate-secret-value"
               value={value}
@@ -840,11 +925,11 @@ function RotateSecretDialog({
           </div>
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={onClose}>
-              Cancel
+              <I18nText text={'Cancel'} />
             </Button>
             <Button type="submit" disabled={isSaving}>
               {isSaving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Rotate
+              <I18nText text={'Rotate'} />
             </Button>
           </DialogFooter>
         </form>

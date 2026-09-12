@@ -4,6 +4,7 @@
 package fileutil
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -71,6 +72,41 @@ func TestWriteFileAtomic(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, os.FileMode(0644), info.Mode().Perm())
 	})
+}
+
+func TestWriteFileAtomicExclusive(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "exclusive.txt")
+	require.NoError(t, WriteFileAtomicExclusive(filePath, []byte("first"), 0o600))
+
+	err := WriteFileAtomicExclusive(filePath, []byte("second"), 0o600)
+	assert.ErrorIs(t, err, fs.ErrExist)
+
+	data, readErr := os.ReadFile(filePath)
+	require.NoError(t, readErr)
+	assert.Equal(t, []byte("first"), data)
+
+	temps, globErr := filepath.Glob(filePath + ".tmp.*")
+	require.NoError(t, globErr)
+	assert.Empty(t, temps)
+}
+
+func TestReplaceFileDurable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.tmp")
+	target := filepath.Join(dir, "target.txt")
+	require.NoError(t, os.WriteFile(source, []byte("new"), 0o600))
+	require.NoError(t, os.WriteFile(target, []byte("old"), 0o600))
+
+	require.NoError(t, ReplaceFileDurable(source, target))
+	require.NoFileExists(t, source)
+	content, err := os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("new"), content)
 }
 
 func TestWriteJSONAtomic(t *testing.T) {

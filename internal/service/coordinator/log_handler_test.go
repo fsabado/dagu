@@ -5,13 +5,16 @@ package coordinator
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestStreamTypeToExtension(t *testing.T) {
@@ -197,7 +200,6 @@ func TestLogHandler_GetOrCreateWriter(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, writer)
 		require.NotNil(t, writer.file)
-		require.NotNil(t, writer.writer)
 	})
 
 	t.Run("ReturnsExistingWriter", func(t *testing.T) {
@@ -310,8 +312,7 @@ func TestLogHandler_CloseWriter(t *testing.T) {
 		require.True(t, exists)
 
 		// Close the writer
-		ctx := context.Background()
-		h.closeWriter(ctx, chunk)
+		require.NoError(t, h.closeWriter(chunk))
 
 		// Verify it's removed
 		h.writersMu.Lock()
@@ -335,8 +336,7 @@ func TestLogHandler_CloseWriter(t *testing.T) {
 		}
 
 		// Should not panic
-		ctx := context.Background()
-		h.closeWriter(ctx, chunk)
+		require.NoError(t, h.closeWriter(chunk))
 	})
 }
 
@@ -393,7 +393,7 @@ func TestLogHandler_Close(t *testing.T) {
 	})
 }
 
-func TestLogWriter_WriteAndFlush(t *testing.T) {
+func TestStreamLogWriter_Write(t *testing.T) {
 	t.Parallel()
 
 	t.Run("WritesDataToFile", func(t *testing.T) {
@@ -416,13 +416,13 @@ func TestLogWriter_WriteAndFlush(t *testing.T) {
 
 		// Write some data using thread-safe method
 		testData := []byte("Hello, World!\n")
-		n, err := writer.write(testData)
+		chunk.Data = testData
+		n, err := writer.write(chunk)
 		require.NoError(t, err)
 		require.Equal(t, len(testData), n)
 
 		// Close writer (which flushes)
-		ctx := context.Background()
-		h.closeWriter(ctx, chunk)
+		require.NoError(t, h.closeWriter(chunk))
 
 		// Verify file contents
 		filePath := h.logFilePath(chunk)
@@ -460,7 +460,8 @@ func TestLogHandler_ConcurrentAccess(t *testing.T) {
 			}
 
 			// Write some data using thread-safe method
-			_, err = writer.write([]byte("test\n"))
+			chunk.Data = []byte("test\n")
+			_, err = writer.write(chunk)
 			if err != nil {
 				t.Errorf("goroutine %d: Write failed: %v", idx, err)
 				done <- false
@@ -530,6 +531,140 @@ func TestLogHandler_HandleStream(t *testing.T) {
 		content, err := os.ReadFile(expectedPath)
 		require.NoError(t, err)
 		assert.Equal(t, "line 1\nline 2\n", string(content))
+	})
+
+	t.Run("ShorterReplayReplacesAndTruncatesPreviouslyWrittenBytes", func(t *testing.T) {
+		t.Parallel()
+
+		logDir := t.TempDir()
+		baseChunk := &coordinatorv1.LogChunk{
+			DagName:    "test-dag",
+			DagRunId:   "run-replay",
+			AttemptId:  "attempt-1",
+			StepName:   "step1",
+			StreamType: coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT,
+		}
+		baseChunk.SetByteOffset(0)
+		firstChunk := proto.Clone(baseChunk).(*coordinatorv1.LogChunk)
+		firstChunk.Data = []byte("hello stale tail")
+
+		firstHandler := newLogHandler(logDir)
+		firstStream := &mockStreamLogsServer{
+			chunks: []*coordinatorv1.LogChunk{firstChunk},
+			ctx:    context.Background(),
+		}
+		require.NoError(t, firstHandler.handleStream(firstStream))
+		firstHandler.Close(context.Background())
+
+		replayedChunk := proto.Clone(baseChunk).(*coordinatorv1.LogChunk)
+		replayedChunk.Data = []byte("hello")
+		finalChunk := proto.Clone(baseChunk).(*coordinatorv1.LogChunk)
+		finalChunk.IsFinal = true
+		finalChunk.SetByteOffset(uint64(len(replayedChunk.Data)))
+		secondHandler := newLogHandler(logDir)
+		defer secondHandler.Close(context.Background())
+		secondStream := &mockStreamLogsServer{
+			chunks: []*coordinatorv1.LogChunk{replayedChunk, finalChunk},
+			ctx:    context.Background(),
+		}
+		require.NoError(t, secondHandler.handleStream(secondStream))
+
+		content, err := os.ReadFile(secondHandler.logFilePath(baseChunk))
+		require.NoError(t, err)
+		assert.Equal(t, replayedChunk.Data, content)
+	})
+
+	t.Run("RejectsPositionedOffsetsPastCurrentEnd", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name  string
+			final bool
+		}{
+			{name: "data"},
+			{name: "final marker", final: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				logDir := t.TempDir()
+				h := newLogHandler(logDir)
+				defer h.Close(context.Background())
+				initial := &coordinatorv1.LogChunk{
+					DagName:    "test-dag",
+					DagRunId:   "run-invalid-offset",
+					AttemptId:  "attempt-1",
+					StepName:   "step1",
+					StreamType: coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT,
+					Data:       []byte("hello"),
+				}
+				initial.SetByteOffset(0)
+				invalid := proto.Clone(initial).(*coordinatorv1.LogChunk)
+				invalid.Data = []byte("x")
+				invalid.IsFinal = tc.final
+				invalid.SetByteOffset(uint64(len(initial.Data) + 1))
+
+				err := h.handleStream(&mockStreamLogsServer{
+					chunks: []*coordinatorv1.LogChunk{initial, invalid},
+					ctx:    context.Background(),
+				})
+				require.Error(t, err)
+
+				content, readErr := os.ReadFile(h.logFilePath(initial))
+				require.NoError(t, readErr)
+				assert.Equal(t, initial.Data, content)
+			})
+		}
+	})
+
+	t.Run("MakesTinyChunkVisibleBeforeStreamCompletion", func(t *testing.T) {
+		t.Parallel()
+
+		logDir := t.TempDir()
+		h := newLogHandler(logDir)
+		defer h.Close(context.Background())
+
+		chunk := &coordinatorv1.LogChunk{
+			DagName:    "test-dag",
+			DagRunId:   "run-live",
+			AttemptId:  "attempt-1",
+			StepName:   "step1",
+			StreamType: coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT,
+			Data:       []byte("live\n"),
+		}
+		stream := &blockingStreamLogsServer{
+			mockStreamLogsServer: mockStreamLogsServer{ctx: context.Background()},
+			chunk:                chunk,
+			waiting:              make(chan struct{}),
+			release:              make(chan struct{}),
+		}
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- h.handleStream(stream)
+		}()
+
+		select {
+		case <-stream.waiting:
+		case <-time.After(5 * time.Second):
+			t.Fatal("stream handler did not process the first chunk")
+		}
+
+		select {
+		case err := <-errCh:
+			t.Fatalf("stream handler completed before stream EOF: %v", err)
+		default:
+		}
+
+		content, err := os.ReadFile(h.logFilePath(chunk))
+		require.NoError(t, err)
+		assert.Equal(t, chunk.Data, content)
+
+		close(stream.release)
+		require.NoError(t, <-errCh)
+		require.NotNil(t, stream.response)
+		assert.Equal(t, uint64(1), stream.response.ChunksReceived)
+		assert.Equal(t, uint64(len(chunk.Data)), stream.response.BytesWritten)
 	})
 
 	t.Run("HandlesEmptyChunks", func(t *testing.T) {
@@ -677,4 +812,23 @@ func TestLogHandler_HandleStream(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "stderr output\n", string(stderrContent))
 	})
+}
+
+type blockingStreamLogsServer struct {
+	mockStreamLogsServer
+	chunk     *coordinatorv1.LogChunk
+	waiting   chan struct{}
+	release   chan struct{}
+	delivered bool
+}
+
+func (s *blockingStreamLogsServer) Recv() (*coordinatorv1.LogChunk, error) {
+	if !s.delivered {
+		s.delivered = true
+		return s.chunk, nil
+	}
+
+	close(s.waiting)
+	<-s.release
+	return nil, io.EOF
 }

@@ -9,50 +9,58 @@ import (
 	"fmt"
 	"io"
 	"os"
+	goruntime "runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	executorpkg "github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/runctx"
+
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	executorpkg "github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func outputCommandTimeout() time.Duration {
-	return 5 * time.Second
-}
-
-func outputDeadlockTimeout() time.Duration {
-	return 5 * time.Second
+	if goruntime.GOOS == "windows" {
+		return 30 * time.Second
+	}
+	return 10 * time.Second
 }
 
 func outputCommandCleanupWait() time.Duration {
 	return 2 * time.Second
 }
 
-func startNodeExecuteAsync(t *testing.T, node *Node, ctx context.Context) <-chan error {
+func executeNodeWithTimeout(t *testing.T, node *Node, ctx context.Context) error {
 	t.Helper()
 
+	execCtx, cancel := context.WithTimeout(ctx, outputCommandTimeout())
+	defer cancel()
+
 	done := make(chan error, 1)
-	finished := make(chan struct{})
 	go func() {
-		defer close(finished)
-		done <- node.Execute(ctx)
+		done <- node.Execute(execCtx)
 	}()
 
-	t.Cleanup(func() {
-		node.Cancel()
-		select {
-		case <-finished:
-		case <-time.After(outputCommandCleanupWait()):
-		}
+	select {
+	case err := <-done:
+		require.NoError(t, node.Teardown())
+		return err
+	case <-execCtx.Done():
 		_ = node.Teardown()
-	})
+		select {
+		case err := <-done:
+			t.Fatalf("node execution exceeded %s and returned after teardown: %v", outputCommandTimeout(), err)
+		case <-time.After(outputCommandCleanupWait()):
+			t.Fatalf("node execution did not finish within %s", outputCommandTimeout())
+		}
+	}
 
-	return done
+	return execCtx.Err()
 }
 
 type outputTestExecutor struct {
@@ -86,13 +94,30 @@ func registerOutputTestExecutor(t *testing.T, run func(context.Context, *outputT
 	t.Helper()
 
 	executorType := fmt.Sprintf("__output_test_%d", outputTestExecutorSeq.Add(1))
-	executorpkg.RegisterExecutor(executorType, func(context.Context, core.Step) (executorpkg.Executor, error) {
+	executorpkg.RegisterExecutor(executorType, func(context.Context, ir.Step) (executorpkg.Executor, error) {
 		return &outputTestExecutor{run: run}, nil
-	}, nil, core.ExecutorCapabilities{})
+	}, nil, registry.ExecutorCapabilities{})
 	t.Cleanup(func() {
 		executorpkg.UnregisterExecutor(executorType)
 	})
 	return executorType
+}
+
+func requireNodeOutputVariable(t *testing.T, node *Node, name string) string {
+	t.Helper()
+
+	nodeData := node.NodeData()
+	require.NotNil(t, nodeData.State.OutputVariables, "OutputVariables should not be nil")
+	v, ok := nodeData.State.OutputVariables.Load(name)
+	require.True(t, ok, "%s variable should be present", name)
+
+	output, ok := v.(string)
+	require.True(t, ok, "%s variable should be stored as a string", name)
+
+	key, value, found := strings.Cut(output, "=")
+	require.True(t, found, "%s variable should be encoded as KEY=value", name)
+	require.Equal(t, name, key, "encoded output variable key should match map key")
+	return value
 }
 
 func writeRepeatedX(ctx context.Context, w io.Writer, size int) error {
@@ -137,32 +162,26 @@ func TestNode_LargeOutput(t *testing.T) {
 	tests := []struct {
 		name       string
 		outputSize int
-		expectHang bool
 	}{
 		{
 			name:       "SmallOutput",
-			outputSize: 1024, // 1KB
-			expectHang: false,
+			outputSize: 1024,
 		},
 		{
 			name:       "MediumOutput",
-			outputSize: 32 * 1024, // 32KB
-			expectHang: false,
+			outputSize: 32 * 1024,
 		},
 		{
 			name:       "LargeOutputJustBelow64KB",
-			outputSize: 63 * 1024, // 63KB
-			expectHang: false,
+			outputSize: 63 * 1024,
 		},
 		{
 			name:       "LargeOutputAt64KB",
-			outputSize: 64 * 1024, // 64KB
-			expectHang: false,     // Fixed - no longer hangs
+			outputSize: 64 * 1024,
 		},
 		{
 			name:       "LargeOutputAbove64KB",
-			outputSize: 128 * 1024, // 128KB
-			expectHang: false,      // Fixed - no longer hangs
+			outputSize: 128 * 1024,
 		},
 	}
 
@@ -171,56 +190,27 @@ func TestNode_LargeOutput(t *testing.T) {
 			executorType := registerOutputTestExecutor(t, func(ctx context.Context, exec *outputTestExecutor) error {
 				return writeRepeatedX(ctx, exec.stdout, tt.outputSize)
 			})
-			step := core.Step{
+			step := ir.Step{
 				Name:           "test",
 				Output:         "RESULT",
-				ExecutorConfig: core.ExecutorConfig{Type: executorType},
+				ExecutorConfig: ir.ExecutorConfig{Type: executorType},
 			}
 
 			node := NewNode(step, NodeState{})
 			ctx := context.Background()
-			// Set up environment context with proper DAG
-			dag := &core.DAG{Name: "test"}
+			dag := &ir.DAG{Name: "test"}
 			ctx = NewContext(ctx, dag, "test-run", "test.log")
 
-			// Setup node with a temporary directory
 			tmpDir := t.TempDir()
 			err := node.Prepare(ctx, tmpDir, "test-run")
 			require.NoError(t, err)
 
-			// Execute with timeout to detect hanging
-			done := startNodeExecuteAsync(t, node, ctx)
+			err = executeNodeWithTimeout(t, node, ctx)
+			require.NoError(t, err)
 
-			select {
-			case err := <-done:
-				if tt.expectHang {
-					t.Errorf("Expected hanging but command completed: %v", err)
-				}
-				// Verify output was captured correctly
-				if !tt.expectHang && err == nil {
-					// Access the output variable through NodeData
-					nodeData := node.NodeData()
-					if nodeData.State.OutputVariables != nil {
-						if v, ok := nodeData.State.OutputVariables.Load("RESULT"); ok {
-							output := v.(string)
-							// Extract the value part after the = sign
-							if idx := strings.Index(output, "="); idx != -1 {
-								output = output[idx+1:]
-							}
-							assert.NotEmpty(t, output, "output should be captured")
-							assert.True(t, strings.HasPrefix(output, "xxx"), "output should start with x's")
-						} else {
-							t.Error("RESULT variable not found in OutputVariables")
-						}
-					} else {
-						t.Error("OutputVariables is nil")
-					}
-				}
-			case <-time.After(outputCommandTimeout()):
-				if !tt.expectHang {
-					t.Errorf("Command hung unexpectedly for output size %d bytes", tt.outputSize)
-				}
-			}
+			output := requireNodeOutputVariable(t, node, "RESULT")
+			assert.Len(t, output, tt.outputSize, "output should be captured completely")
+			assert.True(t, strings.HasPrefix(output, "xxx"), "output should start with x's")
 		})
 	}
 }
@@ -231,42 +221,26 @@ func TestNode_OutputCaptureDeadlock(t *testing.T) {
 	})
 
 	// Test specifically for the pipe deadlock issue
-	step := core.Step{
+	step := ir.Step{
 		Name:           "deadlock-test",
 		Output:         "RESULT",
-		ExecutorConfig: core.ExecutorConfig{Type: executorType},
+		ExecutorConfig: ir.ExecutorConfig{Type: executorType},
 	}
 
 	node := NewNode(step, NodeState{})
 	ctx := context.Background()
-	// Set up environment context with proper DAG
-	dag := &core.DAG{Name: "test"}
+	dag := &ir.DAG{Name: "test"}
 	ctx = NewContext(ctx, dag, "deadlock-test", "test.log")
 
 	tmpDir := t.TempDir()
 	err := node.Prepare(ctx, tmpDir, "deadlock-test")
 	require.NoError(t, err)
 
-	// This should complete without hanging
-	done := startNodeExecuteAsync(t, node, ctx)
+	err = executeNodeWithTimeout(t, node, ctx)
+	require.NoError(t, err, "command should complete successfully")
 
-	select {
-	case err := <-done:
-		assert.NoError(t, err, "command should complete successfully")
-		// Access the output variable through NodeData
-		nodeData := node.NodeData()
-		require.NotNil(t, nodeData.State.OutputVariables, "OutputVariables should not be nil")
-		v, ok := nodeData.State.OutputVariables.Load("RESULT")
-		require.True(t, ok, "RESULT variable should be present")
-		output := v.(string)
-		// Extract the value part after the = sign
-		if idx := strings.Index(output, "="); idx != -1 {
-			output = output[idx+1:]
-		}
-		assert.Len(t, output, 64*1024+1, "output should be exactly 64KB + 1 byte")
-	case <-time.After(outputDeadlockTimeout()):
-		t.Fatal("Command execution hung - possible deadlock detected")
-	}
+	output := requireNodeOutputVariable(t, node, "RESULT")
+	assert.Len(t, output, 64*1024+1, "output should be exactly 64KB + 1 byte")
 }
 
 func TestNode_OutputExceedsLimit(t *testing.T) {
@@ -275,16 +249,16 @@ func TestNode_OutputExceedsLimit(t *testing.T) {
 	})
 
 	// Test that output exceeding the limit returns an error
-	step := core.Step{
+	step := ir.Step{
 		Name:           "exceed-limit-test",
 		Output:         "RESULT",
-		ExecutorConfig: core.ExecutorConfig{Type: executorType},
+		ExecutorConfig: ir.ExecutorConfig{Type: executorType},
 	}
 
 	node := NewNode(step, NodeState{})
 	ctx := context.Background()
 	// Set up environment context with proper DAG
-	dag := &core.DAG{Name: "test"}
+	dag := &ir.DAG{Name: "test"}
 	ctx = NewContext(ctx, dag, "exceed-limit-test", "test.log")
 
 	tmpDir := t.TempDir()
@@ -308,16 +282,16 @@ func TestNode_CustomOutputLimit(t *testing.T) {
 	})
 
 	// Test with custom output limit
-	step := core.Step{
+	step := ir.Step{
 		Name:           "custom-limit-test",
 		Output:         "RESULT",
-		ExecutorConfig: core.ExecutorConfig{Type: executorType},
+		ExecutorConfig: ir.ExecutorConfig{Type: executorType},
 	}
 
 	node := NewNode(step, NodeState{})
 	ctx := context.Background()
 	// Set up environment context with custom limit of 50KB
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:          "test",
 		MaxOutputSize: 50 * 1024, // 50KB limit
 	}
@@ -344,16 +318,16 @@ func TestNode_ConcurrentOutputCapture(t *testing.T) {
 	})
 
 	// Test that output capture doesn't interfere with concurrent writes
-	step := core.Step{
+	step := ir.Step{
 		Name:           "concurrent-test",
-		ExecutorConfig: core.ExecutorConfig{Type: executorType},
+		ExecutorConfig: ir.ExecutorConfig{Type: executorType},
 		Output:         "RESULT",
 	}
 
 	node := NewNode(step, NodeState{})
 	ctx := context.Background()
 	// Set up environment context with proper DAG
-	dag := &core.DAG{Name: "test"}
+	dag := &ir.DAG{Name: "test"}
 	ctx = NewContext(ctx, dag, "concurrent-test", "test.log")
 
 	tmpDir := t.TempDir()
@@ -577,7 +551,7 @@ func newMockLogWriterFactory() *mockLogWriterFactory {
 }
 
 func (m *mockLogWriterFactory) NewStepWriter(_ context.Context, _ string, streamType int) io.WriteCloser {
-	if streamType == exec.StreamTypeStdout {
+	if streamType == runctx.StreamTypeStdout {
 		return m.stdoutWriter
 	}
 	return m.stderrWriter
@@ -594,7 +568,7 @@ func TestOutputCoordinator_SetupRemoteWriters(t *testing.T) {
 		ctx := context.Background()
 
 		data := NodeData{
-			Step: core.Step{Name: "test-step"},
+			Step: ir.Step{Name: "test-step"},
 			State: NodeState{
 				Stdout: "/path/to/stdout.log",
 				Stderr: "/path/to/stderr.log",
@@ -623,7 +597,7 @@ func TestOutputCoordinator_SetupRemoteWriters(t *testing.T) {
 
 		// Same path for both stdout and stderr
 		data := NodeData{
-			Step: core.Step{Name: "test-step"},
+			Step: ir.Step{Name: "test-step"},
 			State: NodeState{
 				Stdout: "/path/to/combined.log",
 				Stderr: "/path/to/combined.log",
@@ -798,10 +772,10 @@ func TestOutputCoordinator_CapturedStderr(t *testing.T) {
 
 		cmd := &outputTestExecutor{}
 		data := NodeData{
-			Step: core.Step{
+			Step: ir.Step{
 				Name: "stderr-structured-output",
-				StructuredOutput: map[string]core.StepOutputEntry{
-					"warning": {From: core.StepOutputSourceStderr},
+				StructuredOutput: map[string]ir.StepOutputEntry{
+					"warning": {From: ir.StepOutputSourceStderr},
 				},
 			},
 		}

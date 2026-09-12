@@ -22,26 +22,29 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	CoordinatorService_Poll_FullMethodName                   = "/coordinator.v1.CoordinatorService/Poll"
-	CoordinatorService_Dispatch_FullMethodName               = "/coordinator.v1.CoordinatorService/Dispatch"
-	CoordinatorService_GetWorkers_FullMethodName             = "/coordinator.v1.CoordinatorService/GetWorkers"
-	CoordinatorService_Heartbeat_FullMethodName              = "/coordinator.v1.CoordinatorService/Heartbeat"
-	CoordinatorService_AckTaskClaim_FullMethodName           = "/coordinator.v1.CoordinatorService/AckTaskClaim"
-	CoordinatorService_RunHeartbeat_FullMethodName           = "/coordinator.v1.CoordinatorService/RunHeartbeat"
-	CoordinatorService_ReportStatus_FullMethodName           = "/coordinator.v1.CoordinatorService/ReportStatus"
-	CoordinatorService_StreamLogs_FullMethodName             = "/coordinator.v1.CoordinatorService/StreamLogs"
-	CoordinatorService_StreamArtifacts_FullMethodName        = "/coordinator.v1.CoordinatorService/StreamArtifacts"
-	CoordinatorService_PutWorkspaceBundle_FullMethodName     = "/coordinator.v1.CoordinatorService/PutWorkspaceBundle"
-	CoordinatorService_HasWorkspaceBundle_FullMethodName     = "/coordinator.v1.CoordinatorService/HasWorkspaceBundle"
-	CoordinatorService_GetWorkspaceBundle_FullMethodName     = "/coordinator.v1.CoordinatorService/GetWorkspaceBundle"
-	CoordinatorService_GetDAGRunStatus_FullMethodName        = "/coordinator.v1.CoordinatorService/GetDAGRunStatus"
-	CoordinatorService_RequestCancel_FullMethodName          = "/coordinator.v1.CoordinatorService/RequestCancel"
-	CoordinatorService_GetState_FullMethodName               = "/coordinator.v1.CoordinatorService/GetState"
-	CoordinatorService_PutState_FullMethodName               = "/coordinator.v1.CoordinatorService/PutState"
-	CoordinatorService_DeleteState_FullMethodName            = "/coordinator.v1.CoordinatorService/DeleteState"
-	CoordinatorService_ListState_FullMethodName              = "/coordinator.v1.CoordinatorService/ListState"
-	CoordinatorService_GetDAG_FullMethodName                 = "/coordinator.v1.CoordinatorService/GetDAG"
-	CoordinatorService_ResolveSecretReference_FullMethodName = "/coordinator.v1.CoordinatorService/ResolveSecretReference"
+	CoordinatorService_Poll_FullMethodName                        = "/coordinator.v1.CoordinatorService/Poll"
+	CoordinatorService_Dispatch_FullMethodName                    = "/coordinator.v1.CoordinatorService/Dispatch"
+	CoordinatorService_GetWorkers_FullMethodName                  = "/coordinator.v1.CoordinatorService/GetWorkers"
+	CoordinatorService_Heartbeat_FullMethodName                   = "/coordinator.v1.CoordinatorService/Heartbeat"
+	CoordinatorService_AckTaskClaim_FullMethodName                = "/coordinator.v1.CoordinatorService/AckTaskClaim"
+	CoordinatorService_ClaimAgentSessionCleanup_FullMethodName    = "/coordinator.v1.CoordinatorService/ClaimAgentSessionCleanup"
+	CoordinatorService_CompleteAgentSessionCleanup_FullMethodName = "/coordinator.v1.CoordinatorService/CompleteAgentSessionCleanup"
+	CoordinatorService_RunHeartbeat_FullMethodName                = "/coordinator.v1.CoordinatorService/RunHeartbeat"
+	CoordinatorService_ReportStatus_FullMethodName                = "/coordinator.v1.CoordinatorService/ReportStatus"
+	CoordinatorService_StreamLogs_FullMethodName                  = "/coordinator.v1.CoordinatorService/StreamLogs"
+	CoordinatorService_StreamArtifacts_FullMethodName             = "/coordinator.v1.CoordinatorService/StreamArtifacts"
+	CoordinatorService_PutWorkspaceBundle_FullMethodName          = "/coordinator.v1.CoordinatorService/PutWorkspaceBundle"
+	CoordinatorService_HasWorkspaceBundle_FullMethodName          = "/coordinator.v1.CoordinatorService/HasWorkspaceBundle"
+	CoordinatorService_GetWorkspaceBundle_FullMethodName          = "/coordinator.v1.CoordinatorService/GetWorkspaceBundle"
+	CoordinatorService_GetDAGRunStatus_FullMethodName             = "/coordinator.v1.CoordinatorService/GetDAGRunStatus"
+	CoordinatorService_RequestCancel_FullMethodName               = "/coordinator.v1.CoordinatorService/RequestCancel"
+	CoordinatorService_GetState_FullMethodName                    = "/coordinator.v1.CoordinatorService/GetState"
+	CoordinatorService_PutState_FullMethodName                    = "/coordinator.v1.CoordinatorService/PutState"
+	CoordinatorService_DeleteState_FullMethodName                 = "/coordinator.v1.CoordinatorService/DeleteState"
+	CoordinatorService_ListState_FullMethodName                   = "/coordinator.v1.CoordinatorService/ListState"
+	CoordinatorService_GetDAG_FullMethodName                      = "/coordinator.v1.CoordinatorService/GetDAG"
+	CoordinatorService_ResolveSecretReference_FullMethodName      = "/coordinator.v1.CoordinatorService/ResolveSecretReference"
+	CoordinatorService_ResolveRuntimeProfile_FullMethodName       = "/coordinator.v1.CoordinatorService/ResolveRuntimeProfile"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -60,6 +63,10 @@ type CoordinatorServiceClient interface {
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	// AckTaskClaim is called by workers after accepting a claimed task.
 	AckTaskClaim(ctx context.Context, in *AckTaskClaimRequest, opts ...grpc.CallOption) (*AckTaskClaimResponse, error)
+	// ClaimAgentSessionCleanup reserves provider cleanup for its owning worker.
+	ClaimAgentSessionCleanup(ctx context.Context, in *ClaimAgentSessionCleanupRequest, opts ...grpc.CallOption) (*ClaimAgentSessionCleanupResponse, error)
+	// CompleteAgentSessionCleanup completes or releases a provider cleanup claim.
+	CompleteAgentSessionCleanup(ctx context.Context, in *CompleteAgentSessionCleanupRequest, opts ...grpc.CallOption) (*CompleteAgentSessionCleanupResponse, error)
 	// RunHeartbeat is called by workers to refresh leases for tasks owned by a
 	// specific coordinator instance.
 	RunHeartbeat(ctx context.Context, in *RunHeartbeatRequest, opts ...grpc.CallOption) (*RunHeartbeatResponse, error)
@@ -99,6 +106,8 @@ type CoordinatorServiceClient interface {
 	// ResolveSecretReference resolves or checks a Dagu-managed secret registry ref.
 	// Used by workers that cannot read the coordinator's secret store.
 	ResolveSecretReference(ctx context.Context, in *ResolveSecretReferenceRequest, opts ...grpc.CallOption) (*ResolveSecretReferenceResponse, error)
+	// ResolveRuntimeProfile resolves inherited and selected runtime profile layers.
+	ResolveRuntimeProfile(ctx context.Context, in *ResolveRuntimeProfileRequest, opts ...grpc.CallOption) (*ResolveRuntimeProfileResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -153,6 +162,26 @@ func (c *coordinatorServiceClient) AckTaskClaim(ctx context.Context, in *AckTask
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AckTaskClaimResponse)
 	err := c.cc.Invoke(ctx, CoordinatorService_AckTaskClaim_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coordinatorServiceClient) ClaimAgentSessionCleanup(ctx context.Context, in *ClaimAgentSessionCleanupRequest, opts ...grpc.CallOption) (*ClaimAgentSessionCleanupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClaimAgentSessionCleanupResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_ClaimAgentSessionCleanup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coordinatorServiceClient) CompleteAgentSessionCleanup(ctx context.Context, in *CompleteAgentSessionCleanupRequest, opts ...grpc.CallOption) (*CompleteAgentSessionCleanupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompleteAgentSessionCleanupResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_CompleteAgentSessionCleanup_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -327,6 +356,16 @@ func (c *coordinatorServiceClient) ResolveSecretReference(ctx context.Context, i
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) ResolveRuntimeProfile(ctx context.Context, in *ResolveRuntimeProfileRequest, opts ...grpc.CallOption) (*ResolveRuntimeProfileResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolveRuntimeProfileResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_ResolveRuntimeProfile_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -343,6 +382,10 @@ type CoordinatorServiceServer interface {
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	// AckTaskClaim is called by workers after accepting a claimed task.
 	AckTaskClaim(context.Context, *AckTaskClaimRequest) (*AckTaskClaimResponse, error)
+	// ClaimAgentSessionCleanup reserves provider cleanup for its owning worker.
+	ClaimAgentSessionCleanup(context.Context, *ClaimAgentSessionCleanupRequest) (*ClaimAgentSessionCleanupResponse, error)
+	// CompleteAgentSessionCleanup completes or releases a provider cleanup claim.
+	CompleteAgentSessionCleanup(context.Context, *CompleteAgentSessionCleanupRequest) (*CompleteAgentSessionCleanupResponse, error)
 	// RunHeartbeat is called by workers to refresh leases for tasks owned by a
 	// specific coordinator instance.
 	RunHeartbeat(context.Context, *RunHeartbeatRequest) (*RunHeartbeatResponse, error)
@@ -382,6 +425,8 @@ type CoordinatorServiceServer interface {
 	// ResolveSecretReference resolves or checks a Dagu-managed secret registry ref.
 	// Used by workers that cannot read the coordinator's secret store.
 	ResolveSecretReference(context.Context, *ResolveSecretReferenceRequest) (*ResolveSecretReferenceResponse, error)
+	// ResolveRuntimeProfile resolves inherited and selected runtime profile layers.
+	ResolveRuntimeProfile(context.Context, *ResolveRuntimeProfileRequest) (*ResolveRuntimeProfileResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -406,6 +451,12 @@ func (UnimplementedCoordinatorServiceServer) Heartbeat(context.Context, *Heartbe
 }
 func (UnimplementedCoordinatorServiceServer) AckTaskClaim(context.Context, *AckTaskClaimRequest) (*AckTaskClaimResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AckTaskClaim not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) ClaimAgentSessionCleanup(context.Context, *ClaimAgentSessionCleanupRequest) (*ClaimAgentSessionCleanupResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ClaimAgentSessionCleanup not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) CompleteAgentSessionCleanup(context.Context, *CompleteAgentSessionCleanupRequest) (*CompleteAgentSessionCleanupResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CompleteAgentSessionCleanup not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) RunHeartbeat(context.Context, *RunHeartbeatRequest) (*RunHeartbeatResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RunHeartbeat not implemented")
@@ -451,6 +502,9 @@ func (UnimplementedCoordinatorServiceServer) GetDAG(context.Context, *GetDAGRequ
 }
 func (UnimplementedCoordinatorServiceServer) ResolveSecretReference(context.Context, *ResolveSecretReferenceRequest) (*ResolveSecretReferenceResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResolveSecretReference not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) ResolveRuntimeProfile(context.Context, *ResolveRuntimeProfileRequest) (*ResolveRuntimeProfileResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResolveRuntimeProfile not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -559,6 +613,42 @@ func _CoordinatorService_AckTaskClaim_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(CoordinatorServiceServer).AckTaskClaim(ctx, req.(*AckTaskClaimRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoordinatorService_ClaimAgentSessionCleanup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClaimAgentSessionCleanupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).ClaimAgentSessionCleanup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_ClaimAgentSessionCleanup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).ClaimAgentSessionCleanup(ctx, req.(*ClaimAgentSessionCleanupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoordinatorService_CompleteAgentSessionCleanup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteAgentSessionCleanupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).CompleteAgentSessionCleanup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_CompleteAgentSessionCleanup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).CompleteAgentSessionCleanup(ctx, req.(*CompleteAgentSessionCleanupRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -793,6 +883,24 @@ func _CoordinatorService_ResolveSecretReference_Handler(srv interface{}, ctx con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_ResolveRuntimeProfile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveRuntimeProfileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).ResolveRuntimeProfile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_ResolveRuntimeProfile_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).ResolveRuntimeProfile(ctx, req.(*ResolveRuntimeProfileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -819,6 +927,14 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AckTaskClaim",
 			Handler:    _CoordinatorService_AckTaskClaim_Handler,
+		},
+		{
+			MethodName: "ClaimAgentSessionCleanup",
+			Handler:    _CoordinatorService_ClaimAgentSessionCleanup_Handler,
+		},
+		{
+			MethodName: "CompleteAgentSessionCleanup",
+			Handler:    _CoordinatorService_CompleteAgentSessionCleanup_Handler,
 		},
 		{
 			MethodName: "RunHeartbeat",
@@ -863,6 +979,10 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResolveSecretReference",
 			Handler:    _CoordinatorService_ResolveSecretReference_Handler,
+		},
+		{
+			MethodName: "ResolveRuntimeProfile",
+			Handler:    _CoordinatorService_ResolveRuntimeProfile_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

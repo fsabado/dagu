@@ -492,7 +492,8 @@ export async function getStepStdout(
   token: string,
   dagName: string,
   dagRunId: string,
-  stepName: string
+  stepName: string,
+  options: { retryNotFound?: boolean } = {}
 ): Promise<string> {
   const response = await request.get(
     `/api/v1/dag-runs/${encodeURIComponent(dagName)}/${encodeURIComponent(
@@ -502,6 +503,11 @@ export async function getStepStdout(
       headers: authHeaders(token),
     }
   );
+  // Log metadata can lag queue completion briefly.
+  if (options.retryNotFound && response.status() === 404) {
+    return '';
+  }
+
   expect(response.ok()).toBeTruthy();
   return ((await response.json()) as LogResponse).content;
 }
@@ -513,7 +519,7 @@ export async function enqueueRunFromUI(page: Page, fileName: string): Promise<st
       response.url().includes(`/api/v1/dags/${encodeURIComponent(fileName)}/enqueue`)
   );
 
-  await page.getByRole('button', { name: 'Enqueue' }).first().click();
+  await page.getByRole('button', { name: 'Start' }).first().click();
 
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();

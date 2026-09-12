@@ -4,14 +4,14 @@
 package harness
 
 import (
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
 var configSchema = &jsonschema.Schema{
 	Type: "object",
 	Properties: map[string]*jsonschema.Schema{
-		"provider": {Type: "string", Description: "Harness provider name. Use builtin for Dagu's in-process agent, a built-in CLI provider, or a custom top-level harnesses entry."},
+		"provider": {Type: "string", Description: "Harness provider name. Use a built-in CLI provider (aider, amp, claude, cline, codex, copilot, cursor, deepseek, droid, gemini, goose, kiro, opencode, pi, or qwen) or a custom top-level harnesses entry."},
 		"fallback": {
 			Type: "array",
 			Items: &jsonschema.Schema{
@@ -21,10 +21,9 @@ var configSchema = &jsonschema.Schema{
 		},
 	},
 	// provider is required (validated in Go).
-	// CLI providers pass other keys through as CLI flags; builtin validates its
-	// agent fields in Go.
+	// CLI providers pass other keys through as CLI flags.
 }
 
 func init() {
-	core.RegisterExecutorConfigSchema("harness", configSchema)
+	registry.RegisterExecutorConfigSchema("harness", configSchema)
 }

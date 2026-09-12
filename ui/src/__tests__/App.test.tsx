@@ -6,19 +6,23 @@ import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Config } from '@/contexts/ConfigContext';
+import { AppBarContext } from '@/contexts/AppBarContext';
 import App from '../App';
 
-const { clientMock, clientGetMock } = vi.hoisted(() => {
-  const clientGetMock = vi.fn();
-  return {
-    clientGetMock,
-    clientMock: {
-      GET: clientGetMock,
-      POST: vi.fn(),
-      DELETE: vi.fn(),
-    },
-  };
-});
+const { clientMock, clientGetMock, overviewImportError, useQueryMock } =
+  vi.hoisted(() => {
+    const clientGetMock = vi.fn();
+    return {
+      clientGetMock,
+      overviewImportError: { current: false },
+      useQueryMock: vi.fn(),
+      clientMock: {
+        GET: clientGetMock,
+        POST: vi.fn(),
+        DELETE: vi.fn(),
+      },
+    };
+  });
 
 vi.hoisted(() => {
   vi.stubGlobal('getConfig', () => ({
@@ -30,13 +34,7 @@ vi.hoisted(() => {
 
 vi.mock('@/hooks/api', () => ({
   useClient: () => clientMock,
-}));
-
-vi.mock('../features/agent', () => ({
-  AgentChatModal: () => null,
-  AgentChatProvider: ({ children }: { children: React.ReactNode }) => (
-    <>{children}</>
-  ),
+  useQuery: useQueryMock,
 }));
 
 vi.mock('../layouts/Layout', () => ({
@@ -45,22 +43,6 @@ vi.mock('../layouts/Layout', () => ({
   ),
 }));
 
-vi.mock('../pages/agent', () => ({ default: () => <h1>Agent</h1> }));
-vi.mock('../pages/agent-memory', () => ({
-  default: () => <h1>Agent Memory</h1>,
-}));
-vi.mock('../pages/agent-settings', () => ({
-  default: () => <h1>Agent Settings</h1>,
-}));
-vi.mock('../pages/agent-souls', () => ({
-  default: () => <h1>Agent Souls</h1>,
-}));
-vi.mock('../pages/agent-souls/SoulEditorPage', () => ({
-  default: () => <h1>Soul Editor</h1>,
-}));
-vi.mock('../pages/agent-tools', () => ({
-  default: () => <h1>Agent Tools</h1>,
-}));
 vi.mock('../pages/administration', () => ({
   default: () => <h1>Administration</h1>,
 }));
@@ -80,8 +62,7 @@ vi.mock('../pages/dags', () => ({ default: () => <h1>DAGs</h1> }));
 vi.mock('../pages/dags/dag', () => ({
   default: () => <h1>DAG Details</h1>,
 }));
-vi.mock('../pages/design', () => ({ default: () => <h1>Design</h1> }));
-vi.mock('../pages/docs', () => ({ default: () => <h1>Docs</h1> }));
+vi.mock('../pages/wiki', () => ({ default: () => <h1>Wiki</h1> }));
 vi.mock('../pages/event-logs', () => ({
   default: () => <h1>Event Logs</h1>,
 }));
@@ -110,15 +91,35 @@ vi.mock('../pages/notification-rules', () => ({
 vi.mock('../pages/notifications', () => ({
   default: () => <h1>Notifications</h1>,
 }));
-vi.mock('../pages/overview', () => ({ default: () => <h1>Overview</h1> }));
+vi.mock('../pages/overview', () => {
+  if (overviewImportError.current) {
+    throw new Error('Loading chunk failed');
+  }
+  return { default: () => <h1>Overview</h1> };
+});
 vi.mock('../pages/views', () => ({ default: () => <h1>View</h1> }));
-vi.mock('../pages/profiles', () => ({ default: () => <h1>Profiles</h1> }));
+vi.mock('../pages/profiles', () => ({
+  default: () => <h1>Profiles &amp; Secrets</h1>,
+}));
 vi.mock('../pages/queues', () => ({ default: () => <h1>Queues</h1> }));
 vi.mock('../pages/queues/queue', () => ({
-  default: () => <h1>Queue Details</h1>,
+  default: () => {
+    const { setTitle } = React.useContext(AppBarContext);
+    React.useEffect(() => {
+      setTitle('Queue name is missing.');
+    }, [setTitle]);
+    return <h1>Queue Details</h1>;
+  },
 }));
-vi.mock('../pages/search', () => ({ default: () => <h1>Search</h1> }));
-vi.mock('../pages/secrets', () => ({ default: () => <h1>Secrets</h1> }));
+vi.mock('../pages/search', () => ({
+  default: () => {
+    const { setTitle } = React.useContext(AppBarContext);
+    React.useEffect(() => {
+      setTitle('Search');
+    }, [setTitle]);
+    return <h1>Search</h1>;
+  },
+}));
 vi.mock('../pages/setup', () => ({ default: () => <h1>Setup</h1> }));
 vi.mock('../pages/system-status', () => ({
   default: () => <h1>System Status</h1>,
@@ -146,9 +147,10 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     setupRequired: false,
     oidcEnabled: false,
     oidcButtonLabel: '',
+    proxyEnabled: false,
+    proxyButtonLabel: '',
     terminalEnabled: true,
     gitSyncEnabled: true,
-    agentEnabled: false,
     updateAvailable: false,
     latestVersion: '',
     permissions: {
@@ -178,6 +180,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
       configFileUsed: '',
       gitSyncDir: '',
       auditLogsDir: '',
+      wikiDir: '',
+      docsDir: '',
     },
     ...overrides,
   };
@@ -188,24 +192,77 @@ function renderAt(path: string, config = makeConfig()): void {
   render(<App config={config} />);
 }
 
-describe('App license routing', () => {
-  beforeEach(() => {
-    localStorage.clear();
-    sessionStorage.clear();
-    clientGetMock.mockReset();
-    clientGetMock.mockResolvedValue({ data: { workspaces: [] } });
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () =>
-        Response.json({
-          remoteNodes: [],
-          type: 'object',
-          properties: {},
-        })
-      )
-    );
+beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+  clientGetMock.mockReset();
+  clientGetMock.mockResolvedValue({ data: { workspaces: [] } });
+  useQueryMock.mockReset();
+  useQueryMock.mockReturnValue({ data: undefined });
+  overviewImportError.current = false;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      Response.json({
+        remoteNodes: [],
+        type: 'object',
+        properties: {},
+      })
+    )
+  );
+});
+
+describe('App document title', () => {
+  it('reflects the page title in the browser tab', async () => {
+    renderAt('/search');
+
+    await waitFor(() => {
+      expect(document.title).toBe('Search - Dagu');
+    });
   });
 
+  it('localizes the page title', async () => {
+    localStorage.setItem('user_preferences', JSON.stringify({ locale: 'ja' }));
+    renderAt('/search');
+
+    await waitFor(() => {
+      expect(document.title).toBe('検索 - Dagu');
+    });
+  });
+
+  it('preserves user-defined page titles', async () => {
+    localStorage.setItem('user_preferences', JSON.stringify({ locale: 'ja' }));
+    renderAt('/queues/name%20is%20missing.');
+
+    await waitFor(() => {
+      expect(document.title).toBe('Queue name is missing. - Dagu');
+    });
+  });
+
+  it('falls back to the configured title when a page sets none', async () => {
+    renderAt('/queues', makeConfig({ title: 'Operations' }));
+
+    expect(
+      await screen.findByRole('heading', { name: 'Queues' })
+    ).toBeVisible();
+    expect(document.title).toBe('Operations');
+  });
+});
+
+describe('legacy Wiki routing', () => {
+  it('preserves the path, query, and hash when redirecting from docs', async () => {
+    renderAt('/docs/runbooks/deploy?workspace=ops#rollback');
+
+    expect(await screen.findByRole('heading', { name: 'Wiki' })).toBeVisible();
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/wiki/runbooks/deploy');
+      expect(window.location.search).toBe('?workspace=ops');
+      expect(window.location.hash).toBe('#rollback');
+    });
+  });
+});
+
+describe('App license routing', () => {
   it.each([
     { path: '/notifications', heading: 'Notifications' },
     { path: '/notification-rules', heading: 'Notification Rules' },
@@ -213,9 +270,7 @@ describe('App license routing', () => {
   ])('allows $path in community mode', async ({ path, heading }) => {
     renderAt(path);
 
-    expect(
-      await screen.findByRole('heading', { name: heading })
-    ).toBeVisible();
+    expect(await screen.findByRole('heading', { name: heading })).toBeVisible();
     expect(
       screen.queryByRole('heading', { name: 'License Required' })
     ).not.toBeInTheDocument();
@@ -232,5 +287,59 @@ describe('App license routing', () => {
     expect(
       screen.queryByRole('heading', { name: 'Incidents' })
     ).not.toBeInTheDocument();
+  });
+
+  it('updates licensed routes from the live license status', async () => {
+    useQueryMock.mockReturnValue({
+      data: {
+        valid: true,
+        plan: 'pro',
+        expiry: '2027-01-01T00:00:00Z',
+        features: ['audit'],
+        gracePeriod: false,
+        graceEndsAt: '',
+        community: false,
+        source: 'file',
+        warningCode: '',
+        error: '',
+      },
+    });
+
+    renderAt('/incidents');
+
+    expect(
+      await screen.findByRole('heading', { name: 'Incidents' })
+    ).toBeVisible();
+    expect(useQueryMock).toHaveBeenCalledWith(
+      '/license/status',
+      { params: { query: { remoteNode: 'local' } } },
+      expect.objectContaining({ refreshInterval: 60_000 })
+    );
+  });
+
+  it('redirects the legacy secrets route to the secret refs section', async () => {
+    renderAt('/secrets');
+
+    expect(
+      await screen.findByRole('heading', { name: 'Profiles & Secrets' })
+    ).toBeVisible();
+    expect(window.location.pathname).toBe('/profiles');
+    expect(window.location.hash).toBe('#secret-refs');
+  });
+
+  it('offers a reload when a lazy route chunk fails to load', async () => {
+    overviewImportError.current = true;
+    const consoleError = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+
+    renderAt('/');
+
+    expect(
+      await screen.findByRole('heading', { name: 'Unable to load this page' })
+    ).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeVisible();
+
+    consoleError.mockRestore();
   });
 });

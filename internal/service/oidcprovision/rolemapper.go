@@ -8,9 +8,16 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/dagucloud/dagu/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/service/authmapping"
 	"github.com/itchyny/gojq"
 )
+
+// WorkspaceGrantConfig maps an IdP group to a role in one workspace.
+type WorkspaceGrantConfig struct {
+	Workspace string
+	Role      string
+}
 
 // RoleMapperConfig holds configuration for role mapping.
 type RoleMapperConfig struct {
@@ -18,30 +25,80 @@ type RoleMapperConfig struct {
 	GroupsClaim string
 	// GroupMappings maps IdP group names to Dagu roles
 	GroupMappings map[string]string
+	// WorkspaceMappings maps IdP group names to workspace grants.
+	WorkspaceMappings map[string][]WorkspaceGrantConfig
+	// DefaultWorkspaceAccess controls access when no mapping matches.
+	DefaultWorkspaceAccess string
 	// RoleAttributePath is a jq expression to extract role from claims
 	RoleAttributePath string
-	// RoleAttributeStrict denies login when no valid role is found
+	// RoleAttributeStrict denies login when neither global nor workspace mapping matches.
 	RoleAttributeStrict bool
-	// SkipOrgRoleSync skips role sync on subsequent logins
+	// SkipOrgRoleSync skips role and workspace-access sync on subsequent logins.
 	SkipOrgRoleSync bool
 	// DefaultRole is the fallback role when no mapping matches
 	DefaultRole auth.Role
 }
 
-// RoleMapper maps OIDC claims to Dagu roles.
+// RoleMapper maps OIDC claims to Dagu authorization.
 type RoleMapper struct {
-	config  RoleMapperConfig
-	jqQuery *gojq.Code // Pre-compiled jq query for performance
+	groupsClaim             string
+	jqQuery                 *gojq.Code
+	groupMapper             *authmapping.Mapper
+	groupMappingsConfigured bool
 }
 
-// ErrNoRoleFound is returned when role mapping fails and strict mode is enabled.
+// ErrNoRoleFound is returned when strict mode finds no global or workspace mapping.
 var ErrNoRoleFound = errors.New("no valid role found from OIDC claims")
 
 // NewRoleMapper creates a new RoleMapper with the given configuration.
 func NewRoleMapper(config RoleMapperConfig) (*RoleMapper, error) {
-	rm := &RoleMapper{config: config}
+	groupsClaim := config.GroupsClaim
+	if groupsClaim == "" {
+		groupsClaim = "groups"
+	}
+	defaultRole := config.DefaultRole
+	if defaultRole == auth.RoleNone {
+		defaultRole = auth.RoleViewer
+	}
 
-	// Pre-compile jq query if provided
+	groupMappings := make(map[string]auth.Role, len(config.GroupMappings))
+	for group, roleValue := range config.GroupMappings {
+		role := auth.Role(strings.ToLower(roleValue))
+		if role.Valid() {
+			groupMappings[group] = role
+		}
+	}
+
+	workspaceMappings := make(map[string][]authmapping.WorkspaceGrantConfig, len(config.WorkspaceMappings))
+	for group, grants := range config.WorkspaceMappings {
+		converted := make([]authmapping.WorkspaceGrantConfig, 0, len(grants))
+		for _, grant := range grants {
+			role, err := auth.ParseRole(grant.Role)
+			if err != nil {
+				return nil, fmt.Errorf("invalid workspace mapping for group %q and workspace %q: %w", group, grant.Workspace, err)
+			}
+			converted = append(converted, authmapping.WorkspaceGrantConfig{Workspace: grant.Workspace, Role: role})
+		}
+		workspaceMappings[group] = converted
+	}
+
+	groupMapper, err := authmapping.New(authmapping.Config{
+		DefaultRole:            defaultRole,
+		GroupMappings:          groupMappings,
+		WorkspaceMappings:      workspaceMappings,
+		DefaultWorkspaceAccess: config.DefaultWorkspaceAccess,
+		Strict:                 config.RoleAttributeStrict,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	rm := &RoleMapper{
+		groupsClaim:             groupsClaim,
+		groupMapper:             groupMapper,
+		groupMappingsConfigured: len(config.GroupMappings) > 0,
+	}
+
 	if config.RoleAttributePath != "" {
 		query, err := gojq.Parse(config.RoleAttributePath)
 		if err != nil {
@@ -63,28 +120,30 @@ func NewRoleMapper(config RoleMapperConfig) (*RoleMapper, error) {
 //  2. GroupMappings if configured
 //  3. DefaultRole as fallback (or error if strict mode)
 func (rm *RoleMapper) MapRole(rawClaims map[string]any) (auth.Role, error) {
-	var role auth.Role
-	var found bool
-
-	// 1. Try jq expression first (most flexible)
 	if rm.jqQuery != nil {
-		role, found = rm.evaluateJqExpression(rawClaims)
-	}
-
-	// 2. Try group mappings
-	if !found && len(rm.config.GroupMappings) > 0 {
-		role, found = rm.evaluateGroupMappings(rawClaims)
-	}
-
-	// 3. Fallback to default role
-	if !found {
-		if rm.config.RoleAttributeStrict {
-			return "", ErrNoRoleFound
+		if role, found := rm.evaluateJqExpression(rawClaims); found {
+			return role, nil
 		}
-		return rm.config.DefaultRole, nil
 	}
+	role, err := rm.groupMapper.MapRole(rm.extractGroups(rawClaims))
+	if errors.Is(err, authmapping.ErrNoMatch) {
+		return auth.RoleNone, ErrNoRoleFound
+	}
+	return role, err
+}
 
-	return role, nil
+// MapAccess determines the global role and workspace access from OIDC claims.
+func (rm *RoleMapper) MapAccess(rawClaims map[string]any) (auth.Role, *auth.WorkspaceAccess, error) {
+	if rm.jqQuery != nil {
+		if role, found := rm.evaluateJqExpression(rawClaims); found {
+			return role, auth.AllWorkspaceAccess(), nil
+		}
+	}
+	result, err := rm.groupMapper.Map(rm.extractGroups(rawClaims))
+	if errors.Is(err, authmapping.ErrNoMatch) {
+		return auth.RoleNone, nil, ErrNoRoleFound
+	}
+	return result.Role, result.WorkspaceAccess, err
 }
 
 // evaluateJqExpression runs the jq query against claims and returns the role.
@@ -92,81 +151,32 @@ func (rm *RoleMapper) evaluateJqExpression(claims map[string]any) (auth.Role, bo
 	iter := rm.jqQuery.Run(claims)
 	v, ok := iter.Next()
 	if !ok {
-		return "", false
+		return auth.RoleNone, false
 	}
 	if _, isErr := v.(error); isErr {
-		// jq evaluation error - treat as not found
-		return "", false
+		return auth.RoleNone, false
 	}
 
 	roleStr, ok := v.(string)
 	if !ok || roleStr == "" {
-		return "", false
+		return auth.RoleNone, false
 	}
 
 	role := auth.Role(strings.ToLower(roleStr))
 	if !role.Valid() {
-		return "", false
+		return auth.RoleNone, false
 	}
-
 	return role, true
-}
-
-// evaluateGroupMappings checks the groups claim and maps to a role.
-// Returns the highest-privilege matching role.
-func (rm *RoleMapper) evaluateGroupMappings(claims map[string]any) (auth.Role, bool) {
-	groups := rm.extractGroups(claims)
-	if len(groups) == 0 {
-		return "", false
-	}
-
-	// Role priority: admin > manager > developer > operator > viewer
-	rolePriority := map[auth.Role]int{
-		auth.RoleAdmin:     5,
-		auth.RoleManager:   4,
-		auth.RoleDeveloper: 3,
-		auth.RoleOperator:  2,
-		auth.RoleViewer:    1,
-	}
-
-	var bestRole auth.Role
-	var bestPriority int
-
-	for _, group := range groups {
-		if roleStr, ok := rm.config.GroupMappings[group]; ok {
-			role := auth.Role(strings.ToLower(roleStr))
-			if role.Valid() {
-				priority := rolePriority[role]
-				if priority > bestPriority {
-					bestRole = role
-					bestPriority = priority
-				}
-			}
-		}
-	}
-
-	if bestPriority == 0 {
-		return "", false
-	}
-
-	return bestRole, true
 }
 
 // extractGroups extracts group names from claims using the configured claim name.
 // Supports nested claims using dot notation (e.g., "realm_access.roles").
 func (rm *RoleMapper) extractGroups(claims map[string]any) []string {
-	claimName := rm.config.GroupsClaim
-	if claimName == "" {
-		claimName = "groups" // Default
-	}
-
-	// Handle nested claims (e.g., "realm_access.roles" for Keycloak)
-	value := getNestedClaim(claims, claimName)
+	value := getNestedClaim(claims, rm.groupsClaim)
 	if value == nil {
 		return nil
 	}
 
-	// Handle different formats
 	switch v := value.(type) {
 	case []any:
 		groups := make([]string, 0, len(v))
@@ -179,11 +189,10 @@ func (rm *RoleMapper) extractGroups(claims map[string]any) []string {
 	case []string:
 		return v
 	case string:
-		// Some providers send space-separated groups
 		return strings.Fields(v)
+	default:
+		return nil
 	}
-
-	return nil
 }
 
 // getNestedClaim retrieves a claim value using dot notation.
@@ -198,11 +207,15 @@ func getNestedClaim(claims map[string]any, path string) any {
 			return nil
 		}
 	}
-
 	return current
 }
 
-// IsConfigured returns true if any role mapping is configured.
+// IsConfigured reports whether any authorization mapping or scoped fallback is configured.
 func (rm *RoleMapper) IsConfigured() bool {
-	return rm.jqQuery != nil || len(rm.config.GroupMappings) > 0
+	return rm.jqQuery != nil || rm.groupMappingsConfigured || rm.WorkspaceAccessPolicyActive()
+}
+
+// WorkspaceAccessPolicyActive reports whether OIDC controls workspace access.
+func (rm *RoleMapper) WorkspaceAccessPolicyActive() bool {
+	return rm.groupMapper.WorkspaceAccessPolicyActive()
 }

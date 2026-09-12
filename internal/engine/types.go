@@ -9,12 +9,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	coreexec "github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/agent"
-	"github.com/dagucloud/dagu/internal/runtime/runstate"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/worker"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/proc"
+	"github.com/dagucloud/dagu/v2/internal/runtime/agent"
+	"github.com/dagucloud/dagu/v2/internal/runtime/runstate"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/worker"
 )
 
 type ExecutionMode string
@@ -37,7 +39,7 @@ type Options struct {
 	Persistence        Persistence
 	PersistenceFactory PersistenceFactory
 	RunStateStore      runstate.Store
-	DAGRunStore        coreexec.DAGRunStore
+	DAGRunRepository   *persis.DAGRunRepository
 	DefaultMode        ExecutionMode
 	Distributed        *DistributedOptions
 }
@@ -68,6 +70,7 @@ type RunOptions struct {
 	WorkerSelector    map[string]string
 	Labels            []string
 	DryRun            bool
+	NoReuse           bool
 }
 
 type RunRef struct {
@@ -102,7 +105,7 @@ type Run struct {
 	doneErr   error
 
 	agent *agent.Agent
-	dag   *core.DAG
+	dag   *ir.DAG
 
 	coordinator coordinator.Client
 }
@@ -121,6 +124,6 @@ type Worker struct {
 }
 
 type localPreparation struct {
-	attempt coreexec.DAGRunAttempt
-	proc    coreexec.ProcHandle
+	attempt dagrun.Attempt
+	proc    proc.ProcHandle
 }

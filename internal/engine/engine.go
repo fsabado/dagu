@@ -10,37 +10,36 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/agentsnapshot"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/core"
-	coreexec "github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/dagstate"
-	"github.com/dagucloud/dagu/internal/node"
-	"github.com/dagucloud/dagu/internal/runtime"
-	runtimeexec "github.com/dagucloud/dagu/internal/runtime/executor"
-	"github.com/dagucloud/dagu/internal/runtime/runstate"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/runtime/runstate"
+	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/spf13/viper"
 )
 
 type Engine struct {
-	cfg             *config.Config
-	dagRunStore     coreexec.DAGRunStore
-	runStateStore   runstate.Store
-	stateStore      dagstate.Store
-	procStore       coreexec.ProcStore
-	serviceRegistry coreexec.ServiceRegistry
-	dagStore        coreexec.DAGStore
-	dagRunMgr       runtime.Manager
-	defaultMode     ExecutionMode
-	distributed     DistributedOptions
-	logger          logger.Logger
+	cfg              *config.Config
+	dagRunRepository *persis.DAGRunRepository
+	runStateStore    runstate.Store
+	stateStore       dagrun.StateStore
+	procRepository   *persis.ProcRepository
+	serviceRegistry  serviceregistry.ServiceRegistry
+	dagRepository    *persis.DAGRepository
+	dagRunMgr        runtime.Manager
+	defaultMode      ExecutionMode
+	distributed      DistributedOptions
+	logger           logger.Logger
 
-	dagStoreFactory      DAGStoreFactory
-	agentStoresFactory   AgentStoresFactory
-	snapshotStoreFactory agentsnapshot.StoreFactory
+	dagRepositoryFactory DAGRepositoryFactory
+	runtimeStoresFactory RuntimeStoresFactory
 }
 
 func New(ctx context.Context, opts Options) (*Engine, error) {
@@ -67,7 +66,7 @@ func New(ctx context.Context, opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	dagRunMgr := runtime.NewManager(persistence.DAGRunStore, persistence.ProcStore, cfg)
+	dagRunMgr := runtime.NewManager(persistence.DAGRunRepository, persistence.ProcRepository, cfg)
 
 	mode := opts.DefaultMode
 	if mode == "" {
@@ -79,21 +78,20 @@ func New(ctx context.Context, opts Options) (*Engine, error) {
 	}
 
 	return &Engine{
-		cfg:             cfg,
-		dagRunStore:     persistence.DAGRunStore,
-		runStateStore:   persistence.RunStateStore,
-		stateStore:      persistence.StateStore,
-		procStore:       persistence.ProcStore,
-		serviceRegistry: persistence.ServiceRegistry,
-		dagStore:        persistence.DAGStore,
-		dagRunMgr:       dagRunMgr,
-		defaultMode:     mode,
-		distributed:     distributed,
-		logger:          log,
+		cfg:              cfg,
+		dagRunRepository: persistence.DAGRunRepository,
+		runStateStore:    persistence.RunStateStore,
+		stateStore:       persistence.StateStore,
+		procRepository:   persistence.ProcRepository,
+		serviceRegistry:  persistence.ServiceRegistry,
+		dagRepository:    persistence.DAGRepository,
+		dagRunMgr:        dagRunMgr,
+		defaultMode:      mode,
+		distributed:      distributed,
+		logger:           log,
 
-		dagStoreFactory:      persistence.DAGStoreFactory,
-		agentStoresFactory:   persistence.AgentStoresFactory,
-		snapshotStoreFactory: persistence.SnapshotStoreFactory,
+		dagRepositoryFactory: persistence.DAGRepositoryFactory,
+		runtimeStoresFactory: persistence.RuntimeStoresFactory,
 	}, nil
 }
 
@@ -188,6 +186,7 @@ func (e *Engine) coordinatorClient(opts DistributedOptions) (coordinator.Client,
 		return nil, fmt.Errorf("distributed execution requires at least one coordinator address")
 	}
 	cfg := coordinator.DefaultConfig()
+	cfg.WorkspaceBundleDir = workspacebundle.StoreDir(e.cfg.Paths.DataDir)
 	cfg.CAFile = opts.TLS.ClientCAFile
 	cfg.CertFile = opts.TLS.CertFile
 	cfg.KeyFile = opts.TLS.KeyFile
@@ -207,14 +206,15 @@ func (e *Engine) coordinatorClient(opts DistributedOptions) (coordinator.Client,
 	return coordinator.New(registry, cfg), nil
 }
 
-func (e *Engine) subWorkflowRunnerFactory(stores AgentStores) func(context.Context) (runtimeexec.SubWorkflowRunner, error) {
-	return node.NewSubWorkflowRunnerFactory(node.SubWorkflowRunnerConfig{
+func (e *Engine) subWorkflowRunnerFactory(stores RuntimeStores) func(context.Context) (runtimeexec.SubWorkflowRunner, error) {
+	return coordinator.NewSubWorkflowRunnerFactory(coordinator.SubWorkflowRunnerConfig{
 		DAGRunMgr:         e.dagRunMgr,
-		DAGStore:          e.dagStore,
-		DAGRunStore:       e.dagRunStore,
+		DAGRepository:     e.dagRepository,
+		DAGRunRepository:  e.dagRunRepository,
 		RunStateStore:     e.runStateStore,
 		StateStore:        e.stateStore,
-		AgentStores:       stores,
+		SecretStore:       stores.SecretStore,
+		ProfileStore:      stores.ProfileStore,
 		ServiceRegistry:   e.serviceRegistry,
 		PeerConfig:        e.cfg.Core.Peer,
 		DefaultExecMode:   configExecutionMode(e.defaultMode),
@@ -224,7 +224,7 @@ func (e *Engine) subWorkflowRunnerFactory(stores AgentStores) func(context.Conte
 	})
 }
 
-func runStatusToPublic(status *coreexec.DAGRunStatus) (*Status, error) {
+func runStatusToPublic(status *ir.DAGRunStatus) (*Status, error) {
 	if status == nil {
 		return nil, nil
 	}
@@ -262,10 +262,10 @@ func parseStatusTime(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, value)
 }
 
-func statusFromValue(status coreexec.DAGRunStatus) (*Status, error) {
+func statusFromValue(status ir.DAGRunStatus) (*Status, error) {
 	return runStatusToPublic(&status)
 }
 
 func isSuccess(status *Status) bool {
-	return status != nil && (status.Status == core.Succeeded.String() || status.Status == core.PartiallySucceeded.String())
+	return status != nil && (status.Status == ir.Succeeded.String() || status.Status == ir.PartiallySucceeded.String())
 }

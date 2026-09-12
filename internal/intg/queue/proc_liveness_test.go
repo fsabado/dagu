@@ -10,11 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
-	"github.com/dagucloud/dagu/internal/test"
-	"github.com/dagucloud/dagu/internal/test/intgharness"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/test/intgharness"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -32,7 +31,7 @@ steps:
   - name: sleep
     run: |
 %s
-`, indentQueueTestScript(intgharness.PortableCommands().WaitForFile(releaseFile), 6)), WithProcConfig(queueTestProcHeartbeatInterval, queueTestProcHeartbeatInterval, queueTestProcStaleThreshold)).
+`, indentQueueTestScript(intgharness.PortableCommands().WaitForFile(releaseFile), 6)), WithProcConfig(queueTestProcHeartbeatInterval, queueTestProcStaleThreshold)).
 		Enqueue(1).
 		StartScheduler(60 * time.Second)
 	defer f.Stop()
@@ -44,13 +43,13 @@ steps:
 	}()
 
 	runID := f.runIDs[0]
-	f.WaitForStatus(runID, core.Running, 30*time.Second)
+	f.WaitForStatus(runID, ir.Running, 30*time.Second)
 
 	f.RequireRunHeartbeatAdvance(runID, 10*time.Second)
 
 	require.NoError(t, os.WriteFile(releaseFile, []byte("release"), 0o600))
 	released = true
-	f.WaitForStatus(runID, core.Succeeded, 20*time.Second)
+	f.WaitForStatus(runID, ir.Succeeded, 20*time.Second)
 }
 
 func TestSchedulerRepairsStaleLocalRunAndCleansProcFile(t *testing.T) {
@@ -59,24 +58,24 @@ name: scheduler-stale-repair
 steps:
   - name: step1
     run: echo never
-`, WithProcConfig(50*time.Millisecond, 50*time.Millisecond, 100*time.Millisecond), WithZombieConfig(50*time.Millisecond, 1))
+`, WithProcConfig(50*time.Millisecond, 100*time.Millisecond), WithZombieConfig(50*time.Millisecond, 1))
 	defer f.Stop()
 
 	dagRunID := uuid.Must(uuid.NewV7()).String()
-	ref := exec.NewDAGRunRef(f.dag.Name, dagRunID)
-	attempt, err := f.th.DAGRunStore.CreateAttempt(f.th.Context, f.dag, time.Now(), dagRunID, exec.NewDAGRunAttemptOptions{})
+	ref := ir.NewDAGRunRef(f.dag.Name, dagRunID)
+	attempt, err := f.th.DAGRunRepository.CreateAttempt(f.th.Context, f.dag, time.Now(), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
-	status := transform.NewStatusBuilder(f.dag).Create(
+	status := ir.NewStatusBuilder(f.dag).Create(
 		dagRunID,
-		core.Running,
+		ir.Running,
 		0,
 		time.Now().Add(-2*time.Second),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithHierarchyRefs(ref, exec.DAGRunRef{}),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithHierarchyRefs(ref, ir.DAGRunRef{}),
 	)
 	require.NotEmpty(t, status.Nodes)
-	status.Nodes[0].Status = core.NodeRunning
+	status.Nodes[0].Status = ir.NodeRunning
 
 	require.NoError(t, attempt.Open(f.th.Context))
 	require.NoError(t, attempt.Write(f.th.Context, status))
@@ -93,11 +92,11 @@ steps:
 	)
 
 	f.StartScheduler(10 * time.Second)
-	f.WaitForStatus(dagRunID, core.Failed, 10*time.Second)
+	f.WaitForStatus(dagRunID, ir.Failed, 10*time.Second)
 
 	repaired, err := f.Status(dagRunID)
 	require.NoError(t, err)
-	require.Equal(t, core.NodeFailed, repaired.Nodes[0].Status)
+	require.Equal(t, ir.NodeFailed, repaired.Nodes[0].Status)
 	require.Contains(t, repaired.Nodes[0].Error, "stale local process detected")
 
 	f.RequireProcFileMissing(procFile, 5*time.Second)
@@ -110,12 +109,12 @@ max_active_runs: 1
 steps:
   - name: echo
     run: echo hello
-`, WithProcConfig(queueTestProcHeartbeatInterval, queueTestProcHeartbeatInterval, queueTestProcStaleThreshold), WithZombieConfig(50*time.Millisecond, 3)).
+`, WithProcConfig(queueTestProcHeartbeatInterval, queueTestProcStaleThreshold), WithZombieConfig(50*time.Millisecond, 3)).
 		Enqueue(1)
 	defer f.Stop()
 
 	fakeRunID := uuid.Must(uuid.NewV7()).String()
-	fakeRef := exec.NewDAGRunRef(f.dag.Name, fakeRunID)
+	fakeRef := ir.NewDAGRunRef(f.dag.Name, fakeRunID)
 	staleStartedAt := time.Now().Add(-30 * time.Second)
 	procFile := test.CreateStaleLegacyProcFile(
 		t,
@@ -129,7 +128,7 @@ steps:
 	f.RequireProcEntryStale(fakeRunID, 5*time.Second)
 
 	f.StartScheduler(30 * time.Second)
-	f.WaitForStatus(f.runIDs[0], core.Succeeded, 20*time.Second)
+	f.WaitForStatus(f.runIDs[0], ir.Succeeded, 20*time.Second)
 
 	f.RequireProcFileMissing(procFile, 15*time.Second)
 }

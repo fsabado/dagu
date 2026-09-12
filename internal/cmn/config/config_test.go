@@ -238,17 +238,6 @@ func TestConfig_Validate(t *testing.T) {
 		assert.Contains(t, err.Error(), "proc.heartbeat_interval")
 	})
 
-	t.Run("InvalidProcHeartbeatSyncInterval", func(t *testing.T) {
-		t.Parallel()
-		cfg := validBaseConfig()
-		cfg.Proc.HeartbeatSyncInterval = 10 * time.Second
-		cfg.Proc.StaleThreshold = 10 * time.Second
-
-		err := cfg.Validate()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "proc.heartbeat_sync_interval")
-	})
-
 	t.Run("InvalidMaxDashboardPageLimit_Negative", func(t *testing.T) {
 		t.Parallel()
 		cfg := validBaseConfig()
@@ -329,6 +318,36 @@ func TestConfig_Validate(t *testing.T) {
 		err := cfg.Validate()
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "positive token TTL")
+	})
+
+	t.Run("BuiltinAuth_MaxTokenTTL", func(t *testing.T) {
+		t.Parallel()
+		cfg := validBaseConfig()
+		cfg.Server.Auth = Auth{
+			Mode: AuthModeBuiltin,
+			Builtin: AuthBuiltin{
+				Token: TokenConfig{Secret: "secret", TTL: 365 * 24 * time.Hour},
+			},
+		}
+		cfg.Paths.UsersDir = "/tmp/users"
+		cfg.UI.MaxDashboardPageLimit = 1
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("BuiltinAuth_TokenTTLAboveMaximum", func(t *testing.T) {
+		t.Parallel()
+		cfg := validBaseConfig()
+		cfg.Server.Auth = Auth{
+			Mode: AuthModeBuiltin,
+			Builtin: AuthBuiltin{
+				Token: TokenConfig{Secret: "secret", TTL: 365*24*time.Hour + time.Second},
+			},
+		}
+		cfg.Paths.UsersDir = "/tmp/users"
+		cfg.UI.MaxDashboardPageLimit = 1
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must not exceed 8760h (365 days)")
 	})
 
 	t.Run("BuiltinAuth_InitialAdmin_BothSet", func(t *testing.T) {
@@ -619,6 +638,287 @@ func TestConfig_Validate(t *testing.T) {
 		err := cfg.Validate()
 		require.NoError(t, err)
 	})
+}
+
+func TestConfigValidateIPAccess(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		wantError string
+	}{
+		{
+			name: "ValidAddressesAndNetworks",
+			configure: func(cfg *Config) {
+				cfg.Server.IPAccess = IPAccessConfig{
+					AllowedIPs:     []string{"203.0.113.10", "10.0.0.0/8", "2001:db8::/32"},
+					TrustedProxies: []string{"127.0.0.1", "::1"},
+				}
+			},
+		},
+		{
+			name: "InvalidAllowedIP",
+			configure: func(cfg *Config) {
+				cfg.Server.IPAccess.AllowedIPs = []string{"not-an-ip"}
+			},
+			wantError: `ip_access.allowed_ips[0] "not-an-ip"`,
+		},
+		{
+			name: "IPv4MappedNetworkBelowMappedPrefix",
+			configure: func(cfg *Config) {
+				cfg.Server.IPAccess.AllowedIPs = []string{"::ffff:192.0.2.0/95"}
+			},
+			wantError: `ip_access.allowed_ips[0] "::ffff:192.0.2.0/95"`,
+		},
+		{
+			name: "InvalidTrustedProxy",
+			configure: func(cfg *Config) {
+				cfg.Server.IPAccess.TrustedProxies = []string{"10.0.0.0/99"}
+			},
+			wantError: `ip_access.trusted_proxies[0] "10.0.0.0/99"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseConfig()
+			tt.configure(cfg)
+
+			err := cfg.Validate()
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestConfig_ValidateOIDCWorkspaceMappings(t *testing.T) {
+	t.Parallel()
+
+	newConfig := func() *Config {
+		cfg := validBaseConfig()
+		cfg.Server.Auth = Auth{
+			Mode: AuthModeBuiltin,
+			Builtin: AuthBuiltin{
+				Token: TokenConfig{Secret: "secret", TTL: 1},
+			},
+			OIDC: AuthOIDC{
+				ClientID:     "client-id",
+				ClientSecret: "secret",
+				ClientURL:    "https://example.com",
+				Issuer:       "https://issuer.example.com",
+				Scopes:       []string{"openid", "email"},
+				RoleMapping: OIDCRoleMapping{
+					DefaultRole:            "viewer",
+					DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				},
+			},
+		}
+		cfg.Paths.UsersDir = "/tmp/users"
+		return cfg
+	}
+
+	t.Run("Valid", func(t *testing.T) {
+		t.Parallel()
+		cfg := newConfig()
+		cfg.Server.Auth.OIDC.RoleMapping.WorkspaceMappings = map[string][]OIDCWorkspaceGrant{
+			"team-a": {
+				{Workspace: "payments", Role: "manager"},
+				{Workspace: "infra", Role: "developer"},
+				{Workspace: "operations", Role: "operator"},
+				{Workspace: "reports", Role: "viewer"},
+			},
+			"team-b": {{Workspace: "payments", Role: "viewer"}},
+		}
+
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("AllowsOmittedDefaultWithoutMappings", func(t *testing.T) {
+		t.Parallel()
+		cfg := newConfig()
+		cfg.Server.Auth.OIDC.RoleMapping.DefaultWorkspaceAccess = ""
+
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("RequiresExplicitDefaultWithMappings", func(t *testing.T) {
+		t.Parallel()
+		cfg := newConfig()
+		cfg.Server.Auth.OIDC.RoleMapping.DefaultWorkspaceAccess = ""
+		cfg.Server.Auth.OIDC.RoleMapping.WorkspaceMappings = map[string][]OIDCWorkspaceGrant{
+			"team": {{Workspace: "payments", Role: "viewer"}},
+		}
+
+		err := cfg.Validate()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "defaultWorkspaceAccess must be explicitly set")
+	})
+
+	t.Run("InvalidMappingWithIncompleteOIDC", func(t *testing.T) {
+		t.Parallel()
+		cfg := newConfig()
+		cfg.Server.Auth.OIDC.ClientID = ""
+		cfg.Server.Auth.OIDC.RoleMapping.WorkspaceMappings = map[string][]OIDCWorkspaceGrant{
+			"team": {{Workspace: "bad/name", Role: "viewer"}},
+		}
+
+		err := cfg.Validate()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "workspace")
+	})
+
+	tests := []struct {
+		name    string
+		mapping OIDCRoleMapping
+		wantErr string
+	}{
+		{
+			name: "InvalidDefaultWorkspaceAccess",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: "restricted",
+			},
+			wantErr: "defaultWorkspaceAccess",
+		},
+		{
+			name: "BlankGroup",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"  ": {{Workspace: "payments", Role: "viewer"}},
+				},
+			},
+			wantErr: "blank group",
+		},
+		{
+			name: "EmptyGrantList",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"team": {},
+				},
+			},
+			wantErr: "at least one grant",
+		},
+		{
+			name: "InvalidWorkspace",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"team": {{Workspace: "bad/name", Role: "viewer"}},
+				},
+			},
+			wantErr: "workspace",
+		},
+		{
+			name: "ReservedWorkspace",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"team": {{Workspace: "global", Role: "viewer"}},
+				},
+			},
+			wantErr: "reserved",
+		},
+		{
+			name: "DuplicateWorkspaceWithinGroup",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"team": {
+						{Workspace: "payments", Role: "viewer"},
+						{Workspace: "payments", Role: "operator"},
+					},
+				},
+			},
+			wantErr: "duplicate workspace",
+		},
+		{
+			name: "InvalidRole",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"team": {{Workspace: "payments", Role: "owner"}},
+				},
+			},
+			wantErr: "invalid role",
+		},
+		{
+			name: "AdminRole",
+			mapping: OIDCRoleMapping{
+				DefaultRole:            "viewer",
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"team": {{Workspace: "payments", Role: "admin"}},
+				},
+			},
+			wantErr: "must not be admin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := newConfig()
+			cfg.Server.Auth.OIDC.RoleMapping = tt.mapping
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestOIDCRoleMapping_WorkspaceAccessPolicyActive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		mapping OIDCRoleMapping
+		want    bool
+	}{
+		{
+			name: "DefaultAll",
+			mapping: OIDCRoleMapping{
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+			},
+		},
+		{
+			name: "ExplicitNone",
+			mapping: OIDCRoleMapping{
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessNone,
+			},
+			want: true,
+		},
+		{
+			name: "Mappings",
+			mapping: OIDCRoleMapping{
+				DefaultWorkspaceAccess: OIDCDefaultWorkspaceAccessAll,
+				WorkspaceMappings: map[string][]OIDCWorkspaceGrant{
+					"team": {{Workspace: "payments", Role: "viewer"}},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, tt.mapping.WorkspaceAccessPolicyActive())
+		})
+	}
 }
 
 func TestConfig_ValidateRemoteNodes(t *testing.T) {

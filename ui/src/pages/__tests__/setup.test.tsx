@@ -13,17 +13,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Config } from '@/contexts/ConfigContext';
 import { ConfigContext } from '@/contexts/ConfigContext';
 import { useAuth } from '@/contexts/AuthContext';
-import { useAgentAuthProviders } from '@/features/agent/hooks/useAgentAuthProviders';
-import { useClient } from '@/hooks/api';
+import { UserPreferencesProvider } from '@/contexts/UserPreference';
+import { I18nProvider } from '@/i18n/I18nProvider';
 import SetupPage from '../setup';
 
 const navigateMock = vi.fn();
 const setupMock = vi.fn();
 const completeSetupMock = vi.fn();
-const getMock = vi.fn();
-const patchMock = vi.fn();
-const postMock = vi.fn();
-const putMock = vi.fn();
 
 vi.mock('react-router-dom', () => ({
   useNavigate: () => navigateMock,
@@ -33,17 +29,7 @@ vi.mock('@/contexts/AuthContext', () => ({
   useAuth: vi.fn(),
 }));
 
-vi.mock('@/hooks/api', () => ({
-  useClient: vi.fn(),
-}));
-
-vi.mock('@/features/agent/hooks/useAgentAuthProviders', () => ({
-  useAgentAuthProviders: vi.fn(),
-}));
-
 const useAuthMock = vi.mocked(useAuth);
-const useClientMock = vi.mocked(useClient);
-const useAgentAuthProvidersMock = vi.mocked(useAgentAuthProviders);
 
 const config: Config = {
   apiURL: '/api/v1',
@@ -60,9 +46,10 @@ const config: Config = {
   setupRequired: true,
   oidcEnabled: false,
   oidcButtonLabel: '',
+  proxyEnabled: false,
+  proxyButtonLabel: '',
   terminalEnabled: false,
   gitSyncEnabled: false,
-  agentEnabled: false,
   updateAvailable: false,
   latestVersion: '',
   permissions: {
@@ -97,31 +84,26 @@ const config: Config = {
 
 function renderPage() {
   return render(
-    <ConfigContext.Provider value={config}>
-      <SetupPage />
-    </ConfigContext.Provider>
+    <UserPreferencesProvider>
+      <I18nProvider>
+        <ConfigContext.Provider value={config}>
+          <SetupPage />
+        </ConfigContext.Provider>
+      </I18nProvider>
+    </UserPreferencesProvider>
   );
 }
 
 beforeEach(() => {
+  localStorage.clear();
   navigateMock.mockReset();
   setupMock.mockReset();
   completeSetupMock.mockReset();
-  useClientMock.mockReset();
-  useAgentAuthProvidersMock.mockReset();
-  getMock.mockReset();
-  patchMock.mockReset();
-  postMock.mockReset();
-  putMock.mockReset();
 
   setupMock.mockResolvedValue({
     token: 'token-1',
     user: { id: '1', username: 'admin-user', role: 'admin' },
   });
-  getMock.mockResolvedValue({ data: {} });
-  patchMock.mockResolvedValue({});
-  postMock.mockResolvedValue({ data: {} });
-  putMock.mockResolvedValue({});
 
   useAuthMock.mockReturnValue({
     user: null,
@@ -135,13 +117,6 @@ beforeEach(() => {
     refreshUser: vi.fn(),
     completeSetup: completeSetupMock,
   });
-
-  useClientMock.mockReturnValue({
-    GET: getMock,
-    PATCH: patchMock,
-    POST: postMock,
-    PUT: putMock,
-  } as never);
 });
 
 afterEach(() => {
@@ -149,7 +124,7 @@ afterEach(() => {
 });
 
 describe('SetupPage', () => {
-  it('completes onboarding after creating the admin account without showing agent setup', async () => {
+  it('completes onboarding after creating the admin account', async () => {
     renderPage();
 
     fireEvent.change(screen.getByLabelText('Username'), {
@@ -173,12 +148,18 @@ describe('SetupPage', () => {
       user: { id: '1', username: 'admin-user', role: 'admin' },
     });
     expect(navigateMock).toHaveBeenCalledWith('/', { replace: true });
-    expect(screen.queryByText('Enable AI Agent')).not.toBeInTheDocument();
-    expect(useClientMock).not.toHaveBeenCalled();
-    expect(useAgentAuthProvidersMock).not.toHaveBeenCalled();
-    expect(getMock).not.toHaveBeenCalled();
-    expect(patchMock).not.toHaveBeenCalled();
-    expect(postMock).not.toHaveBeenCalled();
-    expect(putMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the saved Japanese locale', () => {
+    localStorage.setItem('user_preferences', JSON.stringify({ locale: 'ja' }));
+
+    renderPage();
+
+    expect(
+      screen.getByText('管理者アカウントを作成してください')
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'アカウントを作成' })
+    ).toBeVisible();
   });
 });

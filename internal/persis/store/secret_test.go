@@ -11,10 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/cmn/crypto"
-	"github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
-	"github.com/dagucloud/dagu/internal/secret"
+	"github.com/dagucloud/dagu/v2/internal/cmn/crypto"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/secret"
 )
 
 func newSecretStore(t *testing.T) *store.SecretStore {
@@ -122,6 +122,25 @@ func TestSecretGetByRef_NotFound(t *testing.T) {
 	ctx := context.Background()
 	_, err := newSecretStore(t).GetByRef(ctx, "any", "no/such")
 	assert.ErrorIs(t, err, secret.ErrNotFound)
+}
+
+func TestSecretStoresShareRefLookups(t *testing.T) {
+	ctx := context.Background()
+	col := testutil.NewMemoryBackend().Collection("secrets")
+	enc, err := crypto.NewEncryptor("test-key")
+	require.NoError(t, err)
+
+	writer, err := store.NewSecretStore(col, enc)
+	require.NoError(t, err)
+	reader, err := store.NewSecretStore(col, enc)
+	require.NoError(t, err)
+
+	sec := newSecret("ops", "infra/token")
+	require.NoError(t, writer.Create(ctx, sec, nil))
+
+	got, err := reader.GetByRef(ctx, "ops", "infra/token")
+	require.NoError(t, err)
+	assert.Equal(t, sec.ID, got.ID)
 }
 
 func TestSecretList(t *testing.T) {

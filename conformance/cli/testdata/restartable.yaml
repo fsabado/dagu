@@ -1,0 +1,11 @@
+working_dir: .
+steps:
+  - id: mark_started
+    # Keep the first run active; let its replacement finish immediately.
+    run: |
+      if [ -f restart_marks.out ]; then
+        printf 'started\n' >> restart_marks.out
+      else
+        printf 'started\n' > restart_marks.out
+        sleep 30
+      fi

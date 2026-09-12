@@ -27,6 +27,49 @@ It must not be treated as product behavior until implementation catches up.
 | [015: Step Run Script](015-step-run-script.md) | Implemented |
 | [017: Built-In Run Context](017-built-in-run-context.md) | Implemented |
 | [018: Parallel Fan-Out and Foreach Iteration](018-parallel-and-foreach.md) | Implemented |
+| [019: Sub-DAG Working Directory](019-sub-dag-working-directory.md) | Implemented |
+| [020: MCP Server](020-mcp-server.md) | Not implemented |
+| [021: MCP Read Tool](021-mcp-read-tool.md) | Implemented |
+| [022: MCP Change Tool](022-mcp-change-tool.md) | Implemented |
+| [023: Preconditions](023-preconditions.md) | Implemented |
+| [030: Git Worktree Action](030-git-worktree-action.md) | Implemented |
+| [031: Human Tasks](031-human-task.md) | Implemented |
+| [032: Agent DAGs](032-agent-dag.md) | Implemented |
+| [033: Build Workflows](033-build-workflows.md) | Implemented |
+| [034: Wiki Page File Format](034-wiki-page-format.md) | Implemented |
+| [035: File Dependencies](035-file-dependencies.md) | Implemented |
+| [036: MCP Execute Tool](036-mcp-execute-tool.md) | Implemented |
+| [037: Docker Run Action](037-docker-run.md) | Partially implemented |
+| [038: Kubernetes Run Action](038-kubernetes-run.md) | Partially implemented |
+| [039: Wait Actions](039-wait.md) | Implemented |
+| [040: Router Route Action](040-router-route.md) | Implemented |
+| [041: Log Write Action](041-log-write.md) | Implemented |
+| [042: SSH Run Action](042-ssh-run.md) | Partially implemented |
+| [043: SFTP Transfer Actions](043-sftp-transfer.md) | Partially implemented |
+| [044: Mail Send Action](044-mail-send.md) | Partially implemented |
+| [045: HTTP Request Action](045-http-request.md) | Partially implemented |
+| [046: PostgreSQL Actions](046-postgres.md) | Partially implemented |
+| [047: SQLite Actions](047-sqlite.md) | Partially implemented |
+| [048: DuckDB and Action Bundles](048-duckdb-action.md) | Partially implemented |
+| [049: Data Convert and Pick Actions](049-data.md) | Partially implemented |
+| [050: Outputs Write Action](050-outputs.md) | Implemented |
+| [051: Artifact Actions](051-artifact.md) | Partially implemented |
+| [052: File Actions](052-file.md) | Partially implemented |
+| [053: Archive Actions](053-archive.md) | Partially implemented |
+| [054: Template Action](054-template.md) | Partially implemented |
+| [055: Git Checkout Action](055-git-checkout.md) | Partially implemented |
+| [056: S3 Actions](056-s3.md) | Partially implemented |
+| [057: Redis Actions](057-redis.md) | Partially implemented |
+| [058: JQ Filter Action](058-jq-filter.md) | Partially implemented |
+| [059: Chat Completion Action](059-chat-completion.md) | Partially implemented |
+| [060: Node Script Action](060-node-script.md) | Partially implemented |
+| [061: Python Script Action](061-python-script.md) | Partially implemented |
+| [062: dbt Action](062-dbt.md) | Partially implemented |
+| [063: Schedule Descriptors](063-schedule.md) | Implemented |
+| [067: Harness Executor](067-harness.md) | Partially implemented |
+| [068: State Executor](068-state.md) | Implemented |
+| [069: Secrets Providers](069-secrets-providers.md) | Partially implemented |
+| [070: Runtime Profiles](070-runtime-profiles.md) | Partially implemented |
 
 **Writing guidelines:**
 

@@ -12,11 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file/dag/dagindex"
-	"github.com/dagucloud/dagu/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file/dag/dagindex"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,11 +28,19 @@ func TestMain(m *testing.M) {
 	// Register executor capabilities for testing.
 	// In production, this is done by runtime/builtin init functions.
 	for _, t := range []string{"", "shell", "command"} {
-		core.RegisterExecutorCapabilities(t, core.ExecutorCapabilities{
+		registry.RegisterExecutorCapabilities(t, registry.ExecutorCapabilities{
 			Command: true, MultipleCommands: true, Script: true, Shell: true,
 		})
 	}
 	os.Exit(m.Run())
+}
+
+func newRepository(baseDir string, opts ...Option) *persis.DAGRepository {
+	store := NewStore(baseDir, opts...)
+	return persis.NewDAGRepository(store, persis.DAGRepositoryOptions{
+		BaseConfigPath:         store.baseConfigPath,
+		WorkspaceBaseConfigDir: store.workspaceBaseConfigDir,
+	})
 }
 
 func TestStore(t *testing.T) {
@@ -39,15 +49,37 @@ func TestStore(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	dr := New(tmpDir, WithSkipExamples(true))
+	dr := NewStore(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
-	require.False(t, dr.IsSuspended(ctx, "test"))
+	suspended, err := dr.IsSuspended(ctx, "test")
+	require.NoError(t, err)
+	require.False(t, suspended)
 
-	err := dr.ToggleSuspend(ctx, "test", true)
+	err = dr.SetSuspended(ctx, "test", true)
 	require.NoError(t, err)
 
-	require.True(t, dr.IsSuspended(ctx, "test"))
+	suspended, err = dr.IsSuspended(ctx, "test")
+	require.NoError(t, err)
+	require.True(t, suspended)
+}
+
+func TestStoreReturnsSuspendFlagReadErrors(t *testing.T) {
+	baseDir := t.TempDir()
+	flagsPath := filepath.Join(baseDir, "flags")
+	require.NoError(t, os.WriteFile(flagsPath, []byte("not a directory"), 0600))
+
+	store := NewStore(
+		baseDir,
+		WithFlagsBaseDir(flagsPath),
+		WithSkipExamples(true),
+	)
+
+	_, err := store.IsSuspended(context.Background(), "test")
+	require.Error(t, err)
+
+	_, err = store.Catalog(context.Background())
+	require.Error(t, err)
 }
 
 func TestListDAGsInSubdirectories(t *testing.T) {
@@ -56,7 +88,7 @@ func TestListDAGsInSubdirectories(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAG files in different directory levels
@@ -93,7 +125,7 @@ steps:
 	require.NoError(t, err)
 
 	// List all DAGs
-	opts := exec.ListDAGsOptions{}
+	opts := persis.DAGListOptions{}
 	result, errList, err := store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -105,13 +137,190 @@ steps:
 	require.Equal(t, "root-dag", result.Items[0].Name, "Should only find root-dag")
 }
 
+func TestRecursiveDiscoverySupportsNestedDAGOperations(t *testing.T) {
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "team", "services"), 0750))
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, ".hidden"), 0750))
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "workspaces", "ops"), 0750))
+
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "root.yaml"), []byte(`
+name: root
+steps:
+  - run: echo root
+`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "team", "services", "nested.yaml"), []byte(`
+name: nested-effective-name
+labels:
+  - team=platform
+steps:
+  - run: echo needle
+`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, ".hidden", "ignored.yaml"), []byte(`
+name: ignored-hidden
+steps:
+  - run: echo needle
+`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "workspaces", "ops", "ignored.yaml"), []byte(`
+name: ignored-workspace
+steps:
+  - run: echo needle
+`), 0600))
+
+	store := newRepository(tmpDir, WithSkipExamples(true), WithRecursiveDiscovery(true))
+	ctx := context.Background()
+
+	result, errs, err := store.List(ctx, persis.DAGListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, errs)
+	require.Len(t, result.Items, 2)
+	assert.ElementsMatch(t, []string{"root", "nested-effective-name"}, []string{
+		result.Items[0].Name,
+		result.Items[1].Name,
+	})
+
+	nestedSpec, err := store.GetSpec(ctx, "nested")
+	require.NoError(t, err)
+	assert.Contains(t, nestedSpec, "nested-effective-name")
+
+	search, errs, err := store.SearchCursor(ctx, persis.DAGSearchOptions{
+		Query:      "needle",
+		Limit:      10,
+		MatchLimit: 10,
+	})
+	require.NoError(t, err)
+	require.Empty(t, errs)
+	require.Len(t, search.Items, 1)
+	assert.Equal(t, "nested", search.Items[0].FileName)
+
+	labels, errs, err := store.LabelList(ctx)
+	require.NoError(t, err)
+	require.Empty(t, errs)
+	assert.Contains(t, labels, "team=platform")
+
+	require.NoError(t, store.Rename(ctx, "nested", "renamed"))
+	assert.NoFileExists(t, filepath.Join(tmpDir, "renamed.yaml"))
+	assert.FileExists(t, filepath.Join(tmpDir, "team", "services", "renamed.yaml"))
+	require.NoError(t, store.UpdateSpec(ctx, "renamed", []byte(`
+name: nested-effective-name
+steps:
+  - run: echo updated
+`)))
+	updatedSpec, err := store.GetSpec(ctx, "renamed")
+	require.NoError(t, err)
+	assert.Contains(t, updatedSpec, "updated")
+
+	require.NoError(t, store.Create(ctx, "created", []byte(`
+name: created
+steps:
+  - run: echo created
+`)))
+	assert.FileExists(t, filepath.Join(tmpDir, "created.yaml"))
+
+	require.NoError(t, store.Delete(ctx, "renamed"))
+	assert.NoFileExists(t, filepath.Join(tmpDir, "team", "services", "renamed.yaml"))
+}
+
+func TestRecursiveSearchCursorPaginatesByFileName(t *testing.T) {
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "a"), 0750))
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "b"), 0750))
+	for path, name := range map[string]string{
+		filepath.Join(tmpDir, "a", "zebra.yaml"): "zebra",
+		filepath.Join(tmpDir, "b", "apple.yaml"): "apple",
+	} {
+		require.NoError(t, os.WriteFile(path, fmt.Appendf(nil, `
+name: %s
+steps:
+  - run: echo needle
+`, name), 0600))
+	}
+
+	store := newRepository(tmpDir, WithSkipExamples(true), WithRecursiveDiscovery(true))
+	opts := persis.DAGSearchOptions{Query: "needle", Limit: 1, MatchLimit: 1}
+
+	first, errs, err := store.SearchCursor(context.Background(), opts)
+	require.NoError(t, err)
+	require.Empty(t, errs)
+	require.Len(t, first.Items, 1)
+	require.Equal(t, "apple", first.Items[0].FileName)
+	require.True(t, first.HasMore)
+	require.NotEmpty(t, first.NextCursor)
+
+	opts.Cursor = first.NextCursor
+	second, errs, err := store.SearchCursor(context.Background(), opts)
+	require.NoError(t, err)
+	require.Empty(t, errs)
+	require.Len(t, second.Items, 1)
+	require.Equal(t, "zebra", second.Items[0].FileName)
+	require.False(t, second.HasMore)
+}
+
+func TestRecursiveDiscoveryExcludesAndRecoversConflicts(t *testing.T) {
+	tmpDir := t.TempDir()
+	for _, dir := range []string{"a", "b", "c"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, dir), 0750))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "a", "shared.yaml"), []byte(`
+name: one
+steps:
+  - run: echo a
+`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "b", "shared.yml"), []byte(`
+name: two
+steps:
+  - run: echo b
+`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "c", "unique.yaml"), []byte(`
+name: one
+steps:
+  - run: echo c
+`), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "safe.yaml"), []byte(`
+name: safe
+steps:
+  - run: echo safe
+`), 0600))
+
+	store := newRepository(tmpDir, WithSkipExamples(true), WithRecursiveDiscovery(true))
+	ctx := context.Background()
+
+	result, errs, err := store.List(ctx, persis.DAGListOptions{})
+	require.NoError(t, err)
+	require.Len(t, result.Items, 1)
+	assert.Equal(t, "safe", result.Items[0].Name)
+	assert.Equal(t, []string{
+		`duplicate DAG file name "shared": a/shared.yaml, b/shared.yml`,
+		`duplicate DAG name "one": a/shared.yaml, c/unique.yaml`,
+	}, errs)
+
+	_, err = store.GetSpec(ctx, "shared")
+	assert.ErrorIs(t, err, persis.ErrDAGNotFound)
+	_, err = store.GetSpec(ctx, "a/shared")
+	require.NoError(t, err)
+
+	err = store.Create(ctx, "shared", []byte("steps: []\n"))
+	assert.ErrorIs(t, err, persis.ErrDAGAlreadyExists)
+
+	require.NoError(t, store.Delete(ctx, "b/shared"))
+	require.NoError(t, store.Delete(ctx, "c/unique"))
+
+	result, errs, err = store.List(ctx, persis.DAGListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, errs)
+	require.Len(t, result.Items, 2)
+	assert.ElementsMatch(t, []string{"one", "safe"}, []string{
+		result.Items[0].Name,
+		result.Items[1].Name,
+	})
+}
+
 func TestGetMetadata(t *testing.T) {
 	tmpDir := fileutil.MustTempDir("test-get-metadata")
 	defer func() {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Test successful metadata retrieval
@@ -141,7 +350,7 @@ func TestGetMetadata_InlineSchemaParamsPreserveMetadata(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	dagContent := `name: inline-schema-dag
@@ -166,13 +375,39 @@ steps:
 	assert.Equal(t, `batch_size="10" debug="false"`, dag.DefaultParams)
 }
 
+func TestGetMetadataCachesSharedSymlinkTargetsByEntry(t *testing.T) {
+	dagDir := t.TempDir()
+	targetPath := filepath.Join(t.TempDir(), "shared.yaml")
+	require.NoError(t, os.WriteFile(targetPath, []byte("steps: []\n"), 0600))
+	for _, name := range []string{"first", "second"} {
+		if err := os.Symlink(targetPath, filepath.Join(dagDir, name+".yaml")); err != nil {
+			t.Skipf("symlink creation is unavailable: %v", err)
+		}
+	}
+
+	store := newRepository(
+		dagDir,
+		WithFileCache(fileutil.NewCache[*ir.DAG]("dag_definition", 16, time.Hour)),
+		WithSkipExamples(true),
+		WithSymlinks(true),
+	)
+	ctx := context.Background()
+
+	first, err := store.GetMetadata(ctx, "first")
+	require.NoError(t, err)
+	second, err := store.GetMetadata(ctx, "second")
+	require.NoError(t, err)
+	assert.Equal(t, "first", first.Name)
+	assert.Equal(t, "second", second.Name)
+}
+
 func TestGetDetails(t *testing.T) {
 	tmpDir := fileutil.MustTempDir("test-get-details")
 	defer func() {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Test successful details retrieval
@@ -184,7 +419,7 @@ steps:
 	err := os.WriteFile(filepath.Join(tmpDir, "detailed-dag.yaml"), []byte(dagContent), 0600)
 	require.NoError(t, err)
 
-	dag, err := store.GetDetails(ctx, "detailed-dag")
+	dag, err := store.GetDetails(ctx, "detailed-dag", persis.DAGLoadOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, dag)
 	assert.Equal(t, "detailed-dag", dag.Name)
@@ -192,9 +427,57 @@ steps:
 	assert.Equal(t, "0 1 * * *", dag.Schedule[0].Expression)
 
 	// Test DAG not found
-	_, err = store.GetDetails(ctx, "non-existent")
+	_, err = store.GetDetails(ctx, "non-existent", persis.DAGLoadOptions{})
 	require.Error(t, err)
+	assert.ErrorIs(t, err, persis.ErrDAGNotFound)
 	assert.Contains(t, err.Error(), "failed to locate DAG non-existent")
+
+	// A DAG that builds with errors fails unless the caller tolerates them, in
+	// which case the partially built DAG is returned carrying the errors.
+	buildErrContent := `name: build-error-dag
+steps:
+  - name: step1
+    run: echo "build error"
+    depends: [missing-step]`
+	err = os.WriteFile(filepath.Join(tmpDir, "build-error-dag.yaml"), []byte(buildErrContent), 0600)
+	require.NoError(t, err)
+
+	_, err = store.GetDetails(ctx, "build-error-dag", persis.DAGLoadOptions{})
+	require.Error(t, err)
+
+	dag, err = store.GetDetails(ctx, "build-error-dag", persis.DAGLoadOptions{AllowBuildErrors: true})
+	require.NoError(t, err)
+	require.NotNil(t, dag)
+	assert.Equal(t, "build-error-dag", dag.Name)
+	assert.NotEmpty(t, dag.BuildErrors)
+
+	// Dots remain part of the DAG's lookup identity.
+	dottedDAGContent := `name: dagu.update-cloud-image
+steps:
+  - name: step1
+    run: echo "dotted"`
+	nestedDir := filepath.Join(tmpDir, "nested")
+	require.NoError(t, os.Mkdir(nestedDir, 0750))
+	err = os.WriteFile(filepath.Join(nestedDir, "dagu.update-cloud-image.yaml"), []byte(dottedDAGContent), 0600)
+	require.NoError(t, err)
+
+	recursiveStore := newRepository(tmpDir, WithSkipExamples(true), WithRecursiveDiscovery(true))
+	dag, err = recursiveStore.GetDetails(ctx, "dagu.update-cloud-image", persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "dagu.update-cloud-image", dag.Name)
+
+	err = recursiveStore.Create(ctx, "dagu.update-cloud-image", []byte(dottedDAGContent))
+	require.ErrorIs(t, err, persis.ErrDAGAlreadyExists)
+}
+
+func TestStoreGetPreservesDiscoveryError(t *testing.T) {
+	basePath := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(basePath, []byte("content"), 0600))
+	store := NewStore(basePath, WithRecursiveDiscovery(true), WithSkipExamples(true))
+
+	_, err := store.Get(context.Background(), "example")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, persis.ErrDAGNotFound)
 }
 
 func TestGetSpec(t *testing.T) {
@@ -203,7 +486,7 @@ func TestGetSpec(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Test successful spec retrieval
@@ -221,7 +504,197 @@ steps:
 	// Test DAG not found
 	_, err = store.GetSpec(ctx, "non-existent")
 	require.Error(t, err)
-	assert.Equal(t, exec.ErrDAGNotFound, err)
+	assert.Equal(t, persis.ErrDAGNotFound, err)
+}
+
+func TestGetSpecAllowsNestedPathsWithinConfiguredDirectories(t *testing.T) {
+	baseDir := t.TempDir()
+	nestedDir := filepath.Join(baseDir, "team", "jobs")
+	require.NoError(t, os.MkdirAll(nestedDir, 0750))
+
+	const dagContent = "name: nested-dag\nsteps: []\n"
+	require.NoError(t, os.WriteFile(filepath.Join(nestedDir, "nested-dag.yaml"), []byte(dagContent), 0600))
+
+	store := newRepository(baseDir, WithSkipExamples(true))
+	spec, err := store.GetSpec(context.Background(), "team/jobs/nested-dag")
+
+	require.NoError(t, err)
+	assert.Equal(t, dagContent, spec)
+}
+
+func TestGetSpecRejectsPathsOutsideConfiguredDirectories(t *testing.T) {
+	baseDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsidePath := filepath.Join(outsideDir, "outside.yaml")
+	require.NoError(t, os.WriteFile(outsidePath, []byte("name: outside\nsteps: []\n"), 0600))
+
+	store := newRepository(baseDir, WithSkipExamples(true))
+	relativePath, err := filepath.Rel(baseDir, outsidePath)
+	require.NoError(t, err)
+
+	for _, path := range []string{outsidePath, relativePath} {
+		_, err := store.GetSpec(context.Background(), path)
+		assert.ErrorIs(t, err, persis.ErrDAGNotFound)
+	}
+}
+
+func TestGetSpecRejectsSymlinkOutsideConfiguredDirectories(t *testing.T) {
+	baseDir := t.TempDir()
+	outsideDir := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outsideDir, "outside.yaml"),
+		[]byte("name: outside\nsteps: []\n"),
+		0600,
+	))
+	if err := os.Symlink(outsideDir, filepath.Join(baseDir, "linked")); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+
+	store := newRepository(baseDir, WithSkipExamples(true))
+	_, err := store.GetSpec(context.Background(), "linked/outside.yaml")
+
+	assert.ErrorIs(t, err, persis.ErrDAGNotFound)
+}
+
+func TestExternalDAGFileSymlink(t *testing.T) {
+	baseDir := t.TempDir()
+	targetDir := t.TempDir()
+	const dagContent = "steps:\n  - run: echo external\n"
+	targetPath := filepath.Join(targetDir, "source.yaml")
+	require.NoError(t, os.WriteFile(targetPath, []byte(dagContent), 0600))
+	linkPath := filepath.Join(baseDir, "external.yaml")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+
+	t.Run("Disabled", func(t *testing.T) {
+		store := newRepository(baseDir, WithSkipExamples(true))
+		result, issues, err := store.List(context.Background(), persis.DAGListOptions{})
+		require.NoError(t, err)
+		require.Empty(t, result.Items)
+		require.Len(t, issues, 1)
+		assert.Contains(t, issues[0], "dag_discovery.symlinks")
+
+		_, err = store.GetSpec(context.Background(), "external")
+		assert.ErrorIs(t, err, persis.ErrDAGNotFound)
+	})
+
+	t.Run("Enabled", func(t *testing.T) {
+		store := newRepository(baseDir, WithSkipExamples(true), WithSymlinks(true))
+		result, issues, err := store.List(context.Background(), persis.DAGListOptions{})
+		require.NoError(t, err)
+		require.Empty(t, issues)
+		require.Len(t, result.Items, 1)
+		assert.Equal(t, "external", result.Items[0].Name)
+		assert.Empty(t, result.Items[0].BuildErrors)
+
+		metadata, err := store.GetMetadata(context.Background(), "external")
+		require.NoError(t, err)
+		assert.Equal(t, "external", metadata.Name)
+
+		spec, err := store.GetSpec(context.Background(), "external")
+		require.NoError(t, err)
+		assert.Equal(t, dagContent, spec)
+		details, err := store.GetDetails(context.Background(), "external", persis.DAGLoadOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "external", details.Name)
+
+		assert.ErrorIs(t, store.UpdateSpec(context.Background(), "external", []byte(dagContent)), persis.ErrDAGReadOnly)
+		assert.ErrorIs(t, store.Delete(context.Background(), "external"), persis.ErrDAGReadOnly)
+		assert.ErrorIs(t, store.Rename(context.Background(), "external", "renamed"), persis.ErrDAGReadOnly)
+
+		_, err = os.Lstat(linkPath)
+		require.NoError(t, err)
+		content, err := os.ReadFile(targetPath)
+		require.NoError(t, err)
+		assert.Equal(t, dagContent, string(content))
+	})
+}
+
+func TestListRebuildsIndexAfterSymlinkRepoint(t *testing.T) {
+	baseDir := t.TempDir()
+	targetDir := t.TempDir()
+	firstPath := filepath.Join(targetDir, "first.yaml")
+	secondPath := filepath.Join(targetDir, "second.yaml")
+	firstSpec := []byte("description: first\nsteps:\n  - run: echo one\n")
+	secondSpec := []byte("description: other\nsteps:\n  - run: echo two\n")
+	require.Len(t, secondSpec, len(firstSpec))
+	require.NoError(t, os.WriteFile(firstPath, firstSpec, 0600))
+	require.NoError(t, os.WriteFile(secondPath, secondSpec, 0600))
+	modTime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(firstPath, modTime, modTime))
+	require.NoError(t, os.Chtimes(secondPath, modTime, modTime))
+
+	linkPath := filepath.Join(baseDir, "linked.yaml")
+	if err := os.Symlink(firstPath, linkPath); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+	store := newRepository(baseDir, WithSkipExamples(true), WithSymlinks(true))
+	result, issues, err := store.List(context.Background(), persis.DAGListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, issues)
+	require.Len(t, result.Items, 1)
+	assert.Equal(t, "linked", result.Items[0].Name)
+	assert.Equal(t, "first", result.Items[0].Description)
+
+	require.NoError(t, os.Remove(linkPath))
+	require.NoError(t, os.Symlink(secondPath, linkPath))
+	result, issues, err = store.List(context.Background(), persis.DAGListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, issues)
+	require.Len(t, result.Items, 1)
+	assert.Equal(t, "linked", result.Items[0].Name)
+	assert.Equal(t, "other", result.Items[0].Description)
+}
+
+func TestCatalogIncludingSearchPaths(t *testing.T) {
+	baseDir := t.TempDir()
+	searchDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(baseDir, "base-dag.yaml"), []byte("name: base-dag\nsteps: []\n"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(searchDir, "alt-dag.yaml"), []byte("name: alt-dag\nsteps: []\n"), 0600))
+
+	store := NewStore(baseDir, WithSearchPaths([]string{searchDir}), WithSkipExamples(true))
+	ctx := context.Background()
+
+	baseOnly, err := store.Catalog(ctx)
+	require.NoError(t, err)
+	baseNames := make([]string, 0, len(baseOnly.Items))
+	for _, item := range baseOnly.Items {
+		baseNames = append(baseNames, item.ID)
+	}
+	require.Equal(t, []string{"base-dag"}, baseNames)
+
+	combined, err := store.CatalogIncludingSearchPaths(ctx)
+	require.NoError(t, err)
+	combinedNames := make([]string, 0, len(combined.Items))
+	for _, item := range combined.Items {
+		combinedNames = append(combinedNames, item.ID)
+	}
+	require.ElementsMatch(t, []string{"base-dag", "alt-dag"}, combinedNames)
+
+	// The alternate-directory entry must report a correct location.
+	var altDAG *ir.DAG
+	for _, item := range combined.Items {
+		if item.ID == "alt-dag" {
+			altDAG = item.DAG
+		}
+	}
+	require.NotNil(t, altDAG)
+	require.Equal(t, filepath.Join(searchDir, "alt-dag.yaml"), altDAG.Location)
+}
+
+func TestGetSpecAllowsExplicitSearchPaths(t *testing.T) {
+	baseDir := t.TempDir()
+	searchDir := t.TempDir()
+	const dagContent = "name: searched\nsteps: []\n"
+	searchPath := filepath.Join(searchDir, "searched.yaml")
+	require.NoError(t, os.WriteFile(searchPath, []byte(dagContent), 0600))
+
+	store := newRepository(baseDir, WithSearchPaths([]string{searchDir}), WithSkipExamples(true))
+	spec, err := store.GetSpec(context.Background(), searchPath)
+
+	require.NoError(t, err)
+	assert.Equal(t, dagContent, spec)
 }
 
 func TestCreate(t *testing.T) {
@@ -230,7 +703,7 @@ func TestCreate(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Test successful creation
@@ -253,12 +726,12 @@ steps:
 	// Test creating duplicate DAG
 	err = store.Create(ctx, "new-dag", []byte(dagContent))
 	require.Error(t, err)
-	assert.Equal(t, exec.ErrDAGAlreadyExists, err)
+	assert.Equal(t, persis.ErrDAGAlreadyExists, err)
 }
 
 func TestGenerateFilePathPreventsTraversal(t *testing.T) {
 	baseDir := filepath.FromSlash("/base/dir")
-	store := New(baseDir, WithSkipExamples(true)).(*Storage)
+	store := NewStore(baseDir, WithSkipExamples(true))
 
 	tests := []struct {
 		name  string
@@ -286,9 +759,9 @@ func TestSearchCursorFailsWhenBaseDirIsNotReadableDirectory(t *testing.T) {
 	basePath := filepath.Join(t.TempDir(), "not-a-directory")
 	require.NoError(t, os.WriteFile(basePath, []byte("x"), 0600))
 
-	store := New(basePath, WithSkipExamples(true))
+	store := newRepository(basePath, WithSkipExamples(true))
 
-	result, errs, err := store.SearchCursor(context.Background(), exec.SearchDAGsOptions{
+	result, errs, err := store.SearchCursor(context.Background(), persis.DAGSearchOptions{
 		Query:      "needle",
 		Limit:      1,
 		MatchLimit: 1,
@@ -305,7 +778,7 @@ func TestSearchCursorFiltersByLabels(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	require.NoError(t, store.Create(ctx, "ops-dag", []byte(`name: ops-dag
@@ -330,7 +803,7 @@ steps:
     run: echo needle
 `)))
 
-	result, errs, err := store.SearchCursor(ctx, exec.SearchDAGsOptions{
+	result, errs, err := store.SearchCursor(ctx, persis.DAGSearchOptions{
 		Query:      "needle",
 		Limit:      10,
 		MatchLimit: 1,
@@ -348,7 +821,7 @@ func TestListDAGsFiltersByWorkspaceBeforePagination(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	require.NoError(t, store.Create(ctx, "aaa-global", []byte(`name: aaa-global
@@ -371,10 +844,10 @@ steps:
     run: echo prod
 `)))
 
-	firstPage := exec.NewPaginator(1, 1)
-	result, errs, err := store.List(ctx, exec.ListDAGsOptions{
+	firstPage := pagination.NewPaginator(1, 1)
+	result, errs, err := store.List(ctx, persis.DAGListOptions{
 		Paginator: &firstPage,
-		WorkspaceFilter: &exec.WorkspaceFilter{
+		WorkspaceFilter: &workspace.WorkspaceFilter{
 			Enabled:           true,
 			Workspaces:        []string{"ops"},
 			IncludeUnlabelled: true,
@@ -387,10 +860,10 @@ steps:
 	require.Len(t, result.Items, 1)
 	assert.Equal(t, "aaa-global", result.Items[0].Name)
 
-	secondPage := exec.NewPaginator(2, 1)
-	result, errs, err = store.List(ctx, exec.ListDAGsOptions{
+	secondPage := pagination.NewPaginator(2, 1)
+	result, errs, err = store.List(ctx, persis.DAGListOptions{
 		Paginator: &secondPage,
-		WorkspaceFilter: &exec.WorkspaceFilter{
+		WorkspaceFilter: &workspace.WorkspaceFilter{
 			Enabled:           true,
 			Workspaces:        []string{"ops"},
 			IncludeUnlabelled: true,
@@ -403,10 +876,10 @@ steps:
 	require.Len(t, result.Items, 1)
 	assert.Equal(t, "bbb-ops", result.Items[0].Name)
 
-	workspaceOnly := exec.NewPaginator(1, 10)
-	result, errs, err = store.List(ctx, exec.ListDAGsOptions{
+	workspaceOnly := pagination.NewPaginator(1, 10)
+	result, errs, err = store.List(ctx, persis.DAGListOptions{
 		Paginator: &workspaceOnly,
-		WorkspaceFilter: &exec.WorkspaceFilter{
+		WorkspaceFilter: &workspace.WorkspaceFilter{
 			Enabled:    true,
 			Workspaces: []string{"ops"},
 		},
@@ -424,7 +897,7 @@ func TestSearchCursorFiltersByWorkspace(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	require.NoError(t, store.Create(ctx, "global-dag", []byte(`name: global-dag
@@ -447,11 +920,11 @@ steps:
     run: echo needle
 `)))
 
-	result, errs, err := store.SearchCursor(ctx, exec.SearchDAGsOptions{
+	result, errs, err := store.SearchCursor(ctx, persis.DAGSearchOptions{
 		Query:      "needle",
 		Limit:      10,
 		MatchLimit: 1,
-		WorkspaceFilter: &exec.WorkspaceFilter{
+		WorkspaceFilter: &workspace.WorkspaceFilter{
 			Enabled:           true,
 			Workspaces:        []string{"ops"},
 			IncludeUnlabelled: true,
@@ -469,11 +942,11 @@ steps:
 		result.Items[1].Workspace,
 	})
 
-	result, errs, err = store.SearchCursor(ctx, exec.SearchDAGsOptions{
+	result, errs, err = store.SearchCursor(ctx, persis.DAGSearchOptions{
 		Query:      "needle",
 		Limit:      10,
 		MatchLimit: 1,
-		WorkspaceFilter: &exec.WorkspaceFilter{
+		WorkspaceFilter: &workspace.WorkspaceFilter{
 			Enabled:    true,
 			Workspaces: []string{"ops"},
 		},
@@ -491,7 +964,7 @@ func TestSearchMatchesFiltersByLabels(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	require.NoError(t, store.Create(ctx, "ops-dag", []byte(`name: ops-dag
@@ -504,7 +977,7 @@ steps:
     run: echo needle
 `)))
 
-	result, err := store.SearchMatches(ctx, "ops-dag", exec.SearchDAGMatchesOptions{
+	result, err := store.SearchMatches(ctx, "ops-dag", persis.DAGMatchSearchOptions{
 		Query:  "needle",
 		Limit:  1,
 		Labels: []string{"workspace=ops"},
@@ -513,7 +986,7 @@ steps:
 	require.Len(t, result.Items, 1)
 	require.True(t, result.HasMore)
 
-	next, err := store.SearchMatches(ctx, "ops-dag", exec.SearchDAGMatchesOptions{
+	next, err := store.SearchMatches(ctx, "ops-dag", persis.DAGMatchSearchOptions{
 		Query:  "needle",
 		Limit:  1,
 		Labels: []string{"workspace=ops"},
@@ -522,7 +995,7 @@ steps:
 	require.NoError(t, err)
 	require.Len(t, next.Items, 1)
 
-	filtered, err := store.SearchMatches(ctx, "ops-dag", exec.SearchDAGMatchesOptions{
+	filtered, err := store.SearchMatches(ctx, "ops-dag", persis.DAGMatchSearchOptions{
 		Query:  "needle",
 		Limit:  1,
 		Labels: []string{"workspace=prod"},
@@ -530,13 +1003,13 @@ steps:
 	require.NoError(t, err)
 	require.Empty(t, filtered.Items)
 
-	_, err = store.SearchMatches(ctx, "ops-dag", exec.SearchDAGMatchesOptions{
+	_, err = store.SearchMatches(ctx, "ops-dag", persis.DAGMatchSearchOptions{
 		Query:  "needle",
 		Limit:  1,
 		Labels: []string{"workspace=prod"},
 		Cursor: result.NextCursor,
 	})
-	assert.ErrorIs(t, err, exec.ErrInvalidCursor)
+	assert.ErrorIs(t, err, pagination.ErrInvalidCursor)
 }
 
 func TestUpdateSpec(t *testing.T) {
@@ -545,7 +1018,7 @@ func TestUpdateSpec(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create initial DAG
@@ -586,7 +1059,7 @@ func TestDelete(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAG to delete
@@ -611,6 +1084,19 @@ steps:
 	// Test deleting non-existent DAG (should not error)
 	err = store.Delete(ctx, "non-existent")
 	require.NoError(t, err)
+
+	targetDir := filepath.Join(tmpDir, "targets")
+	require.NoError(t, os.MkdirAll(targetDir, 0750))
+	targetPath := filepath.Join(targetDir, "linked-delete.yaml")
+	require.NoError(t, os.WriteFile(targetPath, []byte(dagContent), 0600))
+	linkPath := filepath.Join(tmpDir, "linked-delete.yaml")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+	require.NoError(t, store.Delete(ctx, "linked-delete"))
+	_, err = os.Lstat(linkPath)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.FileExists(t, targetPath)
 }
 
 func TestRename(t *testing.T) {
@@ -619,7 +1105,7 @@ func TestRename(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAG to rename
@@ -657,7 +1143,24 @@ steps:
 	require.NoError(t, err)
 	err = store.Rename(ctx, "new-name", "another-dag")
 	require.Error(t, err)
-	assert.Equal(t, exec.ErrDAGAlreadyExists, err)
+	assert.Equal(t, persis.ErrDAGAlreadyExists, err)
+
+	targetDir := filepath.Join(tmpDir, "targets")
+	require.NoError(t, os.MkdirAll(targetDir, 0750))
+	targetPath := filepath.Join(targetDir, "linked-target.yaml")
+	require.NoError(t, os.WriteFile(targetPath, []byte(dagContent), 0600))
+	linkPath := filepath.Join(tmpDir, "linked-old.yaml")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+	require.NoError(t, store.Rename(ctx, "linked-old", "linked-new"))
+	_, err = os.Lstat(linkPath)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	renamedPath := filepath.Join(tmpDir, "linked-new.yaml")
+	info, err := os.Lstat(renamedPath)
+	require.NoError(t, err)
+	assert.NotZero(t, info.Mode()&os.ModeSymlink)
+	assert.FileExists(t, targetPath)
 }
 
 func TestGrep(t *testing.T) {
@@ -666,7 +1169,7 @@ func TestGrep(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAGs with different content
@@ -727,7 +1230,7 @@ func TestLabelList(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAGs with different labels
@@ -777,7 +1280,7 @@ func TestLoadSpec(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Test valid spec
@@ -785,15 +1288,35 @@ func TestLoadSpec(t *testing.T) {
 steps:
   - name: step1
     run: echo "load spec"`
-	dag, err := store.LoadSpec(ctx, []byte(validSpec))
+	dag, err := store.LoadSpec(ctx, []byte(validSpec), "", persis.DAGLoadOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, dag)
 	assert.Equal(t, "load-spec-dag", dag.Name)
 
 	// Test invalid spec
 	invalidSpec := `invalid: yaml: content: [unclosed`
-	_, err = store.LoadSpec(ctx, []byte(invalidSpec))
+	_, err = store.LoadSpec(ctx, []byte(invalidSpec), "", persis.DAGLoadOptions{})
 	require.Error(t, err)
+
+	// An explicit name takes precedence over the one the spec declares.
+	dag, err = store.LoadSpec(ctx, []byte(validSpec), "explicit-name", persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "explicit-name", dag.Name)
+
+	// A spec that builds with errors fails unless the caller tolerates them, in
+	// which case the partially built DAG is returned carrying the errors.
+	buildErrSpec := `steps:
+  - name: step1
+    run: echo "load spec"
+    depends: [missing-step]`
+	_, err = store.LoadSpec(ctx, []byte(buildErrSpec), "build-error-dag", persis.DAGLoadOptions{})
+	require.Error(t, err)
+
+	dag, err = store.LoadSpec(ctx, []byte(buildErrSpec), "build-error-dag", persis.DAGLoadOptions{AllowBuildErrors: true})
+	require.NoError(t, err)
+	require.NotNil(t, dag)
+	assert.Equal(t, "build-error-dag", dag.Name)
+	assert.NotEmpty(t, dag.BuildErrors)
 }
 
 func TestLoadSpecWithBaseGraphType(t *testing.T) {
@@ -805,7 +1328,7 @@ func TestLoadSpecWithBaseGraphType(t *testing.T) {
 	baseConfig := filepath.Join(tmpDir, "base.yaml")
 	require.NoError(t, os.WriteFile(baseConfig, []byte("type: graph\n"), 0600))
 
-	store := New(tmpDir, WithBaseConfig(baseConfig), WithSkipExamples(true))
+	store := newRepository(tmpDir, WithBaseConfig(baseConfig), WithSkipExamples(true))
 	ctx := context.Background()
 
 	dag, err := store.LoadSpec(ctx, []byte(`name: base-graph-dag
@@ -815,9 +1338,9 @@ steps:
   - name: test
     run: echo test
     depends: [build]
-`))
+`), "", persis.DAGLoadOptions{})
 	require.NoError(t, err)
-	require.Equal(t, core.TypeGraph, dag.Type)
+	require.Equal(t, ir.TypeGraph, dag.Type)
 	require.Len(t, dag.Steps, 2)
 	require.Equal(t, []string{"build"}, dag.Steps[1].Depends)
 }
@@ -842,7 +1365,7 @@ env:
 log_dir: "/workspace/logs"
 `), 0600))
 
-	store := New(
+	store := newRepository(
 		dagDir,
 		WithBaseConfig(baseConfig),
 		WithWorkspaceBaseConfigDir(workspaceConfigDir),
@@ -856,7 +1379,7 @@ labels:
 steps:
   - name: step1
     run: echo "hello"
-`))
+`), "", persis.DAGLoadOptions{})
 	require.NoError(t, err)
 	assert.Contains(t, dag.Env, "GLOBAL_ONLY=1")
 	assert.Contains(t, dag.Env, "WORKSPACE_ONLY=1")
@@ -872,8 +1395,8 @@ func TestGetMetadataRefreshesCacheWhenBaseConfigChanges(t *testing.T) {
 	baseConfig := filepath.Join(rootDir, "base.yaml")
 	require.NoError(t, os.WriteFile(baseConfig, []byte("type: graph\n"), 0600))
 
-	cache := fileutil.NewCache[*core.DAG]("dag_definition", 16, time.Hour)
-	store := New(
+	cache := fileutil.NewCache[*ir.DAG]("dag_definition", 16, time.Hour)
+	store := newRepository(
 		dagDir,
 		WithBaseConfig(baseConfig),
 		WithFileCache(cache),
@@ -912,8 +1435,8 @@ func TestGetMetadataRefreshesCacheWhenWorkspaceBaseConfigChanges(t *testing.T) {
 	workspaceBaseConfig := filepath.Join(workspaceConfigDir, "ops", "base.yaml")
 	require.NoError(t, os.WriteFile(workspaceBaseConfig, []byte("max_active_steps: 1\n"), 0600))
 
-	cache := fileutil.NewCache[*core.DAG]("dag_definition", 16, time.Hour)
-	store := New(
+	cache := fileutil.NewCache[*ir.DAG]("dag_definition", 16, time.Hour)
+	store := newRepository(
 		dagDir,
 		WithBaseConfig(baseConfig),
 		WithWorkspaceBaseConfigDir(workspaceConfigDir),
@@ -951,7 +1474,7 @@ func TestListRebuildsIndexWhenBaseConfigChanges(t *testing.T) {
 	baseConfig := filepath.Join(rootDir, "base.yaml")
 	require.NoError(t, os.WriteFile(baseConfig, []byte("type: graph\n"), 0600))
 
-	store := New(dagDir, WithBaseConfig(baseConfig), WithSkipExamples(true))
+	store := newRepository(dagDir, WithBaseConfig(baseConfig), WithSkipExamples(true))
 	ctx := context.Background()
 
 	require.NoError(t, os.WriteFile(filepath.Join(dagDir, "index-refresh.yaml"), []byte(`name: index-refresh
@@ -962,7 +1485,7 @@ steps:
     run: echo "hello"
 `), 0600))
 
-	result, errList, err := store.List(ctx, exec.ListDAGsOptions{})
+	result, errList, err := store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	require.Empty(t, errList)
 	require.Len(t, result.Items, 1)
@@ -974,7 +1497,7 @@ steps:
 	time.Sleep(10 * time.Millisecond)
 	require.NoError(t, os.WriteFile(baseConfig, []byte("type: chain\n"), 0600))
 
-	result, errList, err = store.List(ctx, exec.ListDAGsOptions{})
+	result, errList, err = store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	require.Empty(t, errList)
 	require.Len(t, result.Items, 1)
@@ -996,7 +1519,7 @@ func TestListRebuildsIndexWhenWorkspaceBaseConfigChanges(t *testing.T) {
 	workspaceBaseConfig := filepath.Join(workspaceConfigDir, "ops", "base.yaml")
 	require.NoError(t, os.WriteFile(workspaceBaseConfig, []byte("max_active_steps: 1\n"), 0600))
 
-	store := New(
+	store := newRepository(
 		dagDir,
 		WithBaseConfig(baseConfig),
 		WithWorkspaceBaseConfigDir(workspaceConfigDir),
@@ -1012,7 +1535,7 @@ steps:
     run: echo "hello"
 `), 0600))
 
-	result, errList, err := store.List(ctx, exec.ListDAGsOptions{})
+	result, errList, err := store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	require.Empty(t, errList)
 	require.Len(t, result.Items, 1)
@@ -1024,7 +1547,7 @@ steps:
 	time.Sleep(10 * time.Millisecond)
 	require.NoError(t, os.WriteFile(workspaceBaseConfig, []byte("max_active_steps: 2\n"), 0600))
 
-	result, errList, err = store.List(ctx, exec.ListDAGsOptions{})
+	result, errList, err = store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	require.Empty(t, errList)
 	require.Len(t, result.Items, 1)
@@ -1040,7 +1563,7 @@ func TestListWithPagination(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create multiple DAGs
@@ -1054,8 +1577,8 @@ steps:
 	}
 
 	// Test pagination
-	paginator := exec.NewPaginator(2, 2)
-	opts := exec.ListDAGsOptions{Paginator: &paginator}
+	paginator := pagination.NewPaginator(2, 2)
+	opts := persis.DAGListOptions{Paginator: &paginator}
 	result, errList, err := store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -1072,7 +1595,7 @@ func TestListAlphabeticalSorting(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAGs in non-alphabetical order
@@ -1097,7 +1620,7 @@ steps:
 	}
 
 	// List all DAGs
-	opts := exec.ListDAGsOptions{}
+	opts := persis.DAGListOptions{}
 	result, errList, err := store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -1125,7 +1648,7 @@ func TestListWithFiltering(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAGs with different names and labels
@@ -1146,7 +1669,7 @@ steps:
 	require.NoError(t, err)
 
 	// Test name filtering
-	opts := exec.ListDAGsOptions{Name: "web"}
+	opts := persis.DAGListOptions{Name: "web"}
 	result, errList, err := store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -1161,7 +1684,7 @@ steps:
 	err = store.Create(ctx, "file-name-only-match", []byte(fileNameOnlyContent))
 	require.NoError(t, err)
 
-	opts = exec.ListDAGsOptions{Name: "file-name-only-match"}
+	opts = persis.DAGListOptions{Name: "file-name-only-match"}
 	result, errList, err = store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -1170,7 +1693,7 @@ steps:
 	assert.Equal(t, "file-name-only-match", result.Items[0].FileName())
 
 	// Test label filtering
-	opts = exec.ListDAGsOptions{Labels: []string{"frontend"}}
+	opts = persis.DAGListOptions{Labels: []string{"frontend"}}
 	result, errList, err = store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -1178,7 +1701,7 @@ steps:
 	assert.Equal(t, "filter-web-dag", result.Items[0].Name)
 
 	// Test case-insensitive label filtering
-	opts = exec.ListDAGsOptions{Labels: []string{"FRONTEND"}}
+	opts = persis.DAGListOptions{Labels: []string{"FRONTEND"}}
 	result, errList, err = store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -1186,7 +1709,7 @@ steps:
 	assert.Equal(t, "filter-web-dag", result.Items[0].Name)
 
 	// Test multi-label AND filtering (all labels must match)
-	opts = exec.ListDAGsOptions{Labels: []string{"web", "frontend"}}
+	opts = persis.DAGListOptions{Labels: []string{"web", "frontend"}}
 	result, errList, err = store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
@@ -1194,11 +1717,46 @@ steps:
 	assert.Equal(t, "filter-web-dag", result.Items[0].Name)
 
 	// Negative case: missing one label should return nothing
-	opts = exec.ListDAGsOptions{Labels: []string{"web", "backend"}}
+	opts = persis.DAGListOptions{Labels: []string{"web", "backend"}}
 	result, errList, err = store.List(ctx, opts)
 	require.NoError(t, err)
 	require.Empty(t, errList)
 	require.Len(t, result.Items, 0)
+
+	for _, name := range []string{"active-alpha", "active-beta", "active-suspended"} {
+		content := fmt.Sprintf(`name: %s
+schedule: "0 * * * *"
+steps:
+  - name: step1
+    run: echo "active"`, name)
+		require.NoError(t, store.Create(ctx, name, []byte(content)))
+	}
+	require.NoError(t, store.SetSuspended(ctx, "active-suspended", true))
+
+	paginator := pagination.NewPaginator(1, 1)
+	result, errList, err = store.List(ctx, persis.DAGListOptions{
+		Paginator:  &paginator,
+		ActiveOnly: true,
+		Sort:       "name",
+		Order:      "asc",
+	})
+	require.NoError(t, err)
+	require.Empty(t, errList)
+	assert.Equal(t, 2, result.TotalCount)
+	require.Len(t, result.Items, 1)
+	assert.Equal(t, "active-alpha", result.Items[0].Name)
+
+	paginator = pagination.NewPaginator(2, 1)
+	result, errList, err = store.List(ctx, persis.DAGListOptions{
+		Paginator:  &paginator,
+		ActiveOnly: true,
+		Sort:       "name",
+		Order:      "asc",
+	})
+	require.NoError(t, err)
+	require.Empty(t, errList)
+	require.Len(t, result.Items, 1)
+	assert.Equal(t, "active-beta", result.Items[0].Name)
 }
 
 func TestListWithSortAndOrder(t *testing.T) {
@@ -1207,7 +1765,7 @@ func TestListWithSortAndOrder(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAGs with different names
@@ -1232,7 +1790,7 @@ steps:
 	}
 
 	// Test 1: Sort by name ascending (default)
-	opts := exec.ListDAGsOptions{
+	opts := persis.DAGListOptions{
 		Sort:  "name",
 		Order: "asc",
 	}
@@ -1247,7 +1805,7 @@ steps:
 	assert.Equal(t, "zebra-dag", result.Items[3].Name)
 
 	// Test 2: Sort by name descending
-	opts = exec.ListDAGsOptions{
+	opts = persis.DAGListOptions{
 		Sort:  "name",
 		Order: "desc",
 	}
@@ -1262,7 +1820,7 @@ steps:
 	assert.Equal(t, "alpha-dag", result.Items[3].Name)
 
 	// Test 3: Sort by updated_at should fall back to name sorting in storage layer
-	opts = exec.ListDAGsOptions{
+	opts = persis.DAGListOptions{
 		Sort:  "updated_at",
 		Order: "asc",
 	}
@@ -1278,7 +1836,7 @@ steps:
 	assert.Equal(t, "zebra-dag", result.Items[3].Name)
 
 	// Test 4: Sort by updated_at desc should also fall back to name
-	opts = exec.ListDAGsOptions{
+	opts = persis.DAGListOptions{
 		Sort:  "updated_at",
 		Order: "desc",
 	}
@@ -1294,7 +1852,7 @@ steps:
 	assert.Equal(t, "alpha-dag", result.Items[3].Name)
 
 	// Test 5: Default sort (empty sort field) should sort by name
-	opts = exec.ListDAGsOptions{
+	opts = persis.DAGListOptions{
 		Sort:  "",
 		Order: "asc",
 	}
@@ -1309,7 +1867,7 @@ steps:
 	assert.Equal(t, "zebra-dag", result.Items[3].Name)
 
 	// Test 6: Unknown sort field falls back to name
-	opts = exec.ListDAGsOptions{
+	opts = persis.DAGListOptions{
 		Sort:  "unknown",
 		Order: "asc",
 	}
@@ -1324,13 +1882,13 @@ steps:
 	assert.Equal(t, "zebra-dag", result.Items[3].Name)
 }
 
-func TestListSortByNextRunUsesSchedulerProjection(t *testing.T) {
+func TestListSortByNextRunUsesProjection(t *testing.T) {
 	tmpDir := fileutil.MustTempDir("test-list-next-run-projection")
 	defer func() {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	oneOffTime := time.Date(2026, 3, 29, 2, 10, 0, 0, time.UTC)
@@ -1352,7 +1910,7 @@ steps:
     run: echo "cron"`
 	require.NoError(t, store.Create(ctx, "future-cron", []byte(cronContent)))
 
-	defaultResult, errList, err := store.List(ctx, exec.ListDAGsOptions{
+	defaultResult, errList, err := store.List(ctx, persis.DAGListOptions{
 		Sort:  "nextRun",
 		Order: "asc",
 		Time:  &now,
@@ -1362,29 +1920,15 @@ steps:
 	require.Len(t, defaultResult.Items, 2)
 	assert.Equal(t, "future-cron", defaultResult.Items[0].Name)
 
-	oneOffSchedule, err := core.NewOneOffSchedule(oneOffTime.Format(time.RFC3339))
-	require.NoError(t, err)
-
-	state := &scheduler.SchedulerState{
-		Version: scheduler.SchedulerStateVersion,
-		DAGs: map[string]scheduler.DAGWatermark{
-			"overdue-one-off": {
-				OneOffs: map[string]scheduler.OneOffScheduleState{
-					oneOffSchedule.Fingerprint(): {
-						ScheduledTime: oneOffTime,
-						Status:        scheduler.OneOffStatusPending,
-					},
-				},
-			},
-		},
-	}
-
-	result, errList, err := store.List(ctx, exec.ListDAGsOptions{
+	result, errList, err := store.List(ctx, persis.DAGListOptions{
 		Sort:  "nextRun",
 		Order: "asc",
 		Time:  &now,
-		NextRunProjection: func(dag *core.DAG, at time.Time) time.Time {
-			return scheduler.NextPlannedRun(dag, at, state)
+		NextRunProjection: func(dag *ir.DAG, at time.Time) time.Time {
+			if dag.Name == "overdue-one-off" {
+				return oneOffTime
+			}
+			return dag.NextRun(at)
 		},
 	})
 	require.NoError(t, err)
@@ -1400,7 +1944,7 @@ func TestListWithSortingAndPagination(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create multiple DAGs for pagination testing
@@ -1421,8 +1965,8 @@ steps:
 
 	// Test 1: Name sort ascending with pagination
 	// Page 1
-	paginator := exec.NewPaginator(1, 5) // page=1, perPage=5
-	opts := exec.ListDAGsOptions{
+	paginator := pagination.NewPaginator(1, 5) // page=1, perPage=5
+	opts := persis.DAGListOptions{
 		Paginator: &paginator,
 		Sort:      "name",
 		Order:     "asc",
@@ -1442,7 +1986,7 @@ steps:
 	}
 
 	// Page 2
-	paginator = exec.NewPaginator(2, 5) // page=2, perPage=5
+	paginator = pagination.NewPaginator(2, 5) // page=2, perPage=5
 	opts.Paginator = &paginator
 	result, errList, err = store.List(ctx, opts)
 	require.NoError(t, err)
@@ -1458,7 +2002,7 @@ steps:
 	}
 
 	// Page 3
-	paginator = exec.NewPaginator(3, 5) // page=3, perPage=5
+	paginator = pagination.NewPaginator(3, 5) // page=3, perPage=5
 	opts.Paginator = &paginator
 	result, errList, err = store.List(ctx, opts)
 	require.NoError(t, err)
@@ -1472,8 +2016,8 @@ steps:
 	assert.Equal(t, "zulu-dag", result.Items[1].Name)
 
 	// Test 2: Name sort descending with pagination
-	paginator = exec.NewPaginator(1, 5) // page=1, perPage=5
-	opts = exec.ListDAGsOptions{
+	paginator = pagination.NewPaginator(1, 5) // page=1, perPage=5
+	opts = persis.DAGListOptions{
 		Paginator: &paginator,
 		Sort:      "name",
 		Order:     "desc",
@@ -1490,8 +2034,8 @@ steps:
 	}
 
 	// Test 3: Non-name sort fields fall back to name sorting in storage layer
-	paginator = exec.NewPaginator(1, 5) // page=1, perPage=5
-	opts = exec.ListDAGsOptions{
+	paginator = pagination.NewPaginator(1, 5) // page=1, perPage=5
+	opts = persis.DAGListOptions{
 		Paginator: &paginator,
 		Sort:      "updated_at",
 		Order:     "desc", // This will fall back to name desc
@@ -1510,7 +2054,7 @@ steps:
 
 func TestListIncludesDAGsWithErrors(t *testing.T) {
 	tmpDir := t.TempDir()
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create a valid DAG
@@ -1533,7 +2077,7 @@ steps:
 	require.NoError(t, err)
 
 	// List all DAGs
-	result, errList, err := store.List(ctx, exec.ListDAGsOptions{})
+	result, errList, err := store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 
 	// Should include both DAGs
@@ -1564,7 +2108,7 @@ func TestListWithNextRunSorting(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	})
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create test DAG files directly
@@ -1589,7 +2133,7 @@ func TestListWithNextRunSorting(t *testing.T) {
 	fixedTime := time.Date(2024, 1, 15, 1, 30, 0, 0, time.UTC)
 
 	// Test ascending order
-	result, _, err := store.List(ctx, exec.ListDAGsOptions{
+	result, _, err := store.List(ctx, persis.DAGListOptions{
 		Sort:  "nextRun",
 		Order: "asc",
 		Time:  &fixedTime,
@@ -1603,7 +2147,7 @@ func TestListWithNextRunSorting(t *testing.T) {
 	assert.Equal(t, "no-schedule", result.Items[2].Name)
 
 	// Test descending order
-	result, _, err = store.List(ctx, exec.ListDAGsOptions{
+	result, _, err = store.List(ctx, persis.DAGListOptions{
 		Sort:  "nextRun",
 		Order: "desc",
 		Time:  &fixedTime,
@@ -1624,7 +2168,7 @@ func TestListWithNextRunSortingPutsSuspendedDAGsLast(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	})
 
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	createDAG := func(name, schedule string) {
@@ -1638,11 +2182,11 @@ steps:
 
 	createDAG("suspended-sooner", "0 2 * * *")
 	createDAG("live-later", "0 3 * * *")
-	require.NoError(t, store.ToggleSuspend(ctx, "suspended-sooner", true))
+	require.NoError(t, store.SetSuspended(ctx, "suspended-sooner", true))
 
 	fixedTime := time.Date(2024, 1, 15, 1, 30, 0, 0, time.UTC)
 
-	result, _, err := store.List(ctx, exec.ListDAGsOptions{
+	result, _, err := store.List(ctx, persis.DAGListOptions{
 		Sort:  "nextRun",
 		Order: "asc",
 		Time:  &fixedTime,
@@ -1656,7 +2200,7 @@ steps:
 
 func TestConcurrentList(t *testing.T) {
 	tmpDir := t.TempDir()
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create a few DAGs.
@@ -1670,7 +2214,7 @@ func TestConcurrentList(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Go(func() {
-			result, _, err := store.List(ctx, exec.ListDAGsOptions{})
+			result, _, err := store.List(ctx, persis.DAGListOptions{})
 			assert.NoError(t, err)
 			assert.Equal(t, 5, result.TotalCount)
 		})
@@ -1680,7 +2224,7 @@ func TestConcurrentList(t *testing.T) {
 
 func TestIndexInvalidationOnMutations(t *testing.T) {
 	tmpDir := t.TempDir()
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	indexPath := filepath.Join(tmpDir, ".dag.index")
@@ -1693,7 +2237,7 @@ steps:
 	require.NoError(t, store.Create(ctx, "mutation-dag", []byte(content)))
 
 	// List to build index.
-	_, _, err := store.List(ctx, exec.ListDAGsOptions{})
+	_, _, err := store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	assert.True(t, fileExists(indexPath), "index should exist after List")
 
@@ -1702,7 +2246,7 @@ steps:
 	assert.False(t, fileExists(indexPath), "index should be invalidated after Create")
 
 	// Rebuild index.
-	_, _, err = store.List(ctx, exec.ListDAGsOptions{})
+	_, _, err = store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	assert.True(t, fileExists(indexPath))
 
@@ -1711,16 +2255,16 @@ steps:
 	assert.False(t, fileExists(indexPath), "index should be invalidated after Delete")
 
 	// Rebuild index.
-	_, _, err = store.List(ctx, exec.ListDAGsOptions{})
+	_, _, err = store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	assert.True(t, fileExists(indexPath))
 
-	// ToggleSuspend invalidates index.
-	require.NoError(t, store.ToggleSuspend(ctx, "mutation-dag", true))
-	assert.False(t, fileExists(indexPath), "index should be invalidated after ToggleSuspend")
+	// SetSuspended invalidates index.
+	require.NoError(t, store.SetSuspended(ctx, "mutation-dag", true))
+	assert.False(t, fileExists(indexPath), "index should be invalidated after SetSuspended")
 
 	// Rebuild index.
-	_, _, err = store.List(ctx, exec.ListDAGsOptions{})
+	_, _, err = store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	assert.True(t, fileExists(indexPath))
 
@@ -1733,7 +2277,7 @@ steps:
 	assert.False(t, fileExists(indexPath), "index should be invalidated after UpdateSpec")
 
 	// Rebuild index.
-	_, _, err = store.List(ctx, exec.ListDAGsOptions{})
+	_, _, err = store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	assert.True(t, fileExists(indexPath))
 
@@ -1744,7 +2288,7 @@ steps:
 
 func TestListUsesIndex(t *testing.T) {
 	tmpDir := t.TempDir()
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAGs.
@@ -1754,7 +2298,7 @@ func TestListUsesIndex(t *testing.T) {
 	}
 
 	// First List builds index.
-	result1, errList1, err := store.List(ctx, exec.ListDAGsOptions{})
+	result1, errList1, err := store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	require.Empty(t, errList1)
 	assert.Equal(t, 3, result1.TotalCount)
@@ -1764,25 +2308,25 @@ func TestListUsesIndex(t *testing.T) {
 	assert.True(t, fileExists(indexPath))
 
 	// Second List should use index and return same results.
-	result2, errList2, err := store.List(ctx, exec.ListDAGsOptions{})
+	result2, errList2, err := store.List(ctx, persis.DAGListOptions{})
 	require.NoError(t, err)
 	require.Empty(t, errList2)
 	assert.Equal(t, 3, result2.TotalCount)
 
 	// Verify filtering works with index.
-	result3, _, err := store.List(ctx, exec.ListDAGsOptions{Labels: []string{"env=prod"}})
+	result3, _, err := store.List(ctx, persis.DAGListOptions{Labels: []string{"env=prod"}})
 	require.NoError(t, err)
 	assert.Equal(t, 3, result3.TotalCount)
 }
 
-func TestLoadOrRebuildIndex_NonExistentDir(t *testing.T) {
-	store := New("/nonexistent/path/that/does/not/exist", WithSkipExamples(true)).(*Storage)
+func TestList_NonExistentDir(t *testing.T) {
+	store := newRepository("/nonexistent/path/that/does/not/exist", WithSkipExamples(true))
 	ctx := context.Background()
-	result := store.loadOrRebuildIndex(ctx)
-	assert.Nil(t, result, "should return nil when baseDir doesn't exist")
+	_, _, err := store.List(ctx, persis.DAGListOptions{})
+	require.Error(t, err)
 }
 
-func TestLoadOrRebuildIndex_NonExistentFlagsDir(t *testing.T) {
+func TestList_NonExistentFlagsDir(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create a valid DAG file so the index can try to build.
@@ -1792,18 +2336,20 @@ steps:
     run: echo ok`
 	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "flags-test.yaml"), []byte(dagContent), 0600))
 
-	store := New(tmpDir, WithSkipExamples(true)).(*Storage)
+	store := NewStore(tmpDir, WithSkipExamples(true))
 	// Set flagsBaseDir to non-existent path to exercise the debug log branch.
 	store.flagsBaseDir = filepath.Join(tmpDir, "nonexistent-flags-dir")
 
 	ctx := context.Background()
-	result := store.loadOrRebuildIndex(ctx)
-	assert.NotNil(t, result, "should still build index even with missing flags dir")
+	result, err := store.Catalog(ctx)
+	require.NoError(t, err)
+	require.Empty(t, result.Issues)
+	assert.Len(t, result.Items, 1)
 }
 
 func TestInvalidateIndex_RemovesFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	store := New(tmpDir, WithSkipExamples(true)).(*Storage)
+	store := NewStore(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create a DAG and build index.
@@ -1813,8 +2359,8 @@ steps:
     run: echo ok`
 	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "inv-test.yaml"), []byte(dagContent), 0600))
 
-	result := store.loadOrRebuildIndex(ctx)
-	require.NotNil(t, result)
+	_, err := store.Catalog(ctx)
+	require.NoError(t, err)
 	indexPath := filepath.Join(tmpDir, ".dag.index")
 	assert.True(t, fileExists(indexPath), "index should exist after build")
 
@@ -1824,7 +2370,7 @@ steps:
 
 func TestLabelListUsesIndex(t *testing.T) {
 	tmpDir := t.TempDir()
-	store := New(tmpDir, WithSkipExamples(true))
+	store := newRepository(tmpDir, WithSkipExamples(true))
 	ctx := context.Background()
 
 	// Create DAGs with labels.

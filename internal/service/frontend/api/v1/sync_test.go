@@ -9,9 +9,10 @@ import (
 	"testing"
 	"time"
 
-	apigen "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/gitsync"
+	apigen "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/gitsync"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,6 +26,7 @@ type mockSyncService struct {
 	deleteBatchFn    func(ctx context.Context, itemIDs []string, message string, force bool) ([]string, error)
 	deleteAllMissing func(ctx context.Context, message string) ([]string, error)
 	moveFn           func(ctx context.Context, oldID, newID, message string, force bool) error
+	getSyncItemDiff  func(ctx context.Context, itemID string) (*gitsync.SyncItemDiff, error)
 }
 
 func (m *mockSyncService) Pull(_ context.Context) (*gitsync.SyncResult, error) { return nil, nil }
@@ -91,11 +93,14 @@ func (m *mockSyncService) GetStatus(ctx context.Context) (*gitsync.OverallStatus
 	return nil, nil
 }
 
-func (m *mockSyncService) GetDAGStatus(_ context.Context, _ string) (*gitsync.DAGState, error) {
+func (m *mockSyncService) GetSyncItemStatus(_ context.Context, _ string) (*gitsync.SyncItemState, error) {
 	return nil, nil
 }
 
-func (m *mockSyncService) GetDAGDiff(_ context.Context, _ string) (*gitsync.DAGDiff, error) {
+func (m *mockSyncService) GetSyncItemDiff(ctx context.Context, itemID string) (*gitsync.SyncItemDiff, error) {
+	if m.getSyncItemDiff != nil {
+		return m.getSyncItemDiff(ctx, itemID)
+	}
 	return nil, nil
 }
 
@@ -107,6 +112,8 @@ func (m *mockSyncService) TestConnection(_ context.Context) (*gitsync.Connection
 	return nil, nil
 }
 
+type syncAuthService struct{ AuthService }
+
 func newSyncAPIForTest(syncSvc SyncService) *API {
 	return &API{
 		config: &config.Config{
@@ -117,6 +124,156 @@ func newSyncAPIForTest(syncSvc SyncService) *API {
 			},
 		},
 		syncService: syncSvc,
+	}
+}
+
+func TestSyncAuthorizationPolicy(t *testing.T) {
+	t.Parallel()
+
+	a := newSyncAPIForTest(&mockSyncService{})
+	a.authService = syncAuthService{}
+	tests := []struct {
+		name      string
+		user      *auth.User
+		read      bool
+		write     bool
+		admin     bool
+		unauthErr error
+	}{
+		{name: "admin", user: &auth.User{Role: auth.RoleAdmin, WorkspaceAccess: auth.AllWorkspaceAccess()}, read: true, write: true, admin: true},
+		{name: "manager", user: &auth.User{Role: auth.RoleManager, WorkspaceAccess: auth.AllWorkspaceAccess()}, read: true, write: true},
+		{name: "developer", user: &auth.User{Role: auth.RoleDeveloper, WorkspaceAccess: auth.AllWorkspaceAccess()}, read: true, write: true},
+		{name: "operator", user: &auth.User{Role: auth.RoleOperator, WorkspaceAccess: auth.AllWorkspaceAccess()}, read: true},
+		{name: "viewer", user: &auth.User{Role: auth.RoleViewer, WorkspaceAccess: auth.AllWorkspaceAccess()}, read: true},
+		{
+			name: "scoped developer",
+			user: &auth.User{
+				Role: auth.RoleViewer,
+				WorkspaceAccess: &auth.WorkspaceAccess{Grants: []auth.WorkspaceGrant{
+					{Workspace: "ops", Role: auth.RoleDeveloper},
+				}},
+			},
+		},
+		{name: "unauthenticated", unauthErr: errAuthRequired},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
+			if test.user != nil {
+				ctx = auth.WithUser(ctx, test.user)
+			}
+
+			assertSyncPermission(t, a.requireSyncRead(ctx), test.read, test.unauthErr)
+			assertSyncPermission(t, a.requireSyncWrite(ctx), test.write, test.unauthErr)
+			assertSyncPermission(t, a.requireAdmin(ctx), test.admin, test.unauthErr)
+		})
+	}
+}
+
+func assertSyncPermission(t *testing.T, err error, allowed bool, unauthErr error) {
+	t.Helper()
+	if allowed {
+		require.NoError(t, err)
+		return
+	}
+	if unauthErr != nil {
+		require.ErrorIs(t, err, unauthErr)
+		return
+	}
+	require.ErrorIs(t, err, errInsufficientPermissions)
+}
+
+func TestSyncHandlerAuthorization(t *testing.T) {
+	t.Parallel()
+
+	a := newSyncAPIForTest(&mockSyncService{})
+	a.authService = syncAuthService{}
+	allWorkspaceOperator := auth.WithUser(t.Context(), &auth.User{
+		Role:            auth.RoleOperator,
+		WorkspaceAccess: auth.AllWorkspaceAccess(),
+	})
+	allWorkspaceDeveloper := auth.WithUser(t.Context(), &auth.User{
+		Role:            auth.RoleDeveloper,
+		WorkspaceAccess: auth.AllWorkspaceAccess(),
+	})
+	scopedViewer := auth.WithUser(t.Context(), &auth.User{
+		Role: auth.RoleViewer,
+		WorkspaceAccess: &auth.WorkspaceAccess{Grants: []auth.WorkspaceGrant{
+			{Workspace: "ops", Role: auth.RoleViewer},
+		}},
+	})
+
+	tests := map[string]struct {
+		ctx  context.Context
+		call func(context.Context) error
+	}{
+		"get status": {ctx: scopedViewer, call: func(ctx context.Context) error {
+			_, err := a.GetSyncStatus(ctx, apigen.GetSyncStatusRequestObject{})
+			return err
+		}},
+		"get config": {ctx: scopedViewer, call: func(ctx context.Context) error {
+			_, err := a.GetSyncConfig(ctx, apigen.GetSyncConfigRequestObject{})
+			return err
+		}},
+		"get diff": {ctx: scopedViewer, call: func(ctx context.Context) error {
+			_, err := a.GetSyncItemDiff(ctx, apigen.GetSyncItemDiffRequestObject{ItemId: "task"})
+			return err
+		}},
+		"test connection": {ctx: allWorkspaceDeveloper, call: func(ctx context.Context) error {
+			_, err := a.SyncTestConnection(ctx, apigen.SyncTestConnectionRequestObject{})
+			return err
+		}},
+		"update config": {ctx: allWorkspaceDeveloper, call: func(ctx context.Context) error {
+			_, err := a.UpdateSyncConfig(ctx, apigen.UpdateSyncConfigRequestObject{})
+			return err
+		}},
+		"pull": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.SyncPull(ctx, apigen.SyncPullRequestObject{})
+			return err
+		}},
+		"publish all": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.SyncPublishAll(ctx, apigen.SyncPublishAllRequestObject{})
+			return err
+		}},
+		"publish item": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.PublishSyncItem(ctx, apigen.PublishSyncItemRequestObject{ItemId: "task"})
+			return err
+		}},
+		"discard item": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.DiscardSyncItemChanges(ctx, apigen.DiscardSyncItemChangesRequestObject{ItemId: "task"})
+			return err
+		}},
+		"forget item": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.ForgetSyncItem(ctx, apigen.ForgetSyncItemRequestObject{ItemId: "task"})
+			return err
+		}},
+		"cleanup": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.SyncCleanup(ctx, apigen.SyncCleanupRequestObject{})
+			return err
+		}},
+		"delete item": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.DeleteSyncItem(ctx, apigen.DeleteSyncItemRequestObject{ItemId: "task"})
+			return err
+		}},
+		"delete missing": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.SyncDeleteMissing(ctx, apigen.SyncDeleteMissingRequestObject{})
+			return err
+		}},
+		"delete batch": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.SyncDeleteBatch(ctx, apigen.SyncDeleteBatchRequestObject{})
+			return err
+		}},
+		"move item": {ctx: allWorkspaceOperator, call: func(ctx context.Context) error {
+			_, err := a.MoveSyncItem(ctx, apigen.MoveSyncItemRequestObject{ItemId: "task"})
+			return err
+		}},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.ErrorIs(t, test.call(test.ctx), errInsufficientPermissions)
+		})
 	}
 }
 
@@ -152,7 +309,7 @@ func TestSyncPublishAll_Validation(t *testing.T) {
 		assert.Contains(t, apiErr.Message, "No modified or untracked")
 	})
 
-	t.Run("defaults missing dagIds to publishable DAGs from status", func(t *testing.T) {
+	t.Run("defaults missing item IDs to publishable items from status", func(t *testing.T) {
 		t.Parallel()
 
 		var gotIDs []string
@@ -160,7 +317,7 @@ func TestSyncPublishAll_Validation(t *testing.T) {
 			getStatusFn: func(_ context.Context) (*gitsync.OverallStatus, error) {
 				now := time.Now()
 				return &gitsync.OverallStatus{
-					DAGs: map[string]*gitsync.DAGState{
+					Items: map[string]*gitsync.SyncItemState{
 						"zeta":    {Status: gitsync.StatusModified, ModifiedAt: &now},
 						"alpha":   {Status: gitsync.StatusUntracked, ModifiedAt: &now},
 						"ignored": {Status: gitsync.StatusSynced, LastSyncedAt: &now},
@@ -235,7 +392,7 @@ func TestSyncPublishAll_Validation(t *testing.T) {
 		var apiErr *Error
 		require.ErrorAs(t, err, &apiErr)
 		assert.Equal(t, http.StatusBadRequest, apiErr.HTTPStatus)
-		assert.Contains(t, apiErr.Message, "invalid DAG ID")
+		assert.Contains(t, apiErr.Message, "invalid sync item ID")
 	})
 
 	t.Run("passes dag IDs to service and returns 200", func(t *testing.T) {
@@ -753,42 +910,108 @@ func TestMoveSyncItem(t *testing.T) {
 	})
 }
 
-func TestToAPISyncItems_IncludesKindAndPath(t *testing.T) {
+func TestToAPISyncItems_IncludesPath(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	states := map[string]*gitsync.DAGState{
+	states := map[string]*gitsync.SyncItemState{
 		"alpha": {
-			Status:     gitsync.StatusModified,
-			Kind:       gitsync.DAGKindDAG,
+			Status:        gitsync.StatusModified,
+			FileExtension: ".yml",
+			ModifiedAt:    &now,
+		},
+		"reports/monthly": {
+			Status:     gitsync.StatusUntracked,
 			ModifiedAt: &now,
 		},
-		"memory/MEMORY": {
-			Status:     gitsync.StatusUntracked,
-			ModifiedAt: &now, // No Kind set: should fallback by DAG ID
+		"docs/operations/deploy": {
+			Status:        gitsync.StatusSynced,
+			Kind:          gitsync.SyncItemKindWikiPage,
+			FileExtension: ".MD",
+			ModifiedAt:    &now,
 		},
-		"base": {
-			Status:     gitsync.StatusModified,
-			Kind:       gitsync.DAGKindConfig,
+		"docs/.attachments/guides/deploy/logo.png": {
+			Status:     gitsync.StatusSynced,
+			Kind:       gitsync.SyncItemKindWikiPageAsset,
+			ModifiedAt: &now,
+		},
+		"scripts/run.sh": {
+			Status:     gitsync.StatusSynced,
+			Kind:       gitsync.SyncItemKindFile,
 			ModifiedAt: &now,
 		},
 	}
 
 	apiItems := toAPISyncItems(states)
-	require.Len(t, apiItems, 3)
+	require.Len(t, apiItems, 5)
 
 	assert.Equal(t, "alpha", apiItems[0].ItemId)
-	assert.Equal(t, apigen.SyncItemKindDag, apiItems[0].Kind)
-	assert.Equal(t, "alpha.yaml", apiItems[0].FilePath)
-	assert.Equal(t, "alpha.yaml", apiItems[0].DisplayName)
+	assert.Equal(t, "alpha.yml", apiItems[0].FilePath)
+	assert.Equal(t, "alpha.yml", apiItems[0].DisplayName)
 
-	assert.Equal(t, "base", apiItems[1].ItemId)
-	assert.Equal(t, apigen.SyncItemKindConfig, apiItems[1].Kind)
-	assert.Equal(t, "base.yaml", apiItems[1].FilePath)
-	assert.Equal(t, "base.yaml", apiItems[1].DisplayName)
+	// Asset IDs already carry their extension; the path passes through.
+	assert.Equal(t, "docs/.attachments/guides/deploy/logo.png", apiItems[1].ItemId)
+	assert.Equal(t, "docs/.attachments/guides/deploy/logo.png", apiItems[1].FilePath)
+	assert.Equal(t, apigen.SyncItemKindDocAsset, apiItems[1].Kind)
 
-	assert.Equal(t, "memory/MEMORY", apiItems[2].ItemId)
-	assert.Equal(t, apigen.SyncItemKindMemory, apiItems[2].Kind)
-	assert.Equal(t, "memory/MEMORY.md", apiItems[2].FilePath)
-	assert.Equal(t, "memory/MEMORY.md", apiItems[2].DisplayName)
+	assert.Equal(t, "docs/operations/deploy", apiItems[2].ItemId)
+	assert.Equal(t, "docs/operations/deploy.MD", apiItems[2].FilePath)
+	assert.Equal(t, apigen.SyncItemKindDoc, apiItems[2].Kind)
+
+	assert.Equal(t, "reports/monthly", apiItems[3].ItemId)
+	assert.Equal(t, "reports/monthly.yaml", apiItems[3].FilePath)
+	assert.Equal(t, apigen.SyncItemKindDag, apiItems[3].Kind)
+
+	assert.Equal(t, "scripts/run.sh", apiItems[4].ItemId)
+	assert.Equal(t, "scripts/run.sh", apiItems[4].FilePath)
+	assert.Equal(t, apigen.SyncItemKindFile, apiItems[4].Kind)
+}
+
+func TestGetSyncItemDiffPreservesBinarySizeAvailability(t *testing.T) {
+	t.Parallel()
+
+	zero := int64(0)
+	localExecutable := true
+	remoteExecutable := false
+	a := newSyncAPIForTest(&mockSyncService{
+		getSyncItemDiff: func(_ context.Context, itemID string) (*gitsync.SyncItemDiff, error) {
+			return &gitsync.SyncItemDiff{
+				ItemID:           itemID,
+				Kind:             gitsync.SyncItemKindWikiPageAsset,
+				Status:           gitsync.StatusModified,
+				Binary:           true,
+				LocalSize:        &zero,
+				RemoteDeleted:    true,
+				LocalExecutable:  &localExecutable,
+				RemoteExecutable: &remoteExecutable,
+			}, nil
+		},
+	})
+
+	resp, err := a.GetSyncItemDiff(context.Background(), apigen.GetSyncItemDiffRequestObject{
+		ItemId: "docs/.attachments/guide/empty.bin",
+	})
+	require.NoError(t, err)
+	diff, ok := resp.(apigen.GetSyncItemDiff200JSONResponse)
+	require.True(t, ok)
+	require.NotNil(t, diff.LocalSize)
+	assert.Zero(t, *diff.LocalSize)
+	assert.Nil(t, diff.RemoteSize)
+	require.NotNil(t, diff.RemoteDeleted)
+	assert.True(t, *diff.RemoteDeleted)
+	assert.Equal(t, &localExecutable, diff.LocalExecutable)
+	assert.Equal(t, &remoteExecutable, diff.RemoteExecutable)
+}
+
+func TestToAPISyncResultIncludesDeletedItems(t *testing.T) {
+	t.Parallel()
+
+	result := toAPISyncResult(&gitsync.SyncResult{
+		Success:   true,
+		Deleted:   []string{"scripts/run.sh"},
+		Timestamp: time.Now(),
+	})
+
+	require.NotNil(t, result.Deleted)
+	assert.Equal(t, []string{"scripts/run.sh"}, *result.Deleted)
 }

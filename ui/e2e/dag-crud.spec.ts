@@ -83,7 +83,10 @@ steps:
     await dialog.getByRole('button', { name: 'Rename' }).click();
 
     await expect(page).toHaveURL(
-      localScopedURL(stack.local.baseURL, `/dags/${encodeURIComponent(newName)}`)
+      localScopedURL(
+        stack.local.baseURL,
+        `/dags/${encodeURIComponent(newName)}`
+      )
     );
   });
 
@@ -112,8 +115,15 @@ steps:
       page.getByRole('heading', { level: 1, name: dagName, exact: true })
     ).toBeVisible();
 
-    page.once('dialog', (d) => d.accept());
     await page.getByRole('button', { name: 'Delete', exact: true }).click();
+
+    const deleteDialog = page.getByRole('dialog');
+    await expect(deleteDialog).toBeVisible();
+    await expect(deleteDialog).toContainText('Delete DAG');
+    await expect(deleteDialog).toContainText(fileName);
+    await deleteDialog
+      .getByRole('button', { name: 'Delete', exact: true })
+      .click();
 
     await expect(page).toHaveURL(localScopedURL(stack.local.baseURL, '/dags'));
 

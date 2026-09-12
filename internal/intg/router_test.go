@@ -4,11 +4,12 @@
 package intg_test
 
 import (
+	"os"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,7 +19,7 @@ func TestRouterExecutor(t *testing.T) {
 	tests := []struct {
 		name            string
 		dagYAML         string
-		expectedStatus  core.Status
+		expectedStatus  ir.Status
 		expectedOutputs map[string]any
 	}{
 		{
@@ -44,7 +45,7 @@ steps:
     run: echo "Route B executed"
     output: RESULT_B
 `,
-			expectedStatus: core.Succeeded,
+			expectedStatus: ir.Succeeded,
 			expectedOutputs: map[string]any{
 				"RESULT_A": "Route A executed",
 			},
@@ -72,7 +73,7 @@ steps:
     run: echo "Banana route"
     output: RESULT_B
 `,
-			expectedStatus: core.Succeeded,
+			expectedStatus: ir.Succeeded,
 			expectedOutputs: map[string]any{
 				"RESULT_A": "Apple route",
 			},
@@ -100,7 +101,7 @@ steps:
     run: echo "Default route"
     output: RESULT_DEFAULT
 `,
-			expectedStatus: core.Succeeded,
+			expectedStatus: ir.Succeeded,
 			expectedOutputs: map[string]any{
 				"RESULT_DEFAULT": "Default route",
 			},
@@ -133,7 +134,7 @@ steps:
     depends:
       - step_a
 `,
-			expectedStatus: core.Succeeded,
+			expectedStatus: ir.Succeeded,
 			expectedOutputs: map[string]any{
 				"RESULT_A": "Step A",
 				"RESULT_B": "Step B",
@@ -168,7 +169,7 @@ steps:
     run: echo "Catch all"
     output: CATCH_ALL
 `,
-			expectedStatus: core.Succeeded,
+			expectedStatus: ir.Succeeded,
 			expectedOutputs: map[string]any{
 				"SUCCESS":   "Success handler",
 				"CODE":      "Code handler",
@@ -199,7 +200,7 @@ steps:
     depends:
       - router
 `,
-			expectedStatus: core.Succeeded,
+			expectedStatus: ir.Succeeded,
 			expectedOutputs: map[string]any{
 				"ALWAYS": "Always runs",
 			},
@@ -227,7 +228,7 @@ steps:
     run: echo "Staging"
     output: ENV
 `,
-			expectedStatus: core.Succeeded,
+			expectedStatus: ir.Succeeded,
 			expectedOutputs: map[string]any{
 				"ENV": "Production",
 			},
@@ -246,6 +247,80 @@ steps:
 			dag.AssertLatestStatus(t, tc.expectedStatus)
 			if tc.expectedOutputs != nil {
 				dag.AssertOutputs(t, tc.expectedOutputs)
+			}
+		})
+	}
+}
+
+func TestRouterLogsResolvedValue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		dagYAML string
+	}{
+		{
+			name: "DAGRunID",
+			dagYAML: `
+type: graph
+steps:
+  - id: route
+    action: router.route
+    with:
+      value: ${env.DAG_RUN_ID}
+      routes:
+        "TEST_ROUTE": [target]
+
+  - id: target
+    run: echo routed
+`,
+		},
+		{
+			name: "DeclaredStepOutput",
+			dagYAML: `
+type: graph
+steps:
+  - id: extract_properties
+    run: ` + test.ForOS(
+				`printf 'routing_value=TEST_ROUTE\n' >> "$DAGU_OUTPUT_FILE"`,
+				`Set-Content -Path $env:DAGU_OUTPUT_FILE -Value 'routing_value=TEST_ROUTE'`,
+			) + `
+    outputs:
+      - name: routing_value
+
+  - id: route
+    depends: [extract_properties]
+    action: router.route
+    with:
+      value: ${steps.extract_properties.outputs.routing_value}
+      routes:
+        "TEST_ROUTE": [target]
+
+  - id: target
+    run: echo routed
+`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			th := test.Setup(t)
+			dag := th.DAG(t, tc.dagYAML)
+			agent := dag.Agent(test.WithDAGRunID("TEST_ROUTE"))
+			agent.RunSuccess(t)
+
+			status := agent.Status(agent.Context)
+			for _, node := range status.Nodes {
+				switch node.Step.ID {
+				case "route":
+					stdout, err := os.ReadFile(node.Stdout)
+					require.NoError(t, err)
+					require.Contains(t, string(stdout), "Router evaluating: TEST_ROUTE\n")
+				case "target":
+					require.Equal(t, ir.NodeSucceeded, node.Status)
+				}
 			}
 		})
 	}
@@ -295,7 +370,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": "Phone",
 		})
@@ -305,9 +380,9 @@ steps:
 		for _, node := range status.Nodes {
 			switch node.Step.Name {
 			case "category_router", "electronics_router", "phone_handler":
-				require.Equal(t, core.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
+				require.Equal(t, ir.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
 			case "laptop_handler", "clothing_handler":
-				require.Equal(t, core.NodeSkipped, node.Status, "%s should be skipped", node.Step.Name)
+				require.Equal(t, ir.NodeSkipped, node.Status, "%s should be skipped", node.Step.Name)
 			}
 		}
 	})
@@ -357,7 +432,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		// Premium branch executed
 		dag.AssertOutputs(t, map[string]any{
 			"P1": "Premium-1",
@@ -369,9 +444,9 @@ steps:
 		for _, node := range status.Nodes {
 			switch node.Step.Name {
 			case "router", "premium_step1", "premium_step2", "premium_step3":
-				require.Equal(t, core.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
+				require.Equal(t, ir.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
 			case "standard_step1":
-				require.Equal(t, core.NodeSkipped, node.Status, "%s should be skipped", node.Step.Name)
+				require.Equal(t, ir.NodeSkipped, node.Status, "%s should be skipped", node.Step.Name)
 			}
 		}
 	})
@@ -424,14 +499,14 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		// Verify all steps succeeded
 		status := agent.Status(agent.Context)
 		for _, node := range status.Nodes {
 			switch node.Step.Name {
 			case "setup", "router", "branch_a", "branch_b", "branch_c", "aggregator", "final":
-				require.Equal(t, core.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
+				require.Equal(t, ir.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
 			}
 		}
 
@@ -477,7 +552,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"STATUS": "success",
 			"RESULT": "Handling success",
@@ -488,9 +563,9 @@ steps:
 		for _, node := range status.Nodes {
 			switch node.Step.Name {
 			case "check_status", "router", "success_handler":
-				require.Equal(t, core.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
+				require.Equal(t, ir.NodeSucceeded, node.Status, "%s should succeed", node.Step.Name)
 			case "failure_handler":
-				require.Equal(t, core.NodeSkipped, node.Status, "%s should be skipped", node.Step.Name)
+				require.Equal(t, ir.NodeSkipped, node.Status, "%s should be skipped", node.Step.Name)
 			}
 		}
 	})
@@ -527,17 +602,17 @@ steps:
 
 		// Verify the status
 		status := agent.Status(agent.Context)
-		require.Equal(t, core.Succeeded, status.Status)
+		require.Equal(t, ir.Succeeded, status.Status)
 
 		// Check individual node statuses
 		for _, node := range status.Nodes {
 			switch node.Step.Name {
 			case "router":
-				require.Equal(t, core.NodeSucceeded, node.Status, "router should succeed")
+				require.Equal(t, ir.NodeSucceeded, node.Status, "router should succeed")
 			case "step_a":
-				require.Equal(t, core.NodeSucceeded, node.Status, "step_a should succeed")
+				require.Equal(t, ir.NodeSucceeded, node.Status, "step_a should succeed")
 			case "step_b":
-				require.Equal(t, core.NodeSkipped, node.Status, "step_b should be skipped")
+				require.Equal(t, ir.NodeSkipped, node.Status, "step_b should be skipped")
 			}
 		}
 	})

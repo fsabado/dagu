@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,7 +35,7 @@ func TestCleanupCommand(t *testing.T) {
 		})
 
 		// Wait for DAG to complete
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		// Verify history exists
 		dag.AssertDAGRunCount(t, 1)
@@ -65,7 +65,7 @@ func TestCleanupCommand(t *testing.T) {
 		})
 
 		// Wait for DAG to complete
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		// Verify history exists
 		dag.AssertDAGRunCount(t, 1)
@@ -95,7 +95,7 @@ func TestCleanupCommand(t *testing.T) {
 		})
 
 		// Wait for DAG to complete
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		// Verify history exists
 		dag.AssertDAGRunCount(t, 1)
@@ -131,7 +131,7 @@ func TestCleanupCommand(t *testing.T) {
 		}()
 
 		// Wait for DAG to start running
-		dag.AssertLatestStatus(t, core.Running)
+		dag.AssertLatestStatus(t, ir.Running)
 
 		// Try to cleanup while running (nothing to delete since only active run exists)
 		th.RunCommand(t, cmd.Cleanup(), test.CmdTest{
@@ -139,7 +139,7 @@ func TestCleanupCommand(t *testing.T) {
 		})
 
 		// Verify the running DAG is still there (should be preserved)
-		dag.AssertLatestStatus(t, core.Running)
+		dag.AssertLatestStatus(t, ir.Running)
 
 		releaseHoldFile(t, release)
 		<-done
@@ -206,55 +206,55 @@ func TestCleanupCommand(t *testing.T) {
 	})
 }
 
-func TestCleanupCommandDirectStore(t *testing.T) {
+func TestCleanupCommandRepository(t *testing.T) {
 	t.Parallel()
 
-	// Test cleanup using the DAGRunStore directly to verify underlying behavior
-	t.Run("RemoveOldDAGRunsWithStore", func(t *testing.T) {
+	// Test cleanup through the DAG-run repository to verify the public behavior.
+	t.Run("RemoveOldDAGRuns", func(t *testing.T) {
 		t.Parallel()
 
 		th := test.Setup(t)
 
 		dagName := "test-cleanup-dag"
 
-		// Create old DAG runs directly in the store
+		// Create old DAG runs through the repository.
 		oldTime := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		recentTime := time.Now()
 
 		// Create a minimal DAG for the test
-		testDAG := &core.DAG{Name: dagName}
+		testDAG := &ir.DAG{Name: dagName}
 
 		// Create an old run
-		oldAttempt, err := th.DAGRunStore.CreateAttempt(
+		oldAttempt, err := th.DAGRunRepository.CreateAttempt(
 			th.Context,
 			testDAG,
 			oldTime,
 			"old-run-id",
-			exec.NewDAGRunAttemptOptions{},
+			persis.DAGRunCreateAttemptOptions{},
 		)
 		require.NoError(t, err)
 		require.NoError(t, oldAttempt.Open(th.Context))
-		require.NoError(t, oldAttempt.Write(th.Context, exec.DAGRunStatus{
+		require.NoError(t, oldAttempt.Write(th.Context, ir.DAGRunStatus{
 			Name:     dagName,
 			DAGRunID: "old-run-id",
-			Status:   core.Succeeded,
+			Status:   ir.Succeeded,
 		}))
 		require.NoError(t, oldAttempt.Close(th.Context))
 
 		// Create a recent run
-		recentAttempt, err := th.DAGRunStore.CreateAttempt(
+		recentAttempt, err := th.DAGRunRepository.CreateAttempt(
 			th.Context,
 			testDAG,
 			recentTime,
 			"recent-run-id",
-			exec.NewDAGRunAttemptOptions{},
+			persis.DAGRunCreateAttemptOptions{},
 		)
 		require.NoError(t, err)
 		require.NoError(t, recentAttempt.Open(th.Context))
-		require.NoError(t, recentAttempt.Write(th.Context, exec.DAGRunStatus{
+		require.NoError(t, recentAttempt.Write(th.Context, ir.DAGRunStatus{
 			Name:     dagName,
 			DAGRunID: "recent-run-id",
-			Status:   core.Succeeded,
+			Status:   ir.Succeeded,
 		}))
 		require.NoError(t, recentAttempt.Close(th.Context))
 
@@ -262,21 +262,20 @@ func TestCleanupCommandDirectStore(t *testing.T) {
 		setOldModTime(t, th.Config.Paths.DAGRunsDir, dagName, "", oldTime)
 
 		// Verify both runs exist
-		runs := th.DAGRunStore.RecentAttempts(th.Context, dagName, 10)
-		require.Len(t, runs, 2)
+		statuses, err := th.DAGRunRepository.RecentStatuses(th.Context, dagName, 10)
+		require.NoError(t, err)
+		require.Len(t, statuses, 2)
 
 		// Remove runs older than 7 days
-		removedIDs, err := th.DAGRunStore.RemoveOldDAGRuns(th.Context, dagName, 7)
+		removedIDs, err := th.DAGRunRepository.RemoveOldDAGRuns(th.Context, dagName, 7, persis.DAGRunRetentionOptions{})
 		require.NoError(t, err)
 		assert.Len(t, removedIDs, 1)
 
 		// Verify old run is deleted, recent run remains
-		runs = th.DAGRunStore.RecentAttempts(th.Context, dagName, 10)
-		require.Len(t, runs, 1)
-
-		status, err := runs[0].ReadStatus(th.Context)
+		statuses, err = th.DAGRunRepository.RecentStatuses(th.Context, dagName, 10)
 		require.NoError(t, err)
-		assert.Equal(t, "recent-run-id", status.DAGRunID)
+		require.Len(t, statuses, 1)
+		assert.Equal(t, "recent-run-id", statuses[0].DAGRunID)
 	})
 }
 

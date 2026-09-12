@@ -16,13 +16,9 @@ vi.mock('@/hooks/api', () => ({
 
 vi.mock('@/features/search/components/SearchResult', () => ({
   __esModule: true,
-  default: ({
-    type,
-    results,
-  }: {
-    type: 'dag' | 'doc';
-    results: unknown[];
-  }) => <div data-testid={`${type}-results`}>{results.length}</div>,
+  default: ({ results }: { results: unknown[] }) => (
+    <div data-testid="dag-results">{results.length}</div>
+  ),
 }));
 
 class IntersectionObserverMock {
@@ -64,23 +60,6 @@ function renderSearchPage(initialEntry: string) {
 }
 
 describe('SearchPage', () => {
-  it('shows an explicit unavailable message when docs search is forbidden', () => {
-    mockUseInfinite.mockReturnValue({
-      data: undefined,
-      error: { status: 403, message: 'forbidden' },
-      isLoading: false,
-      isValidating: false,
-      setSize: vi.fn(),
-      mutate: vi.fn(),
-    } as never);
-
-    renderSearchPage('/search?q=needle&scope=docs');
-
-    expect(
-      screen.getByText('Document management is not available on this server.')
-    ).toBeInTheDocument();
-  });
-
   it('keeps existing results visible when loading more fails and allows retry', async () => {
     const mutate = vi.fn();
 
@@ -106,12 +85,14 @@ describe('SearchPage', () => {
       mutate,
     } as never);
 
-    renderSearchPage('/search?q=needle&scope=dags');
+    renderSearchPage('/search?q=needle');
 
     expect(screen.getByTestId('dag-results')).toHaveTextContent('1');
     expect(screen.getByText('load failed')).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Retry load more' }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Retry load more' })
+    );
 
     expect(mutate).toHaveBeenCalled();
   });
@@ -126,7 +107,7 @@ describe('SearchPage', () => {
       mutate: vi.fn(),
     } as never);
 
-    renderSearchPage('/search?q=needle&scope=dags');
+    renderSearchPage('/search?q=needle');
 
     const input = screen.getByRole('searchbox');
     await userEvent.clear(input);
@@ -137,7 +118,7 @@ describe('SearchPage', () => {
     ).toBeInTheDocument();
   });
 
-  it('keeps the draft query when switching scope', async () => {
+  it('treats the legacy docs scope as Wiki search', () => {
     mockUseInfinite.mockReturnValue({
       data: [],
       error: undefined,
@@ -147,13 +128,16 @@ describe('SearchPage', () => {
       mutate: vi.fn(),
     } as never);
 
-    renderSearchPage('/search?q=needle&scope=dags');
+    renderSearchPage('/search?q=needle&scope=docs');
 
-    const input = screen.getByRole('searchbox');
-    await userEvent.clear(input);
-    await userEvent.type(input, 'draft');
-    await userEvent.click(screen.getByRole('button', { name: 'Docs' }));
-
-    expect(screen.getByRole('searchbox')).toHaveValue('draft');
+    expect(mockUseInfinite).toHaveBeenCalledWith(
+      '/search/wiki',
+      expect.any(Function),
+      expect.any(Object)
+    );
+    expect(screen.getByRole('button', { name: 'Wiki' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
   });
 });

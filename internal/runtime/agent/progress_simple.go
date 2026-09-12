@@ -5,19 +5,18 @@ package agent
 
 import (
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"golang.org/x/term"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // SimpleProgressDisplay provides a minimal inline progress display.
 type SimpleProgressDisplay struct {
-	dag      *core.DAG
+	progressWriter
+
+	dag      *ir.DAG
 	dagRunID string
 	params   string
 
@@ -25,10 +24,9 @@ type SimpleProgressDisplay struct {
 	total          int
 	completed      int
 	completedNodes map[string]bool // track which nodes are already counted
-	status         core.Status
+	status         ir.Status
 	spinnerIndex   int
 	startTime      time.Time
-	colorEnabled   bool
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -36,16 +34,16 @@ type SimpleProgressDisplay struct {
 }
 
 // NewSimpleProgressDisplay creates a new simple progress display.
-func NewSimpleProgressDisplay(dag *core.DAG) *SimpleProgressDisplay {
+func NewSimpleProgressDisplay(dag *ir.DAG) *SimpleProgressDisplay {
 	total := 0
 	if dag != nil {
 		total = len(dag.Steps)
 	}
 	return &SimpleProgressDisplay{
+		progressWriter: newProgressWriter(),
 		dag:            dag,
 		total:          total,
 		completedNodes: make(map[string]bool),
-		colorEnabled:   term.IsTerminal(int(os.Stderr.Fd())),
 		stopCh:         make(chan struct{}),
 		done:           make(chan struct{}),
 	}
@@ -65,7 +63,7 @@ func (p *SimpleProgressDisplay) Stop() {
 }
 
 // UpdateNode updates the progress for a specific node.
-func (p *SimpleProgressDisplay) UpdateNode(node *exec.Node) {
+func (p *SimpleProgressDisplay) UpdateNode(node *ir.Node) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -79,7 +77,7 @@ func (p *SimpleProgressDisplay) UpdateNode(node *exec.Node) {
 }
 
 // UpdateStatus updates the overall DAG status.
-func (p *SimpleProgressDisplay) UpdateStatus(status *exec.DAGRunStatus) {
+func (p *SimpleProgressDisplay) UpdateStatus(status *ir.DAGRunStatus) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.status = status.Status
@@ -101,7 +99,10 @@ func (p *SimpleProgressDisplay) run() {
 	p.mu.Unlock()
 
 	// Print header
-	p.printHeader()
+	p.mu.Lock()
+	dag, runID, params := p.dag, p.dagRunID, p.params
+	p.mu.Unlock()
+	p.printHeader(dag, runID, params)
 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -115,35 +116,6 @@ func (p *SimpleProgressDisplay) run() {
 			p.render()
 		}
 	}
-}
-
-func (p *SimpleProgressDisplay) printHeader() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	dagName := "unknown"
-	if p.dag != nil {
-		dagName = p.dag.Name
-	}
-
-	runID := p.dagRunID
-	if runID == "" {
-		runID = "..."
-	}
-
-	if p.params != "" {
-		fmt.Fprintf(os.Stderr, "▶ %s %s %s\n", dagName, p.gray("("+runID+")"), p.gray("["+p.params+"]"))
-	} else {
-		fmt.Fprintf(os.Stderr, "▶ %s %s\n", dagName, p.gray("("+runID+")"))
-	}
-}
-
-// gray returns text in gray color if color is enabled.
-func (p *SimpleProgressDisplay) gray(s string) string {
-	if !p.colorEnabled {
-		return s
-	}
-	return "\033[38;5;245m" + s + "\033[0m"
 }
 
 func (p *SimpleProgressDisplay) render() {
@@ -161,7 +133,7 @@ func (p *SimpleProgressDisplay) render() {
 	elapsed := stringutil.FormatDuration(time.Since(p.startTime))
 
 	// Use \r to overwrite the line, pad with spaces to clear previous content
-	fmt.Fprintf(os.Stderr, "\r%s %d%% (%d/%d steps) %s   ", spinner, percent, p.completed, p.total, p.gray(elapsed))
+	fmt.Fprintf(p.out, "\r%s %d%% (%d/%d steps) %s   ", spinner, percent, p.completed, p.total, p.gray(elapsed))
 }
 
 func (p *SimpleProgressDisplay) printFinal() {
@@ -173,13 +145,8 @@ func (p *SimpleProgressDisplay) printFinal() {
 		percent = (p.completed * 100) / p.total
 	}
 
-	icon := "✓"
-	if p.status == core.Failed || p.status == core.Aborted {
-		icon = "✗"
-	}
-
 	elapsed := stringutil.FormatDuration(time.Since(p.startTime))
 
 	// Clear line and print final status
-	fmt.Fprintf(os.Stderr, "\r%s %d%% (%d/%d steps) %s   \n", icon, percent, p.completed, p.total, p.gray(elapsed))
+	fmt.Fprintf(p.out, "\r%s %d%% (%d/%d steps) %s   \n", statusIcon(p.status), percent, p.completed, p.total, p.gray(elapsed))
 }

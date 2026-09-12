@@ -8,16 +8,18 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/service/chatbridge"
-	"github.com/dagucloud/dagu/internal/service/eventstore"
-	"github.com/dagucloud/dagu/internal/testutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/dagucloud/dagu/v2/internal/eventstore"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	filemonitor "github.com/dagucloud/dagu/v2/internal/persis/file/monitor"
+	"github.com/dagucloud/dagu/v2/internal/service/chatbridge"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,10 +29,38 @@ type monitorEventStore struct {
 	headCalls      int
 	readCalls      int
 	lastHeadOffset int64
+	onReadEvents   func([]*eventstore.Event)
 }
 
 var _ eventstore.Store = (*monitorEventStore)(nil)
-var _ eventstore.NotificationReader = (*monitorEventStore)(nil)
+var _ eventstore.DAGRunReader = (*monitorEventStore)(nil)
+
+func newFileNotificationMonitor(
+	eventService *eventstore.Service,
+	stateFile string,
+	transport chatbridge.NotificationTransport,
+	logger *slog.Logger,
+	cfg chatbridge.NotificationMonitorConfig,
+) *chatbridge.NotificationMonitor {
+	return chatbridge.NewNotificationMonitor(
+		eventService,
+		filemonitor.NewStateStore(stateFile),
+		filemonitor.NewLease(stateFile, &dirlock.LockOptions{
+			StaleThreshold: chatbridge.DefaultNotificationLockStaleThreshold,
+			RetryInterval:  chatbridge.DefaultNotificationLockRetryInterval,
+		}),
+		transport,
+		logger,
+		cfg,
+	)
+}
+
+func monitorEventuallyTimeout(base time.Duration) time.Duration {
+	if runtime.GOOS == "windows" {
+		return base * 3
+	}
+	return base
+}
 
 func (s *monitorEventStore) Emit(_ context.Context, event *eventstore.Event) error {
 	if event == nil {
@@ -48,7 +78,7 @@ func (s *monitorEventStore) Query(context.Context, eventstore.QueryFilter) (*eve
 	return &eventstore.QueryResult{}, nil
 }
 
-func (s *monitorEventStore) NotificationHeadCursor(context.Context) (eventstore.NotificationCursor, error) {
+func (s *monitorEventStore) DAGRunHeadCursor(context.Context) (eventstore.DAGRunCursor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.headCalls++
@@ -56,20 +86,27 @@ func (s *monitorEventStore) NotificationHeadCursor(context.Context) (eventstore.
 	return s.currentCursorLocked(), nil
 }
 
-func (s *monitorEventStore) ReadNotificationEvents(_ context.Context, cursor eventstore.NotificationCursor) ([]*eventstore.Event, eventstore.NotificationCursor, error) {
+func (s *monitorEventStore) ReadDAGRunEvents(_ context.Context, cursor eventstore.DAGRunCursor) ([]*eventstore.Event, eventstore.DAGRunCursor, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.readCalls++
 
 	index := int(cursor.Normalize().CommittedOffsets["events"])
 	if index < 0 || index > len(s.events) {
 		index = 0
 	}
-	return append([]*eventstore.Event(nil), s.events[index:]...), s.currentCursorLocked(), nil
+	events := append([]*eventstore.Event(nil), s.events[index:]...)
+	nextCursor := s.currentCursorLocked()
+	onReadEvents := s.onReadEvents
+	s.mu.Unlock()
+
+	if onReadEvents != nil {
+		onReadEvents(events)
+	}
+	return events, nextCursor, nil
 }
 
-func (s *monitorEventStore) currentCursorLocked() eventstore.NotificationCursor {
-	return eventstore.NotificationCursor{
+func (s *monitorEventStore) currentCursorLocked() eventstore.DAGRunCursor {
+	return eventstore.DAGRunCursor{
 		CommittedOffsets: map[string]int64{"events": int64(len(s.events))},
 	}
 }
@@ -136,7 +173,8 @@ func TestNotificationMonitorWithoutDestinationsAdvancesCursorWithoutReadingEvent
 
 	monitor := chatbridge.NewNotificationMonitor(
 		service,
-		filepath.Join(t.TempDir(), "state.json"),
+		nil,
+		nil,
 		transport,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		cfg,
@@ -147,13 +185,13 @@ func TestNotificationMonitorWithoutDestinationsAdvancesCursorWithoutReadingEvent
 	require.Eventually(t, func() bool {
 		headCalls, _ := store.stats()
 		return headCalls > 0
-	}, time.Second, 10*time.Millisecond)
+	}, monitorEventuallyTimeout(time.Second), 10*time.Millisecond)
 
 	require.NoError(t, store.Emit(context.Background(), newMonitorDAGRunEvent("old-run")))
 
 	require.Eventually(t, func() bool {
 		return store.lastHead() >= 1
-	}, time.Second, 10*time.Millisecond)
+	}, monitorEventuallyTimeout(time.Second), 10*time.Millisecond)
 }
 
 func TestNotificationMonitorDeliversOnlyFutureEventsAfterDestinationIsAdded(t *testing.T) {
@@ -169,7 +207,7 @@ func TestNotificationMonitorDeliversOnlyFutureEventsAfterDestinationIsAdded(t *t
 	cfg.UrgentWindow = 5 * time.Millisecond
 	cfg.SuccessWindow = 5 * time.Millisecond
 
-	monitor := chatbridge.NewNotificationMonitor(
+	monitor := newFileNotificationMonitor(
 		service,
 		filepath.Join(t.TempDir(), "state.json"),
 		transport,
@@ -187,32 +225,95 @@ func TestNotificationMonitorDeliversOnlyFutureEventsAfterDestinationIsAdded(t *t
 	require.Eventually(t, func() bool {
 		headCalls, _ := store.stats()
 		return headCalls > 0
-	}, time.Second, 10*time.Millisecond)
+	}, monitorEventuallyTimeout(time.Second), 10*time.Millisecond)
 
 	require.NoError(t, store.Emit(context.Background(), newMonitorDAGRunEvent("old-run")))
 	require.Eventually(t, func() bool {
 		return store.lastHead() >= 1
-	}, time.Second, 10*time.Millisecond)
+	}, monitorEventuallyTimeout(time.Second), 10*time.Millisecond)
 
 	transport.setDestinations([]string{"dest-1"})
-	require.NoError(t, store.Emit(context.Background(), newMonitorDAGRunEvent("new-run")))
+	newEvent := newMonitorDAGRunEvent("new-run")
+	newStatus, err := eventstore.DAGRunStatusFromEvent(newEvent)
+	require.NoError(t, err)
+	require.NoError(t, store.Emit(context.Background(), newEvent))
 
 	require.Eventually(t, func() bool {
-		return slices.Equal(transport.deliveredNames(), []string{"new-run"})
-	}, time.Second, 10*time.Millisecond)
+		return slices.Equal(transport.deliveredNames(), []string{"new-run"}) &&
+			monitor.IsDelivered("dest-1", newStatus)
+	}, monitorEventuallyTimeout(time.Second), 10*time.Millisecond)
 
 	stopMonitor()
 	stopped = true
 	require.Equal(t, []string{"new-run"}, transport.deliveredNames())
 }
 
+func TestNotificationMonitorDoesNotDeliverEventsReadAfterShutdown(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &monitorEventStore{
+		onReadEvents: func(events []*eventstore.Event) {
+			if len(events) > 0 {
+				cancel()
+			}
+		},
+	}
+	service := eventstore.New(store)
+	transport := &mutableNotificationTransport{destinations: []string{"dest-1"}}
+
+	cfg := chatbridge.DefaultNotificationMonitorConfig()
+	cfg.PollInterval = 5 * time.Millisecond
+	cfg.SeenEvictInterval = time.Hour
+	cfg.UrgentWindow = 5 * time.Millisecond
+	cfg.SuccessWindow = 5 * time.Millisecond
+
+	monitor := newFileNotificationMonitor(
+		service,
+		filepath.Join(t.TempDir(), "state.json"),
+		transport,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cfg,
+	)
+	done := make(chan struct{})
+	go func() {
+		monitor.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for monitor shutdown")
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		headCalls, _ := store.stats()
+		return headCalls > 0
+	}, monitorEventuallyTimeout(time.Second), 10*time.Millisecond)
+
+	require.NoError(t, store.Emit(context.Background(), newMonitorDAGRunEvent("cancelled-run")))
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}, monitorEventuallyTimeout(time.Second), 10*time.Millisecond)
+	require.Empty(t, transport.deliveredNames())
+}
+
 func newMonitorDAGRunEvent(name string) *eventstore.Event {
 	return eventstore.NewDAGRunEvent(
 		eventstore.Source{Service: eventstore.SourceServiceScheduler},
 		eventstore.TypeDAGRunFailed,
-		&exec.DAGRunStatus{
+		&ir.DAGRunStatus{
 			Name:      name,
-			Status:    core.Failed,
+			Status:    ir.Failed,
 			DAGRunID:  name + "-run",
 			AttemptID: name + "-attempt",
 		},

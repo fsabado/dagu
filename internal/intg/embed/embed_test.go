@@ -9,13 +9,14 @@ import (
 	"io"
 	"os"
 	osexec "os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,6 +46,8 @@ func TestEmbeddedLocalRunYAML(t *testing.T) {
 		require.NoError(t, engine.Close(context.Background()))
 	})
 
+	workDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, "input.txt"), []byte("input"), 0o600))
 	run, err := engine.RunYAML(ctx, []byte(`
 name: embedded-intg-local
 type: graph
@@ -54,7 +57,13 @@ steps:
   - name: second
     `+embeddedDirectCommandYAML(t, "whoami")+`
     depends: [first]
-`))
+  - name: dependency
+    dependencies: input.txt
+    action: file.read
+    with:
+      path: input.txt
+    depends: [second]
+`), dagu.WithDefaultWorkingDir(workDir))
 	require.NoError(t, err)
 
 	status, err := run.Wait(ctx)
@@ -74,6 +83,15 @@ steps:
 
 func TestEmbeddedCustomExecutorRunYAML(t *testing.T) {
 	const executorType = "embedded_intg_echo"
+	dagYAML := []byte(`
+name: embedded-intg-custom-executor
+type: graph
+steps:
+  - name: go-step
+    action: embedded_intg_echo
+    with:
+      message: called from YAML
+`)
 
 	dagu.RegisterExecutor(
 		executorType,
@@ -95,21 +113,17 @@ func TestEmbeddedCustomExecutorRunYAML(t *testing.T) {
 		require.NoError(t, engine.Close(context.Background()))
 	})
 
-	run, err := engine.RunYAML(ctx, []byte(`
-name: embedded-intg-custom-executor
-type: graph
-steps:
-  - name: go-step
-    action: embedded_intg_echo
-    with:
-      message: called from YAML
-`))
+	run, err := engine.RunYAML(ctx, dagYAML)
 	require.NoError(t, err)
 
 	status, err := run.Wait(ctx)
 	require.NoError(t, err)
 	require.Equal(t, "embedded-intg-custom-executor", status.Name)
 	require.Equal(t, "succeeded", status.Status)
+
+	dagu.UnregisterExecutor(executorType)
+	_, err = engine.RunYAML(ctx, dagYAML)
+	require.ErrorContains(t, err, `unknown action "embedded_intg_echo"`)
 }
 
 func TestEmbeddedDistributedRunYAML(t *testing.T) {
@@ -154,13 +168,18 @@ func TestEmbeddedDistributedRunYAML(t *testing.T) {
 
 	require.NoError(t, worker.WaitReady(ctx))
 
+	workDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, "input.txt"), []byte("input"), 0o600))
 	run, err := engine.RunYAML(ctx, []byte(`
 name: embedded-intg-distributed
 type: graph
 steps:
   - name: worker-step
-    run: echo distributed
-`))
+    dependencies: input.txt
+    action: file.read
+    with:
+      path: input.txt
+`), dagu.WithDefaultWorkingDir(workDir))
 	require.NoError(t, err)
 
 	status, err := run.Wait(ctx)

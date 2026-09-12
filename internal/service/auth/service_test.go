@@ -5,16 +5,19 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/auth"
-	persiststore "github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	persiststore "github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func mustTokenSecret(s string) auth.TokenSecret {
@@ -35,6 +38,24 @@ func setupTestService(t *testing.T) (*Service, func()) {
 		BcryptCost:  4, // Low cost for faster tests
 	}
 	return New(store, config), func() {}
+}
+
+type pauseAfterGetUserStore struct {
+	auth.UserStore
+	afterGet chan struct{}
+	resume   chan struct{}
+	once     sync.Once
+}
+
+func (s *pauseAfterGetUserStore) GetByID(ctx context.Context, id string) (*auth.User, error) {
+	user, err := s.UserStore.GetByID(ctx, id)
+	if err == nil {
+		s.once.Do(func() {
+			close(s.afterGet)
+			<-s.resume
+		})
+	}
+	return user, err
 }
 
 func TestService_CreateUser(t *testing.T) {
@@ -117,6 +138,74 @@ func TestService_Authenticate(t *testing.T) {
 	_, err = svc.Authenticate(ctx, "nonexistent", "password123")
 	if err != ErrInvalidCredentials {
 		t.Errorf("Authenticate() with non-existent user error = %v, want %v", err, ErrInvalidCredentials)
+	}
+}
+
+func TestService_AuthenticateRejectsOIDCUserWithPasswordHash(t *testing.T) {
+	svc, cleanup := setupTestService(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("password123"), svc.config.BcryptCost)
+	require.NoError(t, err)
+	user := auth.NewUser("oidc-user", string(passwordHash), auth.RoleViewer)
+	user.AuthProvider = "oidc"
+	require.NoError(t, svc.store.Create(ctx, user))
+
+	authenticated, err := svc.Authenticate(ctx, user.Username, "password123")
+	assert.Nil(t, authenticated)
+	assert.ErrorIs(t, err, ErrInvalidCredentials)
+}
+
+func TestService_AuthenticateRejectsEveryExternalProvider(t *testing.T) {
+	for _, provider := range []string{"oidc", "proxy", "future_provider"} {
+		t.Run(provider, func(t *testing.T) {
+			svc, cleanup := setupTestService(t)
+			defer cleanup()
+
+			ctx := context.Background()
+			passwordHash, err := bcrypt.GenerateFromPassword([]byte("password123"), svc.config.BcryptCost)
+			require.NoError(t, err)
+			user := auth.NewUser(provider+"-user", string(passwordHash), auth.RoleViewer)
+			user.AuthProvider = provider
+			if provider == auth.AuthProviderProxy {
+				user.TrustedProxyUser = provider + "-identity"
+			}
+			require.NoError(t, svc.store.Create(ctx, user))
+
+			authenticated, err := svc.Authenticate(ctx, user.Username, "password123")
+			assert.Nil(t, authenticated)
+			assert.ErrorIs(t, err, ErrInvalidCredentials)
+		})
+	}
+}
+
+func TestService_PasswordManagementRejectsEveryExternalProvider(t *testing.T) {
+	for _, provider := range []string{"oidc", "proxy", "future_provider"} {
+		t.Run(provider, func(t *testing.T) {
+			svc, cleanup := setupTestService(t)
+			defer cleanup()
+
+			ctx := context.Background()
+			user := auth.NewUser(provider+"-user", "legacy-password-hash", auth.RoleViewer)
+			user.AuthProvider = provider
+			if provider == auth.AuthProviderProxy {
+				user.TrustedProxyUser = provider + "-identity"
+			}
+			require.NoError(t, svc.store.Create(ctx, user))
+
+			newPassword := "newpassword1"
+			updated, err := svc.UpdateUser(ctx, user.ID, UpdateUserInput{Password: &newPassword})
+			assert.Nil(t, updated)
+			assert.ErrorIs(t, err, ErrExternalAuthPasswordManagement)
+			assert.ErrorIs(t, svc.ChangePassword(ctx, user.ID, "oldpassword", newPassword), ErrExternalAuthPasswordManagement)
+			assert.ErrorIs(t, svc.ResetPassword(ctx, user.ID, newPassword), ErrExternalAuthPasswordManagement)
+
+			stored, err := svc.store.GetByID(ctx, user.ID)
+			require.NoError(t, err)
+			assert.Equal(t, "legacy-password-hash", stored.PasswordHash)
+			assert.Nil(t, stored.PasswordChangedAt)
+		})
 	}
 }
 
@@ -207,6 +296,38 @@ func TestService_GetUserFromToken(t *testing.T) {
 	}
 }
 
+func TestService_GetUserFromTokenReturnsCurrentAuthorization(t *testing.T) {
+	svc, cleanup := setupTestService(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user, err := svc.CreateUser(ctx, CreateUserInput{
+		Username:        "authorization-refresh",
+		Password:        "password123",
+		Role:            auth.RoleDeveloper,
+		WorkspaceAccess: auth.AllWorkspaceAccess(),
+	})
+	require.NoError(t, err)
+
+	tokenResult, err := svc.GenerateToken(user)
+	require.NoError(t, err)
+
+	role := auth.RoleViewer
+	workspaceAccess := &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "payments", Role: auth.RoleOperator}},
+	}
+	_, err = svc.UpdateUser(ctx, user.ID, UpdateUserInput{
+		Role:            &role,
+		WorkspaceAccess: workspaceAccess,
+	})
+	require.NoError(t, err)
+
+	retrieved, err := svc.GetUserFromToken(ctx, tokenResult.Token)
+	require.NoError(t, err)
+	assert.Equal(t, auth.RoleViewer, retrieved.Role)
+	assert.Equal(t, workspaceAccess, retrieved.WorkspaceAccess)
+}
+
 func TestService_ChangePassword(t *testing.T) {
 	svc, cleanup := setupTestService(t)
 	defer cleanup()
@@ -263,6 +384,24 @@ func TestService_ChangePassword_WrongOldPassword(t *testing.T) {
 	if err != ErrPasswordMismatch {
 		t.Errorf("ChangePassword() with wrong old password error = %v, want %v", err, ErrPasswordMismatch)
 	}
+}
+
+func TestService_ChangePasswordRejectsOIDCUser(t *testing.T) {
+	svc, cleanup := setupTestService(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user := auth.NewUser("oidc-user", "legacy-password-hash", auth.RoleViewer)
+	user.AuthProvider = "oidc"
+	require.NoError(t, svc.store.Create(ctx, user))
+
+	err := svc.ChangePassword(ctx, user.ID, "oldpassword", "newpassword1")
+	assert.ErrorIs(t, err, ErrExternalAuthPasswordManagement)
+
+	stored, getErr := svc.store.GetByID(ctx, user.ID)
+	require.NoError(t, getErr)
+	assert.Equal(t, "legacy-password-hash", stored.PasswordHash)
+	assert.Nil(t, stored.PasswordChangedAt)
 }
 
 func TestService_DeleteUser(t *testing.T) {
@@ -358,6 +497,115 @@ func TestService_UpdateUser(t *testing.T) {
 	}
 }
 
+func TestService_UpdateUserPreservesOIDCManagedEmptyWorkspaceAccess(t *testing.T) {
+	svc, cleanup := setupTestService(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user := auth.NewUser("oidc-user", "", auth.RoleViewer)
+	user.AuthProvider = "oidc"
+	user.OIDCIssuer = "https://idp.example.com"
+	user.OIDCSubject = "subject-1"
+	user.WorkspaceAccess = &auth.WorkspaceAccess{Grants: []auth.WorkspaceGrant{}}
+	require.NoError(t, svc.store.Create(ctx, user))
+
+	username := "renamed-oidc-user"
+	updated, err := svc.UpdateUser(ctx, user.ID, UpdateUserInput{Username: &username})
+	require.NoError(t, err)
+	assert.Equal(t, username, updated.Username)
+	assert.False(t, updated.WorkspaceAccess.All)
+	assert.Empty(t, updated.WorkspaceAccess.Grants)
+
+	disabled := true
+	updated, err = svc.UpdateUser(ctx, user.ID, UpdateUserInput{IsDisabled: &disabled})
+	require.NoError(t, err)
+	assert.True(t, updated.IsDisabled)
+
+	disabled = false
+	updated, err = svc.UpdateUser(ctx, user.ID, UpdateUserInput{IsDisabled: &disabled})
+	require.NoError(t, err)
+	assert.False(t, updated.IsDisabled)
+
+	stored, err := svc.GetUser(ctx, user.ID)
+	require.NoError(t, err)
+	assert.Equal(t, username, stored.Username)
+	assert.False(t, stored.IsDisabled)
+	assert.False(t, stored.WorkspaceAccess.All)
+	assert.Empty(t, stored.WorkspaceAccess.Grants)
+}
+
+func TestService_UpdateUserPreservesAuthorizationSynchronizedAfterRead(t *testing.T) {
+	ctx := context.Background()
+	baseStore, err := persiststore.NewUserStore(testutil.NewMemoryBackend().Collection("users"))
+	require.NoError(t, err)
+	user := auth.NewUser("proxy-user", "", auth.RoleAdmin)
+	user.AuthProvider = auth.AuthProviderProxy
+	user.TrustedProxyUser = "stable-identity"
+	require.NoError(t, baseStore.Create(ctx, user))
+
+	pausingStore := &pauseAfterGetUserStore{
+		UserStore: baseStore,
+		afterGet:  make(chan struct{}),
+		resume:    make(chan struct{}),
+	}
+	svc := New(pausingStore, Config{
+		TokenSecret: mustTokenSecret("test-secret-key-for-jwt-signing"),
+		TokenTTL:    time.Hour,
+		BcryptCost:  4,
+	})
+
+	type updateResult struct {
+		user *auth.User
+		err  error
+	}
+	result := make(chan updateResult, 1)
+	username := "proxy-renamed"
+	go func() {
+		updated, updateErr := svc.UpdateUser(ctx, user.ID, UpdateUserInput{Username: &username})
+		result <- updateResult{user: updated, err: updateErr}
+	}()
+
+	select {
+	case <-pausingStore.afterGet:
+	case <-time.After(time.Second):
+		t.Fatal("UpdateUser did not reach the store read")
+	}
+	_, syncErr := baseStore.SyncAuthorization(ctx, user.ID, auth.RoleViewer, &auth.WorkspaceAccess{Grants: []auth.WorkspaceGrant{}})
+	close(pausingStore.resume)
+	require.NoError(t, syncErr)
+
+	var got updateResult
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("UpdateUser did not complete")
+	}
+	require.NoError(t, got.err)
+	require.NotNil(t, got.user)
+	assert.Equal(t, username, got.user.Username)
+	assert.Equal(t, auth.RoleViewer, got.user.Role)
+	assert.False(t, got.user.WorkspaceAccess.All)
+	assert.Empty(t, got.user.WorkspaceAccess.Grants)
+}
+
+func TestService_UpdateUserRejectsExplicitEmptyWorkspaceAccess(t *testing.T) {
+	svc, cleanup := setupTestService(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user, err := svc.CreateUser(ctx, CreateUserInput{
+		Username: "testuser",
+		Password: "password123",
+		Role:     auth.RoleViewer,
+	})
+	require.NoError(t, err)
+
+	_, err = svc.UpdateUser(ctx, user.ID, UpdateUserInput{
+		WorkspaceAccess: &auth.WorkspaceAccess{},
+	})
+	require.ErrorIs(t, err, auth.ErrInvalidWorkspaceAccess)
+}
+
 func TestService_ListUsers(t *testing.T) {
 	svc, cleanup := setupTestService(t)
 	defer cleanup()
@@ -444,6 +692,24 @@ func TestService_ResetPassword_WeakPassword(t *testing.T) {
 	}
 }
 
+func TestService_ResetPasswordRejectsOIDCUser(t *testing.T) {
+	svc, cleanup := setupTestService(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user := auth.NewUser("oidc-user", "legacy-password-hash", auth.RoleViewer)
+	user.AuthProvider = "oidc"
+	require.NoError(t, svc.store.Create(ctx, user))
+
+	err := svc.ResetPassword(ctx, user.ID, "newpassword1")
+	assert.ErrorIs(t, err, ErrExternalAuthPasswordManagement)
+
+	stored, getErr := svc.store.GetByID(ctx, user.ID)
+	require.NoError(t, getErr)
+	assert.Equal(t, "legacy-password-hash", stored.PasswordHash)
+	assert.Nil(t, stored.PasswordChangedAt)
+}
+
 func TestService_UpdateUser_WithPassword(t *testing.T) {
 	svc, cleanup := setupTestService(t)
 	defer cleanup()
@@ -472,6 +738,26 @@ func TestService_UpdateUser_WithPassword(t *testing.T) {
 	// Verify new password works
 	_, err = svc.Authenticate(ctx, "testuser", "newpassword1")
 	assert.NoError(t, err, "new password should work")
+}
+
+func TestService_UpdateUserRejectsPasswordForOIDCUser(t *testing.T) {
+	svc, cleanup := setupTestService(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user := auth.NewUser("oidc-user", "legacy-password-hash", auth.RoleViewer)
+	user.AuthProvider = "oidc"
+	require.NoError(t, svc.store.Create(ctx, user))
+
+	newPassword := "newpassword1"
+	updated, err := svc.UpdateUser(ctx, user.ID, UpdateUserInput{Password: &newPassword})
+	assert.Nil(t, updated)
+	assert.ErrorIs(t, err, ErrExternalAuthPasswordManagement)
+
+	stored, getErr := svc.store.GetByID(ctx, user.ID)
+	require.NoError(t, getErr)
+	assert.Equal(t, "legacy-password-hash", stored.PasswordHash)
+	assert.Nil(t, stored.PasswordChangedAt)
 }
 
 func TestService_UpdateUser_WeakPassword(t *testing.T) {
@@ -745,16 +1031,69 @@ func TestService_GetUserFromToken_NoPasswordChangeTokenStillValid(t *testing.T) 
 func setupTestServiceWithAPIKeys(t *testing.T) (*Service, func()) {
 	t.Helper()
 	backend := testutil.NewMemoryBackend()
-	userStore, err := persiststore.NewUserStore(backend.Collection("users"))
-	require.NoError(t, err, "failed to create user store")
 	apiKeyStore, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
 	require.NoError(t, err, "failed to create API key store")
+	return newTestServiceWithAPIKeyStore(t, apiKeyStore), func() {}
+}
+
+func newTestServiceWithAPIKeyStore(tb testing.TB, apiKeyStore auth.APIKeyStore) *Service {
+	tb.Helper()
+	userStore, err := persiststore.NewUserStore(testutil.NewMemoryBackend().Collection("users"))
+	require.NoError(tb, err, "failed to create user store")
 	config := Config{
 		TokenSecret: mustTokenSecret("test-secret-key-for-jwt-signing"),
 		TokenTTL:    time.Hour,
 		BcryptCost:  4, // Low cost for faster tests
 	}
-	return New(userStore, config, WithAPIKeyStore(apiKeyStore)), func() {}
+	return New(userStore, config, WithAPIKeyStore(apiKeyStore))
+}
+
+type observedAPIKeyStore struct {
+	auth.APIKeyStore
+
+	mu                  sync.Mutex
+	promoteCalls        int
+	updateLastUsedCalls int
+	promoteErr          error
+	updateLastUsedErr   error
+}
+
+func (s *observedAPIKeyStore) PromoteDigest(ctx context.Context, id, digest string) error {
+	s.mu.Lock()
+	s.promoteCalls++
+	err := s.promoteErr
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.APIKeyStore.PromoteDigest(ctx, id, digest)
+}
+
+func (s *observedAPIKeyStore) UpdateLastUsed(ctx context.Context, id string) error {
+	s.mu.Lock()
+	s.updateLastUsedCalls++
+	err := s.updateLastUsedErr
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.APIKeyStore.UpdateLastUsed(ctx, id)
+}
+
+func (s *observedAPIKeyStore) counts() (promote, updateLastUsed int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.promoteCalls, s.updateLastUsedCalls
+}
+
+func createLegacyAPIKey(tb testing.TB, store auth.APIKeyStore, name string) (*auth.APIKey, *apiKeyParts) {
+	tb.Helper()
+	parts, err := generateAPIKey(4)
+	require.NoError(tb, err)
+	key, err := auth.NewAPIKey(name, "", auth.RoleViewer, parts.keyHash, parts.keyPrefix, "creator-id")
+	require.NoError(tb, err)
+	require.NoError(tb, store.Create(context.Background(), key))
+	return key, parts
 }
 
 func TestService_CreateAPIKey(t *testing.T) {
@@ -779,6 +1118,7 @@ func TestService_CreateAPIKey(t *testing.T) {
 	assert.True(t, strings.HasPrefix(result.FullKey, "dagu_"), "full key should start with 'dagu_'")
 	assert.NotEmpty(t, result.APIKey.KeyPrefix)
 	assert.NotEmpty(t, result.APIKey.KeyHash)
+	assert.Equal(t, apiKeyDigest(result.FullKey), result.APIKey.KeyDigest)
 }
 
 func TestService_CreateAPIKey_EmptyName(t *testing.T) {
@@ -1072,6 +1412,131 @@ func TestService_ValidateAPIKey(t *testing.T) {
 	assert.Equal(t, auth.RoleManager, apiKey.Role)
 }
 
+func TestService_ValidateAPIKey_LazilyPersistsLegacyDigest(t *testing.T) {
+	backend := testutil.NewMemoryBackend()
+	store, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	observed := &observedAPIKeyStore{APIKeyStore: store}
+	svc := newTestServiceWithAPIKeyStore(t, observed)
+	legacy, parts := createLegacyAPIKey(t, store, "legacy-key")
+
+	validated, err := svc.ValidateAPIKey(context.Background(), parts.fullKey)
+	require.NoError(t, err)
+	assert.Equal(t, legacy.ID, validated.ID)
+
+	digest := apiKeyDigest(parts.fullKey)
+	persisted, err := store.GetByID(context.Background(), legacy.ID)
+	require.NoError(t, err)
+	assert.Equal(t, digest, persisted.KeyDigest)
+	indexed, err := store.GetByDigest(context.Background(), digest)
+	require.NoError(t, err)
+	assert.Equal(t, legacy.ID, indexed.ID)
+	restartedStore, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	restartedSvc := newTestServiceWithAPIKeyStore(t, restartedStore)
+	restartedKey, err := restartedSvc.ValidateAPIKey(context.Background(), parts.fullKey)
+	require.NoError(t, err)
+	assert.Equal(t, legacy.ID, restartedKey.ID)
+
+	_, err = svc.ValidateAPIKey(context.Background(), parts.fullKey)
+	require.NoError(t, err)
+	promoteCalls, _ := observed.counts()
+	assert.Equal(t, 1, promoteCalls)
+}
+
+func TestService_ValidateAPIKey_SerializesLegacyMigration(t *testing.T) {
+	backend := testutil.NewMemoryBackend()
+	store, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	observed := &observedAPIKeyStore{APIKeyStore: store}
+	svc := newTestServiceWithAPIKeyStore(t, observed)
+	legacy, parts := createLegacyAPIKey(t, store, "concurrent-legacy-key")
+
+	const workers = 24
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			<-start
+			key, err := svc.ValidateAPIKey(context.Background(), parts.fullKey)
+			if err == nil && key.ID != legacy.ID {
+				err = fmt.Errorf("validated key ID %q, want %q", key.ID, legacy.ID)
+			}
+			errs <- err
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	promoteCalls, _ := observed.counts()
+	assert.Equal(t, 1, promoteCalls)
+}
+
+func TestService_ValidateAPIKey_PromotionFailureDoesNotRejectLegacyKey(t *testing.T) {
+	backend := testutil.NewMemoryBackend()
+	store, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	observed := &observedAPIKeyStore{
+		APIKeyStore: store,
+		promoteErr:  errors.New("promotion failed"),
+	}
+	svc := newTestServiceWithAPIKeyStore(t, observed)
+	legacy, parts := createLegacyAPIKey(t, store, "promotion-failure-key")
+
+	validated, err := svc.ValidateAPIKey(context.Background(), parts.fullKey)
+	require.NoError(t, err)
+	assert.Equal(t, legacy.ID, validated.ID)
+
+	persisted, err := store.GetByID(context.Background(), legacy.ID)
+	require.NoError(t, err)
+	assert.Empty(t, persisted.KeyDigest)
+}
+
+func TestService_ValidateAPIKey_DoesNotPromoteLegacyKeyForWrongSecret(t *testing.T) {
+	backend := testutil.NewMemoryBackend()
+	store, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	observed := &observedAPIKeyStore{APIKeyStore: store}
+	svc := newTestServiceWithAPIKeyStore(t, observed)
+	legacy, parts := createLegacyAPIKey(t, store, "wrong-secret-legacy-key")
+	wrongSecret := parts.keyPrefix + "different-secret"
+
+	_, err = svc.ValidateAPIKey(context.Background(), wrongSecret)
+	require.ErrorIs(t, err, ErrInvalidAPIKey)
+
+	persisted, err := store.GetByID(context.Background(), legacy.ID)
+	require.NoError(t, err)
+	assert.Empty(t, persisted.KeyDigest)
+	promoteCalls, _ := observed.counts()
+	assert.Zero(t, promoteCalls)
+}
+
+func TestService_ValidateAPIKey_PromotesLegacyKeyBeforeRejectingDisabledOwner(t *testing.T) {
+	backend := testutil.NewMemoryBackend()
+	store, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	svc := newTestServiceWithAPIKeyStore(t, store)
+	owner := auth.NewUser("disabled-owner", "unused-password-hash", auth.RoleViewer)
+	owner.IsDisabled = true
+	require.NoError(t, svc.store.Create(context.Background(), owner))
+
+	legacy, parts := createLegacyAPIKey(t, store, "disabled-owner-legacy-key")
+	legacy.AttributionClass = auth.APIKeyAttributionUserOwned
+	legacy.OwnerUserID = owner.ID
+	require.NoError(t, store.Update(context.Background(), legacy))
+
+	_, err = svc.ValidateAPIKey(context.Background(), parts.fullKey)
+	require.ErrorIs(t, err, ErrInvalidAPIKey)
+	persisted, err := store.GetByID(context.Background(), legacy.ID)
+	require.NoError(t, err)
+	assert.Equal(t, apiKeyDigest(parts.fullKey), persisted.KeyDigest)
+}
+
 func TestService_ValidateAPIKey_InvalidPrefix(t *testing.T) {
 	svc, cleanup := setupTestServiceWithAPIKeys(t)
 	defer cleanup()
@@ -1079,6 +1544,9 @@ func TestService_ValidateAPIKey_InvalidPrefix(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := svc.ValidateAPIKey(ctx, "invalid_prefix_key")
+	require.ErrorIs(t, err, ErrInvalidAPIKey)
+
+	_, err = svc.ValidateAPIKey(ctx, apiKeyPrefix)
 	require.ErrorIs(t, err, ErrInvalidAPIKey)
 }
 
@@ -1165,6 +1633,47 @@ func TestService_ValidateAPIKey_UpdatesLastUsed(t *testing.T) {
 	require.NotNil(t, apiKey2.LastUsedAt, "LastUsedAt should be populated after validation")
 }
 
+func TestService_ValidateAPIKey_ThrottlesLastUsedUpdates(t *testing.T) {
+	backend := testutil.NewMemoryBackend()
+	store, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	observed := &observedAPIKeyStore{APIKeyStore: store}
+	svc := newTestServiceWithAPIKeyStore(t, observed)
+
+	result, err := svc.CreateAPIKey(context.Background(), CreateAPIKeyInput{
+		Name: "last-used-throttle-key",
+		Role: auth.RoleViewer,
+	}, "creator-id")
+	require.NoError(t, err)
+
+	_, err = svc.ValidateAPIKey(context.Background(), result.FullKey)
+	require.NoError(t, err)
+	_, err = svc.ValidateAPIKey(context.Background(), result.FullKey)
+	require.NoError(t, err)
+	_, updateCalls := observed.counts()
+	assert.Equal(t, 1, updateCalls)
+}
+
+func TestService_ValidateAPIKey_LastUsedFailureDoesNotRejectKey(t *testing.T) {
+	backend := testutil.NewMemoryBackend()
+	store, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(t, err)
+	observed := &observedAPIKeyStore{
+		APIKeyStore:       store,
+		updateLastUsedErr: errors.New("last-used update failed"),
+	}
+	svc := newTestServiceWithAPIKeyStore(t, observed)
+
+	result, err := svc.CreateAPIKey(context.Background(), CreateAPIKeyInput{
+		Name: "last-used-failure-key",
+		Role: auth.RoleViewer,
+	}, "creator-id")
+	require.NoError(t, err)
+	validated, err := svc.ValidateAPIKey(context.Background(), result.FullKey)
+	require.NoError(t, err)
+	assert.Equal(t, result.APIKey.ID, validated.ID)
+}
+
 func TestGenerateAPIKey(t *testing.T) {
 	// Test API key generation
 	keyParts, err := generateAPIKey(4) // Low cost for fast tests
@@ -1182,9 +1691,17 @@ func TestGenerateAPIKey(t *testing.T) {
 	// Verify hash is valid bcrypt hash
 	assert.NotEmpty(t, keyParts.keyHash, "Key hash should not be empty")
 	assert.True(t, strings.HasPrefix(keyParts.keyHash, "$2"), "Key hash should be bcrypt format")
+	assert.Equal(t, apiKeyDigest(keyParts.fullKey), keyParts.keyDigest)
 
 	// Verify full key is long enough (should be at least 40 chars: 5 prefix + 32 bytes base58)
 	assert.GreaterOrEqual(t, len(keyParts.fullKey), 40, "Full key should be at least 40 characters")
+}
+
+func TestAPIKeyDigest(t *testing.T) {
+	assert.Equal(t,
+		"sha256:v1:dffc41464f28bdb8ce95d13ecf9acd5ee6bf07a4b56860688431d8e803200514",
+		apiKeyDigest("dagu_example"),
+	)
 }
 
 func TestGenerateAPIKey_UniqueKeys(t *testing.T) {
@@ -1195,5 +1712,41 @@ func TestGenerateAPIKey_UniqueKeys(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, keys[keyParts.fullKey], "Generated key should be unique")
 		keys[keyParts.fullKey] = true
+	}
+}
+
+func BenchmarkService_ValidateAPIKey_DigestPath(b *testing.B) {
+	backend := testutil.NewMemoryBackend()
+	apiKeyStore, err := persiststore.NewAPIKeyStore(backend.Collection("apikeys"))
+	require.NoError(b, err)
+	svc := newTestServiceWithAPIKeyStore(b, apiKeyStore)
+	const fullKey = "dagu_benchmark_digest_path_secret"
+	key, err := auth.NewAPIKey(
+		"benchmark-key",
+		"",
+		auth.RoleViewer,
+		"unused-bcrypt-hash",
+		fullKey[:apiKeyPrefixLength],
+		"creator-id",
+	)
+	require.NoError(b, err)
+	key.KeyDigest = apiKeyDigest(fullKey)
+	require.NoError(b, apiKeyStore.Create(context.Background(), key))
+	_, err = svc.ValidateAPIKey(context.Background(), fullKey)
+	require.NoError(b, err)
+
+	var firstErr error
+	var errOnce sync.Once
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := svc.ValidateAPIKey(context.Background(), fullKey); err != nil {
+				errOnce.Do(func() { firstErr = err })
+				return
+			}
+		}
+	})
+	if firstErr != nil {
+		b.Fatal(firstErr)
 	}
 }

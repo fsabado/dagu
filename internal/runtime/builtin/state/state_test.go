@@ -9,14 +9,16 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/dagstate"
-	"github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
-	"github.com/dagucloud/dagu/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 )
 
 func TestStateExecutorSetGetAndDiff(t *testing.T) {
@@ -128,7 +130,7 @@ func TestStateExecutorRequiresStateStore(t *testing.T) {
 	t.Parallel()
 
 	step := stateStep(opSet, map[string]any{"key": "cursor", "value": "x"})
-	dag := &core.DAG{Name: "daily-agent"}
+	dag := &ir.DAG{Name: "daily-agent"}
 	ctx := runtime.NewContext(context.Background(), dag, "run-1", "")
 	ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, step))
 
@@ -137,12 +139,56 @@ func TestStateExecutorRequiresStateStore(t *testing.T) {
 	assert.Contains(t, err.Error(), "state store")
 }
 
-func newStateStoreForTest(t *testing.T) dagstate.Store {
+func TestStateConfigAllowsExpectedVersionExpression(t *testing.T) {
+	t.Parallel()
+
+	err := registry.ValidateExecutorConfig(executorType, map[string]any{
+		"key":              "cursors/api",
+		"value":            "next",
+		"expected_version": "${steps.load.outputs.version}",
+	})
+
+	require.NoError(t, err)
+}
+
+func TestStateStepValidationExpectedVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		expectedVersion any
+		wantErr         bool
+	}{
+		{name: "Integer", expectedVersion: int64(7)},
+		{name: "NumericString", expectedVersion: "7"},
+		{name: "RuntimeExpression", expectedVersion: "${steps.load.outputs.version}"},
+		{name: "InvalidString", expectedVersion: "latest", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateStep(stateStep(opSet, map[string]any{
+				"key":              "cursors/api",
+				"value":            "next",
+				"expected_version": tt.expectedVersion,
+			}))
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func newStateStoreForTest(t *testing.T) dagrun.StateStore {
 	t.Helper()
 	return store.NewDAGStateStore(testutil.NewMemoryBackend().Collection("dag_state"))
 }
 
-func runStateAction(t *testing.T, stateStore dagstate.Store, op string, cfg map[string]any) *bytes.Buffer {
+func runStateAction(t *testing.T, stateStore dagrun.StateStore, op string, cfg map[string]any) *bytes.Buffer {
 	t.Helper()
 
 	exec, err := newStateExecutorForTest(t, stateStore, op, cfg)
@@ -154,11 +200,11 @@ func runStateAction(t *testing.T, stateStore dagstate.Store, op string, cfg map[
 	return out
 }
 
-func newStateExecutorForTest(t *testing.T, stateStore dagstate.Store, op string, cfg map[string]any) (*executorImpl, error) {
+func newStateExecutorForTest(t *testing.T, stateStore dagrun.StateStore, op string, cfg map[string]any) (*executorImpl, error) {
 	t.Helper()
 
 	step := stateStep(op, cfg)
-	dag := &core.DAG{Name: "daily-agent"}
+	dag := &ir.DAG{Name: "daily-agent"}
 	ctx := runtime.NewContext(context.Background(), dag, "run-1", "", runtime.WithStateStore(stateStore))
 	ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, step))
 
@@ -171,11 +217,11 @@ func newStateExecutorForTest(t *testing.T, stateStore dagstate.Store, op string,
 	return stateExec, nil
 }
 
-func stateStep(op string, cfg map[string]any) core.Step {
-	return core.Step{
+func stateStep(op string, cfg map[string]any) ir.Step {
+	return ir.Step{
 		Name:     "state-step",
-		Commands: []core.CommandEntry{{Command: op}},
-		ExecutorConfig: core.ExecutorConfig{
+		Commands: []ir.CommandEntry{{Command: op}},
+		ExecutorConfig: ir.ExecutorConfig{
 			Type:   executorType,
 			Config: cfg,
 		},

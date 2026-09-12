@@ -13,14 +13,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/backoff"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 )
 
-var quarantineSeq uint64
+var quarantineSeq atomic.Uint64
 
 const (
 	quarantineMarker    = ".gc"
@@ -35,14 +35,14 @@ const (
 // Uses randomized intervals to avoid conflicts when many processes clean simultaneously.
 type cleaner struct {
 	baseDir     string
-	serviceName exec.ServiceName
+	serviceName serviceregistry.ServiceName
 	stopCh      chan struct{}
 	stopOnce    sync.Once
 }
 
 // newCleaner creates a new cleaner that runs with randomized intervals
 // to avoid conflicts between multiple coordinator processes
-func newCleaner(baseDir string, serviceName exec.ServiceName) *cleaner {
+func newCleaner(baseDir string, serviceName serviceregistry.ServiceName) *cleaner {
 	c := &cleaner{
 		baseDir:     baseDir,
 		serviceName: serviceName,
@@ -181,7 +181,7 @@ func (q *quarantine) shouldQuarantine(ctx context.Context, path string, observed
 
 // generateQuarantinePath creates a unique quarantine path for a file
 func (q *quarantine) generateQuarantinePath(path string) string {
-	return fmt.Sprintf("%s%s.%d.%d.%d", path, quarantineMarker, os.Getpid(), time.Now().UnixNano(), atomic.AddUint64(&quarantineSeq, 1))
+	return fmt.Sprintf("%s%s.%d.%d.%d", path, quarantineMarker, os.Getpid(), time.Now().UnixNano(), quarantineSeq.Add(1))
 }
 
 // isQuarantinedFile checks if a filename indicates it's quarantined

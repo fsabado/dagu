@@ -47,6 +47,9 @@ import {
   testEventForTarget,
 } from './notifications/notificationDrafts';
 import { useNotificationSettings } from './notifications/useNotificationSettings';
+import { useI18n } from '@/i18n/I18nProvider';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 type NotificationsTabProps = {
   fileName: string;
@@ -55,6 +58,7 @@ type NotificationsTabProps = {
 
 type DAGNotificationHeaderProps = {
   isDAGConfigured: boolean;
+  loadFailed: boolean;
   hasUnsavedChanges: boolean;
   isSaving: boolean;
   isResetting: boolean;
@@ -69,6 +73,7 @@ type DAGNotificationHeaderProps = {
 
 function DAGNotificationHeader({
   isDAGConfigured,
+  loadFailed,
   hasUnsavedChanges,
   isSaving,
   isResetting,
@@ -85,68 +90,71 @@ function DAGNotificationHeader({
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-normal text-foreground">
-            DAG Notifications
+            <I18nText text={"DAG Notifications"} />
           </h1>
           <p className="text-sm text-muted-foreground">
-            This DAG inherits rules by default. Configure a DAG override only
-            when this DAG needs different events or destinations.
+            <I18nText text={"This DAG inherits rules by default. Configure a DAG override only when this DAG needs different events or destinations."} />
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" onClick={onRefresh}>
             <RefreshCw className="h-4 w-4" />
-            Refresh
+            <I18nText text={"Refresh"} />
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onTestAll}
-            disabled={
-              hasUnsavedChanges ||
-              testableDestinationCount === 0 ||
-              testingTargetId !== null
-            }
-          >
-            {testingTargetId === '__all__' ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <FlaskConical className="h-4 w-4" />
-            )}
-            Send test
-          </Button>
-          {isDAGConfigured ? (
+          {!loadFailed && (
             <>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={onResetDAG}
-                disabled={isResetting || isSaving}
+                onClick={onTestAll}
+                disabled={
+                  hasUnsavedChanges ||
+                  testableDestinationCount === 0 ||
+                  testingTargetId !== null
+                }
               >
-                {isResetting ? (
+                {testingTargetId === '__all__' ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : (
-                  <RotateCcw className="h-4 w-4" />
+                  <FlaskConical className="h-4 w-4" />
                 )}
-                Reset to inherit
+                <I18nText text={"Send test"} />
               </Button>
-              <Button
-                size="sm"
-                onClick={onSave}
-                disabled={!hasUnsavedChanges || isSaving}
-              >
-                {isSaving ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Save className="h-4 w-4" />
-                )}
-                Save changes
-              </Button>
+              {isDAGConfigured ? (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={onResetDAG}
+                    disabled={isResetting || isSaving}
+                  >
+                    {isResetting ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RotateCcw className="h-4 w-4" />
+                    )}
+                    <I18nText text={"Reset to inherit"} />
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={onSave}
+                    disabled={!hasUnsavedChanges || isSaving}
+                  >
+                    {isSaving ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Save className="h-4 w-4" />
+                    )}
+                    <I18nText text={"Save changes"} />
+                  </Button>
+                </>
+              ) : (
+                <Button size="sm" onClick={onConfigureDAG}>
+                  <Settings className="h-4 w-4" />
+                  <I18nText text={"Configure DAG override"} />
+                </Button>
+              )}
             </>
-          ) : (
-            <Button size="sm" onClick={onConfigureDAG}>
-              <Settings className="h-4 w-4" />
-              Configure DAG override
-            </Button>
           )}
         </div>
       </div>
@@ -154,21 +162,21 @@ function DAGNotificationHeader({
       <div className="flex items-center gap-1 border-b border-border">
         <span className="inline-flex h-10 items-center gap-2 border-b-2 border-primary px-3 text-sm font-medium text-foreground">
           <Bell className="h-4 w-4 text-primary" />
-          This DAG
+          <I18nText text={"This DAG"} />
         </span>
         <Link
           to="/notification-rules"
           className="inline-flex h-10 items-center gap-2 border-b-2 border-transparent px-3 text-sm font-medium text-muted-foreground hover:text-foreground"
         >
           <RouteIcon className="h-4 w-4" />
-          Rules
+          <I18nText text={"Rules"} />
         </Link>
         <Link
           to="/notification-channels"
           className="inline-flex h-10 items-center gap-2 border-b-2 border-transparent px-3 text-sm font-medium text-muted-foreground hover:text-foreground"
         >
           <Mail className="h-4 w-4" />
-          Channels
+          <I18nText text={"Channels"} />
         </Link>
       </div>
     </div>
@@ -176,6 +184,7 @@ function DAGNotificationHeader({
 }
 
 function NotificationsTab({ fileName, workspaceName }: NotificationsTabProps) {
+  const { ts } = useI18n();
   const config = useConfig();
   const remoteNode = useRemoteNode();
   const query = useMemo(
@@ -192,6 +201,7 @@ function NotificationsTab({ fileName, workspaceName }: NotificationsTabProps) {
     effectiveRouteSourceLabel,
     isLoading,
     error,
+    loadError,
     setError,
     testResults,
     setTestResults,
@@ -205,6 +215,12 @@ function NotificationsTab({ fileName, workspaceName }: NotificationsTabProps) {
   const [isSaving, setIsSaving] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const localizedRouteSourceLabel =
+    effectiveRouteSourceLabel === 'Global rules'
+      ? ts('Global rules')
+      : ts('{workspace} workspace rules', {
+          workspace: workspaceName ?? '',
+        });
   const [testingTargetId, setTestingTargetId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [resetVisible, setResetVisible] = useState(false);
@@ -450,27 +466,46 @@ function NotificationsTab({ fileName, workspaceName }: NotificationsTabProps) {
     setDeleteSubscriptionIndex(null);
   };
 
+  const loadFailed = !!loadError && !isLoading;
+  const header = (
+    <DAGNotificationHeader
+      isDAGConfigured={hasDAGSettings}
+      loadFailed={loadFailed}
+      hasUnsavedChanges={hasUnsavedChanges}
+      isSaving={isSaving}
+      isResetting={isResetting}
+      testingTargetId={testingTargetId}
+      testableDestinationCount={testableDestinationCount}
+      onRefresh={refreshSettings}
+      onTestAll={() => testNotifications()}
+      onConfigureDAG={configureDAGOverride}
+      onResetDAG={() => setResetVisible(true)}
+      onSave={saveSettings}
+    />
+  );
+
+  if (loadFailed) {
+    return (
+      <div className="space-y-4">
+        {header}
+        <Card>
+          <CardContent className="py-4 text-sm text-destructive">
+            {loadError}
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
-      <DAGNotificationHeader
-        isDAGConfigured={hasDAGSettings}
-        hasUnsavedChanges={hasUnsavedChanges}
-        isSaving={isSaving}
-        isResetting={isResetting}
-        testingTargetId={testingTargetId}
-        testableDestinationCount={testableDestinationCount}
-        onRefresh={refreshSettings}
-        onTestAll={() => testNotifications()}
-        onConfigureDAG={configureDAGOverride}
-        onResetDAG={() => setResetVisible(true)}
-        onSave={saveSettings}
-      />
+      {header}
 
       {isLoading && (
         <Card>
           <CardContent className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Refreshing notifications...
+            <I18nText text={"Refreshing notifications..."} />
           </CardContent>
         </Card>
       )}
@@ -480,7 +515,7 @@ function NotificationsTab({ fileName, workspaceName }: NotificationsTabProps) {
         isDAGConfigured={hasDAGSettings}
         hasDAGDestinations={hasDAGDestinations}
         hasUnsavedChanges={hasUnsavedChanges}
-        inheritedSourceLabel={effectiveRouteSourceLabel}
+        inheritedSourceLabel={localizedRouteSourceLabel}
         error={error}
         notice={notice}
         testResults={testResults}
@@ -507,7 +542,7 @@ function NotificationsTab({ fileName, workspaceName }: NotificationsTabProps) {
         />
       ) : (
         <InheritedNotificationRoutesCard
-          sourceLabel={effectiveRouteSourceLabel}
+          sourceLabel={localizedRouteSourceLabel}
           routes={effectiveRoutes}
           manageRulesHref="/notification-rules"
         />
@@ -524,40 +559,39 @@ function NotificationsTab({ fileName, workspaceName }: NotificationsTabProps) {
         />
       )}
 
-      <ConfirmDialog
+      <I18nProps><ConfirmDialog
         title="Reset DAG Override"
         buttonText="Reset"
         visible={resetVisible}
         dismissModal={() => setResetVisible(false)}
         onSubmit={resetDAGSettings}
       >
-        Remove this DAG override and inherit workspace or Global notification
-        rules?
-      </ConfirmDialog>
+        <I18nText text={"Remove this DAG override and inherit workspace or Global notification rules?"} />
+      </ConfirmDialog></I18nProps>
 
-      <ConfirmDialog
+      <I18nProps><ConfirmDialog
         title="Delete Destination"
         buttonText="Delete"
         visible={deleteTargetIndex !== null}
         dismissModal={() => setDeleteTargetIndex(null)}
         onSubmit={removeTarget}
       >
-        Delete{' '}
+        <I18nText text={"Delete"} />{' '}
         {deleteTargetIndex !== null && draft.targets[deleteTargetIndex]
           ? deliveryLabel(draft.targets[deleteTargetIndex])
-          : 'target'}
+          : <I18nText text={"target"} />}
         ?
-      </ConfirmDialog>
+      </ConfirmDialog></I18nProps>
 
-      <ConfirmDialog
+      <I18nProps><ConfirmDialog
         title="Delete Subscription"
         buttonText="Delete"
         visible={deleteSubscriptionIndex !== null}
         dismissModal={() => setDeleteSubscriptionIndex(null)}
         onSubmit={removeSubscription}
       >
-        Delete this subscription?
-      </ConfirmDialog>
+        <I18nText text={"Delete this subscription?"} />
+      </ConfirmDialog></I18nProps>
     </div>
   );
 }

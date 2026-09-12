@@ -4,14 +4,17 @@
 package gitsync
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
-	"github.com/go-git/go-git/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,8 +35,30 @@ func newTestService(t *testing.T, cfg *Config) (*serviceImpl, string) {
 	dataDir := filepath.Join(tempDir, "data")
 	require.NoError(t, os.MkdirAll(dagsDir, 0755))
 	require.NoError(t, os.MkdirAll(dataDir, 0755))
-	svc := NewService(cfg, dagsDir, dataDir)
+	svc := NewService(cfg, dagsDir, filepath.Join(dagsDir, wikiDir), dataDir)
 	return svc.(*serviceImpl), dagsDir
+}
+
+func TestSelectRepoWikiDirCompatibility(t *testing.T) {
+	repoDir := t.TempDir()
+	service := &serviceImpl{
+		cfg:       &Config{},
+		gitClient: NewGitClient(&Config{}, repoDir),
+	}
+
+	selected, err := service.selectRepoWikiDir()
+	require.NoError(t, err)
+	assert.Equal(t, wikiDir, selected)
+
+	require.NoError(t, os.Mkdir(filepath.Join(repoDir, legacyDocsDir), 0o750))
+	selected, err = service.selectRepoWikiDir()
+	require.NoError(t, err)
+	assert.Equal(t, legacyDocsDir, selected)
+
+	require.NoError(t, os.Mkdir(filepath.Join(repoDir, wikiDir), 0o750))
+	_, err = service.selectRepoWikiDir()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both")
 }
 
 // --- Pre-existing tests ---
@@ -55,9 +80,117 @@ func TestService_GetStatus(t *testing.T) {
 	require.Equal(t, cfg.Branch, status.Branch)
 }
 
+func TestService_GetStatusAdoptsLegacyDocsDirectory(t *testing.T) {
+	t.Parallel()
+
+	impl, dagsDir := newTestService(t, &Config{
+		Enabled:    true,
+		Repository: "host.com/org/repo",
+		Branch:     "main",
+	})
+	require.NoError(t, os.MkdirAll(filepath.Join(impl.gitClient.repoPath, legacyDocsDir), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(dagsDir, wikiDir), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, wikiDir, "runbook.md"), []byte("# Runbook\n"), 0o600))
+
+	status, err := impl.GetStatus(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, status.Items, "docs/runbook")
+	assert.Equal(t, StatusUntracked, status.Items["docs/runbook"].Status)
+}
+
+func TestService_StatusReadsAreConcurrentSafe(t *testing.T) {
+	t.Parallel()
+
+	impl, dagsDir := newTestService(t, &Config{
+		Enabled:    true,
+		Repository: "host.com/org/repo",
+		Branch:     "main",
+	})
+	content := []byte("steps: []\n")
+	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, "concurrent.yml"), content, 0600))
+	require.NoError(t, impl.stateManager.Save(&State{
+		Version: 1,
+		Items: map[string]*SyncItemState{
+			"concurrent": {
+				Status:         StatusSynced,
+				LastSyncedHash: ComputeContentHash(content),
+				LocalHash:      ComputeContentHash(content),
+			},
+		},
+	}))
+
+	const readerCount = 12
+	errCh := make(chan error, readerCount)
+	var wg sync.WaitGroup
+	for reader := range readerCount {
+		wg.Go(func() {
+			var err error
+			switch reader % 3 {
+			case 0:
+				_, err = impl.GetStatus(context.Background())
+			case 1:
+				_, err = impl.GetSyncItemStatus(context.Background(), "concurrent")
+			case 2:
+				_, err = impl.GetSyncItemDiff(context.Background(), "concurrent")
+			}
+			errCh <- err
+		})
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	dagStatus, err := impl.GetSyncItemStatus(context.Background(), "concurrent")
+	require.NoError(t, err)
+	dagStatus.Status = StatusConflict
+
+	overallStatus, err := impl.GetStatus(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, StatusSynced, overallStatus.Items["concurrent"].Status)
+	overallStatus.Items["concurrent"].Status = StatusConflict
+
+	freshStatus, err := impl.GetSyncItemStatus(context.Background(), "concurrent")
+	require.NoError(t, err)
+	assert.Equal(t, StatusSynced, freshStatus.Status)
+	assert.Equal(t, dagYMLExtension, freshStatus.FileExtension)
+}
+
+func TestIsBinaryReader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content []byte
+		binary  bool
+	}{
+		{name: "text", content: []byte("hello, 世界\n")},
+		{name: "nul", content: []byte("hello\x00world"), binary: true},
+		{name: "invalid UTF-8", content: []byte{0xff}, binary: true},
+		{name: "replacement rune", content: []byte("\ufffd")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			binary, err := isBinaryReader(iotest.OneByteReader(bytes.NewReader(tc.content)))
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.binary, binary)
+		})
+	}
+
+	readErr := errors.New("read past binary marker")
+	binary, err := isBinaryReader(io.MultiReader(
+		bytes.NewReader([]byte{0}),
+		iotest.ErrReader(readErr),
+	))
+	require.NoError(t, err)
+	assert.True(t, binary)
+}
+
 func TestService_PathHelpers(t *testing.T) {
 	s := &serviceImpl{
-		dagsDir: "/dags",
 		cfg: &Config{
 			Path: "subdir",
 		},
@@ -66,277 +199,136 @@ func TestService_PathHelpers(t *testing.T) {
 	// Test filePathToDAGID
 	dagID := s.filePathToDAGID(filepath.Join("subdir", "my_dag.yaml"))
 	require.Equal(t, "my_dag", dagID)
-
-	// Test dagIDToFilePath
-	dagPath := s.dagIDToFilePath("my_dag")
-	require.Equal(t, filepath.Join("/dags", "my_dag.yaml"), dagPath)
-
-	// Test dagIDToRepoPath
-	repoPath := s.dagIDToRepoPath("my_dag")
-	require.Equal(t, "subdir/my_dag.yaml", repoPath)
 }
 
-func TestKindForDAGID_ConfigFiles(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, DAGKindConfig, KindForDAGID("base"))
-	assert.Equal(t, DAGKindConfig, KindForDAGID("workspaces/ops/base"))
-	// TestKindForDAGID_ConfigFiles expects KindForDAGID to reject reserved
-	// workspace names through workspace.ValidateName and fall back to DAG files.
-	assert.Equal(t, DAGKindDAG, KindForDAGID("workspaces/default/base"))
-	assert.Equal(t, DAGKindDAG, KindForDAGID("workspaces/ops/other"))
-}
-
-func TestDagIDPathHelpers_ConfigFiles(t *testing.T) {
-	s := &serviceImpl{
-		dagsDir:    "/dags",
-		baseConfig: filepath.Join("/config", "base.yaml"),
-		cfg:        &Config{Path: "subdir"},
-	}
-
-	assert.Equal(t, filepath.Join("/config", "base.yaml"), s.dagIDToFilePath("base"))
-	assert.Equal(t,
-		filepath.Join("/dags", "workspaces", "ops", "base.yaml"),
-		s.dagIDToFilePath("workspaces/ops/base"),
-	)
-	assert.Equal(t, "subdir/base.yaml", s.dagIDToRepoPath("base"))
-	assert.Equal(t, "subdir/workspaces/ops/base.yaml", s.dagIDToRepoPath("workspaces/ops/base"))
-}
-
-func TestIsMemoryFile(t *testing.T) {
-	t.Parallel()
-
-	assert.True(t, isMemoryFile("memory/MEMORY"))
-	assert.True(t, isMemoryFile("memory/dags/my-dag/MEMORY"))
-	assert.False(t, isMemoryFile("my-dag"))
-	assert.False(t, isMemoryFile("memoryfile"))
-}
-
-func TestFileExtensionForID(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, ".md", fileExtensionForID("memory/MEMORY"))
-	assert.Equal(t, ".md", fileExtensionForID("memory/dags/my-dag/MEMORY"))
-	assert.Equal(t, ".yaml", fileExtensionForID("my-dag"))
-	assert.Equal(t, ".yaml", fileExtensionForID("subdir/my-dag"))
-}
-
-func TestDagIDToFilePath_MemoryFiles(t *testing.T) {
-	s := &serviceImpl{
-		dagsDir: "/dags",
-		cfg:     &Config{},
-	}
-
-	// Regular DAG
-	assert.Equal(t, filepath.Join("/dags", "my-dag.yaml"), s.dagIDToFilePath("my-dag"))
-
-	// Memory file
-	assert.Equal(t,
-		filepath.Join("/dags", "memory", "MEMORY.md"),
-		s.dagIDToFilePath("memory/MEMORY"),
-	)
-
-	// DAG-specific memory
-	assert.Equal(t,
-		filepath.Join("/dags", "memory", "dags", "my-dag", "MEMORY.md"),
-		s.dagIDToFilePath("memory/dags/my-dag/MEMORY"),
-	)
-}
-
-func TestDagIDToRepoPath_MemoryFiles(t *testing.T) {
-	s := &serviceImpl{
-		dagsDir: "/dags",
-		cfg:     &Config{Path: "subdir"},
-	}
-
-	// Regular DAG
-	assert.Equal(t, "subdir/my-dag.yaml", s.dagIDToRepoPath("my-dag"))
-
-	// Memory file
-	assert.Equal(t,
-		"subdir/memory/MEMORY.md",
-		s.dagIDToRepoPath("memory/MEMORY"),
-	)
-}
-
-func TestScanMemoryFiles(t *testing.T) {
+func TestScanLocalItems(t *testing.T) {
 	tempDir := t.TempDir()
-	s := &serviceImpl{
-		dagsDir: tempDir,
-		cfg:     &Config{},
-	}
+	wikiPath := filepath.Join(tempDir, "wiki-root")
 
-	// Create memory directory with files
-	memDir := filepath.Join(tempDir, "memory")
-	require.NoError(t, os.MkdirAll(memDir, 0750))
-	require.NoError(t, os.WriteFile(filepath.Join(memDir, "MEMORY.md"), []byte("global memory"), 0600))
-
-	dagMemDir := filepath.Join(memDir, "dags", "my-dag")
-	require.NoError(t, os.MkdirAll(dagMemDir, 0750))
-	require.NoError(t, os.WriteFile(filepath.Join(dagMemDir, "MEMORY.md"), []byte("dag memory"), 0600))
-
-	state := &State{DAGs: make(map[string]*DAGState)}
-	s.scanMemoryFiles(state)
-
-	// Should find global memory
-	globalID := "memory/MEMORY"
-	assert.Contains(t, state.DAGs, globalID)
-	assert.Equal(t, StatusUntracked, state.DAGs[globalID].Status)
-	assert.Equal(t, DAGKindMemory, state.DAGs[globalID].Kind)
-
-	// Should find per-DAG memory
-	dagID := "memory/dags/my-dag/MEMORY"
-	assert.Contains(t, state.DAGs, dagID)
-	assert.Equal(t, StatusUntracked, state.DAGs[dagID].Status)
-	assert.Equal(t, DAGKindMemory, state.DAGs[dagID].Kind)
-}
-
-func TestScanLocalDAGs_ConfigFiles(t *testing.T) {
-	rootDir := t.TempDir()
-	dagsDir := filepath.Join(rootDir, "dags")
-	baseConfig := filepath.Join(rootDir, "base.yaml")
-	require.NoError(t, os.MkdirAll(filepath.Join(dagsDir, "workspaces", "ops"), 0750))
-	require.NoError(t, os.WriteFile(baseConfig, []byte("env:\n  GLOBAL: 1\n"), 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, "workspaces", "ops", "base.yaml"), []byte("env:\n  OPS: 1\n"), 0600))
-
-	s := &serviceImpl{
-		dagsDir:    dagsDir,
-		baseConfig: baseConfig,
-		cfg:        &Config{},
-	}
-	state := &State{DAGs: make(map[string]*DAGState)}
-
-	require.NoError(t, s.scanLocalDAGs(state))
-
-	require.Contains(t, state.DAGs, "base")
-	assert.Equal(t, DAGKindConfig, state.DAGs["base"].Kind)
-	require.Contains(t, state.DAGs, "workspaces/ops/base")
-	assert.Equal(t, DAGKindConfig, state.DAGs["workspaces/ops/base"].Kind)
-}
-
-func TestScanLocalDAGs_IgnoresNonMemoryMd(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Create a non-memory .md file at root (e.g., README.md)
 	require.NoError(t, os.WriteFile(filepath.Join(tempDir, "README.md"), []byte("# readme"), 0600))
-
-	// Create a regular .yaml DAG
 	require.NoError(t, os.WriteFile(filepath.Join(tempDir, "my-dag.yaml"), []byte("steps: []"), 0600))
+	require.NoError(t, os.MkdirAll(filepath.Join(wikiPath, "operations"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(wikiPath, "operations", "deploy.MD"), []byte("# Deploy"), 0600))
 
 	s := &serviceImpl{
-		dagsDir: tempDir,
-		cfg:     &Config{},
+		dagsDir:     tempDir,
+		wikiDir:     wikiPath,
+		repoWikiDir: wikiDir,
+		cfg:         &Config{},
 	}
 
-	state := &State{DAGs: make(map[string]*DAGState)}
-	err := s.scanLocalDAGs(state)
+	state := &State{Items: make(map[string]*SyncItemState)}
+	err := s.scanLocalItems(state)
 	require.NoError(t, err)
 
-	// Should find the yaml DAG
-	assert.Contains(t, state.DAGs, "my-dag")
-	assert.Equal(t, DAGKindDAG, state.DAGs["my-dag"].Kind)
+	require.Len(t, state.Items, 2)
+	assert.Contains(t, state.Items, "my-dag")
+	assert.Equal(t, SyncItemKindWikiPage, state.Items["wiki/operations/deploy"].Kind)
+	assert.Equal(t, ".MD", state.Items["wiki/operations/deploy"].FileExtension)
 
-	// Should NOT find README.md (it's not a yaml DAG or memory file at root)
-	assert.NotContains(t, state.DAGs, "README")
+	localPath, err := s.safeDAGIDToFilePath("wiki/operations/deploy", ".MD")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(wikiPath, "operations", "deploy.MD"), localPath)
 }
 
-func TestService_GetStatusBackfillsKinds(t *testing.T) {
-	t.Parallel()
-
+func TestScanLocalWikiPageAssets(t *testing.T) {
 	tempDir := t.TempDir()
-	dagsDir := filepath.Join(tempDir, "dags")
-	dataDir := filepath.Join(tempDir, "data")
-	require.NoError(t, os.MkdirAll(dagsDir, 0755))
-	require.NoError(t, os.MkdirAll(filepath.Join(dagsDir, "memory", "dags", "a"), 0755))
-	require.NoError(t, os.MkdirAll(dataDir, 0755))
+	wikiPath := filepath.Join(tempDir, "wiki-root")
 
-	// Create files on disk so reconcile doesn't remove/transition them
-	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, "example.yaml"), []byte("steps: []"), 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, "memory", "MEMORY.md"), []byte("mem"), 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, "memory", "dags", "a", "MEMORY.md"), []byte("mem"), 0600))
+	assetDir := filepath.Join(wikiPath, ".attachments", "guides", "deploy")
+	require.NoError(t, os.MkdirAll(assetDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(assetDir, "logo.png"), []byte{0x89, 'P', 'N', 'G'}, 0600))
+	// A markdown-named file inside the asset subtree is neither a Wiki page
+	// nor an asset because Markdown is a reserved extension.
+	require.NoError(t, os.WriteFile(filepath.Join(assetDir, "evil.md"), []byte("# evil"), 0600))
+	// Files placed directly under .attachments have no Wiki page segment.
+	require.NoError(t, os.WriteFile(filepath.Join(wikiPath, ".attachments", "stray.png"), []byte("x"), 0600))
 
-	cfg := &Config{
-		Enabled:    true,
-		Repository: "host.com/org/repo",
-		Branch:     "main",
+	s := &serviceImpl{
+		dagsDir:     tempDir,
+		wikiDir:     wikiPath,
+		repoWikiDir: wikiDir,
+		cfg:         &Config{},
 	}
 
-	svc := NewService(cfg, dagsDir, dataDir)
-	impl, ok := svc.(*serviceImpl)
-	require.True(t, ok)
+	state := &State{Items: make(map[string]*SyncItemState)}
+	require.NoError(t, s.scanLocalItems(state))
 
-	now := time.Now()
-	state := &State{
-		Version: 1,
-		DAGs: map[string]*DAGState{
-			"example":              {Status: StatusModified, ModifiedAt: &now},
-			"memory/MEMORY":        {Status: StatusUntracked, ModifiedAt: &now},
-			"memory/dags/a/MEMORY": {Status: StatusUntracked, ModifiedAt: &now},
-		},
-	}
-	require.NoError(t, impl.stateManager.Save(state))
+	require.Len(t, state.Items, 1)
+	item := state.Items["wiki/.attachments/guides/deploy/logo.png"]
+	require.NotNil(t, item)
+	assert.Equal(t, SyncItemKindWikiPageAsset, item.Kind)
+	assert.Equal(t, StatusUntracked, item.Status)
+	assert.Empty(t, item.FileExtension)
 
-	status, err := svc.GetStatus(context.Background())
+	localPath, err := s.safeDAGIDToFilePath("wiki/.attachments/guides/deploy/logo.png", "")
 	require.NoError(t, err)
-	require.NotNil(t, status.DAGs["example"])
-	require.NotNil(t, status.DAGs["memory/MEMORY"])
-	require.NotNil(t, status.DAGs["memory/dags/a/MEMORY"])
-	assert.Equal(t, DAGKindDAG, status.DAGs["example"].Kind)
-	assert.Equal(t, DAGKindMemory, status.DAGs["memory/MEMORY"].Kind)
-	assert.Equal(t, DAGKindMemory, status.DAGs["memory/dags/a/MEMORY"].Kind)
+	assert.Equal(t, filepath.Join(assetDir, "logo.png"), localPath)
 }
 
-func TestSyncFilesToDAGsDir_PromotesMatchingUntrackedItemToSynced(t *testing.T) {
+func TestSyncItemKindForIDAssets(t *testing.T) {
 	t.Parallel()
 
-	svc, dagsDir := newTestService(t, testCfgReadOnly)
+	assert.Equal(t, SyncItemKindWikiPageAsset, SyncItemKindForID("wiki/.attachments/guides/deploy/logo.png"))
+	assert.Equal(t, SyncItemKindWikiPage, SyncItemKindForID("wiki/guides/deploy"))
+	assert.Equal(t, SyncItemKindWikiPageAsset, SyncItemKindForID("docs/.attachments/guides/deploy/logo.png"))
+	assert.Equal(t, SyncItemKindWikiPage, SyncItemKindForID("docs/guides/deploy"))
+	assert.Equal(t, SyncItemKindDAG, SyncItemKindForID("my-dag"))
+	// A page that happens to be named .attachments.md is not an asset.
+	assert.Equal(t, SyncItemKindWikiPage, SyncItemKindForID("wiki/.attachments"))
+}
 
-	repoPath := filepath.Join(svc.dataDir, "gitsync", "repo")
-	require.NoError(t, os.MkdirAll(filepath.Join(repoPath, "docs", "youtube_translate"), 0755))
-	repo, err := git.PlainInit(repoPath, false)
-	require.NoError(t, err)
-	svc.gitClient.repo = repo
+func TestIsValidAssetItemID(t *testing.T) {
+	t.Parallel()
 
-	itemID := "docs/youtube_translate/example"
-	repoFile := filepath.Join(repoPath, "docs", "youtube_translate", "example.md")
-	localFile := filepath.Join(dagsDir, "docs", "youtube_translate", "example.md")
-	content := []byte("# translated doc\n")
+	assert.True(t, isValidAssetItemID("wiki/.attachments/guides/deploy/logo.png"))
+	assert.True(t, isValidAssetItemID("docs/.attachments/guides/deploy/logo.png"))
+	assert.True(t, isValidAssetItemID("wiki/.attachments/page/image with space.jpg"))
 
-	require.NoError(t, os.MkdirAll(filepath.Dir(localFile), 0755))
-	require.NoError(t, os.WriteFile(repoFile, content, 0600))
-	require.NoError(t, os.WriteFile(localFile, content, 0600))
+	// No Wiki page segment.
+	assert.False(t, isValidAssetItemID("wiki/.attachments/logo.png"))
+	// Reserved extensions.
+	assert.False(t, isValidAssetItemID("wiki/.attachments/page/evil.md"))
+	assert.False(t, isValidAssetItemID("wiki/.attachments/page/flow.yaml"))
+	// Invalid page segment (leading dot) and invalid file name.
+	assert.False(t, isValidAssetItemID("wiki/.attachments/.hidden/logo.png"))
+	assert.False(t, isValidAssetItemID("wiki/.attachments/page/.hidden"))
+	// Not under the asset prefix at all.
+	assert.False(t, isValidAssetItemID("wiki/guides/deploy"))
+}
 
-	commitHash, err := svc.gitClient.AddAndCommit(filepath.Join("docs", "youtube_translate", "example.md"), "add doc")
-	require.NoError(t, err)
+func TestNormalizeTrackedItemsKeepsAssetKind(t *testing.T) {
+	t.Parallel()
 
-	now := time.Now()
-	require.NoError(t, svc.stateManager.Save(&State{
-		Version: 1,
-		DAGs: map[string]*DAGState{
-			itemID: {
-				Status:     StatusUntracked,
-				Kind:       DAGKindDoc,
-				ModifiedAt: &now,
-				LocalHash:  ComputeContentHash(content),
-			},
-		},
-	}))
+	state := &State{Items: map[string]*SyncItemState{
+		"wiki/.attachments/page/logo.png": {Kind: SyncItemKindWikiPageAsset, Status: StatusSynced},
+		"wiki/guides/deploy":              {Kind: SyncItemKindWikiPage, Status: StatusSynced},
+		"scripts/run.sh":                  {Kind: SyncItemKindFile, Status: StatusSynced},
+		"bogus":                           {Kind: SyncItemKind("mystery"), Status: StatusSynced},
+	}}
+	normalizeTrackedItems(state)
 
-	synced, conflicts, err := svc.syncFilesToDAGsDir(context.Background(), &PullResult{
-		PreviousCommit:  commitHash,
-		CurrentCommit:   commitHash,
-		AlreadyUpToDate: true,
-	}, commitHash)
-	require.NoError(t, err)
-	require.Equal(t, []string{itemID}, synced)
-	require.Empty(t, conflicts)
+	require.Contains(t, state.Items, "wiki/.attachments/page/logo.png")
+	assert.Equal(t, SyncItemKindWikiPageAsset, state.Items["wiki/.attachments/page/logo.png"].Kind)
+	assert.Equal(t, SyncItemKindFile, state.Items["scripts/run.sh"].Kind)
+	assert.NotContains(t, state.Items, "bogus")
+}
 
-	state, err := svc.stateManager.GetState()
-	require.NoError(t, err)
-	require.Contains(t, state.DAGs, itemID)
-	assert.Equal(t, StatusSynced, state.DAGs[itemID].Status)
-	assert.Equal(t, commitHash, state.DAGs[itemID].BaseCommit)
-	assert.Equal(t, ComputeContentHash(content), state.DAGs[itemID].LastSyncedHash)
+func TestIsSyncableRepoFile(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, isSyncableRepoFile("workflow.yml", "workflow"))
+	assert.True(t, isSyncableRepoFile("wiki/operations/deploy.md", "wiki/operations/deploy"))
+	assert.False(t, isSyncableRepoFile("README.md", "README"))
+
+	// Attachments: any valid name syncs, invalid locations and reserved
+	// extensions never do — even as wiki.
+	assert.True(t, isSyncableRepoFile(
+		"wiki/.attachments/guides/deploy/logo.png", "wiki/.attachments/guides/deploy/logo.png"))
+	assert.False(t, isSyncableRepoFile(
+		"wiki/.attachments/guides/deploy/evil.md", "wiki/.attachments/guides/deploy/evil.md"))
+	assert.False(t, isSyncableRepoFile(
+		"wiki/.attachments/stray.png", "wiki/.attachments/stray.png"))
 }
 
 func TestResolvePublishTargets(t *testing.T) {
@@ -344,7 +336,7 @@ func TestResolvePublishTargets(t *testing.T) {
 
 	now := time.Now()
 	baseState := &State{
-		DAGs: map[string]*DAGState{
+		Items: map[string]*SyncItemState{
 			"alpha":    {Status: StatusModified, ModifiedAt: &now},
 			"beta":     {Status: StatusUntracked, ModifiedAt: &now},
 			"synced":   {Status: StatusSynced, LastSyncedAt: &now},
@@ -405,38 +397,62 @@ func TestSafeDAGIDPathValidation(t *testing.T) {
 	}
 
 	t.Run("valid regular DAG path", func(t *testing.T) {
-		path, err := s.safeDAGIDToFilePath("my-dag")
+		path, err := s.safeDAGIDToFilePath("my-dag", dagYAMLExtension)
 		require.NoError(t, err)
 		assert.Equal(t, filepath.Join("/dags", "my-dag.yaml"), path)
 	})
 
-	t.Run("valid memory path", func(t *testing.T) {
-		path, err := s.safeDAGIDToRepoPath("memory/MEMORY")
+	t.Run("valid nested DAG path", func(t *testing.T) {
+		path, err := s.safeDAGIDToRepoPath("reports/monthly", dagYAMLExtension)
 		require.NoError(t, err)
-		assert.Equal(t, "subdir/memory/MEMORY.md", path)
+		assert.Equal(t, "subdir/reports/monthly.yaml", path)
+	})
+
+	t.Run("preserves short YAML extension", func(t *testing.T) {
+		path, err := s.safeDAGIDToRepoPath("reports/monthly", dagYMLExtension)
+		require.NoError(t, err)
+		assert.Equal(t, "subdir/reports/monthly.yml", path)
+	})
+
+	t.Run("uses markdown extension for Wiki pages", func(t *testing.T) {
+		path, err := s.safeDAGIDToRepoPath("wiki/operations/deploy", wikiPageExtension)
+		require.NoError(t, err)
+		assert.Equal(t, "subdir/wiki/operations/deploy.md", path)
+	})
+
+	t.Run("valid repo file path", func(t *testing.T) {
+		path, err := s.safeRepoPathToFilePath("subdir/my-dag.yaml")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join("/repo", "subdir", "my-dag.yaml"), path)
 	})
 
 	t.Run("normalizes backslash separators", func(t *testing.T) {
-		path, err := s.safeDAGIDToRepoPath(`memory\MEMORY`)
+		path, err := s.safeDAGIDToRepoPath(`reports\monthly`, dagYAMLExtension)
 		require.NoError(t, err)
-		assert.Equal(t, "subdir/memory/MEMORY.md", path)
+		assert.Equal(t, "subdir/reports/monthly.yaml", path)
 	})
 
 	t.Run("rejects traversal DAG ID", func(t *testing.T) {
-		_, err := s.safeDAGIDToFilePath("../etc/passwd")
+		_, err := s.safeDAGIDToFilePath("../etc/passwd", dagYAMLExtension)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrInvalidDAGID)
 	})
 
 	t.Run("rejects absolute DAG ID", func(t *testing.T) {
-		_, err := s.safeDAGIDToRepoPath("/tmp/file")
+		_, err := s.safeDAGIDToRepoPath("/tmp/file", dagYAMLExtension)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidDAGID)
+	})
+
+	t.Run("rejects traversal repo file path", func(t *testing.T) {
+		_, err := s.safeRepoPathToFilePath("../outside.yaml")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrInvalidDAGID)
 	})
 
 	t.Run("rejects non-canonical DAG ID", func(t *testing.T) {
 		_, err := s.resolvePublishTargets(
-			&State{DAGs: map[string]*DAGState{"a/b": {Status: StatusModified}}},
+			&State{Items: map[string]*SyncItemState{"a/b": {Status: StatusModified}}},
 			[]string{"a/./b"},
 		)
 		require.Error(t, err)
@@ -454,10 +470,9 @@ func TestReconcile_SyncedFileDeleted(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:         StatusSynced,
-			Kind:           DAGKindDAG,
 			BaseCommit:     "abc123",
 			LastSyncedHash: "sha256:aaa",
 			LastSyncedAt:   &now,
@@ -469,7 +484,7 @@ func TestReconcile_SyncedFileDeleted(t *testing.T) {
 	changed := s.reconcile(state)
 	require.True(t, changed)
 
-	ds := state.DAGs["my-dag"]
+	ds := state.Items["my-dag"]
 	assert.Equal(t, StatusMissing, ds.Status)
 	assert.Equal(t, "synced", ds.PreviousStatus)
 	assert.NotNil(t, ds.MissingAt)
@@ -483,10 +498,9 @@ func TestReconcile_ModifiedFileDeleted(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:         StatusModified,
-			Kind:           DAGKindDAG,
 			BaseCommit:     "abc123",
 			LastSyncedHash: "sha256:aaa",
 			LocalHash:      "sha256:bbb",
@@ -497,7 +511,7 @@ func TestReconcile_ModifiedFileDeleted(t *testing.T) {
 	changed := s.reconcile(state)
 	require.True(t, changed)
 
-	ds := state.DAGs["my-dag"]
+	ds := state.Items["my-dag"]
 	assert.Equal(t, StatusMissing, ds.Status)
 	assert.Equal(t, "modified", ds.PreviousStatus)
 	assert.NotNil(t, ds.MissingAt)
@@ -511,10 +525,9 @@ func TestReconcile_ConflictFileDeleted(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:             StatusConflict,
-			Kind:               DAGKindDAG,
 			BaseCommit:         "abc123",
 			LastSyncedHash:     "sha256:aaa",
 			LocalHash:          "sha256:bbb",
@@ -525,7 +538,7 @@ func TestReconcile_ConflictFileDeleted(t *testing.T) {
 	changed := s.reconcile(state)
 	require.True(t, changed)
 
-	ds := state.DAGs["my-dag"]
+	ds := state.Items["my-dag"]
 	assert.Equal(t, StatusMissing, ds.Status)
 	assert.Equal(t, "conflict", ds.PreviousStatus)
 	assert.NotNil(t, ds.MissingAt)
@@ -544,10 +557,9 @@ func TestReconcile_MissingFileReappears_Synced(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	missingAt := time.Now().Add(-time.Hour)
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:         StatusMissing,
-			Kind:           DAGKindDAG,
 			BaseCommit:     "abc123",
 			LastSyncedHash: hash,
 			LocalHash:      "",
@@ -559,7 +571,7 @@ func TestReconcile_MissingFileReappears_Synced(t *testing.T) {
 	changed := s.reconcile(state)
 	require.True(t, changed)
 
-	ds := state.DAGs["my-dag"]
+	ds := state.Items["my-dag"]
 	assert.Equal(t, StatusSynced, ds.Status)
 	assert.Equal(t, hash, ds.LocalHash)
 	assert.Empty(t, ds.PreviousStatus)
@@ -578,10 +590,9 @@ func TestReconcile_MissingFileReappears_Modified(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	missingAt := time.Now().Add(-time.Hour)
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:         StatusMissing,
-			Kind:           DAGKindDAG,
 			BaseCommit:     "abc123",
 			LastSyncedHash: "sha256:old-hash",
 			LocalHash:      "",
@@ -593,7 +604,7 @@ func TestReconcile_MissingFileReappears_Modified(t *testing.T) {
 	changed := s.reconcile(state)
 	require.True(t, changed)
 
-	ds := state.DAGs["my-dag"]
+	ds := state.Items["my-dag"]
 	assert.Equal(t, StatusModified, ds.Status)
 	assert.Equal(t, ComputeContentHash(content), ds.LocalHash)
 	assert.NotNil(t, ds.ModifiedAt)
@@ -609,10 +620,9 @@ func TestReconcile_UntrackedFileDeleted(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:     StatusUntracked,
-			Kind:       DAGKindDAG,
 			LocalHash:  "sha256:aaa",
 			ModifiedAt: &now,
 		},
@@ -622,7 +632,7 @@ func TestReconcile_UntrackedFileDeleted(t *testing.T) {
 	require.True(t, changed)
 
 	// Entry should be removed entirely
-	assert.NotContains(t, state.DAGs, "my-dag")
+	assert.NotContains(t, state.Items, "my-dag")
 }
 
 func TestReconcile_SyncedFileStillExists(t *testing.T) {
@@ -636,10 +646,9 @@ func TestReconcile_SyncedFileStillExists(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:         StatusSynced,
-			Kind:           DAGKindDAG,
 			BaseCommit:     "abc123",
 			LastSyncedHash: "sha256:aaa",
 			LastSyncedAt:   &now,
@@ -650,7 +659,7 @@ func TestReconcile_SyncedFileStillExists(t *testing.T) {
 	changed := s.reconcile(state)
 	require.False(t, changed)
 
-	ds := state.DAGs["my-dag"]
+	ds := state.Items["my-dag"]
 	assert.Equal(t, StatusSynced, ds.Status)
 }
 
@@ -670,17 +679,16 @@ func TestReconcile_BackwardCompatibility(t *testing.T) {
 		Enabled:    true,
 		Repository: "host.com/org/repo",
 		Branch:     "main",
-	}, dagsDir, dataDir)
+	}, dagsDir, filepath.Join(dagsDir, legacyDocsDir), dataDir)
 	impl := svc.(*serviceImpl)
 
 	// Save old state without PreviousStatus/MissingAt fields
 	now := time.Now()
 	oldState := &State{
 		Version: 1,
-		DAGs: map[string]*DAGState{
+		Items: map[string]*SyncItemState{
 			"my-dag": {
 				Status:         StatusSynced,
-				Kind:           DAGKindDAG,
 				BaseCommit:     "abc123",
 				LastSyncedHash: ComputeContentHash([]byte("steps: []")),
 				LastSyncedAt:   &now,
@@ -693,15 +701,32 @@ func TestReconcile_BackwardCompatibility(t *testing.T) {
 	// Load and verify — no fields should be populated
 	loaded, err := impl.stateManager.Load()
 	require.NoError(t, err)
-	ds := loaded.DAGs["my-dag"]
+	ds := loaded.Items["my-dag"]
 	assert.Empty(t, ds.PreviousStatus)
 	assert.Nil(t, ds.MissingAt)
+}
+
+func TestStateManagerLoadIgnoresNullItems(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	stateDir := filepath.Join(dataDir, "gitsync")
+	require.NoError(t, os.MkdirAll(stateDir, 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(stateDir, "state.json"),
+		[]byte(`{"version":1,"dags":{"invalid":null}}`),
+		0600,
+	))
+
+	state, err := NewStateManager(dataDir).Load()
+	require.NoError(t, err)
+	assert.NotContains(t, state.Items, "invalid")
 }
 
 func TestStatusCounts_IncludesMissing(t *testing.T) {
 	t.Parallel()
 
-	dags := map[string]*DAGState{
+	dags := map[string]*SyncItemState{
 		"a": {Status: StatusSynced},
 		"b": {Status: StatusModified},
 		"c": {Status: StatusUntracked},
@@ -733,14 +758,14 @@ func TestSummaryPriority_MissingBetweenConflictAndPending(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dagsDir, 0755))
 	require.NoError(t, os.MkdirAll(dataDir, 0755))
 
-	svc := NewService(cfg, dagsDir, dataDir)
+	svc := NewService(cfg, dagsDir, filepath.Join(dagsDir, legacyDocsDir), dataDir)
 	impl := svc.(*serviceImpl)
 
 	t.Run("missing overrides pending", func(t *testing.T) {
 		now := time.Now()
 		state := &State{
 			Version: 1,
-			DAGs: map[string]*DAGState{
+			Items: map[string]*SyncItemState{
 				"a": {Status: StatusMissing, PreviousStatus: "synced", MissingAt: &now},
 			},
 		}
@@ -758,7 +783,7 @@ func TestSummaryPriority_MissingBetweenConflictAndPending(t *testing.T) {
 		now := time.Now()
 		state := &State{
 			Version: 1,
-			DAGs: map[string]*DAGState{
+			Items: map[string]*SyncItemState{
 				"a": {Status: StatusMissing, PreviousStatus: "synced", MissingAt: &now},
 				"b": {Status: StatusConflict, ConflictDetectedAt: &now},
 			},
@@ -791,10 +816,9 @@ func TestStatBeforeHash_SkipsUnchangedFile(t *testing.T) {
 	size := fi.Size()
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:          StatusSynced,
-			Kind:            DAGKindDAG,
 			LastSyncedHash:  hash,
 			LocalHash:       hash,
 			LastStatModTime: &modTime,
@@ -805,7 +829,7 @@ func TestStatBeforeHash_SkipsUnchangedFile(t *testing.T) {
 	// File hasn't changed — refreshLocalHashes should skip it
 	changed := s.refreshLocalHashes(state)
 	require.False(t, changed)
-	assert.Equal(t, StatusSynced, state.DAGs["my-dag"].Status)
+	assert.Equal(t, StatusSynced, state.Items["my-dag"].Status)
 }
 
 func TestStatBeforeHash_DetectsChangedFile(t *testing.T) {
@@ -830,10 +854,9 @@ func TestStatBeforeHash_DetectsChangedFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(filePath, newContent, 0600))
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:          StatusSynced,
-			Kind:            DAGKindDAG,
 			LastSyncedHash:  oldHash,
 			LocalHash:       oldHash,
 			LastStatModTime: &oldModTime,
@@ -843,11 +866,11 @@ func TestStatBeforeHash_DetectsChangedFile(t *testing.T) {
 
 	changed := s.refreshLocalHashes(state)
 	require.True(t, changed)
-	assert.Equal(t, StatusModified, state.DAGs["my-dag"].Status)
-	assert.Equal(t, ComputeContentHash(newContent), state.DAGs["my-dag"].LocalHash)
+	assert.Equal(t, StatusModified, state.Items["my-dag"].Status)
+	assert.Equal(t, ComputeContentHash(newContent), state.Items["my-dag"].LocalHash)
 	// Stat cache should be updated
-	assert.NotNil(t, state.DAGs["my-dag"].LastStatModTime)
-	assert.NotNil(t, state.DAGs["my-dag"].LastStatSize)
+	assert.NotNil(t, state.Items["my-dag"].LastStatModTime)
+	assert.NotNil(t, state.Items["my-dag"].LastStatSize)
 }
 
 func TestStatBeforeHash_BackwardCompatibility(t *testing.T) {
@@ -863,10 +886,9 @@ func TestStatBeforeHash_BackwardCompatibility(t *testing.T) {
 	hash := ComputeContentHash(content)
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:         StatusSynced,
-			Kind:           DAGKindDAG,
 			LastSyncedHash: hash,
 			LocalHash:      hash,
 			// No stat cache fields — backward compatibility
@@ -878,8 +900,8 @@ func TestStatBeforeHash_BackwardCompatibility(t *testing.T) {
 	// No status change since content matches
 	require.False(t, changed)
 	// But stat cache should now be populated
-	assert.NotNil(t, state.DAGs["my-dag"].LastStatModTime)
-	assert.NotNil(t, state.DAGs["my-dag"].LastStatSize)
+	assert.NotNil(t, state.Items["my-dag"].LastStatModTime)
+	assert.NotNil(t, state.Items["my-dag"].LastStatSize)
 }
 
 func TestStatBeforeHash_PopulatedDuringScan(t *testing.T) {
@@ -891,12 +913,12 @@ func TestStatBeforeHash_PopulatedDuringScan(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, "new-dag.yaml"), []byte("steps: []"), 0600))
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
-	state := &State{DAGs: make(map[string]*DAGState)}
+	state := &State{Items: make(map[string]*SyncItemState)}
 
-	err := s.scanLocalDAGs(state)
+	err := s.scanLocalItems(state)
 	require.NoError(t, err)
 
-	ds := state.DAGs["new-dag"]
+	ds := state.Items["new-dag"]
 	require.NotNil(t, ds)
 	assert.NotNil(t, ds.LastStatModTime)
 	assert.NotNil(t, ds.LastStatSize)
@@ -907,7 +929,7 @@ func TestResolvePublishTargets_RejectsMissing(t *testing.T) {
 
 	now := time.Now()
 	state := &State{
-		DAGs: map[string]*DAGState{
+		Items: map[string]*SyncItemState{
 			"missing-dag": {Status: StatusMissing, PreviousStatus: "synced", MissingAt: &now},
 		},
 	}
@@ -926,7 +948,7 @@ func TestForget_MissingItem(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadOnly)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusMissing, PreviousStatus: "synced", MissingAt: &now},
 	}}))
 
@@ -935,14 +957,14 @@ func TestForget_MissingItem(t *testing.T) {
 	assert.Equal(t, []string{"my-dag"}, forgotten)
 
 	state, _ := impl.stateManager.GetState()
-	assert.NotContains(t, state.DAGs, "my-dag")
+	assert.NotContains(t, state.Items, "my-dag")
 }
 
 func TestForget_UntrackedItem(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadOnly)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusUntracked, ModifiedAt: &now},
 	}}))
 
@@ -955,7 +977,7 @@ func TestForget_ConflictItem(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadOnly)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusConflict, ConflictDetectedAt: &now},
 	}}))
 
@@ -968,7 +990,7 @@ func TestForget_SyncedItem_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadOnly)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusSynced, LastSyncedAt: &now},
 	}}))
 
@@ -981,7 +1003,7 @@ func TestForget_ModifiedItem_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadOnly)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusModified, ModifiedAt: &now},
 	}}))
 
@@ -993,7 +1015,7 @@ func TestForget_ModifiedItem_Rejected(t *testing.T) {
 func TestForget_NotFound(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadOnly)
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{}}))
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{}}))
 
 	_, err := impl.Forget(context.Background(), []string{"nonexistent"})
 	require.Error(t, err)
@@ -1008,7 +1030,7 @@ func TestCleanup_RemovesAllMissing(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dagsDir, "synced-dag.yaml"), []byte("ok"), 0600))
 
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"missing-a":  {Status: StatusMissing, PreviousStatus: "synced", MissingAt: &now},
 		"missing-b":  {Status: StatusMissing, PreviousStatus: "modified", MissingAt: &now},
 		"synced-dag": {Status: StatusSynced, LastSyncedAt: &now},
@@ -1021,19 +1043,32 @@ func TestCleanup_RemovesAllMissing(t *testing.T) {
 	assert.Contains(t, forgotten, "missing-b")
 
 	state, _ := impl.stateManager.GetState()
-	assert.NotContains(t, state.DAGs, "missing-a")
-	assert.NotContains(t, state.DAGs, "missing-b")
-	assert.Contains(t, state.DAGs, "synced-dag")
+	assert.NotContains(t, state.Items, "missing-a")
+	assert.NotContains(t, state.Items, "missing-b")
+	assert.Contains(t, state.Items, "synced-dag")
 }
 
 func TestCleanup_NoMissingItems(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadOnly)
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{}}))
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{}}))
 
 	forgotten, err := impl.Cleanup(context.Background())
 	require.NoError(t, err)
 	assert.Len(t, forgotten, 0)
+}
+
+func TestScanLocalItemsIgnoresSupportingFiles(t *testing.T) {
+	t.Parallel()
+
+	impl, dagsDir := newTestService(t, testCfgReadOnly)
+	filePath := filepath.Join(dagsDir, "scripts", "local.sh")
+	require.NoError(t, os.MkdirAll(filepath.Dir(filePath), 0750))
+	require.NoError(t, os.WriteFile(filePath, []byte("echo local\n"), 0700))
+	state := &State{Items: make(map[string]*SyncItemState)}
+
+	require.NoError(t, impl.scanLocalItems(state))
+	assert.NotContains(t, state.Items, "scripts/local.sh")
 }
 
 // --- Phase 4: Remote deletion detection tests ---
@@ -1046,10 +1081,9 @@ func TestReconcileAfterPull_AutoForget_BothAbsent(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"deleted-dag": {
 			Status:         StatusMissing,
-			Kind:           DAGKindDAG,
 			PreviousStatus: "synced",
 			MissingAt:      &now,
 			LastSyncedHash: "sha256:aaa",
@@ -1060,7 +1094,7 @@ func TestReconcileAfterPull_AutoForget_BothAbsent(t *testing.T) {
 	repoFileSet := map[string]struct{}{}
 	s.reconcileAfterPull(state, repoFileSet)
 
-	assert.NotContains(t, state.DAGs, "deleted-dag")
+	assert.NotContains(t, state.Items, "deleted-dag")
 }
 
 func TestReconcileAfterPull_NoAutoForget_LocalPresent(t *testing.T) {
@@ -1074,10 +1108,9 @@ func TestReconcileAfterPull_NoAutoForget_LocalPresent(t *testing.T) {
 
 	s := &serviceImpl{dagsDir: dagsDir, cfg: &Config{}}
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:         StatusModified,
-			Kind:           DAGKindDAG,
 			LastSyncedHash: "sha256:aaa",
 			ModifiedAt:     &now,
 		},
@@ -1087,7 +1120,7 @@ func TestReconcileAfterPull_NoAutoForget_LocalPresent(t *testing.T) {
 	repoFileSet := map[string]struct{}{}
 	s.reconcileAfterPull(state, repoFileSet)
 
-	assert.Contains(t, state.DAGs, "my-dag")
+	assert.Contains(t, state.Items, "my-dag")
 }
 
 func TestPull_DuplicatePrevention(t *testing.T) {
@@ -1097,10 +1130,9 @@ func TestPull_DuplicatePrevention(t *testing.T) {
 	repoHash := ComputeContentHash(repoContent)
 
 	now := time.Now()
-	state := &State{DAGs: map[string]*DAGState{
+	state := &State{Items: map[string]*SyncItemState{
 		"old-name": {
 			Status:         StatusMissing,
-			Kind:           DAGKindDAG,
 			PreviousStatus: "synced",
 			MissingAt:      &now,
 			LastSyncedHash: repoHash,
@@ -1111,14 +1143,14 @@ func TestPull_DuplicatePrevention(t *testing.T) {
 	// "old-name" is missing with matching hash — should be auto-forgotten.
 	// We test the duplicate-prevention logic directly.
 	dagID := "new-name"
-	for otherID, otherState := range state.DAGs {
+	for otherID, otherState := range state.Items {
 		if otherID != dagID && otherState.Status == StatusMissing && otherState.LastSyncedHash == repoHash {
-			delete(state.DAGs, otherID)
+			delete(state.Items, otherID)
 			break
 		}
 	}
 
-	assert.NotContains(t, state.DAGs, "old-name")
+	assert.NotContains(t, state.Items, "old-name")
 }
 
 // --- Phase 5: Delete tests ---
@@ -1127,7 +1159,7 @@ func TestDelete_UntrackedItem_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusUntracked, ModifiedAt: &now},
 	}}))
 
@@ -1149,7 +1181,7 @@ func TestDelete_ModifiedItem_WithoutForce_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusModified, ModifiedAt: &now},
 	}}))
 
@@ -1162,7 +1194,7 @@ func TestDelete_ModifiedItem_WithoutForce_Rejected(t *testing.T) {
 func TestDelete_NotFound(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{}}))
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{}}))
 
 	err := impl.Delete(context.Background(), "nonexistent", "", false)
 	require.Error(t, err)
@@ -1181,7 +1213,7 @@ func TestDeleteAllMissing_PushDisabled_Rejected(t *testing.T) {
 func TestDeleteAllMissing_NoMissingItems(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"synced-dag": {Status: StatusSynced},
 	}}))
 
@@ -1204,7 +1236,7 @@ func TestDeleteBatch_PushDisabled_Rejected(t *testing.T) {
 func TestDeleteBatch_NotFound(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{}}))
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{}}))
 
 	_, err := impl.DeleteBatch(context.Background(), []string{"nonexistent"}, "", false)
 	require.Error(t, err)
@@ -1215,7 +1247,7 @@ func TestDeleteBatch_UntrackedItem_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"dag-a": {Status: StatusSynced},
 		"dag-b": {Status: StatusUntracked, ModifiedAt: &now},
 	}}))
@@ -1229,7 +1261,7 @@ func TestDeleteBatch_ModifiedWithoutForce_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"dag-a": {Status: StatusSynced},
 		"dag-b": {Status: StatusModified, ModifiedAt: &now},
 	}}))
@@ -1264,7 +1296,7 @@ func TestMove_UntrackedSource_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusUntracked, ModifiedAt: &now},
 	}}))
 
@@ -1278,7 +1310,7 @@ func TestMove_UntrackedSource_Rejected(t *testing.T) {
 func TestMove_NotFound(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{}}))
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{}}))
 
 	err := impl.Move(context.Background(), "nonexistent", "new-dag", "", false)
 	require.Error(t, err)
@@ -1298,27 +1330,29 @@ func TestMove_NonCanonicalID_Rejected(t *testing.T) {
 	assert.True(t, IsInvalidDAGID(err))
 }
 
-func TestMove_CrossKind_Rejected(t *testing.T) {
+func TestMove_RequiresMatchingItemKinds(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
-	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
-		"my-dag": {Status: StatusSynced, ModifiedAt: &now},
-	}}))
 
-	// Trying to move a DAG to a memory path
-	err := impl.Move(context.Background(), "my-dag", "memory/NEW", "", false)
+	err := impl.Move(context.Background(), "workflow", "wiki/workflow", "", false)
 	require.Error(t, err)
 	var validationErr *ValidationError
-	assert.ErrorAs(t, err, &validationErr)
-	assert.Contains(t, validationErr.Message, "cannot move across kinds")
+	require.ErrorAs(t, err, &validationErr)
+	assert.Equal(t, "newItemId", validationErr.Field)
+
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
+		"task": {Kind: SyncItemKindDAG, Status: StatusSynced},
+	}}))
+	err = impl.Move(context.Background(), "task", "wiki/.attachments/page/task", "", false)
+	require.ErrorAs(t, err, &validationErr)
+	assert.Equal(t, "newItemId", validationErr.Field)
 }
 
 func TestMove_ConflictSource_WithoutForce_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {
 			Status:             StatusConflict,
 			ConflictDetectedAt: &now,
@@ -1338,7 +1372,7 @@ func TestMove_DestinationAlreadyTracked_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"old-dag": {Status: StatusSynced, ModifiedAt: &now},
 		"new-dag": {Status: StatusSynced, ModifiedAt: &now},
 	}}))
@@ -1354,7 +1388,7 @@ func TestMove_SourceNoFileAndNoDestFile_Rejected(t *testing.T) {
 	t.Parallel()
 	impl, _ := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"my-dag": {Status: StatusSynced, ModifiedAt: &now},
 	}}))
 
@@ -1370,7 +1404,7 @@ func TestMove_DestinationUntracked_Allowed(t *testing.T) {
 	t.Parallel()
 	impl, dagsDir := newTestService(t, testCfgReadWrite)
 	now := time.Now()
-	require.NoError(t, impl.stateManager.Save(&State{Version: 1, DAGs: map[string]*DAGState{
+	require.NoError(t, impl.stateManager.Save(&State{Version: 1, Items: map[string]*SyncItemState{
 		"old-dag": {Status: StatusMissing, MissingAt: &now, PreviousStatus: "synced"},
 		"new-dag": {Status: StatusUntracked, ModifiedAt: &now},
 	}}))

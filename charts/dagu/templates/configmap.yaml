@@ -1,24 +1,121 @@
+{{- range .Values.extraEnv }}
+{{- if hasPrefix "DAGU_AUTH_PROXY_" .name }}
+{{- fail (printf "extraEnv entry %q must not configure proxy authentication; use auth.proxy values" .name) }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.auth.mode "basic" }}
+{{- if empty .Values.auth.basic.existingSecret }}
+{{- fail "auth.basic.existingSecret is required when auth.mode=basic" }}
+{{- end }}
+{{- range .Values.extraEnv }}
+{{- if has .name (list "DAGU_AUTH_BASIC_USERNAME" "DAGU_AUTH_BASIC_PASSWORD") }}
+{{- fail (printf "extraEnv entry %q conflicts with auth.basic; use the configured Secret keys" .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.license.existingSecret (empty .Values.license.secretKey) }}
+{{- fail "license.secretKey is required when license.existingSecret is set" }}
+{{- end }}
+{{- if .Values.license.existingSecret }}
+{{- range .Values.extraEnv }}
+{{- if has .name (list "DAGU_LICENSE" "DAGU_LICENSE_KEY" "DAGU_LICENSE_FILE") }}
+{{- fail (printf "extraEnv entry %q must not configure licensing when license.existingSecret is set" .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.auth.oidc.enabled }}
+{{- if ne .Values.auth.mode "builtin" }}
+{{- fail "auth.oidc.enabled requires auth.mode=builtin" }}
+{{- end }}
+{{- if empty .Values.auth.oidc.clientId }}
+{{- fail "auth.oidc.clientId is required when auth.oidc.enabled=true" }}
+{{- end }}
+{{- if empty .Values.auth.oidc.clientUrl }}
+{{- fail "auth.oidc.clientUrl is required when auth.oidc.enabled=true" }}
+{{- end }}
+{{- if empty .Values.auth.oidc.issuer }}
+{{- fail "auth.oidc.issuer is required when auth.oidc.enabled=true" }}
+{{- end }}
+{{- if empty .Values.auth.oidc.scopes }}
+{{- fail "auth.oidc.scopes must not be empty when auth.oidc.enabled=true" }}
+{{- end }}
+{{- if and (or (not (empty .Values.auth.oidc.whitelist)) (not (empty .Values.auth.oidc.allowedDomains))) (not (has "email" .Values.auth.oidc.scopes)) }}
+{{- fail "auth.oidc.scopes must include email when auth.oidc.whitelist or auth.oidc.allowedDomains is configured" }}
+{{- end }}
+{{- if empty .Values.auth.oidc.clientSecret.existingSecret }}
+{{- fail "auth.oidc.clientSecret.existingSecret is required when auth.oidc.enabled=true" }}
+{{- end }}
+{{- if empty .Values.auth.oidc.clientSecret.secretKey }}
+{{- fail "auth.oidc.clientSecret.secretKey is required when auth.oidc.enabled=true" }}
+{{- end }}
+{{- range .Values.extraEnv }}
+{{- if hasPrefix "DAGU_AUTH_OIDC_" .name }}
+{{- fail (printf "extraEnv entry %q must not configure OIDC when auth.oidc.enabled=true" .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.auth.proxy.enabled (ne .Values.auth.mode "builtin") }}
+{{- fail "auth.proxy.enabled requires auth.mode=builtin" }}
+{{- end }}
+{{- if and .Values.auth.proxy.enabled (ne (int .Values.ui.replicas) 1) }}
+{{- fail "auth.proxy.enabled requires ui.replicas=1" }}
+{{- end }}
+{{- if and .Values.auth.proxy.enabled (ne .Values.ui.service.type "ClusterIP") }}
+{{- fail "auth.proxy.enabled requires ui.service.type=ClusterIP so traffic cannot bypass the authenticating proxy" }}
+{{- end }}
+{{- if and .Values.auth.proxy.enabled .Values.ingress.enabled }}
+{{- fail "auth.proxy.enabled cannot use the chart-managed ingress; keep ingress.enabled=false and configure an authenticated ingress as documented in PROXY_AUTH.md" }}
+{{- end }}
+{{- if and .Values.auth.proxy.enabled .Values.auth.proxy.roleMapping.requireMapping (empty .Values.auth.proxy.roleMapping.groupMappings) (empty .Values.auth.proxy.roleMapping.workspaceMappings) }}
+{{- fail "auth.proxy.roleMapping.requireMapping=true requires at least one groupMappings or workspaceMappings entry" }}
+{{- end }}
+{{- if .Values.auth.proxy.enabled }}
+{{- $userHeader := .Values.auth.proxy.headers.user }}
+{{- $groupsHeader := .Values.auth.proxy.headers.groups }}
+{{- if not (regexMatch "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" $userHeader) }}
+{{- fail "auth.proxy.headers.user must be a valid HTTP header name" }}
+{{- end }}
+{{- if and $groupsHeader (not (regexMatch "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" $groupsHeader)) }}
+{{- fail "auth.proxy.headers.groups must be a valid HTTP header name" }}
+{{- end }}
+{{- if has (lower $userHeader) (list "authorization" "cookie" "host") }}
+{{- fail "auth.proxy.headers.user must not be Authorization, Cookie, or Host" }}
+{{- end }}
+{{- if and $groupsHeader (has (lower $groupsHeader) (list "authorization" "cookie" "host")) }}
+{{- fail "auth.proxy.headers.groups must not be Authorization, Cookie, or Host" }}
+{{- end }}
+{{- if and $groupsHeader (eq (lower $userHeader) (lower $groupsHeader)) }}
+{{- fail "auth.proxy.headers.user and auth.proxy.headers.groups must be different" }}
+{{- end }}
+{{- if and (not $groupsHeader) (or .Values.auth.proxy.roleMapping.groupMappings .Values.auth.proxy.roleMapping.workspaceMappings) }}
+{{- fail "auth.proxy.headers.groups is required when group or workspace mappings are configured" }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "dagu.fullname" . }}-config
+  name: {{ include "dagu.componentName" (dict "root" . "component" "config") }}
   labels:
     {{- include "dagu.labels" . | nindent 4 }}
 data:
   dagu.yaml: |
     # Dagu configuration rendered by the Helm chart
     # This file intentionally includes only the minimal,
-    # schema-correct configuration required to run dagu
-    # in a distributed Kubernetes environment.
+    # schema-correct configuration required to run Dagu
+    # in a {{ .Values.deploymentMode }} Kubernetes deployment.
 
     # Server / UI
     host: "0.0.0.0"
-    port: 8080
+    port: {{ .Values.ui.containerPort }}
     api_base_path: "/api/v1"
 {{- with .Values.config.publicUrl }}
     public_url: {{ . | quote }}
 {{- end }}
-    default_execution_mode: "distributed"
+    cors_allowed_origins: {{ .Values.config.corsAllowedOrigins | toJson }}
+    ip_access:
+      allowed_ips: {{ .Values.config.ipAccess.allowedIPs | toJson }}
+      trusted_proxies: {{ .Values.config.ipAccess.trustedProxies | toJson }}
+    default_execution_mode: {{ ternary "distributed" "local" (eq .Values.deploymentMode "distributed") | quote }}
 {{- with .Values.config.envPassthrough }}
     env_passthrough:
 {{ toYaml . | indent 6 }}
@@ -28,8 +125,10 @@ data:
 {{ toYaml . | indent 6 }}
 {{- end }}
 
-    # Coordinator (distributed execution)
+{{- if eq .Values.deploymentMode "distributed" }}
+    # Distributed execution
     coordinator:
+      enabled: true
       host: "0.0.0.0"
       port: 50055
       health_port: {{ .Values.coordinator.healthPort }}
@@ -41,6 +140,10 @@ data:
     # Scheduler
     scheduler:
       port: 8090
+{{- else }}
+    coordinator:
+      enabled: false
+{{- end }}
 
     # Paths (MUST be under `paths`)
     paths:
@@ -52,6 +155,7 @@ data:
       suspend_flags_dir: /data/suspend
       admin_logs_dir: /data/admin/logs
       dag_runs_dir: /data/dag-runs
+      dag_run_work_dir: /data/dag-run-work
       queue_dir: /data/queue
       proc_dir: /data/proc
       service_registry_dir: /data/services
@@ -66,7 +170,68 @@ data:
         token:
           secret: {{ .Values.auth.builtin.token.secret | quote }}
           ttl: {{ .Values.auth.builtin.token.ttl | quote }}
+{{- if .Values.auth.oidc.enabled }}
+      oidc:
+        client_id: {{ .Values.auth.oidc.clientId | quote }}
+        client_url: {{ .Values.auth.oidc.clientUrl | quote }}
+        issuer: {{ .Values.auth.oidc.issuer | quote }}
+        scopes: {{ .Values.auth.oidc.scopes | toJson }}
+        whitelist: {{ .Values.auth.oidc.whitelist | toJson }}
+        auto_signup: {{ .Values.auth.oidc.autoSignup }}
+        allowed_domains: {{ .Values.auth.oidc.allowedDomains | toJson }}
+        button_label: {{ .Values.auth.oidc.buttonLabel | quote }}
+        role_mapping:
+          default_role: {{ .Values.auth.oidc.roleMapping.defaultRole | quote }}
+          groups_claim: {{ .Values.auth.oidc.roleMapping.groupsClaim | quote }}
+          default_workspace_access: {{ .Values.auth.oidc.roleMapping.defaultWorkspaceAccess | quote }}
+          role_attribute_path: {{ .Values.auth.oidc.roleMapping.roleAttributePath | quote }}
+          role_attribute_strict: {{ .Values.auth.oidc.roleMapping.roleAttributeStrict }}
+          skip_org_role_sync: {{ .Values.auth.oidc.roleMapping.skipOrgRoleSync }}
+{{- with .Values.auth.oidc.roleMapping.groupMappings }}
+          group_mappings:
+{{ toYaml . | indent 12 }}
+{{- else }}
+          group_mappings: {}
+{{- end }}
+{{- with .Values.auth.oidc.roleMapping.workspaceMappings }}
+          workspace_mappings:
+{{ toYaml . | indent 12 }}
+{{- else }}
+          workspace_mappings: {}
+{{- end }}
+{{- end }}
+{{- if .Values.auth.proxy.enabled }}
+      proxy:
+        enabled: true
+{{- with .Values.auth.proxy.source }}
+        source: {{ . | quote }}
+{{- end }}
+        button_label: {{ .Values.auth.proxy.buttonLabel | quote }}
+        headers:
+          user: {{ .Values.auth.proxy.headers.user | quote }}
+          groups: {{ .Values.auth.proxy.headers.groups | quote }}
+        auto_signup: {{ .Values.auth.proxy.autoSignup }}
+        role_mapping:
+          default_role: {{ .Values.auth.proxy.roleMapping.defaultRole | quote }}
+          default_workspace_access: {{ .Values.auth.proxy.roleMapping.defaultWorkspaceAccess | quote }}
+          require_mapping: {{ .Values.auth.proxy.roleMapping.requireMapping }}
+          skip_org_role_sync: {{ .Values.auth.proxy.roleMapping.skipOrgRoleSync }}
+{{- with .Values.auth.proxy.roleMapping.groupMappings }}
+          group_mappings:
+{{ toYaml . | indent 12 }}
+{{- else }}
+          group_mappings: {}
+{{- end }}
+{{- with .Values.auth.proxy.roleMapping.workspaceMappings }}
+          workspace_mappings:
+{{ toYaml . | indent 12 }}
+{{- else }}
+          workspace_mappings: {}
+{{- end }}
+{{- end }}
 
-    # Peer communication (required for distributed mode)
+{{- if eq .Values.deploymentMode "distributed" }}
+    # Peer communication
     peer:
       insecure: true
+{{- end }}

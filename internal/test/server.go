@@ -12,13 +12,12 @@ import (
 	"testing"
 	"time"
 
-	cmdprocess "github.com/dagucloud/dagu/internal/cmd/process"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/telemetry"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/frontend"
-	"github.com/dagucloud/dagu/internal/service/frontend/api/pathutil"
-	apiv1 "github.com/dagucloud/dagu/internal/service/frontend/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/api/pathutil"
+	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
+	frontendfile "github.com/dagucloud/dagu/v2/internal/service/frontend/file"
 	"github.com/go-resty/resty/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -26,6 +25,18 @@ import (
 // Server represents a test HTTP server instance
 type Server struct {
 	Helper
+}
+
+// ReserveServerListener binds a loopback listener and closes it during test cleanup.
+func ReserveServerListener(t *testing.T) (net.Listener, string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	port := listener.Addr().(*net.TCPAddr).Port
+	return listener, fmt.Sprintf("%d", port)
 }
 
 // SetupServer creates and starts a test server instance
@@ -78,17 +89,7 @@ func SetupServer(t *testing.T, opts ...HelperOption) Server {
 
 // newFrontendServer constructs the HTTP server with the provided listener.
 func (srv *Server) newFrontendServer(listener net.Listener) (*frontend.Server, error) {
-	cc := coordinator.New(srv.ServiceRegistry, coordinator.DefaultConfig())
-
-	collector := telemetry.NewCollector(
-		config.Version,
-		srv.DAGStore,
-		srv.DAGRunStore,
-		srv.QueueStore,
-		srv.ServiceRegistry,
-	)
-	collector.SetWorkerHeartbeatStore(srv.WorkerHeartbeatStore)
-	mr := telemetry.NewRegistry(collector)
+	cc := coordinator.New(srv.ServiceRegistry, CoordinatorClientConfig(srv.Config.Paths.DataDir))
 
 	// Pass the pre-bound listener to the server to avoid port race conditions
 	serverOpts := append([]frontend.ServerOption{
@@ -96,13 +97,24 @@ func (srv *Server) newFrontendServer(listener net.Listener) (*frontend.Server, e
 		frontend.WithAPIOption(apiv1.WithDAGRunLeaseStore(srv.DAGRunLeaseStore)),
 		frontend.WithAPIOption(apiv1.WithWorkerHeartbeatStore(srv.WorkerHeartbeatStore)),
 	}, srv.ServerOptions...)
-	server, err := frontend.NewServer(
-		srv.Context, srv.Config, srv.DAGStore, srv.DAGRunStore,
-		srv.QueueStore, srv.ProcStore, srv.DAGRunMgr, cc,
-		srv.ServiceRegistry, mr, collector, nil,
-		cmdprocess.NewFrontendStoreFactories(),
-		serverOpts...,
-	)
+	stores, err := frontendfile.NewStores(srv.Context, srv.Config, srv.Backend)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize server stores: %w", err)
+	}
+	server, err := frontend.NewServer(frontend.ServerConfig{
+		Context:              srv.Context,
+		Config:               srv.Config,
+		DAGRepository:        srv.DAGRepository,
+		DAGRunRepository:     srv.DAGRunRepository,
+		ProcRepository:       srv.ProcRepository,
+		QueueStore:           srv.QueueStore,
+		DAGRunManager:        srv.DAGRunMgr,
+		CoordinatorClient:    cc,
+		ServiceRegistry:      srv.ServiceRegistry,
+		DAGRunLeaseStore:     srv.DAGRunLeaseStore,
+		WorkerHeartbeatStore: srv.WorkerHeartbeatStore,
+		Stores:               stores,
+	}, serverOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create server: %w", err)
 	}

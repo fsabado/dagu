@@ -9,19 +9,30 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
+
+func createOrSwap(ctx context.Context, col persis.Collection, current, next *persis.Record) error {
+	if current == nil {
+		return col.Create(ctx, next)
+	}
+	err := col.CompareAndSwap(ctx, current.ID, current.Data, next.Data)
+	if errors.Is(err, persis.ErrNotFound) {
+		return persis.ErrConflict
+	}
+	return err
+}
 
 const (
-	casRetryInitialBackoff = 5 * time.Millisecond
-	casRetryMaxBackoff     = 5 * time.Second
+	conflictRetryInitialBackoff = 5 * time.Millisecond
+	conflictRetryMaxBackoff     = 5 * time.Second
 )
 
-// retryCAS runs op with exponential full-jitter backoff while op returns
+// retryConflict runs op with exponential full-jitter backoff while op returns
 // [persis.ErrConflict]. Any other error (including ErrNotFound) propagates.
 // Total time is bounded by ctx.
-func retryCAS(ctx context.Context, op func(ctx context.Context) error) error {
-	backoff := casRetryInitialBackoff
+func retryConflict(ctx context.Context, op func(ctx context.Context) error) error {
+	backoff := conflictRetryInitialBackoff
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -43,6 +54,6 @@ func retryCAS(ctx context.Context, op func(ctx context.Context) error) error {
 		case <-timer.C:
 		}
 
-		backoff = min(backoff*2, casRetryMaxBackoff)
+		backoff = min(backoff*2, conflictRetryMaxBackoff)
 	}
 }

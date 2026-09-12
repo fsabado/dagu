@@ -1,0 +1,815 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package spec
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+)
+
+var v2LegacyExecutionFields = map[string]struct{}{
+	"call":           {},
+	"command":        {},
+	"config":         {},
+	"exec":           {},
+	"llm":            {},
+	"messages":       {},
+	"params":         {},
+	"routes":         {},
+	"script":         {},
+	"shell":          {},
+	"shell_args":     {},
+	"shell_packages": {},
+	"type":           {},
+	"value":          {},
+}
+
+var v2RunWithFields = map[string]struct{}{
+	"shell":          {},
+	"shell_args":     {},
+	"shell_packages": {},
+}
+
+type actionNormalizer func(normalized map[string]any, with map[string]any) error
+
+var builtinActionNormalizers = map[string]actionNormalizer{
+	"artifact.list":       operationAction("artifact", "list"),
+	"artifact.read":       operationAction("artifact", "read"),
+	"artifact.write":      operationAction("artifact", "write"),
+	"archive.create":      operationAction("archive", "create"),
+	"archive.extract":     operationAction("archive", "extract"),
+	"archive.list":        operationAction("archive", "list"),
+	"chat.completion":     normalizeChatAction,
+	"container.run":       optionalCommandAction("container", "command"),
+	"dag.enqueue":         normalizeDagEnqueueAction,
+	"dag.run":             normalizeDagRunAction,
+	"data.convert":        operationAction("data", "convert"),
+	"data.pick":           operationAction("data", "pick"),
+	"docker.run":          optionalCommandAction("docker", "command"),
+	"exec":                normalizeExecAction,
+	"file.copy":           operationAction("file", "copy"),
+	"file.delete":         operationAction("file", "delete"),
+	"file.list":           operationAction("file", "list"),
+	"file.mkdir":          operationAction("file", "mkdir"),
+	"file.move":           operationAction("file", "move"),
+	"file.read":           operationAction("file", "read"),
+	"file.stat":           operationAction("file", "stat"),
+	"file.write":          operationAction("file", "write"),
+	"git.checkout":        operationAction("git", "checkout"),
+	"git.worktree.add":    normalizeGitWorktreeAddAction,
+	"git.worktree.remove": normalizeGitWorktreeRemoveAction,
+	"harness.run":         normalizeHarnessRunAction,
+	"http.request":        normalizeHTTPRequestAction,
+	"human.task":          normalizeHumanTaskAction,
+	"jq.filter":           normalizeJQFilterAction,
+	"k8s.run":             optionalCommandAction("k8s", "command"),
+	"kubernetes.run":      optionalCommandAction("kubernetes", "command"),
+	"log.write":           normalizeLogAction,
+	"mail.send":           typedAction("mail"),
+	"noop":                normalizeNoopAction,
+	"outputs.write":       operationAction("outputs", "write"),
+	"postgres.query":      commandAction("postgres", "query"),
+	"postgres.import":     importAction("postgres"),
+	"router.route":        normalizeRouterAction,
+	"s3.delete":           operationAction("s3", "delete"),
+	"s3.download":         operationAction("s3", "download"),
+	"s3.list":             operationAction("s3", "list"),
+	"s3.upload":           operationAction("s3", "upload"),
+	"sftp.download":       directionAction("sftp", "download"),
+	"sftp.upload":         directionAction("sftp", "upload"),
+	"sqlite.query":        commandAction("sqlite", "query"),
+	"sqlite.import":       importAction("sqlite"),
+	"ssh.run":             commandAction("ssh", "command"),
+	"state.delete":        operationAction("state", "delete"),
+	"state.diff":          operationAction("state", "diff"),
+	"state.get":           operationAction("state", "get"),
+	"state.list":          operationAction("state", "list"),
+	"state.set":           operationAction("state", "set"),
+	"template.render":     normalizeTemplateAction,
+	"wait.duration":       operationAction("wait", "duration"),
+	"wait.file":           operationAction("wait", "file"),
+	"wait.http":           operationAction("wait", "http"),
+	"wait.until":          operationAction("wait", "until"),
+}
+
+func normalizeStepExecutionRaw(raw map[string]any, registry *customStepTypeRegistry) (map[string]any, error) {
+	if raw == nil {
+		return nil, nil
+	}
+
+	_, hasRun := raw["run"]
+	_, hasAction := raw["action"]
+	if !hasRun && !hasAction {
+		return raw, nil
+	}
+	if hasRun && hasAction {
+		return nil, ir.NewValidationError("action", raw["action"], fmt.Errorf("run cannot be used together with action"))
+	}
+
+	normalized := cloneMap(raw)
+	if hasRun {
+		if err := normalizeRunStep(normalized, raw); err != nil {
+			return nil, err
+		}
+		return normalized, nil
+	}
+
+	if err := normalizeActionStep(normalized, raw, registry); err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
+func normalizeRunStep(normalized, raw map[string]any) error {
+	for field := range v2LegacyExecutionFields {
+		if _, exists := raw[field]; exists {
+			return ir.NewValidationError("run", raw["run"], fmt.Errorf("run cannot be used together with %s", field))
+		}
+	}
+
+	runValue := raw["run"]
+	switch runValue.(type) {
+	case string, []any:
+	default:
+		return ir.NewValidationError("run", runValue, fmt.Errorf("run must be a string or array"))
+	}
+
+	if withRaw, exists := raw["with"]; exists {
+		with, ok := withRaw.(map[string]any)
+		if !ok {
+			return ir.NewValidationError("with", withRaw, fmt.Errorf("with must be an object"))
+		}
+		for key, val := range with {
+			if _, ok := v2RunWithFields[key]; !ok {
+				return ir.NewValidationError("with", withRaw, fmt.Errorf("run only supports shell, shell_args, and shell_packages in with; got %q", key))
+			}
+			normalized[key] = cloneAny(val)
+		}
+		delete(normalized, "with")
+	}
+
+	normalized["command"] = cloneAny(runValue)
+	delete(normalized, "run")
+	return nil
+}
+
+func normalizeActionStep(normalized, raw map[string]any, registry *customStepTypeRegistry) error {
+	for field := range v2LegacyExecutionFields {
+		if _, exists := raw[field]; exists {
+			return ir.NewValidationError("action", raw["action"], fmt.Errorf("action cannot be used together with %s", field))
+		}
+	}
+
+	action, ok := raw["action"].(string)
+	if !ok {
+		return ir.NewValidationError("action", raw["action"], fmt.Errorf("action must be a string"))
+	}
+	action = strings.TrimSpace(action)
+	if action == "" {
+		return ir.NewValidationError("action", raw["action"], fmt.Errorf("action is required"))
+	}
+	if isRemoteActionReference(action) {
+		with, err := actionWith(raw)
+		if err != nil {
+			return err
+		}
+		if err := validateRemoteActionReference(action); err != nil {
+			return ir.NewValidationError("action", raw["action"], err)
+		}
+		return normalizeRemoteAction(normalized, action, with)
+	}
+	if strings.Contains(action, "@") {
+		return ir.NewValidationError("action", raw["action"], fmt.Errorf("versioned action references must use official action@version or GitHub owner/repo@version"))
+	}
+
+	if registry != nil {
+		if customType, ok := registry.Lookup(action); ok && customType.Kind == customStepKindAction {
+			normalized["type"] = action
+			delete(normalized, "action")
+			return nil
+		}
+	}
+
+	with, err := actionWith(raw)
+	if err != nil {
+		return err
+	}
+
+	if isRegisteredExecutorTypeName(action) {
+		return finishAction(normalized, action, with)
+	}
+
+	if normalizer, ok := builtinActionNormalizers[action]; ok {
+		return normalizer(normalized, with)
+	}
+	if after, ok0 := strings.CutPrefix(action, "redis."); ok0 {
+		return normalizeRedisAction(normalized, with, after)
+	}
+	return ir.NewValidationError("action", raw["action"], fmt.Errorf("unknown action %q", action))
+}
+
+func isRemoteActionReference(action string) bool {
+	return strings.HasPrefix(action, "source:") || isOfficialActionReference(action) || isGitHubActionReference(action)
+}
+
+func validateRemoteActionReference(action string) error {
+	if after, ok := strings.CutPrefix(action, "source:"); ok {
+		target, version, err := splitActionRef(after)
+		if err != nil || target == "" {
+			return fmt.Errorf("source action references must use source:target@version")
+		}
+		if !isSafeActionVersion(version) {
+			return fmt.Errorf("invalid action version %q", version)
+		}
+		return nil
+	}
+	if isOfficialActionReference(action) || isGitHubActionReference(action) {
+		return nil
+	}
+	return fmt.Errorf("versioned action references must use official action@version or GitHub owner/repo@version")
+}
+
+func isOfficialActionReference(action string) bool {
+	target, version, err := splitActionRef(action)
+	return err == nil && isOfficialActionTarget(target) && isSafeActionVersion(version)
+}
+
+func isGitHubActionReference(action string) bool {
+	target, version, err := splitActionRef(action)
+	return err == nil && isGitHubActionTarget(target) && isSafeActionVersion(version)
+}
+
+func isOfficialActionTarget(target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" || strings.Contains(target, "/") {
+		return false
+	}
+	if target == "." || target == ".." || strings.HasPrefix(target, ".") || strings.HasPrefix(target, "-") || strings.HasSuffix(target, ".git") {
+		return false
+	}
+	for _, r := range target {
+		if !isGitHubRepoRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func splitActionRef(action string) (string, string, error) {
+	idx := strings.LastIndex(action, "@")
+	if idx <= 0 || idx == len(action)-1 {
+		return "", "", fmt.Errorf("action ref must be target@version")
+	}
+	return strings.TrimSpace(action[:idx]), strings.TrimSpace(action[idx+1:]), nil
+}
+
+func isGitHubActionTarget(target string) bool {
+	parts := strings.Split(target, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	owner, repo := parts[0], parts[1]
+	if owner == "" || repo == "" || strings.HasPrefix(owner, "-") || strings.HasSuffix(owner, "-") {
+		return false
+	}
+	if len(owner) > 39 || repo == "." || repo == ".." || strings.HasSuffix(repo, ".git") {
+		return false
+	}
+	for _, r := range owner {
+		if !isGitHubOwnerRune(r) {
+			return false
+		}
+	}
+	for _, r := range repo {
+		if !isGitHubRepoRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isGitHubOwnerRune(r rune) bool {
+	return r >= 'A' && r <= 'Z' ||
+		r >= 'a' && r <= 'z' ||
+		r >= '0' && r <= '9' ||
+		r == '-'
+}
+
+func isGitHubRepoRune(r rune) bool {
+	return isGitHubOwnerRune(r) || r == '_' || r == '.'
+}
+
+func isSafeActionVersion(version string) bool {
+	version = strings.TrimSpace(version)
+	if version == "" ||
+		strings.HasPrefix(version, "-") ||
+		strings.ContainsAny(version, " \t\r\n\\~^:?*[]") ||
+		strings.Contains(version, "..") ||
+		strings.Contains(version, "@{") ||
+		strings.Contains(version, "//") ||
+		strings.HasSuffix(version, "/") ||
+		strings.HasSuffix(version, ".") ||
+		strings.HasSuffix(version, ".lock") {
+		return false
+	}
+	for part := range strings.SplitSeq(version, "/") {
+		if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeRemoteAction(normalized map[string]any, action string, with map[string]any) error {
+	cfg := map[string]any{
+		"ref":   action,
+		"input": map[string]any{},
+	}
+	if len(with) > 0 {
+		cfg["input"] = with
+	}
+	normalized["type"] = ir.ExecutorTypeAction
+	normalized["with"] = cfg
+	delete(normalized, "action")
+	return nil
+}
+
+func actionWith(raw map[string]any) (map[string]any, error) {
+	withRaw, exists := raw["with"]
+	if !exists {
+		return nil, nil
+	}
+	with, ok := withRaw.(map[string]any)
+	if !ok {
+		return nil, ir.NewValidationError("with", withRaw, fmt.Errorf("with must be an object"))
+	}
+	return cloneMap(with), nil
+}
+
+func requireActionField(with map[string]any, field string) (any, error) {
+	if with == nil {
+		return nil, ir.NewValidationError("with", nil, fmt.Errorf("with.%s is required", field))
+	}
+	value, exists := with[field]
+	if !exists {
+		return nil, ir.NewValidationError("with", with, fmt.Errorf("with.%s is required", field))
+	}
+	return value, nil
+}
+
+func requireActionStringField(with map[string]any, field string) (string, error) {
+	value, err := requireActionField(with, field)
+	if err != nil {
+		return "", err
+	}
+	str, ok := value.(string)
+	if !ok || strings.TrimSpace(str) == "" {
+		return "", ir.NewValidationError("with", with, fmt.Errorf("with.%s must be a non-empty string", field))
+	}
+	return strings.TrimSpace(str), nil
+}
+
+func finishAction(normalized map[string]any, executorType string, with map[string]any) error {
+	normalized["type"] = executorType
+	if len(with) == 0 {
+		delete(normalized, "with")
+	} else {
+		normalized["with"] = with
+	}
+	delete(normalized, "action")
+	return nil
+}
+
+func normalizeTypedAction(normalized map[string]any, executorType string, with map[string]any) error {
+	return finishAction(normalized, executorType, with)
+}
+
+func typedAction(executorType string) actionNormalizer {
+	return func(normalized map[string]any, with map[string]any) error {
+		return normalizeTypedAction(normalized, executorType, with)
+	}
+}
+
+func normalizeHTTPRequestAction(normalized map[string]any, with map[string]any) error {
+	if _, err := requireActionStringField(with, "method"); err != nil {
+		return err
+	}
+	if _, err := requireActionStringField(with, "url"); err != nil {
+		return err
+	}
+	return finishAction(normalized, "http", with)
+}
+
+func normalizeDagRunAction(normalized map[string]any, with map[string]any) error {
+	dagName, err := requireActionStringField(with, "dag")
+	if err != nil {
+		return err
+	}
+	for key := range with {
+		if key != "dag" && key != "params" {
+			return ir.NewValidationError("with", with, fmt.Errorf("dag.run does not support with.%s", key))
+		}
+	}
+	normalized["call"] = dagName
+	if params, ok := with["params"]; ok {
+		normalized["params"] = cloneAny(params)
+	}
+	delete(normalized, "with")
+	delete(normalized, "action")
+	return nil
+}
+
+func normalizeDagEnqueueAction(normalized map[string]any, with map[string]any) error {
+	dagName, err := requireActionStringField(with, "dag")
+	if err != nil {
+		return err
+	}
+	for key := range with {
+		if key != "dag" && key != "params" && key != "queue" {
+			return ir.NewValidationError("with", with, fmt.Errorf("dag.enqueue does not support with.%s", key))
+		}
+	}
+	normalized["type"] = ir.ExecutorTypeDAGEnqueue
+	normalized["call"] = dagName
+	if params, ok := with["params"]; ok {
+		normalized["params"] = cloneAny(params)
+	}
+	config := make(map[string]any)
+	if queue, ok := with["queue"]; ok {
+		config["queue"] = cloneAny(queue)
+	}
+	if len(config) > 0 {
+		normalized["with"] = config
+	} else {
+		delete(normalized, "with")
+	}
+	delete(normalized, "action")
+	return nil
+}
+
+func normalizeExecAction(normalized map[string]any, with map[string]any) error {
+	command, err := requireActionStringField(with, "command")
+	if err != nil {
+		return err
+	}
+	exec := map[string]any{"command": command}
+	if args, ok := with["args"]; ok {
+		exec["args"] = cloneAny(args)
+	}
+	for key := range with {
+		if key != "command" && key != "args" {
+			return ir.NewValidationError("with", with, fmt.Errorf("exec does not support with.%s", key))
+		}
+	}
+	normalized["exec"] = exec
+	delete(normalized, "with")
+	delete(normalized, "action")
+	return nil
+}
+
+func normalizeCommandAction(normalized map[string]any, executorType string, with map[string]any, field string) error {
+	value, err := requireActionField(with, field)
+	if err != nil {
+		return err
+	}
+	delete(with, field)
+	normalized["command"] = cloneAny(value)
+	return finishAction(normalized, executorType, with)
+}
+
+func commandAction(executorType, field string) actionNormalizer {
+	return func(normalized map[string]any, with map[string]any) error {
+		return normalizeCommandAction(normalized, executorType, with, field)
+	}
+}
+
+func normalizeOptionalCommandAction(normalized map[string]any, executorType string, with map[string]any, field string) error {
+	if value, ok := with[field]; ok {
+		delete(with, field)
+		normalized["command"] = cloneAny(value)
+	}
+	return finishAction(normalized, executorType, with)
+}
+
+func optionalCommandAction(executorType, field string) actionNormalizer {
+	return func(normalized map[string]any, with map[string]any) error {
+		return normalizeOptionalCommandAction(normalized, executorType, with, field)
+	}
+}
+
+func normalizeHarnessRunAction(normalized map[string]any, with map[string]any) error {
+	if err := normalizeCommandAction(normalized, "harness", with, "prompt"); err != nil {
+		return err
+	}
+	cfg, _ := normalized["with"].(map[string]any)
+	if stdin, ok := cfg["stdin"]; ok {
+		text, ok := stdin.(string)
+		if !ok {
+			return ir.NewValidationError("with.stdin", stdin, fmt.Errorf("with.stdin must be a string"))
+		}
+		normalized["script"] = text
+		delete(cfg, "stdin")
+		if len(cfg) == 0 {
+			delete(normalized, "with")
+		}
+	}
+	return nil
+}
+
+func normalizeImportAction(normalized map[string]any, executorType string, with map[string]any) error {
+	if _, err := requireActionField(with, "import"); err != nil {
+		return err
+	}
+	return finishAction(normalized, executorType, with)
+}
+
+func importAction(executorType string) actionNormalizer {
+	return func(normalized map[string]any, with map[string]any) error {
+		return normalizeImportAction(normalized, executorType, with)
+	}
+}
+
+func normalizeDirectionAction(normalized map[string]any, executorType string, with map[string]any, direction string) error {
+	if with == nil {
+		with = map[string]any{}
+	}
+	if existing, ok := with["direction"]; ok && existing != direction {
+		return ir.NewValidationError("with.direction", existing, fmt.Errorf("direction must be %q for this action", direction))
+	}
+	with["direction"] = direction
+	return finishAction(normalized, executorType, with)
+}
+
+func directionAction(executorType, direction string) actionNormalizer {
+	return func(normalized map[string]any, with map[string]any) error {
+		return normalizeDirectionAction(normalized, executorType, with, direction)
+	}
+}
+
+func normalizeOperationAction(normalized map[string]any, executorType string, with map[string]any, operation string) error {
+	normalized["command"] = operation
+	return finishAction(normalized, executorType, with)
+}
+
+func operationAction(executorType, operation string) actionNormalizer {
+	return func(normalized map[string]any, with map[string]any) error {
+		return normalizeOperationAction(normalized, executorType, with, operation)
+	}
+}
+
+func normalizeGitWorktreeAddAction(normalized map[string]any, with map[string]any) error {
+	if err := validateGitWorktreeOutputOverrides(normalized); err != nil {
+		return err
+	}
+	if err := validateGitWorktreeFields(with, map[string]gitWorktreeFieldKind{
+		"branch":        gitWorktreeString,
+		"path":          gitWorktreeString,
+		"create_branch": gitWorktreeBool,
+		"base":          gitWorktreeString,
+	}); err != nil {
+		return err
+	}
+	if _, hasBranch := with["branch"]; hasBranch {
+		if _, hasBase := with["base"]; hasBase {
+			createBranch, _ := with["create_branch"].(bool)
+			if !createBranch {
+				return ir.NewValidationError("with", with, fmt.Errorf("with.base requires create_branch: true when branch is specified"))
+			}
+		}
+	}
+	return normalizeOperationAction(normalized, "git", with, "worktree.add")
+}
+
+func normalizeGitWorktreeRemoveAction(normalized map[string]any, with map[string]any) error {
+	if err := validateGitWorktreeOutputOverrides(normalized); err != nil {
+		return err
+	}
+	if err := validateGitWorktreeFields(with, map[string]gitWorktreeFieldKind{
+		"branch":              gitWorktreeString,
+		"path":                gitWorktreeString,
+		"force":               gitWorktreeBool,
+		"delete_branch":       gitWorktreeBool,
+		"force_delete_branch": gitWorktreeBool,
+	}); err != nil {
+		return err
+	}
+	_, hasBranch := with["branch"]
+	_, hasPath := with["path"]
+	if !hasBranch && !hasPath {
+		return ir.NewValidationError("with", with, fmt.Errorf("git.worktree.remove requires with.branch or with.path"))
+	}
+	deleteBranch, _ := with["delete_branch"].(bool)
+	if deleteBranch && !hasBranch {
+		return ir.NewValidationError("with", with, fmt.Errorf("with.delete_branch requires with.branch"))
+	}
+	forceDeleteBranch, _ := with["force_delete_branch"].(bool)
+	if forceDeleteBranch && !deleteBranch {
+		return ir.NewValidationError("with", with, fmt.Errorf("with.force_delete_branch requires delete_branch: true"))
+	}
+	return normalizeOperationAction(normalized, "git", with, "worktree.remove")
+}
+
+type gitWorktreeFieldKind uint8
+
+const (
+	gitWorktreeString gitWorktreeFieldKind = iota
+	gitWorktreeBool
+)
+
+func validateGitWorktreeFields(with map[string]any, allowed map[string]gitWorktreeFieldKind) error {
+	for name, value := range with {
+		kind, ok := allowed[name]
+		if !ok {
+			return ir.NewValidationError("with", with, fmt.Errorf("unsupported git worktree field %q", name))
+		}
+		switch kind {
+		case gitWorktreeString:
+			text, ok := value.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return ir.NewValidationError("with", with, fmt.Errorf("with.%s must be a non-empty string", name))
+			}
+		case gitWorktreeBool:
+			if _, ok := value.(bool); !ok {
+				return ir.NewValidationError("with", with, fmt.Errorf("with.%s must be a boolean", name))
+			}
+		}
+	}
+	return nil
+}
+
+func validateGitWorktreeOutputOverrides(normalized map[string]any) error {
+	if _, ok := normalized["output"]; ok {
+		return ir.NewValidationError("output", normalized["output"], fmt.Errorf("git worktree actions have fixed outputs"))
+	}
+	if _, ok := normalized["outputs"]; ok {
+		return ir.NewValidationError("outputs", normalized["outputs"], fmt.Errorf("git worktree actions have fixed outputs"))
+	}
+	stdout, ok := normalized["stdout"].(map[string]any)
+	if ok {
+		if _, hasOutputs := stdout["outputs"]; hasOutputs {
+			return ir.NewValidationError("stdout.outputs", stdout["outputs"], fmt.Errorf("git worktree actions have fixed outputs"))
+		}
+	}
+	return nil
+}
+
+func normalizeTemplateAction(normalized map[string]any, with map[string]any) error {
+	_, hasTemplate := with["template"]
+	refValue, hasRef := with["template_ref"]
+	if hasTemplate == hasRef {
+		return ir.NewValidationError("with", with, fmt.Errorf("template.render requires exactly one of with.template or with.template_ref"))
+	}
+
+	if hasTemplate {
+		template, err := requireActionStringField(with, "template")
+		if err != nil {
+			return err
+		}
+		delete(with, "template")
+		normalized["script"] = template
+		return finishAction(normalized, "template", with)
+	}
+
+	ref, ok := refValue.(string)
+	if !ok || !cmnvalue.IsExactRef(ref) {
+		return ir.NewValidationError("with", with, fmt.Errorf("with.template_ref must be one complete scoped value reference such as ${env.NAME}"))
+	}
+	return finishAction(normalized, "template", with)
+}
+
+func normalizeJQFilterAction(normalized map[string]any, with map[string]any) error {
+	filter, err := requireActionField(with, "filter")
+	if err != nil {
+		return err
+	}
+	delete(with, "filter")
+	normalized["command"] = cloneAny(filter)
+	if data, ok := with["data"]; ok {
+		if _, hasInput := with["input"]; hasInput {
+			return ir.NewValidationError("with", with, fmt.Errorf("jq.filter does not allow both with.data and with.input"))
+		}
+		script, err := stringifyActionData(data)
+		if err != nil {
+			return ir.NewValidationError("with.data", data, err)
+		}
+		normalized["script"] = script
+		delete(with, "data")
+	}
+	return finishAction(normalized, "jq", with)
+}
+
+func stringifyActionData(data any) (string, error) {
+	switch val := data.(type) {
+	case string:
+		if strings.TrimSpace(val) == "" {
+			return "", fmt.Errorf("with.data must not be empty")
+		}
+		return val, nil
+	default:
+		encoded, err := json.Marshal(val)
+		if err != nil {
+			return "", fmt.Errorf("with.data must be JSON-serializable: %w", err)
+		}
+		return string(encoded), nil
+	}
+}
+
+func normalizeLogAction(normalized map[string]any, with map[string]any) error {
+	if _, err := requireActionStringField(with, "message"); err != nil {
+		return err
+	}
+	return finishAction(normalized, "log", with)
+}
+
+func normalizeRouterAction(normalized map[string]any, with map[string]any) error {
+	value, err := requireActionStringField(with, "value")
+	if err != nil {
+		return err
+	}
+	routes, err := requireActionField(with, "routes")
+	if err != nil {
+		return err
+	}
+	normalized["value"] = value
+	normalized["routes"] = cloneAny(routes)
+	delete(normalized, "with")
+	normalized["type"] = "router"
+	delete(normalized, "action")
+	return nil
+}
+
+func normalizeChatAction(normalized map[string]any, with map[string]any) error {
+	messages, ok, err := actionMessages(with)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ir.NewValidationError("with", with, fmt.Errorf("chat.completion requires with.prompt or with.messages"))
+	}
+	normalized["messages"] = messages
+	delete(with, "prompt")
+	delete(with, "messages")
+	if len(with) > 0 {
+		normalized["llm"] = with
+	}
+	delete(normalized, "with")
+	normalized["type"] = "chat"
+	delete(normalized, "action")
+	return nil
+}
+
+func actionMessages(with map[string]any) ([]any, bool, error) {
+	if with == nil {
+		return nil, false, nil
+	}
+	if promptRaw, ok := with["prompt"]; ok {
+		prompt, ok := promptRaw.(string)
+		if !ok || strings.TrimSpace(prompt) == "" {
+			return nil, false, ir.NewValidationError("with.prompt", promptRaw, fmt.Errorf("with.prompt must be a non-empty string"))
+		}
+		return []any{map[string]any{"role": "user", "content": prompt}}, true, nil
+	}
+	if messagesRaw, ok := with["messages"]; ok {
+		messages, ok := messagesRaw.([]any)
+		if !ok || len(messages) == 0 {
+			return nil, false, ir.NewValidationError("with.messages", messagesRaw, fmt.Errorf("with.messages must be a non-empty array"))
+		}
+		return cloneAny(messages).([]any), true, nil
+	}
+	return nil, false, nil
+}
+
+func normalizeRedisAction(normalized map[string]any, with map[string]any, op string) error {
+	op = strings.TrimSpace(op)
+	if op == "" {
+		return ir.NewValidationError("action", normalized["action"], fmt.Errorf("redis action requires an operation name"))
+	}
+	if with == nil {
+		with = map[string]any{}
+	}
+	if existing, ok := with["command"]; ok && !strings.EqualFold(fmt.Sprintf("%v", existing), op) {
+		return ir.NewValidationError("with.command", existing, fmt.Errorf("command must be %q for this action", strings.ToUpper(op)))
+	}
+	with["command"] = strings.ToUpper(op)
+	return finishAction(normalized, "redis", with)
+}
+
+func normalizeNoopAction(normalized map[string]any, with map[string]any) error {
+	if len(with) > 0 {
+		return ir.NewValidationError("with", with, fmt.Errorf("noop does not accept with"))
+	}
+	return finishAction(normalized, "noop", nil)
+}
+
+func isBuiltinActionName(name string) bool {
+	name = strings.TrimSpace(name)
+	if _, ok := builtinActionNormalizers[name]; ok {
+		return true
+	}
+	return strings.HasPrefix(name, "redis.") && strings.TrimPrefix(name, "redis.") != ""
+}

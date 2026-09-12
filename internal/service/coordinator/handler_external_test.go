@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	coord "github.com/dagucloud/dagu/internal/service/coordinator"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	coord "github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,18 +22,18 @@ func TestHandlerPollReleasesClaimWhenTaskEncodingFails(t *testing.T) {
 	t.Parallel()
 
 	store := &claimReleaseStore{
-		claimed: &exec.ClaimedDispatchTask{
-			Task: &exec.DispatchTask{
+		claimed: &dispatch.ClaimedDispatchTask{
+			Task: &dispatch.DispatchTask{
 				DAGRunID: "run-invalid-port",
 				Target:   "dag-invalid-port",
-				Owner:    exec.CoordinatorEndpoint{Port: -1},
+				Owner:    dispatch.CoordinatorEndpoint{Port: -1},
 			},
 			ClaimToken: "claim-invalid-port",
 		},
 	}
 	handler := coord.NewHandler(coord.HandlerConfig{
 		DispatchTaskStore: store,
-		Owner:             exec.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 1234},
+		Owner:             dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 1234},
 	})
 
 	resp, err := handler.Poll(context.Background(), &coordinatorv1.PollRequest{
@@ -90,8 +90,8 @@ func TestHandlerPollDistributedWakeClaimsWithoutTimer(t *testing.T) {
 	}()
 
 	store.WaitForClaimCalls(t, 1)
-	store.SetClaimed(&exec.ClaimedDispatchTask{
-		Task: &exec.DispatchTask{
+	store.SetClaimed(&dispatch.ClaimedDispatchTask{
+		Task: &dispatch.DispatchTask{
 			DAGRunID:   "run-wake",
 			Target:     "dag-wake",
 			Definition: "name: dag-wake\nsteps:\n  - name: step\n    run: echo wake",
@@ -136,8 +136,8 @@ func TestHandlerPollDistributedFallbackTimerClaimsWithoutWake(t *testing.T) {
 	}()
 
 	store.WaitForClaimCalls(t, 1)
-	store.SetClaimed(&exec.ClaimedDispatchTask{
-		Task: &exec.DispatchTask{
+	store.SetClaimed(&dispatch.ClaimedDispatchTask{
+		Task: &dispatch.DispatchTask{
 			DAGRunID:   "run-fallback",
 			Target:     "dag-fallback",
 			Definition: "name: dag-fallback\nsteps:\n  - name: step\n    run: echo fallback",
@@ -227,22 +227,22 @@ func TestHandlerPollDistributedWakeDoesNotBlockManyPollers(t *testing.T) {
 }
 
 type claimReleaseStore struct {
-	claimed       *exec.ClaimedDispatchTask
+	claimed       *dispatch.ClaimedDispatchTask
 	releasedToken string
 }
 
-func (s *claimReleaseStore) Enqueue(context.Context, *exec.DispatchTask) error {
+func (s *claimReleaseStore) Enqueue(context.Context, *dispatch.DispatchTask) error {
 	return nil
 }
 
-func (s *claimReleaseStore) ClaimNext(context.Context, exec.DispatchTaskClaim) (*exec.ClaimedDispatchTask, error) {
+func (s *claimReleaseStore) ClaimNext(context.Context, dispatch.DispatchTaskClaim) (*dispatch.ClaimedDispatchTask, error) {
 	claimed := s.claimed
 	s.claimed = nil
 	return claimed, nil
 }
 
-func (s *claimReleaseStore) GetClaim(context.Context, string) (*exec.ClaimedDispatchTask, error) {
-	return nil, exec.ErrDispatchTaskNotFound
+func (s *claimReleaseStore) GetClaim(context.Context, string) (*dispatch.ClaimedDispatchTask, error) {
+	return nil, dispatch.ErrDispatchTaskNotFound
 }
 
 func (s *claimReleaseStore) ReleaseClaim(_ context.Context, claimToken string) error {
@@ -254,6 +254,10 @@ func (s *claimReleaseStore) DeleteClaim(context.Context, string) error {
 	return nil
 }
 
+func (s *claimReleaseStore) ListBundleDigests(context.Context) ([]string, error) {
+	return nil, nil
+}
+
 func (s *claimReleaseStore) CountOutstandingByQueue(context.Context, string, time.Duration) (int, error) {
 	return 0, nil
 }
@@ -263,21 +267,21 @@ func (s *claimReleaseStore) HasOutstandingAttempt(context.Context, string, time.
 }
 
 type pollingDispatchStore struct {
-	claimed    atomic.Pointer[exec.ClaimedDispatchTask]
+	claimed    atomic.Pointer[dispatch.ClaimedDispatchTask]
 	claimCalls atomic.Int64
 }
 
-func (s *pollingDispatchStore) Enqueue(context.Context, *exec.DispatchTask) error {
+func (s *pollingDispatchStore) Enqueue(context.Context, *dispatch.DispatchTask) error {
 	return nil
 }
 
-func (s *pollingDispatchStore) ClaimNext(context.Context, exec.DispatchTaskClaim) (*exec.ClaimedDispatchTask, error) {
+func (s *pollingDispatchStore) ClaimNext(context.Context, dispatch.DispatchTaskClaim) (*dispatch.ClaimedDispatchTask, error) {
 	s.claimCalls.Add(1)
 	return s.claimed.Swap(nil), nil
 }
 
-func (s *pollingDispatchStore) GetClaim(context.Context, string) (*exec.ClaimedDispatchTask, error) {
-	return nil, exec.ErrDispatchTaskNotFound
+func (s *pollingDispatchStore) GetClaim(context.Context, string) (*dispatch.ClaimedDispatchTask, error) {
+	return nil, dispatch.ErrDispatchTaskNotFound
 }
 
 func (s *pollingDispatchStore) ReleaseClaim(context.Context, string) error {
@@ -288,6 +292,10 @@ func (s *pollingDispatchStore) DeleteClaim(context.Context, string) error {
 	return nil
 }
 
+func (s *pollingDispatchStore) ListBundleDigests(context.Context) ([]string, error) {
+	return nil, nil
+}
+
 func (s *pollingDispatchStore) CountOutstandingByQueue(context.Context, string, time.Duration) (int, error) {
 	return 0, nil
 }
@@ -296,7 +304,7 @@ func (s *pollingDispatchStore) HasOutstandingAttempt(context.Context, string, ti
 	return false, nil
 }
 
-func (s *pollingDispatchStore) SetClaimed(claimed *exec.ClaimedDispatchTask) {
+func (s *pollingDispatchStore) SetClaimed(claimed *dispatch.ClaimedDispatchTask) {
 	s.claimed.Store(claimed)
 }
 

@@ -11,8 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	indexv1 "github.com/dagucloud/dagu/proto/index/v1"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	indexv1 "github.com/dagucloud/dagu/v2/proto/index/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -172,7 +173,7 @@ func TestBuild_BasicDAGs(t *testing.T) {
 	}
 
 	// Register executor capabilities for testing.
-	core.RegisterExecutorCapabilities("", core.ExecutorCapabilities{
+	registry.RegisterExecutorCapabilities("", registry.ExecutorCapabilities{
 		Command: true, MultipleCommands: true, Script: true, Shell: true,
 	})
 
@@ -195,6 +196,25 @@ func TestBuild_BasicDAGs(t *testing.T) {
 	require.NotNil(t, legacyEntry)
 	assert.Contains(t, legacyEntry.Labels, "env=legacy")
 	assert.Empty(t, legacyEntry.LoadError)
+}
+
+func TestBuild_UsesEntryNameForResolvedLoadPath(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := filepath.Join(t.TempDir(), "resolved-target-name-that-is-not-the-entry.yaml")
+	require.NoError(t, os.WriteFile(targetPath, []byte("steps: []\n"), 0600))
+
+	info, err := os.Stat(targetPath)
+	require.NoError(t, err)
+	idx := Build(context.Background(), dir, []YAMLFileMeta{{
+		Name:     "entry-name.yaml",
+		LoadPath: targetPath,
+		Size:     info.Size(),
+		ModTime:  info.ModTime().UnixNano(),
+	}}, nil)
+
+	require.Len(t, idx.Entries, 1)
+	assert.Equal(t, "entry-name", idx.Entries[0].Name)
+	assert.Empty(t, idx.Entries[0].LoadError)
 }
 
 func TestBuild_WithBuildErrors(t *testing.T) {
@@ -250,7 +270,7 @@ func TestRoundTrip(t *testing.T) {
 	oneOffContent := []byte("name: roundtrip-one-off\nschedule:\n  - at: \"2026-03-29T02:10:00+01:00\"\nsteps:\n  - name: s1\n    command: echo ok\n")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "rt-one-off.yaml"), oneOffContent, 0600))
 
-	core.RegisterExecutorCapabilities("", core.ExecutorCapabilities{
+	registry.RegisterExecutorCapabilities("", registry.ExecutorCapabilities{
 		Command: true, MultipleCommands: true, Script: true, Shell: true,
 	})
 
@@ -278,14 +298,14 @@ func TestRoundTrip(t *testing.T) {
 	assert.Equal(t, "roundtrip", cronDAG.Name)
 	assert.Contains(t, cronDAG.Labels.Strings(), "team=backend")
 	require.Len(t, cronDAG.Schedule, 1)
-	assert.Equal(t, core.ScheduleKindCron, cronDAG.Schedule[0].GetKind())
+	assert.Equal(t, ir.ScheduleKindCron, cronDAG.Schedule[0].GetKind())
 	assert.Equal(t, "0 * * * *", cronDAG.Schedule[0].Expression)
 	assert.NotNil(t, cronDAG.Schedule[0].Parsed)
 
 	oneOffDAG := DAGFromEntry(entries[1], dir)
 	assert.Equal(t, "roundtrip-one-off", oneOffDAG.Name)
 	require.Len(t, oneOffDAG.Schedule, 1)
-	assert.Equal(t, core.ScheduleKindAt, oneOffDAG.Schedule[0].GetKind())
+	assert.Equal(t, ir.ScheduleKindAt, oneOffDAG.Schedule[0].GetKind())
 	assert.Equal(t, "2026-03-29T02:10:00+01:00", oneOffDAG.Schedule[0].At)
 	oneOffTime, ok := oneOffDAG.Schedule[0].OneOffTime()
 	require.True(t, ok)
@@ -337,7 +357,7 @@ func TestBuild_WithSuspendFlags(t *testing.T) {
 	dagContent := []byte("name: flagged-dag\nsteps:\n  - name: step1\n    command: echo hello\n")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "flagged.yaml"), dagContent, 0600))
 
-	core.RegisterExecutorCapabilities("", core.ExecutorCapabilities{
+	registry.RegisterExecutorCapabilities("", registry.ExecutorCapabilities{
 		Command: true, MultipleCommands: true, Script: true, Shell: true,
 	})
 
@@ -348,7 +368,7 @@ func TestBuild_WithSuspendFlags(t *testing.T) {
 		{Name: "flagged.yaml", Size: info.Size(), ModTime: info.ModTime().UnixNano()},
 	}
 
-	flags := SuspendFlags{"flagged-dag.suspend": {}}
+	flags := SuspendFlags{"flagged.suspend": {}}
 	idx := Build(context.Background(), dir, files, flags)
 	require.Len(t, idx.Entries, 1)
 	assert.True(t, idx.Entries[0].Suspended)
@@ -357,7 +377,7 @@ func TestBuild_WithSuspendFlags(t *testing.T) {
 func TestBuild_ContextCancellation(t *testing.T) {
 	dir := t.TempDir()
 
-	core.RegisterExecutorCapabilities("", core.ExecutorCapabilities{
+	registry.RegisterExecutorCapabilities("", registry.ExecutorCapabilities{
 		Command: true, MultipleCommands: true, Script: true, Shell: true,
 	})
 

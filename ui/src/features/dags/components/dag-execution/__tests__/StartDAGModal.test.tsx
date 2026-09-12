@@ -1,7 +1,13 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -71,6 +77,95 @@ beforeEach(() => {
 });
 
 describe('StartDAGModal', () => {
+  it('groups run settings separately from DAG parameters', () => {
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn()}
+        dag={
+          {
+            name: 'typed-dag',
+            paramDefs: [
+              {
+                name: 'region',
+                type: 'string',
+                required: true,
+              },
+            ],
+          } as never
+        }
+        defaultProfile="prod"
+      />
+    );
+
+    const runSettings = screen.getByRole('group', { name: 'Run settings' });
+    expect(
+      within(runSettings).getByRole('checkbox', { name: 'Enqueue' })
+    ).toBeInTheDocument();
+    expect(
+      within(runSettings).getByRole('textbox', {
+        name: 'DAG-Run ID (optional)',
+      })
+    ).toBeInTheDocument();
+    expect(
+      within(runSettings).getByRole('combobox', { name: 'Profile' })
+    ).toBeInTheDocument();
+
+    const parameters = screen.getByRole('region', { name: 'Parameters' });
+    expect(within(parameters).getByLabelText(/region/i)).toBeInTheDocument();
+  });
+
+  it('toggles between compact and fullscreen layouts', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn()}
+        dag={{ name: 'example-dag' } as never}
+      />
+    );
+
+    const maximizeButton = screen.getByRole('button', {
+      name: 'Maximize dialog',
+    });
+    expect(maximizeButton).toHaveAttribute('aria-pressed', 'false');
+
+    await user.click(maximizeButton);
+
+    const restoreButton = screen.getByRole('button', {
+      name: 'Restore dialog',
+    });
+    expect(restoreButton).toHaveAttribute('aria-pressed', 'true');
+
+    await user.click(restoreButton);
+
+    expect(
+      screen.getByRole('button', { name: 'Maximize dialog' })
+    ).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('focuses a submission error so it is visible in the scroll area', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn().mockRejectedValue(new Error('Backend unavailable'))}
+        dag={{ name: 'example-dag' } as never}
+      />
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Start' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Backend unavailable');
+    await waitFor(() => expect(alert).toHaveFocus());
+  });
+
   it('renders the schema-backed form path and submits a JSON object payload', async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
 
@@ -85,15 +180,19 @@ describe('StartDAGModal', () => {
             paramSchema: {
               type: 'object',
               properties: {
+                count: {
+                  type: 'integer',
+                },
                 region: {
                   type: 'string',
                   enum: ['us-east-1', 'us-west-2'],
                 },
-                count: {
-                  type: 'integer',
-                },
               },
             },
+            paramDefs: [
+              { name: 'region', type: 'string', required: false },
+              { name: 'count', type: 'integer', required: false },
+            ],
             defaultParams: 'region="us-east-1" count="3"',
           } as never
         }
@@ -105,6 +204,7 @@ describe('StartDAGModal', () => {
       expect.objectContaining({
         formData: { region: 'us-east-1', count: 3 },
         uiSchema: expect.objectContaining({
+          'ui:order': ['region', 'count', '*'],
           region: expect.objectContaining({ 'ui:widget': 'radio' }),
         }),
         templates: expect.objectContaining({
@@ -349,6 +449,37 @@ describe('StartDAGModal', () => {
 
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith('', undefined, true, '')
+    );
+  });
+
+  it('can disable reuse for a build run', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={onSubmit}
+        dag={{ name: 'build-dag', type: 'build' } as never}
+      />
+    );
+
+    await user.click(
+      screen.getByRole('checkbox', {
+        name: /disable reuse for this run/i,
+      })
+    );
+    await user.click(screen.getByRole('button', { name: 'Start' }));
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(
+        '',
+        undefined,
+        true,
+        undefined,
+        true
+      )
     );
   });
 });

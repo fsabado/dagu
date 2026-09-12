@@ -15,6 +15,8 @@ var (
 	// ErrUserAlreadyExists is returned when attempting to create a user
 	// with a username that already exists.
 	ErrUserAlreadyExists = errors.New("user already exists")
+	// ErrUserDisabled is returned when an operation requires an enabled user.
+	ErrUserDisabled = errors.New("your account has been disabled, contact administrator")
 	// ErrInvalidUsername is returned when the username is invalid.
 	ErrInvalidUsername = errors.New("invalid username")
 	// ErrInvalidUserID is returned when the user ID is invalid.
@@ -24,6 +26,15 @@ var (
 	// ErrOIDCIdentityAlreadyExists is returned when attempting to create a user
 	// with an OIDC identity that already exists.
 	ErrOIDCIdentityAlreadyExists = errors.New("OIDC identity already exists")
+	// ErrTrustedProxyIdentityNotFound is returned when a proxy identity cannot be found.
+	ErrTrustedProxyIdentityNotFound = errors.New("proxy identity not found")
+	// ErrTrustedProxyIdentityAlreadyExists is returned when attempting to create a user
+	// with a proxy identity that already exists.
+	ErrTrustedProxyIdentityAlreadyExists = errors.New("proxy identity already exists")
+	// ErrInvalidTrustedProxyIdentity is returned when the provider and trusted identity are inconsistent.
+	ErrInvalidTrustedProxyIdentity = errors.New("invalid proxy identity")
+	// ErrTrustedProxyIdentityImmutable is returned when an existing trusted identity is changed.
+	ErrTrustedProxyIdentityImmutable = errors.New("proxy identity is immutable")
 )
 
 // Common errors for API key store operations.
@@ -87,6 +98,10 @@ type UserStore interface {
 	// Returns ErrOIDCIdentityNotFound if no user exists with the given OIDC identity.
 	GetByOIDCIdentity(ctx context.Context, issuer, subject string) (*User, error)
 
+	// GetByTrustedProxyIdentity retrieves a user by their proxy identity source and user.
+	// Returns ErrTrustedProxyIdentityNotFound if no user exists with the given identity.
+	GetByTrustedProxyIdentity(ctx context.Context, source, user string) (*User, error)
+
 	// List returns all users in the store.
 	List(ctx context.Context) ([]*User, error)
 
@@ -94,12 +109,46 @@ type UserStore interface {
 	// Returns ErrUserNotFound if the user does not exist.
 	Update(ctx context.Context, user *User) error
 
+	// Patch atomically applies the non-nil fields in patch to an existing user.
+	// Returns the stored user after the update.
+	Patch(ctx context.Context, id string, patch UserPatch) (*User, error)
+
 	// Delete removes a user by their ID.
 	// Returns ErrUserNotFound if the user does not exist.
 	Delete(ctx context.Context, id string) error
 
 	// Count returns the total number of users.
 	Count(ctx context.Context) (int64, error)
+}
+
+// UserPatch contains independently updateable account fields.
+type UserPatch struct {
+	Username        *string
+	Role            *Role
+	WorkspaceAccess *WorkspaceAccess
+	PasswordHash    *string
+	IsDisabled      *bool
+}
+
+// AuthorizationSyncResult describes an atomic authorization synchronization.
+type AuthorizationSyncResult struct {
+	// User is the current stored user.
+	User *User
+	// Changed reports whether the synchronization modified authorization.
+	Changed bool
+	// PreviousRole is the role observed immediately before synchronization.
+	PreviousRole Role
+	// PreviousWorkspaceAccess is the workspace policy observed immediately before synchronization.
+	PreviousWorkspaceAccess *WorkspaceAccess
+}
+
+// AuthorizationSyncUserStore atomically synchronizes externally managed authorization.
+type AuthorizationSyncUserStore interface {
+	UserStore
+
+	// SyncAuthorization updates role and, when non-nil, workspace access on an enabled user.
+	// It returns the current user and the authorization state observed under the same lock.
+	SyncAuthorization(ctx context.Context, id string, role Role, workspaceAccess *WorkspaceAccess) (AuthorizationSyncResult, error)
 }
 
 // APIKeyStore defines the interface for API key persistence operations.
@@ -113,10 +162,15 @@ type APIKeyStore interface {
 	// Returns ErrAPIKeyNotFound if the API key does not exist.
 	GetByID(ctx context.Context, id string) (*APIKey, error)
 
+	// GetByDigest retrieves an API key by its credential digest.
+	// Returns ErrAPIKeyNotFound if the API key does not exist.
+	GetByDigest(ctx context.Context, digest string) (*APIKey, error)
+
 	// List returns all API keys in the store.
 	List(ctx context.Context) ([]*APIKey, error)
 
 	// Update modifies an existing API key.
+	// Credential fields and a newer LastUsedAt value in storage are preserved.
 	// Returns ErrAPIKeyNotFound if the API key does not exist.
 	Update(ctx context.Context, key *APIKey) error
 
@@ -124,8 +178,11 @@ type APIKeyStore interface {
 	// Returns ErrAPIKeyNotFound if the API key does not exist.
 	Delete(ctx context.Context, id string) error
 
-	// UpdateLastUsed updates the LastUsedAt timestamp for an API key.
-	// This is called when the API key is used for authentication.
+	// PromoteDigest atomically assigns a credential digest to an API key.
+	// Repeating the promotion with the same digest is idempotent.
+	PromoteDigest(ctx context.Context, id, digest string) error
+
+	// UpdateLastUsed records recent API key use without persisting more than once per minute.
 	UpdateLastUsed(ctx context.Context, id string) error
 }
 

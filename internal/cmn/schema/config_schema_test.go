@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/stretchr/testify/require"
 )
@@ -40,119 +40,6 @@ func TestConfigSchemaTopLevelPropertiesCoverDefinition(t *testing.T) {
 			field.Name,
 			key,
 		)
-	}
-}
-
-func TestConfigSchemaBotProviderValidation(t *testing.T) {
-	t.Parallel()
-
-	resolved := mustResolveConfigSchema(t)
-
-	tests := []struct {
-		name    string
-		spec    string
-		wantErr string
-	}{
-		{
-			name: "ValidTelegramBotConfig",
-			spec: `
-bots:
-  provider: telegram
-  safe_mode: true
-  telegram:
-    token: secret-token
-    allowed_chat_ids: [12345]
-`,
-		},
-		{
-			name: "ValidSlackBotConfig",
-			spec: `
-bots:
-  provider: slack
-  slack:
-    bot_token: xoxb-example
-    app_token: xapp-example
-    allowed_channel_ids: [C12345]
-    respond_to_all: true
-`,
-		},
-		{
-			name: "ValidLineBotConfig",
-			spec: `
-bots:
-  provider: line
-  line:
-    channel_access_token: line-channel-token
-    channel_secret: line-channel-secret
-    allowed_source_ids: [U12345, C67890]
-    respond_to_all: false
-`,
-		},
-		{
-			name: "ValidDiscordBotConfig",
-			spec: `
-bots:
-  provider: discord
-  discord:
-    token: discord-token
-    allowed_channel_ids: [C12345]
-    respond_to_all: true
-`,
-		},
-		{
-			name: "RejectInvalidProvider",
-			spec: `
-bots:
-  provider: unknown
-`,
-			wantErr: "bots",
-		},
-		{
-			name: "RejectTelegramWithoutAllowedChats",
-			spec: `
-bots:
-  provider: telegram
-  telegram:
-    token: secret-token
-`,
-			wantErr: "bots",
-		},
-		{
-			name: "RejectSlackWithoutTokens",
-			spec: `
-bots:
-  provider: slack
-  slack:
-    allowed_channel_ids: [C12345]
-`,
-			wantErr: "bots",
-		},
-		{
-			name: "RejectLineWithoutChannelSecret",
-			spec: `
-bots:
-  provider: line
-  line:
-    channel_access_token: line-channel-token
-    allowed_source_ids: [U12345]
-`,
-			wantErr: "bots",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			doc := mustParseYAMLDocument(t, tt.spec)
-			err := resolved.Validate(doc)
-			if tt.wantErr == "" {
-				require.NoError(t, err)
-				return
-			}
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.wantErr)
-		})
 	}
 }
 
@@ -185,6 +72,411 @@ check_updates: false
 
 			doc := mustParseYAMLDocument(t, tt.spec)
 			require.NoError(t, resolved.Validate(doc))
+		})
+	}
+}
+
+func TestConfigSchemaIPAccess(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveConfigSchema(t)
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{
+			name: "AddressesAndNetworks",
+			spec: `
+ip_access:
+  allowed_ips:
+    - 203.0.113.10
+    - 10.0.0.0/8
+  trusted_proxies:
+    - 127.0.0.1
+    - 2001:db8::/32
+`,
+		},
+		{
+			name: "RejectsNonStringEntry",
+			spec: `
+ip_access:
+  allowed_ips:
+    - 42
+`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			doc := mustParseYAMLDocument(t, tt.spec)
+			err := resolved.Validate(doc)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestConfigSchemaOIDCWorkspaceMappings(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveConfigSchema(t)
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{
+			name: "Valid",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: payments
+            role: operator
+          - workspace: infra
+            role: developer
+      default_workspace_access: none
+`,
+		},
+		{
+			name: "ValidExplicitAll",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: payments
+            role: viewer
+      default_workspace_access: all
+`,
+		},
+		{
+			name: "ValidEmptyMappingsWithoutDefault",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings: {}
+`,
+		},
+		{
+			name: "MissingDefaultWithMappings",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: payments
+            role: viewer
+`,
+			wantErr: true,
+		},
+		{
+			name: "AdminGrant",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: payments
+            role: admin
+`,
+			wantErr: true,
+		},
+		{
+			name: "BlankGroup",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        " ":
+          - workspace: payments
+            role: viewer
+`,
+			wantErr: true,
+		},
+		{
+			name: "EmptyGrants",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team: []
+`,
+			wantErr: true,
+		},
+		{
+			name: "InvalidWorkspace",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: bad/name
+            role: viewer
+`,
+			wantErr: true,
+		},
+		{
+			name: "ReservedWorkspaceAll",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: all
+            role: viewer
+      default_workspace_access: none
+`,
+			wantErr: true,
+		},
+		{
+			name: "ReservedWorkspaceDefaultMixedCase",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: DeFaUlT
+            role: viewer
+      default_workspace_access: none
+`,
+			wantErr: true,
+		},
+		{
+			name: "ReservedWorkspaceGlobal",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      workspace_mappings:
+        sre-team:
+          - workspace: global
+            role: viewer
+      default_workspace_access: none
+`,
+			wantErr: true,
+		},
+		{
+			name: "InvalidDefault",
+			spec: `
+auth:
+  oidc:
+    role_mapping:
+      default_workspace_access: restricted
+`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			doc := mustParseYAMLDocument(t, tt.spec)
+			err := resolved.Validate(doc)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestConfigSchemaProxy(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveConfigSchema(t)
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{
+			name: "DisabledByDefault",
+			spec: `
+auth:
+  mode: builtin
+  proxy: {}
+`,
+		},
+		{
+			name: "ValidWithDefaultMappingPolicy",
+			spec: `
+auth:
+  mode: builtin
+  proxy:
+    enabled: true
+    headers:
+      user: X-Auth-Request-User
+`,
+		},
+		{
+			name: "ValidMappings",
+			spec: `
+auth:
+  mode: builtin
+  proxy:
+    enabled: true
+    source: corp-sso
+    button_label: Company SSO
+    headers:
+      user: X-Auth-Request-User
+      groups: X-Auth-Request-Groups
+    auto_signup: false
+    role_mapping:
+      default_role: viewer
+      default_workspace_access: none
+      require_mapping: true
+      skip_org_role_sync: false
+      group_mappings:
+        admins: admin
+      workspace_mappings:
+        developers:
+          - workspace: payments
+            role: developer
+`,
+		},
+		{
+			name: "RequiredMappingMustBeConfigured",
+			spec: `
+auth:
+  mode: builtin
+  proxy:
+    enabled: true
+    headers:
+      user: X-Auth-Request-User
+    role_mapping:
+      require_mapping: true
+`,
+			wantErr: true,
+		},
+		{
+			name: "SourceTooLong",
+			spec: `
+auth:
+  proxy:
+    source: ` + strings.Repeat("x", 129) + `
+`,
+			wantErr: true,
+		},
+		{
+			name: "EnabledRequiresUserHeader",
+			spec: `
+auth:
+  proxy:
+    enabled: true
+`,
+			wantErr: true,
+		},
+		{
+			name: "GroupMappingsRequireGroupsHeader",
+			spec: `
+auth:
+  proxy:
+    headers:
+      user: X-Auth-Request-User
+    role_mapping:
+      group_mappings:
+        admins: admin
+`,
+			wantErr: true,
+		},
+		{
+			name: "WorkspaceMappingsRequireGroupsHeader",
+			spec: `
+auth:
+  proxy:
+    headers:
+      user: X-Auth-Request-User
+    role_mapping:
+      workspace_mappings:
+        developers:
+          - workspace: payments
+            role: developer
+`,
+			wantErr: true,
+		},
+		{
+			name: "InvalidGlobalRole",
+			spec: `
+auth:
+  proxy:
+    role_mapping:
+      group_mappings:
+        admins: owner
+`,
+			wantErr: true,
+		},
+		{
+			name: "WorkspaceAdminRole",
+			spec: `
+auth:
+  proxy:
+    headers:
+      groups: X-Auth-Request-Groups
+    role_mapping:
+      workspace_mappings:
+        developers:
+          - workspace: payments
+            role: admin
+`,
+			wantErr: true,
+		},
+		{
+			name: "InvalidWorkspace",
+			spec: `
+auth:
+  proxy:
+    headers:
+      groups: X-Auth-Request-Groups
+    role_mapping:
+      workspace_mappings:
+        developers:
+          - workspace: bad/name
+            role: viewer
+`,
+			wantErr: true,
+		},
+		{
+			name: "UnexpectedProperty",
+			spec: `
+auth:
+  proxy:
+    enabled: false
+    unexpected: true
+`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			doc := mustParseYAMLDocument(t, tt.spec)
+			err := resolved.Validate(doc)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
 		})
 	}
 }

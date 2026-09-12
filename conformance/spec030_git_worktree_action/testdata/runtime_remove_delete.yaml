@@ -1,0 +1,26 @@
+params:
+  - name: working_dir
+    type: string
+    required: true
+  - name: branch
+    type: string
+    required: true
+working_dir: .
+steps:
+  - id: remove
+    working_dir: "${params.working_dir}"
+    action: git.worktree.remove
+    with:
+      branch: "${params.branch}"
+      delete_branch: true
+    stderr: ../action-stderr.txt
+
+  - id: capture
+    depends: remove
+    run: |
+      printf '%s\n' \
+        'path=${steps.remove.outputs.path}' \
+        'branch=${steps.remove.outputs.branch}' \
+        'worktree_removed=${steps.remove.outputs.worktree_removed}' \
+        'branch_deleted=${steps.remove.outputs.branch_deleted}'
+    stdout: action-outputs.txt

@@ -12,12 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/cmn/procutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/proc"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 )
 
 // panicToError converts a panic value to an error, including stack trace.
@@ -31,8 +33,8 @@ func panicToError(r any) error {
 
 // ZombieDetector finds and cleans up zombie DAG runs
 type ZombieDetector struct {
-	dagRunStore      exec.DAGRunStore
-	procStore        exec.ProcStore
+	dagRunRepository *persis.DAGRunRepository
+	procRepository   zombieProcessRepository
 	interval         time.Duration
 	failureThreshold int
 	staleCounters    map[string]int // attempt identity -> consecutive stale count
@@ -44,8 +46,8 @@ type ZombieDetector struct {
 
 // NewZombieDetector creates a new zombie detector
 func NewZombieDetector(
-	dagRunStore exec.DAGRunStore,
-	procStore exec.ProcStore,
+	dagRunRepository *persis.DAGRunRepository,
+	procRepository zombieProcessRepository,
 	interval time.Duration,
 	failureThreshold int,
 ) *ZombieDetector {
@@ -56,8 +58,8 @@ func NewZombieDetector(
 		failureThreshold = 3
 	}
 	return &ZombieDetector{
-		dagRunStore:      dagRunStore,
-		procStore:        procStore,
+		dagRunRepository: dagRunRepository,
+		procRepository:   procRepository,
 		interval:         interval,
 		failureThreshold: failureThreshold,
 		staleCounters:    make(map[string]int),
@@ -116,16 +118,16 @@ func (z *ZombieDetector) clearAttemptState(attemptKey string) {
 	delete(z.staleCounters, attemptKey)
 }
 
-func (z *ZombieDetector) findAttempt(ctx context.Context, entry exec.ProcEntry) (exec.DAGRunAttempt, error) {
+func (z *ZombieDetector) findAttempt(ctx context.Context, entry proc.ProcEntry) (dagrun.Attempt, error) {
 	if entry.IsRoot() {
-		return z.dagRunStore.FindAttempt(ctx, entry.Meta.DAGRun())
+		return z.dagRunRepository.FindAttempt(ctx, entry.Meta.DAGRun())
 	}
-	return z.dagRunStore.FindSubAttempt(ctx, entry.Meta.Root(), entry.Meta.DAGRunID)
+	return z.dagRunRepository.FindSubAttempt(ctx, entry.Meta.Root(), entry.Meta.DAGRunID)
 }
 
 // detectAndCleanZombies finds stale proc entries and repairs only the matching persisted attempt.
 func (z *ZombieDetector) detectAndCleanZombies(ctx context.Context) {
-	entries, err := z.procStore.ListAllEntries(ctx)
+	entries, err := z.procRepository.ListAllEntries(ctx)
 	if err != nil {
 		logger.Error(ctx, "Failed to list proc entries", tag.Error(err))
 		return
@@ -133,7 +135,7 @@ func (z *ZombieDetector) detectAndCleanZombies(ctx context.Context) {
 
 	logger.Debug(ctx, "Checking proc entries for zombie DAG runs", tag.Count(len(entries)))
 
-	freshByRunScope := make(map[string]exec.ProcEntry)
+	freshByRunScope := make(map[string]proc.ProcEntry)
 	activeAttemptKeys := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		activeAttemptKeys[entry.AttemptKey()] = struct{}{}
@@ -160,7 +162,7 @@ func (z *ZombieDetector) detectAndCleanZombies(ctx context.Context) {
 
 		if err := z.checkAndCleanZombie(ctx, entry, freshByRunScope); err != nil {
 			logger.Error(ctx, "Failed to check zombie status",
-				tag.Name(entry.Meta.Name),
+				tag.DAG(entry.Meta.Name),
 				tag.RunID(entry.Meta.DAGRunID),
 				tag.AttemptID(entry.Meta.AttemptID),
 				tag.Error(err))
@@ -183,7 +185,7 @@ func (z *ZombieDetector) detectAndCleanZombies(ctx context.Context) {
 }
 
 // checkAndCleanZombie checks if a single stale proc entry is a zombie candidate and cleans it up.
-func (z *ZombieDetector) checkAndCleanZombie(ctx context.Context, entry exec.ProcEntry, freshByRunScope map[string]exec.ProcEntry) error {
+func (z *ZombieDetector) checkAndCleanZombie(ctx context.Context, entry proc.ProcEntry, freshByRunScope map[string]proc.ProcEntry) error {
 	attemptKey := entry.AttemptKey()
 	ctx = logger.WithValues(ctx,
 		tag.DAG(entry.Meta.Name),
@@ -199,7 +201,7 @@ func (z *ZombieDetector) checkAndCleanZombie(ctx context.Context, entry exec.Pro
 
 	if sibling, ok := freshByRunScope[entry.RunScopeKey()]; ok && sibling.Meta.AttemptID != entry.Meta.AttemptID {
 		z.clearAttemptState(attemptKey)
-		if err := z.procStore.RemoveIfStale(ctx, entry); err != nil {
+		if err := z.procRepository.RemoveIfStale(ctx, entry); err != nil {
 			return fmt.Errorf("remove stale proc with fresh sibling: %w", err)
 		}
 		return nil
@@ -229,9 +231,9 @@ func (z *ZombieDetector) checkAndCleanZombie(ctx context.Context, entry exec.Pro
 	if err != nil {
 		return fmt.Errorf("read status: %w", err)
 	}
-	if status.AttemptID != entry.Meta.AttemptID || status.Status != core.Running {
+	if status.AttemptID != entry.Meta.AttemptID || status.Status != ir.Running {
 		z.clearAttemptState(attemptKey)
-		if err := z.procStore.RemoveIfStale(ctx, entry); err != nil {
+		if err := z.procRepository.RemoveIfStale(ctx, entry); err != nil {
 			return fmt.Errorf("remove mismatched stale proc: %w", err)
 		}
 		return nil
@@ -239,7 +241,7 @@ func (z *ZombieDetector) checkAndCleanZombie(ctx context.Context, entry exec.Pro
 
 	if status.WorkerID != "" && status.WorkerID != "local" {
 		z.clearAttemptState(attemptKey)
-		if err := z.procStore.RemoveIfStale(ctx, entry); err != nil {
+		if err := z.procRepository.RemoveIfStale(ctx, entry); err != nil {
 			return fmt.Errorf("remove remote stale proc: %w", err)
 		}
 		return nil
@@ -282,7 +284,7 @@ func (z *ZombieDetector) checkAndCleanZombie(ctx context.Context, entry exec.Pro
 		)
 	}
 
-	if err := z.procStore.RemoveIfStale(ctx, entry); err != nil {
+	if err := z.procRepository.RemoveIfStale(ctx, entry); err != nil {
 		return fmt.Errorf("remove stale proc after repair: %w", err)
 	}
 	z.clearAttemptState(attemptKey)
@@ -290,14 +292,14 @@ func (z *ZombieDetector) checkAndCleanZombie(ctx context.Context, entry exec.Pro
 	return nil
 }
 
-func (z *ZombieDetector) cleanupOrphanedStaleEntry(ctx context.Context, entry exec.ProcEntry, attemptKey string, findErr error) error {
-	if !errors.Is(findErr, exec.ErrDAGRunIDNotFound) &&
-		!errors.Is(findErr, exec.ErrNoStatusData) &&
-		!errors.Is(findErr, exec.ErrCorruptedStatusFile) {
+func (z *ZombieDetector) cleanupOrphanedStaleEntry(ctx context.Context, entry proc.ProcEntry, attemptKey string, findErr error) error {
+	if !errors.Is(findErr, dagrun.ErrDAGRunIDNotFound) &&
+		!errors.Is(findErr, dagrun.ErrNoStatusData) &&
+		!errors.Is(findErr, dagrun.ErrCorruptedStatusData) {
 		return fmt.Errorf("find attempt: %w", findErr)
 	}
 
-	if errors.Is(findErr, exec.ErrCorruptedStatusFile) {
+	if errors.Is(findErr, dagrun.ErrCorruptedStatusData) {
 		logger.Warn(ctx, "Removing orphaned stale proc entry with corrupted persisted DAG run state", tag.Error(findErr))
 	} else {
 		logger.Info(ctx, "Removing orphaned stale proc entry with missing persisted DAG run state", tag.Error(findErr))
@@ -305,7 +307,7 @@ func (z *ZombieDetector) cleanupOrphanedStaleEntry(ctx context.Context, entry ex
 	// A corrupted or missing status snapshot cannot be used for recovery, so the
 	// stale proc entry must be dropped to stop reporting the run as active.
 	z.clearAttemptState(attemptKey)
-	if err := z.procStore.RemoveIfStale(ctx, entry); err != nil {
+	if err := z.procRepository.RemoveIfStale(ctx, entry); err != nil {
 		return fmt.Errorf("remove orphaned stale proc: %w", err)
 	}
 	return nil

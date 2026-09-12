@@ -4,7 +4,7 @@
 import dayjs from 'dayjs';
 import { Layers, List, Search } from 'lucide-react';
 import React from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Status } from '../../api/v1/schema';
 import { Button } from '@/components/ui/button';
 import { DateRangePicker } from '@/components/ui/date-range-picker';
@@ -36,6 +36,9 @@ import {
 } from '../../lib/workspace';
 import StatusChip from '@/components/ui/status-chip';
 import Title from '@/components/ui/title';
+import type { StatusTab } from '@/features/dags/components/DAGStatus';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 type DAGRunsFilters = {
   searchText: string;
@@ -71,13 +74,13 @@ const STATUS_CONFIG: Record<Status, string> = {
 
 function StatusSelectDisplay({ status }: { status: string }): React.ReactNode {
   if (status === 'all') {
-    return 'All Statuses';
+    return <I18nText text="All Statuses" />;
   }
 
   const statusNum = parseInt(status) as Status;
   const label = STATUS_CONFIG[statusNum];
   if (label) {
-    return label;
+    return <I18nText text={label} />;
   }
 
   return null;
@@ -125,6 +128,7 @@ function supportsIntersectionObserver(): boolean {
 
 function DAGRuns() {
   const location = useLocation();
+  const navigate = useNavigate();
   const appBarContext = React.useContext(AppBarContext);
   const config = useConfig();
   const { preferences, updatePreference } = useUserPreferences();
@@ -253,7 +257,74 @@ function DAGRuns() {
   const [selectedDAGRun, setSelectedDAGRun] = React.useState<{
     name: string;
     dagRunId: string;
-  } | null>(null);
+  } | null>(() => {
+    const params = new URLSearchParams(location.search);
+    const name = params.get('selectedRunName');
+    const dagRunId = params.get('selectedRunId');
+    return name && dagRunId ? { name, dagRunId } : null;
+  });
+  const [selectedDAGRunInitialTab, setSelectedDAGRunInitialTab] =
+    React.useState<StatusTab>(() =>
+      new URLSearchParams(location.search).get('selectedRunTab') === 'artifacts'
+        ? 'artifacts'
+        : 'status'
+    );
+  const updateSelectedDAGRun = React.useCallback(
+    (
+      dagRun: { name: string; dagRunId: string } | null,
+      initialTab: StatusTab = 'status',
+      replace = false
+    ) => {
+      setSelectedDAGRun(dagRun);
+      setSelectedDAGRunInitialTab(initialTab);
+      const params = new URLSearchParams(location.search);
+      if (dagRun) {
+        params.set('selectedRunName', dagRun.name);
+        params.set('selectedRunId', dagRun.dagRunId);
+        if (initialTab === 'status') {
+          params.delete('selectedRunTab');
+        } else {
+          params.set('selectedRunTab', initialTab);
+        }
+      } else {
+        params.delete('selectedRunName');
+        params.delete('selectedRunId');
+        params.delete('selectedRunTab');
+      }
+      const search = params.toString();
+      navigate(
+        {
+          pathname: location.pathname,
+          search: search ? `?${search}` : '',
+        },
+        { replace }
+      );
+    },
+    [location.pathname, location.search, navigate]
+  );
+
+  React.useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const name = params.get('selectedRunName');
+    const dagRunId = params.get('selectedRunId');
+    setSelectedDAGRun(name && dagRunId ? { name, dagRunId } : null);
+    setSelectedDAGRunInitialTab(
+      params.get('selectedRunTab') === 'artifacts' ? 'artifacts' : 'status'
+    );
+  }, [location.search]);
+
+  const selectDAGRun = React.useCallback(
+    (dagRun: { name: string; dagRunId: string } | null) => {
+      updateSelectedDAGRun(dagRun);
+    },
+    [updateSelectedDAGRun]
+  );
+  const viewDAGRunArtifacts = React.useCallback(
+    (dagRun: { name: string; dagRunId: string }) => {
+      updateSelectedDAGRun(dagRun, 'artifacts');
+    },
+    [updateSelectedDAGRun]
+  );
   const loadMoreSentinelRef = React.useRef<HTMLDivElement>(null);
   const autoLoadPendingRef = React.useRef(false);
 
@@ -488,6 +559,7 @@ function DAGRuns() {
   );
   const {
     dagRuns,
+    isInitialLoading,
     isLoadingMore,
     loadMoreError,
     hasMore,
@@ -522,21 +594,23 @@ function DAGRuns() {
     toggleSelection,
   } = useBulkDAGRunSelection(dagRuns);
 
-  const addSearchParam = (key: string, value: string | undefined) => {
-    const locationQuery = new URLSearchParams(window.location.search);
-    if (key === 'labels') {
-      locationQuery.delete('tags');
+  const updateSearchParams = (updates: Record<string, string | undefined>) => {
+    const params = new URLSearchParams(location.search);
+    if ('labels' in updates) {
+      params.delete('tags');
     }
-    if (value && value.length > 0) {
-      locationQuery.set(key, value);
-    } else {
-      locationQuery.delete(key);
+    for (const [key, value] of Object.entries(updates)) {
+      if (value) {
+        params.set(key, value);
+      } else {
+        params.delete(key);
+      }
     }
-    window.history.pushState(
-      {},
-      '',
-      `${window.location.pathname}?${locationQuery.toString()}`
-    );
+    const search = params.toString();
+    navigate({
+      pathname: location.pathname,
+      search: search ? `?${search}` : '',
+    });
   };
 
   const handleSearch = (overrideStatus?: string) => {
@@ -551,20 +625,18 @@ function DAGRuns() {
     setApiFromDate(fromDate);
     setApiToDate(toDate);
 
-    // Update URL parameters
-    addSearchParam('name', searchText);
-    addSearchParam('dagRunId', dagRunId);
-    addSearchParam('status', statusToUse);
-    addSearchParam(
-      'labels',
-      selectedLabels.length > 0 ? selectedLabels.join(',') : undefined
-    );
-    addSearchParam('fromDate', fromDate);
-    addSearchParam('toDate', toDate);
-    addSearchParam('dateMode', dateRangeMode);
-    addSearchParam('preset', datePreset);
-    addSearchParam('specificValue', specificValue);
-    addSearchParam('specificPeriod', specificPeriod);
+    updateSearchParams({
+      name: searchText,
+      dagRunId,
+      status: statusToUse,
+      labels: selectedLabels.length > 0 ? selectedLabels.join(',') : undefined,
+      fromDate,
+      toDate,
+      dateMode: dateRangeMode,
+      preset: dateRangeMode === 'preset' ? datePreset : undefined,
+      specificValue: dateRangeMode === 'specific' ? specificValue : undefined,
+      specificPeriod: dateRangeMode === 'specific' ? specificPeriod : undefined,
+    });
   };
 
   const handleNameInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -586,10 +658,9 @@ function DAGRuns() {
   const updateLabels = (newLabels: string[]) => {
     setSelectedLabels(newLabels);
     setApiLabels(newLabels);
-    addSearchParam(
-      'labels',
-      newLabels.length > 0 ? newLabels.join(',') : undefined
-    );
+    updateSearchParams({
+      labels: newLabels.length > 0 ? newLabels.join(',') : undefined,
+    });
   };
 
   const handleViewModeChange = (value: string) => {
@@ -636,10 +707,12 @@ function DAGRuns() {
     setToDate(dates.to);
     setApiFromDate(dates.from);
     setApiToDate(dates.to);
-    addSearchParam('preset', preset);
-    addSearchParam('dateMode', 'preset');
-    addSearchParam('fromDate', dates.from);
-    addSearchParam('toDate', dates.to);
+    updateSearchParams({
+      preset,
+      dateMode: 'preset',
+      fromDate: dates.from,
+      toDate: dates.to,
+    });
   };
 
   const getSpecificPeriodDates = (
@@ -693,18 +766,19 @@ function DAGRuns() {
     setToDate(dates.to);
     setApiFromDate(dates.from);
     setApiToDate(dates.to);
-    addSearchParam('specificValue', value);
-    addSearchParam('specificPeriod', periodToUse);
-    addSearchParam('dateMode', 'specific');
-    addSearchParam('fromDate', dates.from);
-    addSearchParam('toDate', dates.to);
+    updateSearchParams({
+      specificValue: value,
+      specificPeriod: periodToUse,
+      dateMode: 'specific',
+      fromDate: dates.from,
+      toDate: dates.to,
+    });
   };
 
   const handleDateRangeModeChange = (
     newMode: 'preset' | 'specific' | 'custom'
   ) => {
     setDateRangeMode(newMode);
-    addSearchParam('dateMode', newMode);
 
     if (newMode === 'preset') {
       // Apply current preset
@@ -713,11 +787,14 @@ function DAGRuns() {
       setToDate(dates.to);
       setApiFromDate(dates.from);
       setApiToDate(dates.to);
-      addSearchParam('preset', datePreset);
-      addSearchParam('fromDate', dates.from);
-      addSearchParam('toDate', dates.to);
-      addSearchParam('specificValue', '');
-      addSearchParam('specificPeriod', '');
+      updateSearchParams({
+        dateMode: newMode,
+        preset: datePreset,
+        fromDate: dates.from,
+        toDate: dates.to,
+        specificValue: undefined,
+        specificPeriod: undefined,
+      });
     } else if (newMode === 'specific') {
       // Apply current specific period value
       const dates = getSpecificPeriodDates(specificPeriod, specificValue);
@@ -725,15 +802,21 @@ function DAGRuns() {
       setToDate(dates.to);
       setApiFromDate(dates.from);
       setApiToDate(dates.to);
-      addSearchParam('specificPeriod', specificPeriod);
-      addSearchParam('specificValue', specificValue);
-      addSearchParam('fromDate', dates.from);
-      addSearchParam('toDate', dates.to);
-      addSearchParam('preset', '');
+      updateSearchParams({
+        dateMode: newMode,
+        specificPeriod,
+        specificValue,
+        fromDate: dates.from,
+        toDate: dates.to,
+        preset: undefined,
+      });
     } else {
-      addSearchParam('preset', '');
-      addSearchParam('specificValue', '');
-      addSearchParam('specificPeriod', '');
+      updateSearchParams({
+        dateMode: newMode,
+        preset: undefined,
+        specificValue: undefined,
+        specificPeriod: undefined,
+      });
     }
   };
 
@@ -765,59 +848,75 @@ function DAGRuns() {
   return (
     <div className="max-w-7xl">
       <div className="flex items-center justify-between mb-2">
-        <Title>Executions</Title>
-        <ToggleGroup aria-label="View mode" className="h-9 p-0.5">
-          <ToggleButton
-            value="list"
-            groupValue={viewMode}
-            onClick={() => handleViewModeChange('list')}
-            position="first"
-            aria-label="List view"
-            className="h-8 px-3"
-          >
-            <List size={16} className="mr-1.5" />
-            List
-          </ToggleButton>
-          <ToggleButton
-            value="grouped"
-            groupValue={viewMode}
-            onClick={() => handleViewModeChange('grouped')}
-            position="last"
-            aria-label="Grouped view"
-            className="h-8 px-3"
-          >
-            <Layers size={16} className="mr-1.5" />
-            Grouped
-          </ToggleButton>
-        </ToggleGroup>
+        <Title>
+          <I18nText text={'Executions'} />
+        </Title>
+        <I18nProps>
+          <ToggleGroup aria-label="View mode" className="h-9 p-0.5">
+            <I18nProps>
+              <ToggleButton
+                value="list"
+                groupValue={viewMode}
+                onClick={() => handleViewModeChange('list')}
+                position="first"
+                aria-label="List view"
+                className="h-8 px-3"
+              >
+                <List size={16} className="mr-1.5" />
+                <I18nText text={'List'} />
+              </ToggleButton>
+            </I18nProps>
+            <I18nProps>
+              <ToggleButton
+                value="grouped"
+                groupValue={viewMode}
+                onClick={() => handleViewModeChange('grouped')}
+                position="last"
+                aria-label="Grouped view"
+                className="h-8 px-3"
+              >
+                <Layers size={16} className="mr-1.5" />
+                <I18nText text={'Grouped'} />
+              </ToggleButton>
+            </I18nProps>
+          </ToggleGroup>
+        </I18nProps>
       </div>
       <div>
         <div className="mb-3 space-y-3 rounded-lg border border-border bg-card/50 p-3">
           <div className="flex flex-wrap items-center gap-2">
-            <Input
-              placeholder="Filter by DAG name..."
-              value={searchText}
-              onChange={handleNameInputChange}
-              onKeyDown={handleInputKeyPress}
-              className="w-[200px]"
-            />
-            <Input
-              placeholder="Filter by Run ID..."
-              value={dagRunId}
-              onChange={handleDagRunIdInputChange}
-              onKeyDown={handleInputKeyPress}
-              className="w-[180px]"
-            />
+            <I18nProps>
+              <Input
+                placeholder="Filter by DAG name..."
+                value={searchText}
+                onChange={handleNameInputChange}
+                onKeyDown={handleInputKeyPress}
+                className="w-[200px]"
+              />
+            </I18nProps>
+            <I18nProps>
+              <Input
+                placeholder="Filter by Run ID..."
+                value={dagRunId}
+                onChange={handleDagRunIdInputChange}
+                onKeyDown={handleInputKeyPress}
+                className="w-[180px]"
+              />
+            </I18nProps>
             <Select value={status} onValueChange={handleStatusChange}>
-              <SelectTrigger aria-label="Status" className="w-[150px]">
-                <SelectValue placeholder="Status">
-                  <StatusSelectDisplay status={status} />
-                </SelectValue>
-              </SelectTrigger>
+              <I18nProps>
+                <SelectTrigger aria-label="Status" className="w-[150px]">
+                  <I18nProps>
+                    <SelectValue placeholder="Status">
+                      <StatusSelectDisplay status={status} />
+                    </SelectValue>
+                  </I18nProps>
+                </SelectTrigger>
+              </I18nProps>
               <SelectContent>
                 <SelectItem value="all">
                   <div className="inline-flex items-center rounded-full border bg-muted border-border text-foreground py-0.5 px-2 text-xs font-medium">
-                    All Statuses
+                    <I18nText text={'All Statuses'} />
                   </div>
                 </SelectItem>
                 {Object.entries(STATUS_CONFIG).map(([statusValue, label]) => (
@@ -826,73 +925,96 @@ function DAGRuns() {
                       status={Number(statusValue) as Status}
                       size="sm"
                     >
-                      {label}
+                      <I18nText text={label} />
                     </StatusChip>
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
             {/* Labels filter */}
-            <LabelCombobox
-              selectedLabels={selectedLabels}
-              onLabelsChange={updateLabels}
-              availableLabels={availableLabels}
-              placeholder="Filter by labels..."
-              className="h-9 min-w-[170px] max-w-[220px]"
-            />
-            <Button
-              onClick={() => handleSearch()}
-              className="px-4 font-medium"
-            >
+            <I18nProps>
+              <LabelCombobox
+                selectedLabels={selectedLabels}
+                onLabelsChange={updateLabels}
+                availableLabels={availableLabels}
+                placeholder="Filter by labels..."
+                className="h-9 min-w-[170px] max-w-[220px]"
+              />
+            </I18nProps>
+            <Button onClick={() => handleSearch()} className="px-4 font-medium">
               <Search className="mr-1.5 h-4 w-4" />
-              Search
+              <I18nText text={'Search'} />
             </Button>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <ToggleGroup aria-label="Date range mode" className="h-9 p-0.5">
-              <ToggleButton
-                value="preset"
-                groupValue={dateRangeMode}
-                onClick={() => handleDateRangeModeChange('preset')}
-                position="first"
-                aria-label="Quick select"
-                className="h-8 px-3"
-              >
-                Quick
-              </ToggleButton>
-              <ToggleButton
-                value="specific"
-                groupValue={dateRangeMode}
-                onClick={() => handleDateRangeModeChange('specific')}
-                position="middle"
-                aria-label="Specific date/month/year"
-                className="h-8 px-3"
-              >
-                Specific
-              </ToggleButton>
-              <ToggleButton
-                value="custom"
-                groupValue={dateRangeMode}
-                onClick={() => handleDateRangeModeChange('custom')}
-                position="last"
-                aria-label="Custom range"
-                className="h-8 px-3"
-              >
-                Custom
-              </ToggleButton>
-            </ToggleGroup>
+            <I18nProps>
+              <ToggleGroup aria-label="Date range mode" className="h-9 p-0.5">
+                <I18nProps>
+                  <ToggleButton
+                    value="preset"
+                    groupValue={dateRangeMode}
+                    onClick={() => handleDateRangeModeChange('preset')}
+                    position="first"
+                    aria-label="Quick select"
+                    className="h-8 px-3"
+                  >
+                    <I18nText text={'Quick'} />
+                  </ToggleButton>
+                </I18nProps>
+                <I18nProps>
+                  <ToggleButton
+                    value="specific"
+                    groupValue={dateRangeMode}
+                    onClick={() => handleDateRangeModeChange('specific')}
+                    position="middle"
+                    aria-label="Specific date/month/year"
+                    className="h-8 px-3"
+                  >
+                    <I18nText text={'Specific'} />
+                  </ToggleButton>
+                </I18nProps>
+                <I18nProps>
+                  <ToggleButton
+                    value="custom"
+                    groupValue={dateRangeMode}
+                    onClick={() => handleDateRangeModeChange('custom')}
+                    position="last"
+                    aria-label="Custom range"
+                    className="h-8 px-3"
+                  >
+                    <I18nText text={'Custom'} />
+                  </ToggleButton>
+                </I18nProps>
+              </ToggleGroup>
+            </I18nProps>
             {dateRangeMode === 'preset' ? (
               <Select value={datePreset} onValueChange={handleDatePresetChange}>
-                <SelectTrigger aria-label="Date preset" className="w-[180px]">
-                  <SelectValue placeholder="Select period" />
-                </SelectTrigger>
+                <I18nProps>
+                  <SelectTrigger aria-label="Date preset" className="w-[180px]">
+                    <I18nProps>
+                      <SelectValue placeholder="Select period" />
+                    </I18nProps>
+                  </SelectTrigger>
+                </I18nProps>
                 <SelectContent>
-                  <SelectItem value="today">Today</SelectItem>
-                  <SelectItem value="yesterday">Yesterday</SelectItem>
-                  <SelectItem value="last7days">Last 7 days</SelectItem>
-                  <SelectItem value="last30days">Last 30 days</SelectItem>
-                  <SelectItem value="thisWeek">This week</SelectItem>
-                  <SelectItem value="thisMonth">This month</SelectItem>
+                  <SelectItem value="today">
+                    <I18nText text={'Today'} />
+                  </SelectItem>
+                  <SelectItem value="yesterday">
+                    <I18nText text={'Yesterday'} />
+                  </SelectItem>
+                  <SelectItem value="last7days">
+                    <I18nText text={'Last 7 days'} />
+                  </SelectItem>
+                  <SelectItem value="last30days">
+                    <I18nText text={'Last 30 days'} />
+                  </SelectItem>
+                  <SelectItem value="thisWeek">
+                    <I18nText text={'This week'} />
+                  </SelectItem>
+                  <SelectItem value="thisMonth">
+                    <I18nText text={'This month'} />
+                  </SelectItem>
                 </SelectContent>
               </Select>
             ) : dateRangeMode === 'specific' ? (
@@ -923,16 +1045,24 @@ function DAGRuns() {
                     handleSpecificPeriodChange(newValue, newPeriod);
                   }}
                 >
-                  <SelectTrigger
-                    aria-label="Specific period"
-                    className="w-[120px]"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
+                  <I18nProps>
+                    <SelectTrigger
+                      aria-label="Specific period"
+                      className="w-[120px]"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                  </I18nProps>
                   <SelectContent>
-                    <SelectItem value="date">Date</SelectItem>
-                    <SelectItem value="month">Month</SelectItem>
-                    <SelectItem value="year">Year</SelectItem>
+                    <SelectItem value="date">
+                      <I18nText text={'Date'} />
+                    </SelectItem>
+                    <SelectItem value="month">
+                      <I18nText text={'Month'} />
+                    </SelectItem>
+                    <SelectItem value="year">
+                      <I18nText text={'Year'} />
+                    </SelectItem>
                   </SelectContent>
                 </Select>
                 <Input
@@ -970,16 +1100,20 @@ function DAGRuns() {
         {viewMode === 'list' ? (
           <DAGRunTable
             dagRuns={dagRuns}
+            isLoading={isInitialLoading}
             selectedDAGRun={selectedDAGRun}
-            onSelectDAGRun={setSelectedDAGRun}
+            onSelectDAGRun={selectDAGRun}
+            onViewArtifacts={viewDAGRunArtifacts}
             selectedRunKeys={selectedKeys}
             onToggleBulkSelect={toggleSelection}
           />
         ) : (
           <DAGRunGroupedView
             dagRuns={dagRuns}
+            isLoading={isInitialLoading}
             selectedDAGRun={selectedDAGRun}
-            onSelectDAGRun={setSelectedDAGRun}
+            onSelectDAGRun={selectDAGRun}
+            onViewArtifacts={viewDAGRunArtifacts}
             selectedRunKeys={selectedKeys}
             onToggleBulkSelect={toggleSelection}
           />
@@ -993,7 +1127,7 @@ function DAGRuns() {
               <div ref={loadMoreSentinelRef} className="h-4 w-full" />
               {isLoadingMore ? (
                 <div className="text-sm text-muted-foreground">
-                  Loading more DAG runs...
+                  <I18nText text={'Loading more DAG runs...'} />
                 </div>
               ) : (
                 <Button
@@ -1002,13 +1136,17 @@ function DAGRuns() {
                   size="sm"
                   onClick={() => void handleLoadMore()}
                 >
-                  {loadMoreError ? 'Retry loading more' : 'Load more'}
+                  {loadMoreError ? (
+                    <I18nText text={'Retry loading more'} />
+                  ) : (
+                    <I18nText text={'Load more'} />
+                  )}
                 </Button>
               )}
             </>
           ) : dagRuns.length > 0 ? (
             <div className="text-sm text-muted-foreground">
-              All loaded DAG runs are displayed.
+              <I18nText text={'All loaded DAG runs are displayed.'} />
             </div>
           ) : null}
         </div>
@@ -1020,7 +1158,8 @@ function DAGRuns() {
           name={selectedDAGRun.name}
           dagRunId={selectedDAGRun.dagRunId}
           isOpen={!!selectedDAGRun}
-          onClose={() => setSelectedDAGRun(null)}
+          onClose={() => updateSelectedDAGRun(null, 'status', true)}
+          initialTab={selectedDAGRunInitialTab}
         />
       )}
     </div>

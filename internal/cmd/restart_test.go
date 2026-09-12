@@ -8,11 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,7 +38,7 @@ steps:
 	}()
 
 	// Wait for the DAG to be running.
-	dag.AssertCurrentStatus(t, core.Running)
+	dag.AssertCurrentStatus(t, ir.Running)
 
 	// Restart the DAG.
 	done2 := make(chan struct{})
@@ -60,7 +59,8 @@ steps:
 	require.NoError(t, err)
 
 	// Check parameter was the same as the first execution
-	recentHistory := th.DAGRunMgr.ListRecentStatus(th.Context, loaded.Name, 2)
+	recentHistory, err := th.DAGRunRepository.RecentStatuses(th.Context, loaded.Name, 2)
+	require.NoError(t, err)
 
 	require.Len(t, recentHistory, 2)
 	require.Equal(t, recentHistory[0].Params, recentHistory[1].Params)
@@ -93,7 +93,7 @@ steps:
 
 	require.Eventually(t, func() bool {
 		status, err := th.DAGRunMgr.GetCurrentStatus(th.Context, dag.DAG, "")
-		return err == nil && status != nil && status.Status == core.Running
+		return err == nil && status != nil && status.Status == ir.Running
 	}, 10*time.Second, 100*time.Millisecond)
 
 	releaseDone := releaseHoldFileWhenRecentStatusCountAtLeastWithin(t, th, dag.Name, 2, release, holdTimeout)
@@ -104,10 +104,10 @@ steps:
 
 	latestStatus, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
 	require.NoError(t, err)
-	require.Equal(t, core.Succeeded, latestStatus.Status)
+	require.Equal(t, ir.Succeeded, latestStatus.Status)
 	require.Equal(t, "from-host|", test.StatusOutputValue(t, &latestStatus, "RESULT"))
 
-	latestAttempt, err := th.DAGRunStore.FindAttempt(th.Context, exec.NewDAGRunRef(dag.Name, latestStatus.DAGRunID))
+	latestAttempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, latestStatus.DAGRunID))
 	require.NoError(t, err)
 	latestAttemptStatus, err := latestAttempt.ReadStatus(th.Context)
 	require.NoError(t, err)
@@ -117,12 +117,5 @@ steps:
 func builtExecutableRestartWaitTimeout(t *testing.T) time.Duration {
 	t.Helper()
 
-	timeout := 6 * commandLogWaitTimeout()
-	if deadline, ok := t.Deadline(); ok {
-		remaining := time.Until(deadline) - 15*time.Second
-		if remaining > 0 && remaining < timeout {
-			return remaining
-		}
-	}
-	return timeout
+	return boundedWaitTimeout(t, 6*commandLogWaitTimeout())
 }

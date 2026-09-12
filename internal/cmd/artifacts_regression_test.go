@@ -11,14 +11,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewContext_DAGRunStoreUsesConfiguredArtifactDirForCleanup(t *testing.T) {
+func TestNewContext_DAGRunRepositoryUsesConfiguredArtifactDirForCleanup(t *testing.T) {
 	t.Parallel()
 
 	home := t.TempDir()
@@ -35,14 +35,14 @@ func TestNewContext_DAGRunStoreUsesConfiguredArtifactDirForCleanup(t *testing.T)
 	ctx, err := NewContext(command, nil)
 	require.NoError(t, err)
 
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:      "cleanup-artifact-test",
 		Location:  filepath.Join(home, "dags", "cleanup-artifact-test.yaml"),
-		Artifacts: &core.ArtifactsConfig{Enabled: true},
+		Artifacts: &ir.ArtifactsConfig{Enabled: true},
 	}
 	const dagRunID = "run-cleanup-1"
 
-	attempt, err := ctx.DAGRunStore.CreateAttempt(ctx.Context, dag, time.Now(), dagRunID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := ctx.Persistence.DAGRunRepository.CreateAttempt(ctx.Context, dag, time.Now(), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 	require.NoError(t, attempt.Open(ctx.Context))
 
@@ -50,16 +50,16 @@ func TestNewContext_DAGRunStoreUsesConfiguredArtifactDirForCleanup(t *testing.T)
 	require.NoError(t, os.MkdirAll(archiveDir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(archiveDir, "artifact.txt"), []byte("artifact"), 0o600))
 
-	status := exec.InitialStatus(dag)
+	status := ir.InitialStatus(dag)
 	status.DAGRunID = dagRunID
-	status.Status = core.Succeeded
+	status.Status = ir.Succeeded
 	status.ArchiveDir = archiveDir
 	require.NoError(t, attempt.Write(ctx.Context, status))
 	require.NoError(t, attempt.Close(ctx.Context))
 
 	require.DirExists(t, archiveDir)
 
-	err = ctx.DAGRunStore.RemoveDAGRun(ctx.Context, exec.NewDAGRunRef(dag.Name, dagRunID))
+	err = ctx.Persistence.DAGRunRepository.RemoveDAGRun(ctx.Context, ir.NewDAGRunRef(dag.Name, dagRunID), persis.DAGRunRemoveOptions{})
 	require.NoError(t, err)
 	assert.NoDirExists(t, archiveDir)
 }

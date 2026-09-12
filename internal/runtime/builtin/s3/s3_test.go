@@ -4,15 +4,259 @@
 package s3
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestUpload_PathPrefixedEndpoint(t *testing.T) {
+	t.Parallel()
+
+	type observedRequest struct {
+		method        string
+		path          string
+		authorization string
+	}
+
+	requests := make(chan observedRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- observedRequest{
+			method:        r.Method,
+			path:          r.URL.Path,
+			authorization: r.Header.Get("Authorization"),
+		}
+		w.Header().Set("ETag", `"test-etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	source := filepath.Join(t.TempDir(), "report.txt")
+	require.NoError(t, os.WriteFile(source, []byte("daily report"), 0o600))
+
+	impl := newS3TestExecutor(t, server.URL+"/storage/v1/s3", opUpload, map[string]any{
+		"source": source,
+		"key":    "daily/report.txt",
+	})
+
+	var stdout bytes.Buffer
+	impl.SetStdout(&stdout)
+	require.NoError(t, impl.Run(context.Background()))
+
+	request := <-requests
+	assert.Equal(t, http.MethodPut, request.method)
+	assert.Equal(t, "/storage/v1/s3/reports/daily/report.txt", request.path)
+	assert.NotEmpty(t, request.authorization)
+
+	var result UploadResult
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result))
+	assert.Equal(t, "test-etag", result.ETag)
+	assert.Equal(t, int64(len("daily report")), result.Size)
+}
+
+func TestUpload_AppliesConfiguredHeaders(t *testing.T) {
+	t.Parallel()
+
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		w.Header().Set("ETag", `"test-etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	source := filepath.Join(t.TempDir(), "report.txt")
+	require.NoError(t, os.WriteFile(source, []byte("daily report"), 0o600))
+	impl := newS3TestExecutor(t, server.URL, opUpload, map[string]any{
+		"source":         source,
+		"key":            "daily/report.txt",
+		"content_type":   "text/plain",
+		"storage_class":  "STANDARD_IA",
+		"metadata":       map[string]string{"owner": "finance"},
+		"tags":           map[string]string{"environment": "test", "owner": "finance"},
+		"acl":            "bucket-owner-full-control",
+		"sse":            "aws:kms",
+		"sse_kms_key_id": "test-key-id",
+	})
+	impl.SetStdout(&bytes.Buffer{})
+	require.NoError(t, impl.Run(context.Background()))
+
+	requestHeaders := <-headers
+	assert.Equal(t, "text/plain", requestHeaders.Get("Content-Type"))
+	assert.Equal(t, "STANDARD_IA", requestHeaders.Get("X-Amz-Storage-Class"))
+	assert.Equal(t, "finance", requestHeaders.Get("X-Amz-Meta-Owner"))
+	assert.Equal(t, "environment=test&owner=finance", requestHeaders.Get("X-Amz-Tagging"))
+	assert.Equal(t, "bucket-owner-full-control", requestHeaders.Get("X-Amz-Acl"))
+	assert.Equal(t, "aws:kms", requestHeaders.Get("X-Amz-Server-Side-Encryption"))
+	assert.Equal(t, "test-key-id", requestHeaders.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"))
+}
+
+func TestDownload_PathPrefixedEndpoint(t *testing.T) {
+	t.Parallel()
+
+	type observedRequest struct {
+		method string
+		path   string
+	}
+
+	requests := make(chan observedRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- observedRequest{method: r.Method, path: r.URL.Path}
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("ETag", `"download-etag"`)
+		_, _ = w.Write([]byte("daily report"))
+	}))
+	t.Cleanup(server.Close)
+
+	destination := filepath.Join(t.TempDir(), "downloads", "report.txt")
+	impl := newS3TestExecutor(t, server.URL+"/storage/v1/s3", opDownload, map[string]any{
+		"key":         "daily/report.txt",
+		"destination": destination,
+	})
+
+	var stdout bytes.Buffer
+	impl.SetStdout(&stdout)
+	require.NoError(t, impl.Run(context.Background()))
+
+	request := <-requests
+	assert.Equal(t, http.MethodGet, request.method)
+	assert.Equal(t, "/storage/v1/s3/reports/daily/report.txt", request.path)
+	contents, err := os.ReadFile(destination)
+	require.NoError(t, err)
+	assert.Equal(t, "daily report", string(contents))
+
+	var result DownloadResult
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result))
+	assert.Equal(t, "download-etag", result.ETag)
+	assert.Equal(t, int64(len("daily report")), result.Size)
+}
+
+func TestList_PathPrefixedEndpoint(t *testing.T) {
+	t.Parallel()
+
+	type observedRequest struct {
+		path      string
+		listType  string
+		prefix    string
+		delimiter string
+	}
+
+	requests := make(chan observedRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- observedRequest{
+			path:      r.URL.Path,
+			listType:  r.URL.Query().Get("list-type"),
+			prefix:    r.URL.Query().Get("prefix"),
+			delimiter: r.URL.Query().Get("delimiter"),
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>reports</Name>
+  <Prefix>daily/</Prefix>
+  <KeyCount>1</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>daily/report.txt</Key>
+    <LastModified>2026-08-21T00:00:00Z</LastModified>
+    <ETag>&quot;list-etag&quot;</ETag>
+    <Size>12</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>`))
+	}))
+	t.Cleanup(server.Close)
+
+	impl := newS3TestExecutor(t, server.URL+"/storage/v1/s3", opList, map[string]any{
+		"prefix": "daily/",
+	})
+
+	var stdout bytes.Buffer
+	impl.SetStdout(&stdout)
+	require.NoError(t, impl.Run(context.Background()))
+
+	request := <-requests
+	assert.Equal(t, "/storage/v1/s3/reports", request.path)
+	assert.Equal(t, "2", request.listType)
+	assert.Equal(t, "daily/", request.prefix)
+	assert.Equal(t, "/", request.delimiter)
+
+	var result ListResult
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result))
+	require.Len(t, result.Objects, 1)
+	assert.Equal(t, "daily/report.txt", result.Objects[0].Key)
+	assert.Equal(t, "list-etag", result.Objects[0].ETag)
+}
+
+func TestDelete_PathPrefixedEndpoint(t *testing.T) {
+	t.Parallel()
+
+	type observedRequest struct {
+		method string
+		path   string
+	}
+
+	requests := make(chan observedRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- observedRequest{method: r.Method, path: r.URL.Path}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	impl := newS3TestExecutor(t, server.URL+"/storage/v1/s3", opDelete, map[string]any{
+		"key": "daily/report.txt",
+	})
+
+	var stdout bytes.Buffer
+	impl.SetStdout(&stdout)
+	require.NoError(t, impl.Run(context.Background()))
+
+	request := <-requests
+	assert.Equal(t, http.MethodDelete, request.method)
+	assert.Equal(t, "/storage/v1/s3/reports/daily/report.txt", request.path)
+
+	var result DeleteResult
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result))
+	assert.Equal(t, 1, result.DeletedCount)
+	assert.Equal(t, []string{"daily/report.txt"}, result.DeletedKeys)
+}
+
+func newS3TestExecutor(t *testing.T, endpoint, operation string, config map[string]any) *executorImpl {
+	t.Helper()
+
+	mergedConfig := map[string]any{
+		"endpoint":          endpoint,
+		"region":            "local",
+		"bucket":            "reports",
+		"access_key_id":     "test-key",
+		"secret_access_key": "test-secret",
+		"force_path_style":  true,
+	}
+	maps.Copy(mergedConfig, config)
+
+	exec, err := newExecutor(context.Background(), ir.Step{
+		Name:     operation,
+		Commands: []ir.CommandEntry{{Command: operation}},
+		ExecutorConfig: ir.ExecutorConfig{
+			Type:   "s3",
+			Config: mergedConfig,
+		},
+	})
+	require.NoError(t, err)
+	return exec.(*executorImpl)
+}
 
 func TestContextInjection(t *testing.T) {
 	t.Parallel()
@@ -20,7 +264,7 @@ func TestContextInjection(t *testing.T) {
 	t.Run("WithS3Config_and_get", func(t *testing.T) {
 		t.Parallel()
 
-		cfg := &core.S3Config{
+		cfg := &ir.S3Config{
 			Region:          "us-west-2",
 			Bucket:          "test-bucket",
 			Endpoint:        "http://localhost:9000",
@@ -68,7 +312,7 @@ func TestNewExecutor_DAGLevelConfigMerging(t *testing.T) {
 		t.Parallel()
 
 		// Create DAG-level S3 config
-		dagS3 := &core.S3Config{
+		dagS3 := &ir.S3Config{
 			Region:          "us-east-1",
 			Bucket:          "dag-bucket",
 			Endpoint:        "http://minio:9000",
@@ -81,10 +325,10 @@ func TestNewExecutor_DAGLevelConfigMerging(t *testing.T) {
 		ctx = WithS3Config(ctx, dagS3)
 
 		// Step with minimal config (just source and key for upload)
-		step := core.Step{
+		step := ir.Step{
 			Name:     "upload-step",
-			Commands: []core.CommandEntry{{Command: "upload"}},
-			ExecutorConfig: core.ExecutorConfig{
+			Commands: []ir.CommandEntry{{Command: "upload"}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "s3",
 				Config: map[string]any{
 					"source": "/tmp/test.txt",
@@ -116,7 +360,7 @@ func TestNewExecutor_DAGLevelConfigMerging(t *testing.T) {
 		t.Parallel()
 
 		// Create DAG-level S3 config
-		dagS3 := &core.S3Config{
+		dagS3 := &ir.S3Config{
 			Region:          "us-east-1",
 			Bucket:          "dag-bucket",
 			Endpoint:        "http://minio:9000",
@@ -128,10 +372,10 @@ func TestNewExecutor_DAGLevelConfigMerging(t *testing.T) {
 		ctx = WithS3Config(ctx, dagS3)
 
 		// Step with config that overrides DAG-level bucket and region
-		step := core.Step{
+		step := ir.Step{
 			Name:     "upload-step",
-			Commands: []core.CommandEntry{{Command: "upload"}},
-			ExecutorConfig: core.ExecutorConfig{
+			Commands: []ir.CommandEntry{{Command: "upload"}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "s3",
 				Config: map[string]any{
 					"source": "/tmp/test.txt",
@@ -164,10 +408,10 @@ func TestNewExecutor_DAGLevelConfigMerging(t *testing.T) {
 		ctx := context.Background()
 		// No DAG-level config set
 
-		step := core.Step{
+		step := ir.Step{
 			Name:     "upload-step",
-			Commands: []core.CommandEntry{{Command: "upload"}},
-			ExecutorConfig: core.ExecutorConfig{
+			Commands: []ir.CommandEntry{{Command: "upload"}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "s3",
 				Config: map[string]any{
 					"source":            "/tmp/test.txt",
@@ -196,7 +440,7 @@ func TestNewExecutor_DAGLevelConfigMerging(t *testing.T) {
 		t.Parallel()
 
 		// Create DAG-level S3 config with all fields
-		dagS3 := &core.S3Config{
+		dagS3 := &ir.S3Config{
 			Region:          "us-west-2",
 			Bucket:          "dag-bucket",
 			Endpoint:        "http://localhost:9000",
@@ -211,10 +455,10 @@ func TestNewExecutor_DAGLevelConfigMerging(t *testing.T) {
 		ctx = WithS3Config(ctx, dagS3)
 
 		// Step only overrides endpoint and force_path_style
-		step := core.Step{
+		step := ir.Step{
 			Name:     "list-step",
-			Commands: []core.CommandEntry{{Command: "list"}},
-			ExecutorConfig: core.ExecutorConfig{
+			Commands: []ir.CommandEntry{{Command: "list"}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "s3",
 				Config: map[string]any{
 					"endpoint":         "http://production-s3:9000",
@@ -250,7 +494,7 @@ func TestNewExecutor_ValidationWithDAGConfig(t *testing.T) {
 		t.Parallel()
 
 		// DAG-level config provides bucket
-		dagS3 := &core.S3Config{
+		dagS3 := &ir.S3Config{
 			Bucket: "dag-bucket",
 		}
 
@@ -258,10 +502,10 @@ func TestNewExecutor_ValidationWithDAGConfig(t *testing.T) {
 		ctx = WithS3Config(ctx, dagS3)
 
 		// Step doesn't specify bucket (uses DAG-level)
-		step := core.Step{
+		step := ir.Step{
 			Name:     "list-step",
-			Commands: []core.CommandEntry{{Command: "list"}},
-			ExecutorConfig: core.ExecutorConfig{
+			Commands: []ir.CommandEntry{{Command: "list"}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type:   "s3",
 				Config: map[string]any{},
 			},
@@ -281,10 +525,10 @@ func TestNewExecutor_ValidationWithDAGConfig(t *testing.T) {
 		ctx := context.Background()
 		// No DAG-level config
 
-		step := core.Step{
+		step := ir.Step{
 			Name:     "list-step",
-			Commands: []core.CommandEntry{{Command: "list"}},
-			ExecutorConfig: core.ExecutorConfig{
+			Commands: []ir.CommandEntry{{Command: "list"}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type:   "s3",
 				Config: map[string]any{},
 			},
@@ -302,9 +546,9 @@ func TestValidateStep(t *testing.T) {
 	t.Run("valid_command", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
-			ExecutorConfig: core.ExecutorConfig{Type: "s3"},
-			Commands:       []core.CommandEntry{{Command: "upload"}},
+		step := ir.Step{
+			ExecutorConfig: ir.ExecutorConfig{Type: "s3"},
+			Commands:       []ir.CommandEntry{{Command: "upload"}},
 		}
 		err := validateStep(step)
 		require.NoError(t, err)
@@ -313,9 +557,9 @@ func TestValidateStep(t *testing.T) {
 	t.Run("empty_command", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
-			ExecutorConfig: core.ExecutorConfig{Type: "s3"},
-			Commands:       []core.CommandEntry{{Command: ""}},
+		step := ir.Step{
+			ExecutorConfig: ir.ExecutorConfig{Type: "s3"},
+			Commands:       []ir.CommandEntry{{Command: ""}},
 		}
 		err := validateStep(step)
 		require.Error(t, err)
@@ -325,9 +569,9 @@ func TestValidateStep(t *testing.T) {
 	t.Run("no_commands", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
-			ExecutorConfig: core.ExecutorConfig{Type: "s3"},
-			Commands:       []core.CommandEntry{},
+		step := ir.Step{
+			ExecutorConfig: ir.ExecutorConfig{Type: "s3"},
+			Commands:       []ir.CommandEntry{},
 		}
 		err := validateStep(step)
 		require.Error(t, err)
@@ -337,9 +581,9 @@ func TestValidateStep(t *testing.T) {
 	t.Run("different_executor_type_skipped", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
-			ExecutorConfig: core.ExecutorConfig{Type: "http"},
-			Commands:       []core.CommandEntry{},
+		step := ir.Step{
+			ExecutorConfig: ir.ExecutorConfig{Type: "http"},
+			Commands:       []ir.CommandEntry{},
 		}
 		err := validateStep(step)
 		require.NoError(t, err)
@@ -438,10 +682,10 @@ func TestNewExecutor_Operations(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			step := core.Step{
+			step := ir.Step{
 				Name:     tt.name,
-				Commands: []core.CommandEntry{{Command: tt.command}},
-				ExecutorConfig: core.ExecutorConfig{
+				Commands: []ir.CommandEntry{{Command: tt.command}},
+				ExecutorConfig: ir.ExecutorConfig{
 					Type:   "s3",
 					Config: tt.config,
 				},
@@ -476,7 +720,7 @@ func TestS3ConfigVariableEvaluation(t *testing.T) {
 		t.Parallel()
 
 		// Create S3Config with variable references
-		cfg := core.S3Config{
+		cfg := ir.S3Config{
 			Region:          "${AWS_REGION}",
 			Bucket:          "${S3_BUCKET}",
 			Endpoint:        "${S3_ENDPOINT}",
@@ -514,7 +758,7 @@ func TestS3ConfigVariableEvaluation(t *testing.T) {
 	t.Run("EvalObject_partial_variable_expansion", func(t *testing.T) {
 		t.Parallel()
 
-		cfg := core.S3Config{
+		cfg := ir.S3Config{
 			Region:   "${AWS_REGION}",
 			Bucket:   "prefix-${BUCKET_NAME}-suffix",
 			Endpoint: "http://${HOST}:${PORT}",
@@ -539,7 +783,7 @@ func TestS3ConfigVariableEvaluation(t *testing.T) {
 	t.Run("EvalObject_missing_variable_preserved", func(t *testing.T) {
 		t.Parallel()
 
-		cfg := core.S3Config{
+		cfg := ir.S3Config{
 			Region: "${UNDEFINED_VAR}",
 			Bucket: "static-bucket",
 		}
@@ -558,7 +802,7 @@ func TestS3ConfigVariableEvaluation(t *testing.T) {
 	t.Run("EvalObject_preserves_boolean_fields", func(t *testing.T) {
 		t.Parallel()
 
-		cfg := core.S3Config{
+		cfg := ir.S3Config{
 			Region:         "${AWS_REGION}",
 			ForcePathStyle: true,
 			DisableSSL:     true,
@@ -578,16 +822,16 @@ func TestS3ConfigVariableEvaluation(t *testing.T) {
 	})
 }
 
-func evalS3TestConfig(ctx context.Context, cfg core.S3Config, vars map[string]string) (core.S3Config, error) {
+func evalS3TestConfig(ctx context.Context, cfg ir.S3Config, vars map[string]string) (ir.S3Config, error) {
 	scope := cmnvalue.NewEnvScope(nil, false).WithEntries(vars, cmnvalue.EnvSourceStepEnv)
 	resolver := cmnvalue.NewResolver(cmnvalue.StaticScope{}, cmnvalue.RuntimeScope{Env: scope})
 	got, err := resolver.Object(ctx, cfg, cmnvalue.HostConfigObjectField("s3"))
 	if err != nil {
-		return core.S3Config{}, err
+		return ir.S3Config{}, err
 	}
-	value, ok := got.(core.S3Config)
+	value, ok := got.(ir.S3Config)
 	if !ok {
-		return core.S3Config{}, fmt.Errorf("type assertion failed: expected core.S3Config, got %T", got)
+		return ir.S3Config{}, fmt.Errorf("type assertion failed: expected ir.S3Config, got %T", got)
 	}
 	return value, nil
 }

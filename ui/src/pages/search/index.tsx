@@ -9,6 +9,7 @@ import { Search as SearchIcon } from 'lucide-react';
 import React, { useEffect, useMemo, useRef } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import { ToggleButton, ToggleGroup } from '@/components/ui/toggle-group';
+import { components } from '@/api/v1/schema';
 import { AppBarContext } from '../../contexts/AppBarContext';
 import { useSearchState } from '../../contexts/SearchStateContext';
 import {
@@ -16,8 +17,14 @@ import {
   workspaceSelectionQuery,
 } from '../../lib/workspace';
 import Title from '@/components/ui/title';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { useI18n } from '@/i18n/I18nProvider';
 
-type SearchScope = 'dags' | 'docs';
+type SearchScope = 'dags' | 'wiki';
+type DagResult = components['schemas']['DAGSearchPageItem'];
+type WikiPageResult = components['schemas']['WikiPageSearchPageItem'];
+type SearchPageResult = DagResult | WikiPageResult;
 
 type SearchFilters = {
   searchVal: string;
@@ -28,6 +35,7 @@ type SearchFeedPanelProps = {
   title: string;
   query: string;
   hasResults: boolean;
+  resultCount: number;
   isLoading: boolean;
   initialErrorMessage: string | null;
   loadMoreErrorMessage: string | null;
@@ -46,8 +54,22 @@ type SearchFeedProps = {
   workspaceQuery: ReturnType<typeof workspaceSelectionQuery>;
 };
 
+type SearchFeedPage = {
+  results?: SearchPageResult[];
+  hasMore?: boolean;
+  nextCursor?: string;
+};
+
+type CursorSearchFeedProps<T extends SearchPageResult> = SearchFeedProps & {
+  endpoint: '/search/dags' | '/search/wiki';
+  title: string;
+  emptyMessage: string;
+  unavailableMessage?: string;
+  renderResults: (results: T[]) => React.ReactNode;
+};
+
 function parseScope(value: string | null): SearchScope {
-  return value === 'docs' ? 'docs' : 'dags';
+  return value === 'wiki' || value === 'docs' ? 'wiki' : 'dags';
 }
 
 function buildSearchParams(filters: SearchFilters): URLSearchParams {
@@ -110,6 +132,7 @@ function SearchFeedPanel({
   title,
   query,
   hasResults,
+  resultCount,
   isLoading,
   initialErrorMessage,
   loadMoreErrorMessage,
@@ -121,10 +144,13 @@ function SearchFeedPanel({
   sentinelRef,
   children,
 }: SearchFeedPanelProps) {
+  const { ts } = useI18n();
   if (!query) {
     return (
       <div className="text-sm text-muted-foreground italic">
-        Enter a search term and press Enter or click Search
+        <I18nText
+          text={'Enter a search term and press Enter or click Search'}
+        />
       </div>
     );
   }
@@ -132,7 +158,7 @@ function SearchFeedPanel({
   if (isLoading && !hasResults && !initialErrorMessage) {
     return (
       <div className="text-sm text-muted-foreground italic">
-        Searching {title.toLowerCase()}...
+        {ts('Searching {type}...', { type: ts(title) })}
       </div>
     );
   }
@@ -153,7 +179,14 @@ function SearchFeedPanel({
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
         <h2 className="text-lg font-semibold">{title}</h2>
-        <span className="text-xs text-muted-foreground">Infinite results</span>
+        <span className="text-xs text-muted-foreground">
+          {ts(
+            resultCount === 1 && !hasMore
+              ? '{count} result'
+              : '{count} results',
+            { count: `${resultCount}${hasMore ? '+' : ''}` }
+          )}
+        </span>
       </div>
 
       {children}
@@ -168,7 +201,11 @@ function SearchFeedPanel({
             }}
             disabled={isLoadingMore}
           >
-            {isLoadingMore ? 'Retrying...' : 'Retry load more'}
+            {isLoadingMore ? (
+              <I18nText text={'Retrying...'} />
+            ) : (
+              <I18nText text={'Retry load more'} />
+            )}
           </Button>
         </div>
       )}
@@ -182,7 +219,11 @@ function SearchFeedPanel({
             }}
             disabled={isLoadingMore}
           >
-            {isLoadingMore ? 'Loading...' : 'Load more'}
+            {isLoadingMore ? (
+              <I18nText text={'Loading...'} />
+            ) : (
+              <I18nText text={'Load more'} />
+            )}
           </Button>
           <div ref={sentinelRef} className="h-4 w-full" />
         </div>
@@ -190,18 +231,27 @@ function SearchFeedPanel({
 
       {!hasMore && (
         <div className="mb-6 text-center text-xs text-muted-foreground">
-          End of results
+          <I18nText text={'End of results'} />
         </div>
       )}
     </div>
   );
 }
 
-function DAGSearchFeed({ query, remoteNode, workspaceQuery }: SearchFeedProps) {
+function CursorSearchFeed<T extends SearchPageResult>({
+  endpoint,
+  title,
+  emptyMessage,
+  unavailableMessage,
+  query,
+  remoteNode,
+  workspaceQuery,
+  renderResults,
+}: CursorSearchFeedProps<T>) {
   const sentinelRef = useRef<HTMLDivElement>(null);
   const { data, error, isLoading, isValidating, setSize, mutate } = useInfinite(
-    '/search/dags',
-    (pageIndex, previousPage) => {
+    endpoint,
+    (pageIndex, previousPage: SearchFeedPage | null) => {
       if (!query) {
         return null;
       }
@@ -228,98 +278,12 @@ function DAGSearchFeed({ query, remoteNode, workspaceQuery }: SearchFeedProps) {
     }
   );
 
-  const pages = data ?? [];
-  const results = pages.flatMap((page) => page.results ?? []);
+  const pages = (data ?? []) as SearchFeedPage[];
+  const results = pages.flatMap((page) => page.results ?? []) as T[];
   const hasResults = results.length > 0;
   const lastPage = pages[pages.length - 1];
   const hasMore = lastPage?.hasMore ?? false;
   const isLoadingMore = isValidating && pages.length > 0;
-  const initialErrorMessage =
-    pages.length === 0 && error ? getErrorMessage(error) : null;
-  const loadMoreErrorMessage =
-    pages.length > 0 && error ? getErrorMessage(error) : null;
-
-  const loadMoreResults = React.useCallback(() => {
-    if (!query || !hasMore || isLoadingMore || loadMoreErrorMessage) {
-      return;
-    }
-    void setSize((current) => current + 1);
-  }, [hasMore, isLoadingMore, loadMoreErrorMessage, query, setSize]);
-
-  const retryLoadMore = React.useCallback(() => {
-    void mutate();
-  }, [mutate]);
-
-  useAutoLoadMore(
-    sentinelRef,
-    !!query && hasMore && !loadMoreErrorMessage,
-    loadMoreResults
-  );
-
-  return (
-    <SearchFeedPanel
-      title="DAGs"
-      query={query}
-      hasResults={hasResults}
-      isLoading={isLoading}
-      initialErrorMessage={initialErrorMessage}
-      loadMoreErrorMessage={loadMoreErrorMessage}
-      emptyMessage="No dags found"
-      hasMore={hasMore}
-      isLoadingMore={isLoadingMore}
-      onLoadMore={loadMoreResults}
-      onRetryLoadMore={retryLoadMore}
-      sentinelRef={sentinelRef}
-    >
-      <SearchResult
-        type="dag"
-        query={query}
-        results={results}
-        workspaceQuery={workspaceQuery}
-      />
-    </SearchFeedPanel>
-  );
-}
-
-function DocSearchFeed({ query, remoteNode, workspaceQuery }: SearchFeedProps) {
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  const { data, error, isLoading, isValidating, setSize, mutate } = useInfinite(
-    '/search/docs',
-    (pageIndex, previousPage) => {
-      if (!query) {
-        return null;
-      }
-      if (previousPage && !previousPage.hasMore) {
-        return null;
-      }
-
-      return {
-        params: {
-          query: {
-            remoteNode,
-            q: query,
-            cursor: pageIndex === 0 ? undefined : previousPage?.nextCursor,
-            ...workspaceQuery,
-          },
-        },
-      };
-    },
-    {
-      revalidateIfStale: false,
-      revalidateOnFocus: false,
-      revalidateOnReconnect: false,
-      revalidateFirstPage: false,
-    }
-  );
-
-  const pages = data ?? [];
-  const results = pages.flatMap((page) => page.results ?? []);
-  const hasResults = results.length > 0;
-  const lastPage = pages[pages.length - 1];
-  const hasMore = lastPage?.hasMore ?? false;
-  const isLoadingMore = isValidating && pages.length > 0;
-  const unavailableMessage =
-    'Document management is not available on this server.';
   const initialErrorMessage =
     pages.length === 0 && error
       ? getErrorMessage(error, unavailableMessage)
@@ -348,21 +312,68 @@ function DocSearchFeed({ query, remoteNode, workspaceQuery }: SearchFeedProps) {
 
   return (
     <SearchFeedPanel
-      title="Documents"
+      title={title}
       query={query}
       hasResults={hasResults}
+      resultCount={results.length}
       isLoading={isLoading}
       initialErrorMessage={initialErrorMessage}
       loadMoreErrorMessage={loadMoreErrorMessage}
-      emptyMessage="No documents found"
+      emptyMessage={emptyMessage}
       hasMore={hasMore}
       isLoadingMore={isLoadingMore}
       onLoadMore={loadMoreResults}
       onRetryLoadMore={retryLoadMore}
       sentinelRef={sentinelRef}
     >
-      <SearchResult type="doc" query={query} results={results} />
+      {renderResults(results)}
     </SearchFeedPanel>
+  );
+}
+
+function DAGSearchFeed({ query, remoteNode, workspaceQuery }: SearchFeedProps) {
+  return (
+    <I18nProps>
+      <CursorSearchFeed<DagResult>
+        endpoint="/search/dags"
+        title="DAGs"
+        emptyMessage="No dags found"
+        query={query}
+        remoteNode={remoteNode}
+        workspaceQuery={workspaceQuery}
+        renderResults={(results) => (
+          <SearchResult
+            type="dag"
+            query={query}
+            results={results}
+            workspaceQuery={workspaceQuery}
+          />
+        )}
+      />
+    </I18nProps>
+  );
+}
+
+function WikiSearchFeed({
+  query,
+  remoteNode,
+  workspaceQuery,
+}: SearchFeedProps) {
+  return (
+    <I18nProps>
+      <CursorSearchFeed<WikiPageResult>
+        endpoint="/search/wiki"
+        title="Wiki"
+        emptyMessage="No Wiki pages found"
+        unavailableMessage="Wiki page management is not available on this server."
+        query={query}
+        remoteNode={remoteNode}
+        workspaceQuery={workspaceQuery}
+        renderResults={(results) => (
+          <SearchResult type="wiki" query={query} results={results} />
+        )}
+      />
+    </I18nProps>
   );
 }
 
@@ -458,25 +469,29 @@ function Search() {
   return (
     <div className="max-w-5xl">
       <div className="w-full">
-        <Title>Search</Title>
+        <Title>
+          <I18nText text={'Search'} />
+        </Title>
 
         <div className="flex flex-col gap-3 pt-2">
           <div className="flex flex-wrap items-center gap-2">
-            <Input
-              placeholder="Search text..."
-              className="max-w-md"
-              ref={inputRef}
-              value={searchVal}
-              onChange={(e) => {
-                setSearchVal(e.target.value);
-              }}
-              type="search"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  onSubmit(searchVal);
-                }
-              }}
-            />
+            <I18nProps>
+              <Input
+                placeholder="Search text..."
+                className="max-w-md"
+                ref={inputRef}
+                value={searchVal}
+                onChange={(e) => {
+                  setSearchVal(e.target.value);
+                }}
+                type="search"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    onSubmit(searchVal);
+                  }
+                }}
+              />
+            </I18nProps>
             <Button
               disabled={!searchVal.trim() && !submittedQuery}
               onClick={() => {
@@ -484,41 +499,42 @@ function Search() {
               }}
             >
               <SearchIcon className="h-4 w-4" />
-              Search
+              <I18nText text={'Search'} />
             </Button>
+            <I18nProps>
+              <ToggleGroup aria-label="Search scope">
+                <ToggleButton
+                  value="dags"
+                  groupValue={currentFilters.scope}
+                  onClick={() => {
+                    syncFilters({
+                      searchVal: currentFilters.searchVal,
+                      scope: 'dags',
+                    });
+                  }}
+                >
+                  <I18nText text={'DAGs'} />
+                </ToggleButton>
+                <ToggleButton
+                  value="wiki"
+                  groupValue={currentFilters.scope}
+                  onClick={() => {
+                    syncFilters({
+                      searchVal: currentFilters.searchVal,
+                      scope: 'wiki',
+                    });
+                  }}
+                >
+                  <I18nText text={'Wiki'} />
+                </ToggleButton>
+              </ToggleGroup>
+            </I18nProps>
           </div>
-
-          <ToggleGroup aria-label="Search scope">
-            <ToggleButton
-              value="dags"
-              groupValue={currentFilters.scope}
-              onClick={() => {
-                syncFilters({
-                  searchVal,
-                  scope: 'dags',
-                });
-              }}
-            >
-              DAGs
-            </ToggleButton>
-            <ToggleButton
-              value="docs"
-              groupValue={currentFilters.scope}
-              onClick={() => {
-                syncFilters({
-                  searchVal,
-                  scope: 'docs',
-                });
-              }}
-            >
-              Docs
-            </ToggleButton>
-          </ToggleGroup>
         </div>
 
         <div className="mt-4 space-y-4">
-          {currentFilters.scope === 'docs' ? (
-            <DocSearchFeed
+          {currentFilters.scope === 'wiki' ? (
+            <WikiSearchFeed
               query={submittedQuery}
               remoteNode={remoteNode}
               workspaceQuery={workspaceQuery}

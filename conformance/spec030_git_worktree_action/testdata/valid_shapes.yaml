@@ -1,0 +1,41 @@
+working_dir: ./missing-repository
+steps:
+  - id: add_generated
+    action: git.worktree.add
+
+  - id: add_generated_from_base
+    action: git.worktree.add
+    with:
+      base: missing-base
+
+  - id: add_explicit
+    action: git.worktree.add
+    with:
+      branch: missing-branch
+
+  - id: add_all_fields
+    action: git.worktree.add
+    with:
+      branch: missing-branch
+      path: ./missing-worktree
+      create_branch: true
+      base: missing-base
+
+  - id: remove_by_branch
+    action: git.worktree.remove
+    with:
+      branch: missing-branch
+
+  - id: remove_by_path
+    action: git.worktree.remove
+    with:
+      path: ./missing-worktree
+
+  - id: remove_by_both
+    action: git.worktree.remove
+    with:
+      branch: missing-branch
+      path: ./missing-worktree
+      force: true
+      delete_branch: true
+      force_delete_branch: true

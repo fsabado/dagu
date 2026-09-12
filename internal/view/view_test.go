@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/view"
+	"github.com/dagucloud/dagu/v2/internal/view"
 )
 
 func validView() *view.View {
@@ -20,11 +20,52 @@ func validView() *view.View {
 		Name:         "My View",
 		Type:         view.TypeKanban,
 		IntervalDays: 3,
+		Columns:      view.DefaultColumns(),
 	}
 }
 
 func TestView_Validate_OK(t *testing.T) {
 	require.NoError(t, validView().Validate())
+}
+
+func TestView_ValidateWorkflow(t *testing.T) {
+	v := &view.View{
+		Name:           "Production workflows",
+		Type:           view.TypeWorkflow,
+		WorkspaceScope: view.WorkspaceScopeWorkspace,
+		Workspace:      "production",
+		SortField:      view.WorkflowSortNextRun,
+		SortOrder:      view.SortOrderDescending,
+		Pinned:         true,
+	}
+	v.Normalize()
+
+	require.NoError(t, v.Validate())
+	assert.Equal(t, view.MinIntervalDays, v.IntervalDays)
+	assert.Nil(t, v.Columns)
+	assert.True(t, v.Pinned)
+}
+
+func TestView_ValidateWorkflowRejectsInvalidFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*view.View)
+		want   error
+	}{
+		{"all scope with workspace", func(v *view.View) { v.Workspace = "production" }, view.ErrInvalidWorkspaceScope},
+		{"workspace scope without workspace", func(v *view.View) { v.WorkspaceScope = view.WorkspaceScopeWorkspace }, view.ErrInvalidWorkspaceScope},
+		{"unknown sort field", func(v *view.View) { v.SortField = "created" }, view.ErrInvalidSortField},
+		{"unknown sort order", func(v *view.View) { v.SortOrder = "descending" }, view.ErrInvalidSortOrder},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := &view.View{Name: "workflow", Type: view.TypeWorkflow}
+			v.Normalize()
+			tt.mutate(v)
+			assert.ErrorIs(t, v.Validate(), tt.want)
+		})
+	}
 }
 
 func TestView_Validate_Errors(t *testing.T) {
@@ -40,6 +81,8 @@ func TestView_Validate_Errors(t *testing.T) {
 		{"interval too large", func(v *view.View) { v.IntervalDays = view.MaxIntervalDays + 1 }, view.ErrInvalidInterval},
 		{"too many labels", func(v *view.View) { v.Labels = make([]string, view.MaxLabels+1) }, view.ErrTooManyLabels},
 		{"unknown type", func(v *view.View) { v.Type = "timeline" }, view.ErrInvalidType},
+		{"unknown column", func(v *view.View) { v.Columns = []string{"running", "unknown"} }, view.ErrInvalidColumns},
+		{"duplicate column", func(v *view.View) { v.Columns = []string{"running", "running"} }, view.ErrInvalidColumns},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -67,6 +110,7 @@ func TestView_Normalize(t *testing.T) {
 	assert.Equal(t, "dag", v.DAGName)
 	assert.Equal(t, []string{"a", "b"}, v.Labels, "empty and oversized labels are dropped")
 	assert.Equal(t, 5, v.IntervalDays)
+	assert.Equal(t, view.DefaultColumns(), v.Columns)
 }
 
 func TestView_StorageRoundTrip(t *testing.T) {
@@ -79,6 +123,7 @@ func TestView_StorageRoundTrip(t *testing.T) {
 		Labels:       []string{"a", "b=c"},
 		DAGName:      "etl",
 		IntervalDays: 7,
+		Columns:      []string{view.ColumnRunning, view.ColumnFailed},
 		Pinned:       true,
 		CreatedBy:    "alice",
 		CreatedAt:    now,
@@ -87,4 +132,29 @@ func TestView_StorageRoundTrip(t *testing.T) {
 
 	got := original.ToStorage().ToView()
 	assert.Equal(t, original, got)
+}
+
+func TestView_WorkflowStorageRoundTrip(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	original := &view.View{
+		ID:             "workflow-id",
+		Name:           "Production workflows",
+		Type:           view.TypeWorkflow,
+		WorkspaceScope: view.WorkspaceScopeDefault,
+		SortField:      view.WorkflowSortName,
+		SortOrder:      view.SortOrderAscending,
+		ActiveOnly:     true,
+		Default:        true,
+		Pinned:         true,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	assert.Equal(t, original, original.ToStorage().ToView())
+}
+
+func TestView_StoredViewWithoutColumnsUsesDefaultLayout(t *testing.T) {
+	stored := &view.ViewForStorage{ID: "legacy", Name: "Legacy"}
+
+	assert.Equal(t, view.DefaultColumns(), stored.ToView().Columns)
 }

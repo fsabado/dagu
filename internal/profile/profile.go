@@ -44,17 +44,20 @@ var (
 	envKeyPattern      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
+const maxProfileNameLength = 128
+
 type Profile struct {
-	ID          string
-	Name        string
-	Description string
-	Status      Status
-	Protected   bool
-	Entries     []Entry
-	CreatedBy   string
-	CreatedAt   time.Time
-	UpdatedBy   string
-	UpdatedAt   time.Time
+	ID             string
+	Name           string
+	Description    string
+	Status         Status
+	Protected      bool
+	DefaultProfile string `json:"defaultProfile,omitempty"`
+	Entries        []Entry
+	CreatedBy      string
+	CreatedAt      time.Time
+	UpdatedBy      string
+	UpdatedAt      time.Time
 }
 
 type Entry struct {
@@ -102,7 +105,7 @@ func New(input CreateInput, now time.Time) (*Profile, error) {
 }
 
 func ValidateName(name string) error {
-	if !profileNamePattern.MatchString(name) {
+	if len(name) > maxProfileNameLength || !profileNamePattern.MatchString(name) {
 		return fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
 	return nil

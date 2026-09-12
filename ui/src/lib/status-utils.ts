@@ -75,57 +75,57 @@ export function getStatusColors(
   switch (baseClass) {
     case 'status-success':
       return {
-        bgClass: 'bg-[#1e8e3e] dark:bg-[#81c995]',
-        textClass: 'text-[#1e8e3e] dark:text-[#81c995]',
-        borderClass: 'border-[#1e8e3e] dark:border-[#81c995]',
+        bgClass: 'bg-[var(--status-success)]',
+        textClass: 'text-[var(--status-success)]',
+        borderClass: 'border-[var(--status-success)]',
         animation: '',
       };
 
     case 'status-failed':
       return {
-        bgClass: 'bg-[#d93025] dark:bg-[#f28b82]',
-        textClass: 'text-[#d93025] dark:text-[#f28b82]',
-        borderClass: 'border-[#d93025] dark:border-[#f28b82]',
+        bgClass: 'bg-[var(--status-error)]',
+        textClass: 'text-[var(--status-error)]',
+        borderClass: 'border-[var(--status-error)]',
         animation: '',
       };
 
     case 'status-running':
       return {
-        bgClass: 'bg-[#81c784] dark:bg-[#b9f6ca]',
-        textClass: 'text-[#81c784] dark:text-[#b9f6ca]',
-        borderClass: 'border-[#81c784] dark:border-[#b9f6ca]',
+        bgClass: 'bg-[var(--status-running)]',
+        textClass: 'text-[var(--status-running)]',
+        borderClass: 'border-[var(--status-running)]',
         animation: '',
       };
 
     case 'status-neutral':
       return {
-        bgClass: 'bg-[#5f6368] dark:bg-[#9aa0a6]',
-        textClass: 'text-[#5f6368] dark:text-[#9aa0a6]',
-        borderClass: 'border-[#5f6368] dark:border-[#9aa0a6]',
+        bgClass: 'bg-[var(--status-neutral)]',
+        textClass: 'text-[var(--status-neutral)]',
+        borderClass: 'border-[var(--status-neutral)]',
         animation: '',
       };
 
     case 'status-warning':
       return {
-        bgClass: 'bg-[#e37400] dark:bg-[#fdd663]',
-        textClass: 'text-[#e37400] dark:text-[#fdd663]',
-        borderClass: 'border-[#e37400] dark:border-[#fdd663]',
+        bgClass: 'bg-[var(--status-warning)]',
+        textClass: 'text-[var(--status-warning)]',
+        borderClass: 'border-[var(--status-warning)]',
         animation: isPulsingWarning ? 'animate-pulse' : '',
       };
 
     case 'status-aborted':
       return {
-        bgClass: 'bg-[#d946ef] dark:bg-[#e879f9]',
-        textClass: 'text-[#d946ef] dark:text-[#e879f9]',
-        borderClass: 'border-[#d946ef] dark:border-[#e879f9]',
+        bgClass: 'bg-[var(--status-aborted)]',
+        textClass: 'text-[var(--status-aborted)]',
+        borderClass: 'border-[var(--status-aborted)]',
         animation: '',
       };
 
     default:
       return {
-        bgClass: 'bg-[#5f6368] dark:bg-[#9aa0a6]',
-        textClass: 'text-[#5f6368] dark:text-[#9aa0a6]',
-        borderClass: 'border-[#5f6368] dark:border-[#9aa0a6]',
+        bgClass: 'bg-[var(--status-neutral)]',
+        textClass: 'text-[var(--status-neutral)]',
+        borderClass: 'border-[var(--status-neutral)]',
         animation: '',
       };
   }

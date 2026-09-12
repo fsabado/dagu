@@ -6,456 +6,519 @@ package api
 import (
 	"context"
 	"errors"
-	"net/http"
+	"fmt"
+	"strings"
+	"time"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/agent"
-	"github.com/dagucloud/dagu/internal/auth"
+	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/opencodehost"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
-var (
-	errAgentNotAvailable = &Error{
-		Code:       api.ErrorCodeNotFound,
-		Message:    "Agent feature is not available",
-		HTTPStatus: http.StatusNotFound,
-	}
-
-	errAgentNotConfigured = &Error{
-		Code:       api.ErrorCodeInternalError,
-		Message:    "Agent is not configured properly",
-		HTTPStatus: http.StatusServiceUnavailable,
-	}
-
-	errAgentSessionNotFound = &Error{
-		Code:       api.ErrorCodeNotFound,
-		Message:    "Session not found",
-		HTTPStatus: http.StatusNotFound,
-	}
-
-	errAgentBadRequest = &Error{
-		Code:       api.ErrorCodeBadRequest,
-		Message:    "Invalid request",
-		HTTPStatus: http.StatusBadRequest,
-	}
-
-	errAgentPromptExpired = &Error{
-		Code:       api.ErrorCodeNotFound,
-		Message:    "Prompt expired or already answered",
-		HTTPStatus: http.StatusGone,
-	}
-
-	errAgentProcessFailed = &Error{
-		Code:       api.ErrorCodeInternalError,
-		Message:    "Failed to process message",
-		HTTPStatus: http.StatusInternalServerError,
-	}
-
-	errAgentCancelFailed = &Error{
-		Code:       api.ErrorCodeInternalError,
-		Message:    "Failed to cancel session",
-		HTTPStatus: http.StatusInternalServerError,
-	}
+const (
+	managedAgentOwnerStaleThreshold = 30 * time.Second
+	maxAgentSessionAPIEvents        = 1000
 )
 
-// requireAgent checks that the agent API is available and enabled.
-func (a *API) requireAgent(ctx context.Context) error {
-	if a.agentAPI == nil || a.agentConfigStore == nil {
-		return errAgentNotAvailable
+var errAgentSessionAlreadyUnavailable = errors.New("managed-agent session is already unavailable")
+
+type agentSessionActionClass uint8
+
+const (
+	agentSessionActionBadRequest agentSessionActionClass = iota
+	agentSessionActionNotFound
+	agentSessionActionConflict
+)
+
+type agentSessionActionError struct {
+	notFound bool
+	conflict bool
+	message  string
+}
+
+func (e *agentSessionActionError) Error() string { return e.message }
+
+func classifyAgentSessionAction(err error) agentSessionActionClass {
+	var actionErr *agentSessionActionError
+	if !errors.As(err, &actionErr) {
+		return agentSessionActionBadRequest
 	}
-	if !a.agentConfigStore.IsEnabled(ctx) {
-		return errAgentNotAvailable
+	if actionErr.notFound {
+		return agentSessionActionNotFound
+	}
+	if actionErr.conflict {
+		return agentSessionActionConflict
+	}
+	return agentSessionActionBadRequest
+}
+
+// RespondDAGRunStepAgentInteraction records an answer and resumes the managed session.
+func (a *API) RespondDAGRunStepAgentInteraction(ctx context.Context, request api.RespondDAGRunStepAgentInteractionRequestObject) (api.RespondDAGRunStepAgentInteractionResponseObject, error) {
+	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	response, err := a.respondAgentInteraction(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), "", request.StepName, request.InteractionId, request.Body)
+	if err != nil {
+		switch classifyAgentSessionAction(err) {
+		case agentSessionActionNotFound:
+			return &api.RespondDAGRunStepAgentInteraction404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
+		case agentSessionActionConflict:
+			return &api.RespondDAGRunStepAgentInteraction409JSONResponse{Code: api.ErrorCodeConflict, Message: err.Error()}, nil
+		default:
+			return &api.RespondDAGRunStepAgentInteraction400JSONResponse{Code: api.ErrorCodeBadRequest, Message: err.Error()}, nil
+		}
+	}
+	return (*api.RespondDAGRunStepAgentInteraction200JSONResponse)(&response), nil
+}
+
+// RespondSubDAGRunStepAgentInteraction records an answer for a sub DAG-run session.
+func (a *API) RespondSubDAGRunStepAgentInteraction(ctx context.Context, request api.RespondSubDAGRunStepAgentInteractionRequestObject) (api.RespondSubDAGRunStepAgentInteractionResponseObject, error) {
+	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	response, err := a.respondAgentInteraction(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), request.SubDAGRunId, request.StepName, request.InteractionId, request.Body)
+	if err != nil {
+		switch classifyAgentSessionAction(err) {
+		case agentSessionActionNotFound:
+			return &api.RespondSubDAGRunStepAgentInteraction404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
+		case agentSessionActionConflict:
+			return &api.RespondSubDAGRunStepAgentInteraction409JSONResponse{Code: api.ErrorCodeConflict, Message: err.Error()}, nil
+		default:
+			return &api.RespondSubDAGRunStepAgentInteraction400JSONResponse{Code: api.ErrorCodeBadRequest, Message: err.Error()}, nil
+		}
+	}
+	return (*api.RespondSubDAGRunStepAgentInteraction200JSONResponse)(&response), nil
+}
+
+// RestartDAGRunStepAgentSession discards a lost session and queues a clean run.
+func (a *API) RestartDAGRunStepAgentSession(ctx context.Context, request api.RestartDAGRunStepAgentSessionRequestObject) (api.RestartDAGRunStepAgentSessionResponseObject, error) {
+	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	response, err := a.restartAgentSession(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), "", request.StepName)
+	if err != nil {
+		switch classifyAgentSessionAction(err) {
+		case agentSessionActionNotFound:
+			return &api.RestartDAGRunStepAgentSession404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
+		case agentSessionActionConflict:
+			return &api.RestartDAGRunStepAgentSession409JSONResponse{Code: api.ErrorCodeConflict, Message: err.Error()}, nil
+		default:
+			return &api.RestartDAGRunStepAgentSession400JSONResponse{Code: api.ErrorCodeBadRequest, Message: err.Error()}, nil
+		}
+	}
+	return (*api.RestartDAGRunStepAgentSession200JSONResponse)(&response), nil
+}
+
+// RestartSubDAGRunStepAgentSession discards a lost sub DAG-run session and queues a clean run.
+func (a *API) RestartSubDAGRunStepAgentSession(ctx context.Context, request api.RestartSubDAGRunStepAgentSessionRequestObject) (api.RestartSubDAGRunStepAgentSessionResponseObject, error) {
+	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	response, err := a.restartAgentSession(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), request.SubDAGRunId, request.StepName)
+	if err != nil {
+		switch classifyAgentSessionAction(err) {
+		case agentSessionActionNotFound:
+			return &api.RestartSubDAGRunStepAgentSession404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
+		case agentSessionActionConflict:
+			return &api.RestartSubDAGRunStepAgentSession409JSONResponse{Code: api.ErrorCodeConflict, Message: err.Error()}, nil
+		default:
+			return &api.RestartSubDAGRunStepAgentSession400JSONResponse{Code: api.ErrorCodeBadRequest, Message: err.Error()}, nil
+		}
+	}
+	return (*api.RestartSubDAGRunStepAgentSession200JSONResponse)(&response), nil
+}
+
+func (a *API) loadAgentStatus(ctx context.Context, root ir.DAGRunRef, subDAGRunID string) (ir.DAGRunRef, *ir.DAGRunStatus, dagrun.Attempt, error) {
+	var (
+		mutationRef ir.DAGRunRef
+		status      *ir.DAGRunStatus
+		attempt     dagrun.Attempt
+		err         error
+	)
+	if subDAGRunID == "" {
+		mutationRef = root
+		status, err = a.dagRunMgr.GetSavedStatus(ctx, root)
+		if err == nil {
+			attempt, err = a.dagRunRepository.FindAttempt(ctx, root)
+		}
+	} else {
+		mutationRef, status, err = a.getReferencedDAGRunStatusWithRef(ctx, root, subDAGRunID, "")
+		if err == nil {
+			attempt, err = a.getReferencedAttempt(ctx, root, subDAGRunID, status.Name)
+		}
+	}
+	if err != nil {
+		return ir.DAGRunRef{}, nil, nil, &agentSessionActionError{notFound: true, message: "DAG-run not found"}
+	}
+	workspaceName, err := workspaceNameForAttempt(ctx, attempt)
+	if err != nil {
+		return ir.DAGRunRef{}, nil, nil, err
+	}
+	if err := a.requireWorkspaceVisible(ctx, workspaceName); err != nil {
+		return ir.DAGRunRef{}, nil, nil, err
+	}
+	return mutationRef, status, attempt, nil
+}
+
+func (a *API) requireAgentOwnerAvailable(ctx context.Context, ref ir.DAGRunRef, status *ir.DAGRunStatus, stepName string) error {
+	node, err := agentSessionNode(status, stepName)
+	if err != nil {
+		return err
+	}
+	workerID := node.AgentSession.OwnerWorkerID
+	if workerID == "" || workerID == "local" {
+		message := "The server that owns this OpenCode session is unavailable; the interaction remains pending"
+		if a.openCodeHost != nil {
+			hostConfig, hostErr := a.openCodeHost.Ensure()
+			if hostErr != nil {
+				return &agentSessionActionError{conflict: true, message: "The managed OpenCode service is temporarily unavailable; the interaction remains pending"}
+			}
+			available, probeErr := opencodehost.SessionAvailable(ctx, hostConfig, node.AgentSession.Directory, node.AgentSession.SessionID)
+			if probeErr != nil {
+				return &agentSessionActionError{conflict: true, message: "The managed OpenCode session could not be verified; the interaction remains pending"}
+			}
+			if available {
+				return nil
+			}
+		}
+		_ = a.markAgentSessionUnavailable(ctx, ref, stepName, message)
+		return &agentSessionActionError{conflict: true, message: message}
+	}
+	message := "The worker that owns this OpenCode session is unavailable; the interaction remains pending"
+	if a.workerHeartbeatStore == nil {
+		_ = a.markAgentSessionUnavailable(ctx, ref, stepName, message)
+		return &agentSessionActionError{conflict: true, message: message}
+	}
+	record, heartbeatErr := a.workerHeartbeatStore.Get(ctx, workerID)
+	if heartbeatErr == nil && record != nil && time.Since(record.LastHeartbeatTime()) < managedAgentOwnerStaleThreshold {
+		return nil
+	}
+	if heartbeatErr != nil && !errors.Is(heartbeatErr, dispatch.ErrWorkerHeartbeatNotFound) {
+		return &agentSessionActionError{conflict: true, message: "The owning worker could not be verified; the interaction remains pending"}
+	}
+	_ = a.markAgentSessionUnavailable(ctx, ref, stepName, message)
+	return &agentSessionActionError{conflict: true, message: message}
+}
+
+func (a *API) markAgentSessionUnavailable(ctx context.Context, ref ir.DAGRunRef, stepName, message string) error {
+	status, err := a.dagRunMgr.GetSavedStatus(ctx, ref)
+	if err != nil {
+		return err
+	}
+	_, swapped, err := a.compareAndSwapManualStatus(ctx, ref, status, func(latest *ir.DAGRunStatus) error {
+		node, nodeErr := agentSessionNode(latest, stepName)
+		if nodeErr != nil {
+			return nodeErr
+		}
+		if node.AgentSession.State == ir.AgentSessionUnavailable && node.AgentSession.LastError == message {
+			return errAgentSessionAlreadyUnavailable
+		}
+		node.AgentSession.State = ir.AgentSessionUnavailable
+		node.AgentSession.LastError = message
+		appendAgentAPIEvent(node.AgentSession, "lifecycle", "unavailable", message)
+		return nil
+	})
+	if errors.Is(err, errAgentSessionAlreadyUnavailable) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !swapped {
+		return errors.New("DAG-run state changed while marking the managed-agent owner unavailable")
 	}
 	return nil
 }
 
-// extractUserContext extracts user identity and IP from the request context.
-func extractUserContext(ctx context.Context) agent.UserIdentity {
-	u := agent.UserIdentity{
-		UserID:   "admin",
-		Username: "admin",
-		Role:     auth.RoleAdmin,
-	}
-	if user, ok := auth.UserFromContext(ctx); ok && user != nil {
-		u.UserID = user.ID
-		u.Username = user.Username
-		u.Role = user.Role
-	}
-	u.IPAddress, _ = auth.ClientIPFromContext(ctx)
-	return u
+func isAgentOwnerDispatchUnavailable(err error) bool {
+	code := grpcstatus.Code(err)
+	return code == codes.FailedPrecondition || code == codes.Unavailable
 }
 
-// mapAgentError maps agent sentinel errors to API errors.
-func mapAgentError(err error) error {
-	switch {
-	case errors.Is(err, agent.ErrMessageRequired):
-		return errAgentBadRequest
-	case errors.Is(err, agent.ErrAgentNotConfigured):
-		return errAgentNotConfigured
-	case errors.Is(err, agent.ErrSessionNotFound):
-		return errAgentSessionNotFound
-	case errors.Is(err, agent.ErrInvalidSessionCursor):
-		return errAgentBadRequest
-	case errors.Is(err, agent.ErrFailedToProcessMessage):
-		return errAgentProcessFailed
-	case errors.Is(err, agent.ErrFailedToCancel):
-		return errAgentCancelFailed
-	case errors.Is(err, agent.ErrPromptIDRequired):
-		return errAgentBadRequest
-	case errors.Is(err, agent.ErrPromptExpired):
-		return errAgentPromptExpired
-	default:
-		return &Error{
-			Code:       api.ErrorCodeInternalError,
-			Message:    err.Error(),
-			HTTPStatus: http.StatusInternalServerError,
-		}
-	}
-}
-
-// CreateAgentSession creates a new agent session with the first message.
-func (a *API) CreateAgentSession(ctx context.Context, request api.CreateAgentSessionRequestObject) (api.CreateAgentSessionResponseObject, error) {
-	if err := a.requireAgent(ctx); err != nil {
-		return nil, err
-	}
-	if request.Body == nil {
-		return nil, errAgentBadRequest
-	}
-
-	user := extractUserContext(ctx)
-	chatReq := toAgentChatRequest(request.Body)
-
-	sessionID, status, err := a.agentAPI.CreateSession(ctx, user, chatReq)
+func (a *API) respondAgentInteraction(ctx context.Context, root ir.DAGRunRef, subDAGRunID, stepName, interactionID string, body *api.AgentInteractionResponseRequest) (api.AgentInteractionResponse, error) {
+	mutationRef, status, attempt, err := a.loadAgentStatus(ctx, root, subDAGRunID)
 	if err != nil {
-		return nil, mapAgentError(err)
+		return api.AgentInteractionResponse{}, err
 	}
-
-	return api.CreateAgentSession201JSONResponse{
-		SessionId: sessionID,
-		Status:    status,
-	}, nil
-}
-
-// ListAgentSessions lists sessions for the current user with pagination.
-func (a *API) ListAgentSessions(ctx context.Context, request api.ListAgentSessionsRequestObject) (api.ListAgentSessionsResponseObject, error) {
-	if err := a.requireAgent(ctx); err != nil {
-		return nil, err
+	status, err = a.waitForManualStepMutationReady(ctx, attempt, status)
+	if err != nil {
+		return api.AgentInteractionResponse{}, err
 	}
-
-	user := extractUserContext(ctx)
-	perPage := valueOf(request.Params.PerPage)
-	cursorMode := request.Params.Cursor != nil ||
-		(request.Params.PaginationMode != nil && *request.Params.PaginationMode == api.ListAgentSessionsParamsPaginationModeCursor)
-	if cursorMode {
-		if request.Params.Page != nil {
-			return nil, errAgentBadRequest
-		}
-		cursor := ""
-		if request.Params.Cursor != nil {
-			cursor = string(*request.Params.Cursor)
-		}
-		result, err := a.agentAPI.ListSessionsCursor(ctx, user.UserID, cursor, perPage)
+	if err := a.requireAgentOwnerAvailable(ctx, mutationRef, status, stepName); err != nil {
+		return api.AgentInteractionResponse{}, err
+	}
+	original, err := cloneManualStatus(status)
+	if err != nil {
+		return api.AgentInteractionResponse{}, err
+	}
+	updated, swapped, err := a.compareAndSwapManualStatus(ctx, mutationRef, status, func(latest *ir.DAGRunStatus) error {
+		node, err := agentSessionNode(latest, stepName)
 		if err != nil {
-			return nil, mapAgentError(err)
+			return err
 		}
-		return api.ListAgentSessions200JSONResponse{
-			Sessions:   toAPISessions(result.Items),
-			Pagination: cursorPagination(result.NextCursor),
-			NextCursor: emptyToNilString(result.NextCursor),
-		}, nil
+		return applyAgentInteractionResponse(ctx, node, interactionID, body)
+	})
+	if err != nil {
+		return api.AgentInteractionResponse{}, err
 	}
-
-	page := valueOf(request.Params.Page)
-	result := a.agentAPI.ListSessionsPaginated(ctx, user.UserID, page, perPage)
-
-	return api.ListAgentSessions200JSONResponse{
-		Sessions:   toAPISessions(result.Items),
-		Pagination: toPagination(result),
+	if !swapped {
+		return api.AgentInteractionResponse{}, &agentSessionActionError{conflict: true, message: "DAG-run state changed before the interaction response could be stored"}
+	}
+	applied, err := cloneManualStatus(updated)
+	if err != nil {
+		return api.AgentInteractionResponse{}, err
+	}
+	resumed := !hasWaitingSteps(updated.Nodes)
+	if resumed {
+		if subDAGRunID == "" {
+			err = a.resumeDAGRun(ctx, root, root.ID)
+		} else {
+			err = a.resumeSubDAGRun(ctx, root, subDAGRunID)
+		}
+		if err != nil {
+			_ = a.rollbackPushBack(ctx, mutationRef, applied, original)
+			if isAgentOwnerDispatchUnavailable(err) {
+				_ = a.markAgentSessionUnavailable(ctx, mutationRef, stepName, "The worker that owns this OpenCode session is unavailable")
+				return api.AgentInteractionResponse{}, &agentSessionActionError{conflict: true, message: "The worker that owns this OpenCode session is unavailable; the response remains pending"}
+			}
+			return api.AgentInteractionResponse{}, fmt.Errorf("resume managed-agent session: %w", err)
+		}
+	}
+	a.logAudit(ctx, audit.CategoryDAG, "dag_agent_interaction_respond", map[string]any{
+		"dag_name": root.Name, "dag_run_id": root.ID, "sub_dag_run_id": subDAGRunID,
+		"step": stepName, "interaction_id": interactionID,
+	})
+	return api.AgentInteractionResponse{
+		DagRunId: responseDAGRunID(root.ID, subDAGRunID), StepName: stepName, InteractionId: interactionID,
+		Resumed: resumed, SubDAGRunId: optionalAgentSubRunID(subDAGRunID),
 	}, nil
 }
 
-func cursorPagination(nextCursor string) api.Pagination {
-	totalPages := 1
-	nextPage := 1
-	if nextCursor != "" {
-		totalPages = 2
-		nextPage = 2
+func (a *API) restartAgentSession(ctx context.Context, root ir.DAGRunRef, subDAGRunID, stepName string) (api.AgentSessionRestartResponse, error) {
+	mutationRef, status, attempt, err := a.loadAgentStatus(ctx, root, subDAGRunID)
+	if err != nil {
+		return api.AgentSessionRestartResponse{}, err
 	}
-	return api.Pagination{
-		CurrentPage:  1,
-		NextPage:     nextPage,
-		PrevPage:     1,
-		TotalPages:   totalPages,
-		TotalRecords: 0,
+	status, err = a.waitForManualStepMutationReady(ctx, attempt, status)
+	if err != nil {
+		return api.AgentSessionRestartResponse{}, err
 	}
+	original, err := cloneManualStatus(status)
+	if err != nil {
+		return api.AgentSessionRestartResponse{}, err
+	}
+	updated, swapped, err := a.compareAndSwapManualStatus(ctx, mutationRef, status, func(latest *ir.DAGRunStatus) error {
+		node, err := agentSessionNode(latest, stepName)
+		if err != nil {
+			return err
+		}
+		return applyAgentSessionRestart(node)
+	})
+	if err != nil {
+		return api.AgentSessionRestartResponse{}, err
+	}
+	if !swapped {
+		return api.AgentSessionRestartResponse{}, &agentSessionActionError{conflict: true, message: "DAG-run state changed before the agent session could be restarted"}
+	}
+	applied, err := cloneManualStatus(updated)
+	if err != nil {
+		return api.AgentSessionRestartResponse{}, err
+	}
+	node, err := agentSessionNode(updated, stepName)
+	if err != nil {
+		return api.AgentSessionRestartResponse{}, err
+	}
+	if subDAGRunID == "" {
+		err = a.resumeDAGRun(ctx, root, root.ID)
+	} else {
+		err = a.resumeSubDAGRun(ctx, root, subDAGRunID)
+	}
+	if err != nil {
+		_ = a.rollbackPushBack(ctx, mutationRef, applied, original)
+		if isAgentOwnerDispatchUnavailable(err) {
+			return api.AgentSessionRestartResponse{}, &agentSessionActionError{conflict: true, message: "No eligible worker is available to start a clean OpenCode session"}
+		}
+		return api.AgentSessionRestartResponse{}, fmt.Errorf("restart managed-agent session: %w", err)
+	}
+	a.logAudit(ctx, audit.CategoryDAG, "dag_agent_session_restart", map[string]any{
+		"dag_name": root.Name, "dag_run_id": root.ID, "sub_dag_run_id": subDAGRunID,
+		"step": stepName, "generation": node.AgentSession.Generation,
+	})
+	return api.AgentSessionRestartResponse{
+		DagRunId: responseDAGRunID(root.ID, subDAGRunID), StepName: stepName, Generation: node.AgentSession.Generation,
+		Resumed: true, SubDAGRunId: optionalAgentSubRunID(subDAGRunID),
+	}, nil
 }
 
-func emptyToNilString(s string) *string {
-	if s == "" {
+func agentSessionNode(status *ir.DAGRunStatus, stepName string) (*ir.Node, error) {
+	if status == nil {
+		return nil, &agentSessionActionError{notFound: true, message: "DAG-run status not found"}
+	}
+	index := findStepByName(status.Nodes, stepName)
+	if index < 0 {
+		return nil, &agentSessionActionError{notFound: true, message: fmt.Sprintf("step %s not found", stepName)}
+	}
+	node := status.Nodes[index]
+	if node.AgentSession == nil {
+		return nil, &agentSessionActionError{notFound: true, message: fmt.Sprintf("step %s has no managed-agent session", stepName)}
+	}
+	return node, nil
+}
+
+func applyAgentInteractionResponse(ctx context.Context, node *ir.Node, interactionID string, body *api.AgentInteractionResponseRequest) error {
+	if node.Status != ir.NodeWaiting || node.AgentSession.State != ir.AgentSessionWaiting {
+		return errors.New("managed-agent session is not waiting for input")
+	}
+	for i := range node.AgentSession.Interactions {
+		interaction := &node.AgentSession.Interactions[i]
+		if interaction.ID != interactionID {
+			continue
+		}
+		if interaction.Status != ir.AgentInteractionPending {
+			return errors.New("managed-agent interaction has already been answered")
+		}
+		if err := validateAgentInteractionResponse(*interaction, body); err != nil {
+			return err
+		}
+		if body.Decision != nil {
+			interaction.Decision = string(*body.Decision)
+		}
+		if body.Answers != nil {
+			interaction.Answers = cloneAgentAnswers(*body.Answers)
+		}
+		if interaction.Decision == "reject" {
+			interaction.Status = ir.AgentInteractionRejected
+		} else {
+			interaction.Status = ir.AgentInteractionAnswered
+		}
+		interaction.RespondedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		interaction.RespondedBy, interaction.RespondedByID = manualActionSubject(ctx)
+		node.Status = ir.NodeNotStarted
+		node.Error = ""
+		node.FinishedAt = "-"
+		appendAgentAPIEvent(node.AgentSession, "interaction.response", "answered", "Managed-agent interaction answered")
 		return nil
 	}
-	return &s
+	return &agentSessionActionError{notFound: true, message: fmt.Sprintf("interaction %s not found", interactionID)}
 }
 
-// GetAgentSession returns session details including messages and state.
-func (a *API) GetAgentSession(ctx context.Context, request api.GetAgentSessionRequestObject) (api.GetAgentSessionResponseObject, error) {
-	if err := a.requireAgent(ctx); err != nil {
-		return nil, err
+func validateAgentInteractionResponse(interaction ir.AgentInteraction, body *api.AgentInteractionResponseRequest) error {
+	if body == nil {
+		return errors.New("interaction response is required")
 	}
-
-	user := extractUserContext(ctx)
-	detail, err := a.agentAPI.GetSessionDetail(ctx, request.SessionId, user.UserID)
-	if err != nil {
-		return nil, mapAgentError(err)
-	}
-
-	return api.GetAgentSession200JSONResponse(toAPISessionDetail(detail)), nil
-}
-
-// ChatAgentSession sends a message to an existing session.
-func (a *API) ChatAgentSession(ctx context.Context, request api.ChatAgentSessionRequestObject) (api.ChatAgentSessionResponseObject, error) {
-	if err := a.requireAgent(ctx); err != nil {
-		return nil, err
-	}
-	if request.Body == nil {
-		return nil, errAgentBadRequest
-	}
-
-	user := extractUserContext(ctx)
-	chatReq := toAgentChatRequest(request.Body)
-
-	if err := a.agentAPI.SendMessage(ctx, request.SessionId, user, chatReq); err != nil {
-		return nil, mapAgentError(err)
-	}
-
-	return api.ChatAgentSession202JSONResponse{Status: "accepted"}, nil
-}
-
-// CancelAgentSession cancels an active session.
-func (a *API) CancelAgentSession(ctx context.Context, request api.CancelAgentSessionRequestObject) (api.CancelAgentSessionResponseObject, error) {
-	if err := a.requireAgent(ctx); err != nil {
-		return nil, err
-	}
-
-	user := extractUserContext(ctx)
-	if err := a.agentAPI.CancelSession(ctx, request.SessionId, user.UserID); err != nil {
-		return nil, mapAgentError(err)
-	}
-
-	return api.CancelAgentSession200JSONResponse{Status: "cancelled"}, nil
-}
-
-// RespondAgentSession submits a user's response to an agent prompt.
-func (a *API) RespondAgentSession(ctx context.Context, request api.RespondAgentSessionRequestObject) (api.RespondAgentSessionResponseObject, error) {
-	if err := a.requireAgent(ctx); err != nil {
-		return nil, err
-	}
-	if request.Body == nil {
-		return nil, errAgentBadRequest
-	}
-
-	user := extractUserContext(ctx)
-	resp := toAgentUserPromptResponse(request.Body)
-
-	if err := a.agentAPI.SubmitUserResponse(ctx, request.SessionId, user.UserID, resp); err != nil {
-		return nil, mapAgentError(err)
-	}
-
-	return api.RespondAgentSession200JSONResponse{Status: "accepted"}, nil
-}
-
-// --- Conversion functions ---
-
-func toAgentChatRequest(req *api.AgentChatRequest) agent.ChatRequest {
-	out := agent.ChatRequest{
-		Message: req.Message,
-	}
-	if req.Model != nil {
-		out.Model = *req.Model
-	}
-	if req.SafeMode != nil {
-		out.SafeMode = *req.SafeMode
-	}
-	if req.SoulId != nil {
-		out.SoulID = *req.SoulId
-	}
-	if req.SessionId != nil {
-		out.SessionID = *req.SessionId
-	}
-	if req.DagContexts != nil {
-		for _, dc := range *req.DagContexts {
-			ctx := agent.DAGContext{DAGFile: dc.DagFile}
-			if dc.DagRunId != nil {
-				ctx.DAGRunID = *dc.DagRunId
+	switch interaction.Kind {
+	case ir.AgentInteractionPermission:
+		if body.Decision == nil {
+			return errors.New("permission response requires a decision")
+		}
+		decision := string(*body.Decision)
+		if decision != "once" && decision != "session" && decision != "reject" {
+			return errors.New("permission decision must be once, session, or reject")
+		}
+		if decision == "session" && len(interaction.AllowForSessionPatterns) == 0 {
+			return errors.New("OpenCode did not provide a session permission scope")
+		}
+	case ir.AgentInteractionQuestion:
+		if body.Decision != nil {
+			if string(*body.Decision) == "reject" {
+				return nil
 			}
-			out.DAGContexts = append(out.DAGContexts, ctx)
+			return errors.New("question responses accept answers or reject")
 		}
-	}
-	return out
-}
-
-func toAgentUserPromptResponse(req *api.AgentUserPromptResponse) agent.UserPromptResponse {
-	out := agent.UserPromptResponse{
-		PromptID: req.PromptId,
-	}
-	if req.SelectedOptionIds != nil {
-		out.SelectedOptionIDs = *req.SelectedOptionIds
-	}
-	if req.FreeTextResponse != nil {
-		out.FreeTextResponse = *req.FreeTextResponse
-	}
-	if req.Cancelled != nil {
-		out.Cancelled = *req.Cancelled
-	}
-	return out
-}
-
-func toAPISessions(sessions []agent.SessionWithState) []api.AgentSessionWithState {
-	result := make([]api.AgentSessionWithState, len(sessions))
-	for i, s := range sessions {
-		result[i] = api.AgentSessionWithState{
-			Session:          toAPISession(s.Session),
-			SessionId:        s.Session.ID,
-			Working:          s.Working,
-			HasPendingPrompt: ptrOf(s.HasPendingPrompt),
-			Model:            ptrOf(s.Model),
-			TotalCost:        s.TotalCost,
+		if body.Answers == nil || len(*body.Answers) != len(interaction.Questions) {
+			return errors.New("question response must include one answer set per question")
 		}
-	}
-	return result
-}
-
-func toAPISessionDetail(resp *agent.StreamResponse) api.AgentSessionDetailResponse {
-	out := api.AgentSessionDetailResponse{}
-
-	if resp.Session != nil {
-		out.Session = toAPISession(*resp.Session)
-	}
-	if resp.SessionState != nil {
-		out.SessionState = api.AgentSessionState{
-			SessionId:        resp.SessionState.SessionID,
-			Working:          resp.SessionState.Working,
-			HasPendingPrompt: ptrOf(resp.SessionState.HasPendingPrompt),
-			Model:            ptrOf(resp.SessionState.Model),
-			TotalCost:        resp.SessionState.TotalCost,
-		}
-	}
-	if resp.Messages != nil {
-		out.Messages = toAPIMessages(resp.Messages)
-	}
-	if len(resp.Delegates) > 0 {
-		delegates := make([]api.AgentDelegateSnapshot, len(resp.Delegates))
-		for i, d := range resp.Delegates {
-			cost := d.Cost
-			delegates[i] = api.AgentDelegateSnapshot{
-				Id:     d.ID,
-				Task:   d.Task,
-				Status: api.AgentDelegateSnapshotStatus(d.Status),
-				Cost:   &cost,
+		for i, question := range interaction.Questions {
+			answers := (*body.Answers)[i]
+			if len(answers) == 0 {
+				return fmt.Errorf("question %d requires an answer", i+1)
 			}
-		}
-		out.Delegates = &delegates
-	}
-	return out
-}
-
-func toAPISession(s agent.Session) api.AgentSession {
-	return api.AgentSession{
-		Id:              s.ID,
-		UserId:          ptrOf(s.UserID),
-		DagName:         ptrOf(s.DAGName),
-		Title:           ptrOf(s.Title),
-		CreatedAt:       s.CreatedAt,
-		UpdatedAt:       s.UpdatedAt,
-		ParentSessionId: ptrOf(s.ParentSessionID),
-		DelegateTask:    ptrOf(s.DelegateTask),
-	}
-}
-
-func toAPIMessages(msgs []agent.Message) []api.AgentMessage {
-	result := make([]api.AgentMessage, len(msgs))
-	for i, m := range msgs {
-		msg := api.AgentMessage{
-			Id:          m.ID,
-			SessionId:   m.SessionID,
-			Type:        api.AgentMessageType(m.Type),
-			SequenceId:  m.SequenceID,
-			Content:     ptrOf(m.Content),
-			CreatedAt:   m.CreatedAt,
-			Cost:        m.Cost,
-			DelegateIds: ptrOf(m.DelegateIDs),
-		}
-
-		if len(m.ToolCalls) > 0 {
-			calls := make([]api.AgentToolCall, len(m.ToolCalls))
-			for j, tc := range m.ToolCalls {
-				calls[j] = api.AgentToolCall{
-					Id:   tc.ID,
-					Type: tc.Type,
-					Function: api.AgentToolCallFunction{
-						Name:      tc.Function.Name,
-						Arguments: tc.Function.Arguments,
-					},
+			if !question.Multiple && len(answers) != 1 {
+				return fmt.Errorf("question %d accepts one answer", i+1)
+			}
+			for _, answer := range answers {
+				answer = strings.TrimSpace(answer)
+				if answer == "" {
+					return fmt.Errorf("question %d contains an empty answer", i+1)
+				}
+				if !question.Custom && !agentQuestionHasOption(question, answer) {
+					return fmt.Errorf("question %d answer %q is not an offered option", i+1, answer)
 				}
 			}
-			msg.ToolCalls = &calls
 		}
-
-		if len(m.ToolResults) > 0 {
-			results := make([]api.AgentToolResult, len(m.ToolResults))
-			for j, tr := range m.ToolResults {
-				results[j] = api.AgentToolResult{
-					ToolCallId: tr.ToolCallID,
-					Content:    tr.Content,
-					IsError:    ptrOf(tr.IsError),
-				}
-			}
-			msg.ToolResults = &results
-		}
-
-		if m.Usage != nil {
-			msg.Usage = &api.AgentTokenUsage{
-				PromptTokens:     ptrOf(m.Usage.PromptTokens),
-				CompletionTokens: ptrOf(m.Usage.CompletionTokens),
-				TotalTokens:      ptrOf(m.Usage.TotalTokens),
-			}
-		}
-
-		if m.UIAction != nil {
-			msg.UiAction = &api.AgentUIAction{
-				Type: string(m.UIAction.Type),
-				Path: ptrOf(m.UIAction.Path),
-			}
-		}
-
-		if m.UserPrompt != nil {
-			prompt := &api.AgentUserPrompt{
-				PromptId:            m.UserPrompt.PromptID,
-				Question:            m.UserPrompt.Question,
-				AllowFreeText:       m.UserPrompt.AllowFreeText,
-				FreeTextPlaceholder: ptrOf(m.UserPrompt.FreeTextPlaceholder),
-				MultiSelect:         m.UserPrompt.MultiSelect,
-				Command:             ptrOf(m.UserPrompt.Command),
-				WorkingDir:          ptrOf(m.UserPrompt.WorkingDir),
-			}
-			if m.UserPrompt.PromptType != "" {
-				pt := api.AgentUserPromptPromptType(m.UserPrompt.PromptType)
-				prompt.PromptType = &pt
-			}
-			if len(m.UserPrompt.Options) > 0 {
-				opts := make([]api.AgentUserPromptOption, len(m.UserPrompt.Options))
-				for j, o := range m.UserPrompt.Options {
-					opts[j] = api.AgentUserPromptOption{
-						Id:          o.ID,
-						Label:       o.Label,
-						Description: ptrOf(o.Description),
-					}
-				}
-				prompt.Options = &opts
-			}
-			msg.UserPrompt = prompt
-		}
-
-		result[i] = msg
+	default:
+		return errors.New("unsupported managed-agent interaction")
 	}
-	return result
+	return nil
+}
+
+func agentQuestionHasOption(question ir.AgentQuestion, answer string) bool {
+	for _, option := range question.Options {
+		if option.Label == answer {
+			return true
+		}
+	}
+	return false
+}
+
+func applyAgentSessionRestart(node *ir.Node) error {
+	if node.Status != ir.NodeWaiting && !node.Status.IsDone() {
+		return errors.New("managed-agent step is still running")
+	}
+	session := node.AgentSession
+	if session.Provider != "opencode" {
+		return errors.New("only managed OpenCode sessions can be restarted")
+	}
+	session.StartNewGeneration()
+	node.ChatMessages = nil
+	node.Status = ir.NodeNotStarted
+	node.Error = ""
+	node.FinishedAt = "-"
+	appendAgentAPIEvent(session, "lifecycle", "restarting", "Starting a clean OpenCode session")
+	return nil
+}
+
+func appendAgentAPIEvent(session *ir.AgentSession, eventType, status, content string) {
+	sequence := int64(1)
+	if len(session.Events) > 0 {
+		sequence = session.Events[len(session.Events)-1].Sequence + 1
+	}
+	session.Events = append(session.Events, ir.AgentSessionEvent{
+		Sequence: sequence, ID: fmt.Sprintf("dagu-%d-%d", session.Generation, sequence),
+		Type: eventType, Status: status, Content: content, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if len(session.Events) > maxAgentSessionAPIEvents {
+		session.Events = append([]ir.AgentSessionEvent(nil), session.Events[len(session.Events)-maxAgentSessionAPIEvents:]...)
+	}
+}
+
+func cloneAgentAnswers(answers [][]string) [][]string {
+	cloned := make([][]string, len(answers))
+	for i := range answers {
+		cloned[i] = make([]string, len(answers[i]))
+		for j := range answers[i] {
+			cloned[i][j] = strings.TrimSpace(answers[i][j])
+		}
+	}
+	return cloned
+}
+
+func optionalAgentSubRunID(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func responseDAGRunID(rootDAGRunID, subDAGRunID string) string {
+	if subDAGRunID != "" {
+		return subDAGRunID
+	}
+	return rootDAGRunID
 }

@@ -1,21 +1,33 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Calendar, Check, Copy, RefreshCw, Server, Timer } from 'lucide-react';
+import {
+  Calendar,
+  Check,
+  Copy,
+  Link2,
+  RefreshCw,
+  Server,
+  Timer,
+} from 'lucide-react';
 import React, { useCallback, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { components, Status } from '../../../../api/v1/schema';
+import { useConfig } from '../../../../contexts/ConfigContext';
 import dayjs from '../../../../lib/dayjs';
+import { useCopyFeedback } from '@/hooks/useCopyFeedback';
 import StatusChip from '@/components/ui/status-chip';
 import AutoRetryBadge from '../../../dag-runs/components/common/AutoRetryBadge';
 import { RootDAGRunContext } from '../../contexts/RootDAGRunContext';
 import { DAGActions } from '../common';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { useI18n } from '@/i18n/I18nProvider';
 
 interface DAGHeaderProps {
   dag: components['schemas']['DAG'] | components['schemas']['DAGDetails'];
   currentDAGRun?: components['schemas']['DAGRunDetails'];
   fileName: string;
-  filePath?: string;
   refreshFn: () => void;
   formatDuration: (startDate: string, endDate: string) => string;
   navigateToStatusTab?: () => void;
@@ -26,44 +38,37 @@ const DAGHeader: React.FC<DAGHeaderProps> = ({
   dag,
   currentDAGRun,
   fileName,
-  filePath,
   refreshFn,
   formatDuration,
   navigateToStatusTab,
   buildScopedUrl,
 }) => {
+  const { ts } = useI18n();
   const navigate = useNavigate();
   const params = useParams<{ tab?: string }>();
   const rootDAGRunContext = React.useContext(RootDAGRunContext);
   const [isRefreshing, setIsRefreshing] = React.useState(false);
   const [currentDuration, setCurrentDuration] = React.useState<string>('--');
-  const [copiedPath, setCopiedPath] = React.useState(false);
+  const { copied: nameCopied, copy: copyName } = useCopyFeedback();
+  const { copied: linkCopied, copy: copyLink } = useCopyFeedback();
+  const config = useConfig();
 
   const scopedUrl = useCallback(
     (path: string) => (buildScopedUrl ? buildScopedUrl(path) : path),
     [buildScopedUrl]
   );
 
-  const copyFilePath = useCallback(async () => {
-    if (!filePath) return;
-    try {
-      await navigator.clipboard.writeText(filePath);
-      setCopiedPath(true);
-      setTimeout(() => setCopiedPath(false), 2000);
-    } catch {
-      const textArea = document.createElement('textarea');
-      textArea.value = filePath;
-      document.body.appendChild(textArea);
-      textArea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textArea);
-      setCopiedPath(true);
-      setTimeout(() => setCopiedPath(false), 2000);
-    }
-  }, [filePath]);
+  const copyPageLink = useCallback(() => {
+    const basePrefix = config.basePath === '/' ? '' : (config.basePath ?? '');
+    void copyLink(
+      `${window.location.origin}${basePrefix}${scopedUrl(`/dags/${fileName}`)}`
+    );
+  }, [config.basePath, copyLink, fileName, scopedUrl]);
 
   // Use the DAG-run from context if available, otherwise use the prop
   const dagRunToDisplay = rootDAGRunContext.data || currentDAGRun;
+
+  const displayName = dagRunToDisplay?.name || dag.name;
 
   // Calculate duration between start and end times
   const calculateDuration = React.useCallback(() => {
@@ -230,21 +235,54 @@ const DAGHeader: React.FC<DAGHeaderProps> = ({
 
           <div className="flex min-w-0 items-center gap-2">
             <h1 className="min-w-0 break-words text-2xl font-bold text-foreground sm:truncate">
-              {dagRunToDisplay?.name || dag.name}
+              {displayName}
             </h1>
-            {filePath && (
+            {displayName && (
               <button
-                onClick={copyFilePath}
+                onClick={() => copyName(displayName)}
                 className="flex-shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 text-xs rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-all"
-                title={`Copy file path: ${filePath}`}
+                title={
+                  nameCopied
+                    ? ts('Name copied')
+                    : ts('Copy name: {name}', { name: displayName })
+                }
+                aria-label={ts(nameCopied ? 'Name copied' : 'Copy name')}
               >
-                {copiedPath ? (
+                {nameCopied ? (
                   <Check className="h-3.5 w-3.5 text-green-500" />
                 ) : (
                   <Copy className="h-3.5 w-3.5" />
                 )}
               </button>
             )}
+            <span className="sr-only" aria-live="polite">
+              {nameCopied
+                ? ts('Copied name {name}', { name: displayName })
+                : ''}
+            </span>
+            <button
+              onClick={copyPageLink}
+              className="flex-shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 text-xs rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-all"
+              title={ts(
+                linkCopied ? 'Link copied' : 'Copy link to this workflow'
+              )}
+              aria-label={ts(
+                linkCopied ? 'Link copied' : 'Copy link to this workflow'
+              )}
+            >
+              {linkCopied ? (
+                <Check className="h-3.5 w-3.5 text-green-500" />
+              ) : (
+                <Link2 className="h-3.5 w-3.5" />
+              )}
+            </button>
+            <span className="sr-only" aria-live="polite">
+              {linkCopied ? (
+                <I18nText text={'Workflow link copied to clipboard'} />
+              ) : (
+                ''
+              )}
+            </span>
           </div>
         </div>
 
@@ -255,7 +293,7 @@ const DAGHeader: React.FC<DAGHeaderProps> = ({
               dag={dag}
               fileName={fileName}
               refresh={refreshFn}
-              displayMode="compact"
+              displayMode="full"
               navigateToStatusTab={navigateToStatusTab}
             />
           </div>
@@ -276,17 +314,21 @@ const DAGHeader: React.FC<DAGHeaderProps> = ({
               limit={dagRunToDisplay.autoRetryLimit}
             />
 
-            <button
-              onClick={handleRefresh}
-              disabled={isRefreshing}
-              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-md text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-              title="Refresh (R)"
-            >
-              <RefreshCw
-                className={`h-3 w-3 ${isRefreshing ? 'animate-spin' : ''}`}
-              />
-              <span>Refresh</span>
-            </button>
+            <I18nProps>
+              <button
+                onClick={handleRefresh}
+                disabled={isRefreshing}
+                className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-md text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                title="Refresh (R)"
+              >
+                <RefreshCw
+                  className={`h-3 w-3 ${isRefreshing ? 'animate-spin' : ''}`}
+                />
+                <span>
+                  <I18nText text={'Refresh'} />
+                </span>
+              </button>
+            </I18nProps>
 
             <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
               <Calendar className="h-3 w-3" />

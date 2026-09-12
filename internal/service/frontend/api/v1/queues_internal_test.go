@@ -5,17 +5,20 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
-	openapiv1 "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file"
-	"github.com/dagucloud/dagu/internal/persis/file/dagrun"
-	"github.com/dagucloud/dagu/internal/persis/store"
+	openapiv1 "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,17 +32,17 @@ func TestGetQueueFiltersDistributedRunsByLeaseFreshness(t *testing.T) {
 
 	ctx := context.Background()
 	tmpDir := t.TempDir()
-	dagRunStore := dagrun.New(filepath.Join(tmpDir, "dag-runs"))
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 	leaseStore := newTestDAGRunLeaseStore(filepath.Join(tmpDir, "distributed"))
-	procStore := newTestProcStore(filepath.Join(tmpDir, "proc"))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
 
-	createDistributedQueueRun(t, ctx, dagRunStore, leaseStore, "lease-q", "fresh-run", "lease-q", time.Now())
-	createDistributedQueueRun(t, ctx, dagRunStore, leaseStore, "lease-q", "stale-run", "lease-q", time.Now().Add(-2*time.Minute))
+	createDistributedQueueRun(t, ctx, dagRunRepository, leaseStore, "lease-q", "fresh-run", "lease-q", time.Now())
+	createDistributedQueueRun(t, ctx, dagRunRepository, leaseStore, "lease-q", "stale-run", "lease-q", time.Now().Add(-2*time.Minute))
 
 	a := &API{
-		dagRunStore:         dagRunStore,
+		dagRunRepository:    dagRunRepository,
 		dagRunLeaseStore:    leaseStore,
-		procStore:           procStore,
+		procRepository:      procRepository,
 		config:              &config.Config{},
 		leaseStaleThreshold: time.Minute,
 	}
@@ -61,16 +64,16 @@ func TestGetQueueFallsBackToDAGNameWhenLeaseQueueIsEmpty(t *testing.T) {
 
 	ctx := context.Background()
 	tmpDir := t.TempDir()
-	dagRunStore := dagrun.New(filepath.Join(tmpDir, "dag-runs"))
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 	leaseStore := newTestDAGRunLeaseStore(filepath.Join(tmpDir, "distributed"))
-	procStore := newTestProcStore(filepath.Join(tmpDir, "proc"))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
 
-	createDistributedQueueRun(t, ctx, dagRunStore, leaseStore, "fallback-q", "fresh-run", "", time.Now())
+	createDistributedQueueRun(t, ctx, dagRunRepository, leaseStore, "fallback-q", "fresh-run", "", time.Now())
 
 	a := &API{
-		dagRunStore:         dagRunStore,
+		dagRunRepository:    dagRunRepository,
 		dagRunLeaseStore:    leaseStore,
-		procStore:           procStore,
+		procRepository:      procRepository,
 		config:              &config.Config{},
 		leaseStaleThreshold: time.Minute,
 	}
@@ -91,10 +94,10 @@ func TestGetQueueCountsFreshLeaseForClaimedAttemptAsRunning(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		status core.Status
+		status ir.Status
 	}{
-		{name: "Queued", status: core.Queued},
-		{name: "NotStarted", status: core.NotStarted},
+		{name: "Queued", status: ir.Queued},
+		{name: "NotStarted", status: ir.NotStarted},
 	}
 
 	for _, tt := range tests {
@@ -103,16 +106,16 @@ func TestGetQueueCountsFreshLeaseForClaimedAttemptAsRunning(t *testing.T) {
 
 			ctx := context.Background()
 			tmpDir := t.TempDir()
-			dagRunStore := dagrun.New(filepath.Join(tmpDir, "dag-runs"))
+			dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 			leaseStore := newTestDAGRunLeaseStore(filepath.Join(tmpDir, "distributed"))
-			procStore := newTestProcStore(filepath.Join(tmpDir, "proc"))
+			procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
 
-			createDistributedQueueRunWithStatus(t, ctx, dagRunStore, leaseStore, "lease-q", "claimed-run", "lease-q", time.Now(), tt.status)
+			createDistributedQueueRunWithStatus(t, ctx, dagRunRepository, leaseStore, "lease-q", "claimed-run", "lease-q", time.Now(), tt.status)
 
 			a := &API{
-				dagRunStore:         dagRunStore,
+				dagRunRepository:    dagRunRepository,
 				dagRunLeaseStore:    leaseStore,
-				procStore:           procStore,
+				procRepository:      procRepository,
 				config:              &config.Config{},
 				leaseStaleThreshold: time.Minute,
 			}
@@ -128,6 +131,8 @@ func TestGetQueueCountsFreshLeaseForClaimedAttemptAsRunning(t *testing.T) {
 			assert.Equal(t, 1, queueResp.RunningCount)
 			assert.Equal(t, "claimed-run", queueResp.Running[0].DagRunId)
 			assert.Equal(t, openapiv1.StatusRunning, queueResp.Running[0].Status)
+			assert.Equal(t, openapiv1.StatusLabelRunning, queueResp.Running[0].StatusLabel)
+			assert.Nil(t, queueResp.Running[0].Conditions)
 		})
 	}
 }
@@ -137,19 +142,19 @@ func TestGetQueueCountsQueuedItemsSeparatelyFromRunningItems(t *testing.T) {
 
 	ctx := context.Background()
 	tmpDir := t.TempDir()
-	dagRunStore := dagrun.New(filepath.Join(tmpDir, "dag-runs"))
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 	leaseStore := newTestDAGRunLeaseStore(filepath.Join(tmpDir, "distributed"))
 	queueStore := store.NewQueueStore(file.NewCollection(filepath.Join(tmpDir, "queue")))
-	procStore := newTestProcStore(filepath.Join(tmpDir, "proc"))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
 
-	createDistributedQueueRun(t, ctx, dagRunStore, leaseStore, "mixed-q", "running-run", "mixed-q", time.Now())
-	createQueuedQueueRun(t, ctx, dagRunStore, queueStore, "mixed-q", "queued-run", core.Queued)
+	createDistributedQueueRun(t, ctx, dagRunRepository, leaseStore, "mixed-q", "running-run", "mixed-q", time.Now())
+	createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "mixed-q", "queued-run", ir.Queued)
 
 	a := &API{
-		dagRunStore:         dagRunStore,
+		dagRunRepository:    dagRunRepository,
 		dagRunLeaseStore:    leaseStore,
 		queueStore:          queueStore,
-		procStore:           procStore,
+		procRepository:      procRepository,
 		config:              &config.Config{},
 		leaseStaleThreshold: time.Minute,
 	}
@@ -170,20 +175,20 @@ func TestListQueueItemsUsesCursorPaginationAndSkipsRunningEntries(t *testing.T) 
 
 	ctx := context.Background()
 	tmpDir := t.TempDir()
-	dagRunStore := dagrun.New(filepath.Join(tmpDir, "dag-runs"))
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 	queueStore := store.NewQueueStore(file.NewCollection(filepath.Join(tmpDir, "queue")))
-	procStore := newTestProcStore(filepath.Join(tmpDir, "proc"))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
 
-	createQueuedQueueRun(t, ctx, dagRunStore, queueStore, "cursor-q", "run-1", core.Queued)
-	createQueuedQueueRun(t, ctx, dagRunStore, queueStore, "cursor-q", "run-2", core.Running)
-	createQueuedQueueRun(t, ctx, dagRunStore, queueStore, "cursor-q", "run-3", core.Queued)
-	createQueuedQueueRun(t, ctx, dagRunStore, queueStore, "cursor-q", "run-4", core.Queued)
+	createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "cursor-q", "run-1", ir.Queued)
+	createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "cursor-q", "run-2", ir.Running)
+	createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "cursor-q", "run-3", ir.Queued)
+	createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "cursor-q", "run-4", ir.Queued)
 
 	a := &API{
-		dagRunStore: dagRunStore,
-		queueStore:  queueStore,
-		procStore:   procStore,
-		config:      &config.Config{},
+		dagRunRepository: dagRunRepository,
+		queueStore:       queueStore,
+		procRepository:   procRepository,
+		config:           &config.Config{},
 	}
 
 	firstResp, err := a.ListQueueItems(ctx, openapiv1.ListQueueItemsRequestObject{
@@ -217,6 +222,78 @@ func TestListQueueItemsUsesCursorPaginationAndSkipsRunningEntries(t *testing.T) 
 	assert.Nil(t, secondPage.NextCursor)
 }
 
+func TestListQueueItemsCapsScannedEntries(t *testing.T) {
+	// Not parallel: this test temporarily lowers the package-level scan cap.
+	originalCap := queueItemsScanCap
+	queueItemsScanCap = 3
+	t.Cleanup(func() { queueItemsScanCap = originalCap })
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+	queueStore := store.NewQueueStore(file.NewCollection(filepath.Join(tmpDir, "queue")))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
+
+	for i := range 4 {
+		createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "scan-cap-q", fmt.Sprintf("running-run-%d", i), ir.Running)
+	}
+	for i := range 2 {
+		createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "scan-cap-q", fmt.Sprintf("queued-run-%d", i), ir.Queued)
+	}
+	for i := range 3 {
+		createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "exact-cap-q", fmt.Sprintf("running-run-%d", i), ir.Running)
+	}
+
+	a := &API{
+		dagRunRepository: dagRunRepository,
+		queueStore:       queueStore,
+		procRepository:   procRepository,
+		config:           &config.Config{},
+	}
+
+	firstResp, err := a.ListQueueItems(ctx, openapiv1.ListQueueItemsRequestObject{
+		Name: "scan-cap-q",
+		Params: openapiv1.ListQueueItemsParams{
+			Limit: queueListLimitPtr(2),
+		},
+	})
+	require.NoError(t, err)
+
+	firstPage, ok := firstResp.(openapiv1.ListQueueItems200JSONResponse)
+	require.True(t, ok)
+	assert.Empty(t, firstPage.Items)
+	require.NotNil(t, firstPage.NextCursor)
+
+	secondResp, err := a.ListQueueItems(ctx, openapiv1.ListQueueItemsRequestObject{
+		Name: "scan-cap-q",
+		Params: openapiv1.ListQueueItemsParams{
+			Limit:  queueListLimitPtr(2),
+			Cursor: firstPage.NextCursor,
+		},
+	})
+	require.NoError(t, err)
+
+	secondPage, ok := secondResp.(openapiv1.ListQueueItems200JSONResponse)
+	require.True(t, ok)
+	require.Len(t, secondPage.Items, 2)
+	assert.Equal(t, "queued-run-0", secondPage.Items[0].DagRunId)
+	assert.Equal(t, "queued-run-1", secondPage.Items[1].DagRunId)
+	assert.Nil(t, secondPage.NextCursor)
+
+	exactResp, err := a.ListQueueItems(ctx, openapiv1.ListQueueItemsRequestObject{
+		Name: "exact-cap-q",
+		Params: openapiv1.ListQueueItemsParams{
+			Limit: queueListLimitPtr(2),
+		},
+	})
+	require.NoError(t, err)
+
+	exactPage, ok := exactResp.(openapiv1.ListQueueItems200JSONResponse)
+	require.True(t, ok)
+	assert.Empty(t, exactPage.Items)
+	assert.Nil(t, exactPage.NextCursor)
+}
+
 func TestListQueuesReturnsDeterministicQueueOrder(t *testing.T) {
 	t.Parallel()
 
@@ -245,60 +322,71 @@ func TestListQueuesReturnsDeterministicQueueOrder(t *testing.T) {
 func createDistributedQueueRun(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	leaseStore exec.DAGRunLeaseStore,
+	repository *persis.DAGRunRepository,
+	leaseStore dispatch.DAGRunLeaseStore,
 	name string,
 	dagRunID string,
 	leaseQueueName string,
 	lastHeartbeatAt time.Time,
 ) {
 	t.Helper()
-	createDistributedQueueRunWithStatus(t, ctx, store, leaseStore, name, dagRunID, leaseQueueName, lastHeartbeatAt, core.Running)
+	createDistributedQueueRunWithStatus(t, ctx, repository, leaseStore, name, dagRunID, leaseQueueName, lastHeartbeatAt, ir.Running)
 }
 
 func createDistributedQueueRunWithStatus(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	leaseStore exec.DAGRunLeaseStore,
+	repository *persis.DAGRunRepository,
+	leaseStore dispatch.DAGRunLeaseStore,
 	name string,
 	dagRunID string,
 	leaseQueueName string,
 	lastHeartbeatAt time.Time,
-	status core.Status,
+	status ir.Status,
 ) {
 	t.Helper()
 
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: name,
-		Steps: []core.Step{
+		Steps: []ir.Step{
 			{Name: "step", Command: "echo hello"},
 		},
 	}
 
-	attempt, err := store.CreateAttempt(ctx, dag, time.Now().UTC(), dagRunID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := repository.CreateAttempt(ctx, dag, time.Now().UTC(), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 	require.NoError(t, attempt.Open(ctx))
 	defer func() {
 		require.NoError(t, attempt.Close(ctx))
 	}()
 
-	runStatus := exec.InitialStatus(dag)
+	runStatus := ir.InitialStatus(dag)
 	runStatus.Status = status
 	runStatus.DAGRunID = dagRunID
 	runStatus.AttemptID = attempt.ID()
 	runStatus.ProcGroup = name
 	runStatus.WorkerID = "worker-1"
-	if status == core.Running {
+	if status == ir.Queued {
+		runStatus.Conditions = []ir.DAGRunCondition{
+			ir.NewDAGRunCondition(
+				"Runnable",
+				"False",
+				"MaxConcurrencyReached",
+				"The DAG-run cannot start because the queue active-run concurrency limit has been reached.",
+				time.Now().UTC(),
+			),
+		}
+	}
+	if status == ir.Running {
 		runStatus.StartedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	runStatus.CreatedAt = time.Now().UnixMilli()
 
 	require.NoError(t, attempt.Write(ctx, runStatus))
-	require.NoError(t, leaseStore.Upsert(ctx, exec.DAGRunLease{
-		AttemptKey:      exec.GenerateAttemptKey(name, dagRunID, name, dagRunID, attempt.ID()),
-		DAGRun:          exec.NewDAGRunRef(name, dagRunID),
-		Root:            exec.NewDAGRunRef(name, dagRunID),
+	require.NoError(t, leaseStore.Upsert(ctx, dispatch.DAGRunLease{
+		AttemptKey:      ir.GenerateAttemptKey(name, dagRunID, name, dagRunID, attempt.ID()),
+		DAGRun:          ir.NewDAGRunRef(name, dagRunID),
+		Root:            ir.NewDAGRunRef(name, dagRunID),
 		AttemptID:       attempt.ID(),
 		QueueName:       leaseQueueName,
 		WorkerID:        "worker-1",
@@ -309,44 +397,197 @@ func createDistributedQueueRunWithStatus(
 func createQueuedQueueRun(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	queueStore exec.QueueStore,
+	repository *persis.DAGRunRepository,
+	queueStore queue.QueueStore,
 	name string,
 	dagRunID string,
-	status core.Status,
+	status ir.Status,
 ) {
 	t.Helper()
 
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: name,
-		Steps: []core.Step{
+		Steps: []ir.Step{
 			{Name: "step", Command: "echo hello"},
 		},
 	}
 
-	attempt, err := store.CreateAttempt(ctx, dag, time.Now().UTC(), dagRunID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := repository.CreateAttempt(ctx, dag, time.Now().UTC(), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 	require.NoError(t, attempt.Open(ctx))
 	defer func() {
 		require.NoError(t, attempt.Close(ctx))
 	}()
 
-	runStatus := exec.InitialStatus(dag)
+	runStatus := ir.InitialStatus(dag)
 	runStatus.Status = status
 	runStatus.DAGRunID = dagRunID
 	runStatus.AttemptID = attempt.ID()
 	runStatus.ProcGroup = name
 	runStatus.QueuedAt = time.Now().UTC().Format(time.RFC3339)
 	runStatus.CreatedAt = time.Now().UnixMilli()
-	if status == core.Running {
+	if status == ir.Running {
 		runStatus.StartedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 
 	require.NoError(t, attempt.Write(ctx, runStatus))
-	require.NoError(t, queueStore.Enqueue(ctx, name, exec.QueuePriorityLow, exec.NewDAGRunRef(name, dagRunID)))
+	require.NoError(t, queueStore.Enqueue(ctx, name, queue.QueuePriorityLow, ir.NewDAGRunRef(name, dagRunID)))
 }
 
 func queueListLimitPtr(v int) *openapiv1.QueueListLimit {
 	limit := openapiv1.QueueListLimit(v)
 	return &limit
+}
+
+func TestGetQueueCapsQueuedCountAndFlagsItAsLowerBound(t *testing.T) {
+	// Not parallel: this test temporarily lowers the package-level scan cap.
+	originalCap := queuedCountScanCap
+	queuedCountScanCap = 3
+	t.Cleanup(func() { queuedCountScanCap = originalCap })
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+	queueStore := store.NewQueueStore(file.NewCollection(filepath.Join(tmpDir, "queue")))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
+
+	for i := range 5 {
+		createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "deep-q", fmt.Sprintf("queued-run-%d", i), ir.Queued)
+	}
+
+	a := &API{
+		dagRunRepository:    dagRunRepository,
+		queueStore:          queueStore,
+		procRepository:      procRepository,
+		config:              &config.Config{},
+		leaseStaleThreshold: time.Minute,
+	}
+
+	resp, err := a.GetQueue(ctx, openapiv1.GetQueueRequestObject{Name: "deep-q"})
+	require.NoError(t, err)
+
+	queueResp, ok := resp.(openapiv1.GetQueue200JSONResponse)
+	require.True(t, ok)
+	assert.Equal(t, 3, queueResp.QueuedCount, "count stops at the cap")
+	require.NotNil(t, queueResp.QueuedCountCapped)
+	assert.True(t, *queueResp.QueuedCountCapped, "capped count is flagged as a lower bound")
+}
+
+func TestGetQueueReportsExactQueuedCountBelowCap(t *testing.T) {
+	// Not parallel: this test temporarily lowers the package-level scan cap.
+	originalCap := queuedCountScanCap
+	queuedCountScanCap = 10
+	t.Cleanup(func() { queuedCountScanCap = originalCap })
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+	queueStore := store.NewQueueStore(file.NewCollection(filepath.Join(tmpDir, "queue")))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
+
+	for i := range 4 {
+		createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "shallow-q", fmt.Sprintf("queued-run-%d", i), ir.Queued)
+	}
+
+	a := &API{
+		dagRunRepository:    dagRunRepository,
+		queueStore:          queueStore,
+		procRepository:      procRepository,
+		config:              &config.Config{},
+		leaseStaleThreshold: time.Minute,
+	}
+
+	resp, err := a.GetQueue(ctx, openapiv1.GetQueueRequestObject{Name: "shallow-q"})
+	require.NoError(t, err)
+
+	queueResp, ok := resp.(openapiv1.GetQueue200JSONResponse)
+	require.True(t, ok)
+	assert.Equal(t, 4, queueResp.QueuedCount)
+	assert.Nil(t, queueResp.QueuedCountCapped, "an exact count sets no capped flag")
+}
+
+func TestGetQueueCapsScanWhenRunningEntriesPrecedeQueuedEntries(t *testing.T) {
+	// Not parallel: this test temporarily lowers the package-level scan cap.
+	originalCap := queuedCountScanCap
+	queuedCountScanCap = 3
+	t.Cleanup(func() { queuedCountScanCap = originalCap })
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+	queueStore := store.NewQueueStore(file.NewCollection(filepath.Join(tmpDir, "queue")))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
+
+	// More running entries than the cap, ahead of any visible queued entry.
+	// These are invisible to the count but still cost a status read each, so the
+	// scan must stop on them rather than running to the end of the queue.
+	for i := range 4 {
+		createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "running-heavy-q", fmt.Sprintf("running-run-%d", i), ir.Running)
+	}
+	for i := range 2 {
+		createQueuedQueueRun(t, ctx, dagRunRepository, queueStore, "running-heavy-q", fmt.Sprintf("queued-run-%d", i), ir.Queued)
+	}
+
+	a := &API{
+		dagRunRepository:    dagRunRepository,
+		queueStore:          queueStore,
+		procRepository:      procRepository,
+		config:              &config.Config{},
+		leaseStaleThreshold: time.Minute,
+	}
+
+	resp, err := a.GetQueue(ctx, openapiv1.GetQueueRequestObject{Name: "running-heavy-q"})
+	require.NoError(t, err)
+
+	queueResp, ok := resp.(openapiv1.GetQueue200JSONResponse)
+	require.True(t, ok)
+	assert.Equal(t, 0, queueResp.QueuedCount, "scan stopped inside the running entries, before any visible one")
+	require.NotNil(t, queueResp.QueuedCountCapped)
+	assert.True(t, *queueResp.QueuedCountCapped, "a truncated scan is reported as a lower bound")
+}
+
+func TestListQueuesBoundsTotalScanAcrossQueues(t *testing.T) {
+	// Not parallel: this test temporarily lowers the package-level scan caps.
+	originalQueueCap, originalRequestCap := queuedCountScanCap, queuedCountRequestScanCap
+	queuedCountScanCap = 100      // effectively disabled, so only the request budget bites
+	queuedCountRequestScanCap = 5 // total across all queues
+	t.Cleanup(func() {
+		queuedCountScanCap = originalQueueCap
+		queuedCountRequestScanCap = originalRequestCap
+	})
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+	queueStore := store.NewQueueStore(file.NewCollection(filepath.Join(tmpDir, "queue")))
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
+
+	// Four queues of four entries each: 16 entries, far above the request budget.
+	// The per-queue cap alone would not bound this, since each queue is small.
+	for q := range 4 {
+		for i := range 4 {
+			createQueuedQueueRun(t, ctx, dagRunRepository, queueStore,
+				fmt.Sprintf("budget-q-%d", q), fmt.Sprintf("q%d-run-%d", q, i), ir.Queued)
+		}
+	}
+
+	a := &API{
+		dagRunRepository:    dagRunRepository,
+		queueStore:          queueStore,
+		procRepository:      procRepository,
+		config:              &config.Config{},
+		leaseStaleThreshold: time.Minute,
+	}
+
+	resp, err := a.ListQueues(ctx, openapiv1.ListQueuesRequestObject{})
+	require.NoError(t, err)
+
+	listResp, ok := resp.(openapiv1.ListQueues200JSONResponse)
+	require.True(t, ok)
+
+	assert.LessOrEqual(t, listResp.Summary.TotalQueued, queuedCountRequestScanCap,
+		"the whole request must not count more entries than the shared budget allows")
+	require.NotNil(t, listResp.Summary.TotalQueuedCapped)
+	assert.True(t, *listResp.Summary.TotalQueuedCapped,
+		"exhausting the request budget marks the total as a lower bound")
 }

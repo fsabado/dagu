@@ -10,7 +10,9 @@ on:
       - "charts/dagu/values.schema.json"
       - "charts/dagu/.helmignore"
       - "charts/dagu/README.md"
+      - "charts/dagu/PROXY_AUTH.md"
       - "charts/dagu/RELEASE.md"
+      - "charts/dagu/examples/**"
       - "charts/dagu/LICENSE*"
       - "charts/dagu/templates/**"
       - "charts/dagu/charts/**"
@@ -28,7 +30,9 @@ on:
       - "charts/dagu/values.schema.json"
       - "charts/dagu/.helmignore"
       - "charts/dagu/README.md"
+      - "charts/dagu/PROXY_AUTH.md"
       - "charts/dagu/RELEASE.md"
+      - "charts/dagu/examples/**"
       - "charts/dagu/LICENSE*"
       - "charts/dagu/templates/**"
       - "charts/dagu/charts/**"
@@ -47,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
 
@@ -73,7 +77,9 @@ jobs:
             charts/dagu/values.schema.json \
             charts/dagu/.helmignore \
             charts/dagu/README.md \
+            charts/dagu/PROXY_AUTH.md \
             charts/dagu/RELEASE.md \
+            charts/dagu/examples \
             charts/dagu/LICENSE* \
             charts/dagu/templates \
             charts/dagu/charts \
@@ -99,13 +105,207 @@ jobs:
           fi
 
       - name: Set up Helm
-        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
 
       - name: Lint chart
-        run: helm lint ./charts/dagu
+        run: helm lint --strict ./charts/dagu
 
-      - name: Render chart
-        run: helm template dagu ./charts/dagu --set persistence.storageClass=nfs-client >/dev/null
+      - name: Render standalone defaults
+        run: |
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --kube-version 1.19.0 >/tmp/dagu-default-render.yaml
+
+          grep -Fq 'cors_allowed_origins: []' /tmp/dagu-default-render.yaml
+          grep -Fq -- '- start-all' /tmp/dagu-default-render.yaml
+          grep -Fq 'type: ClusterIP' /tmp/dagu-default-render.yaml
+          grep -Fq 'helm.sh/resource-policy: keep' /tmp/dagu-default-render.yaml
+          grep -Fq 'kind: ServiceAccount' /tmp/dagu-default-render.yaml
+          grep -Fq 'serviceAccountName: dagu' /tmp/dagu-default-render.yaml
+          test "$(grep -Fc 'httpGet:' /tmp/dagu-default-render.yaml)" -eq 2
+          grep -Fq "command: ['wget']" /tmp/dagu-default-render.yaml
+
+      - name: Render IP allowlist
+        run: |
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --kube-version 1.35.0 \
+            --set-string 'config.ipAccess.allowedIPs[0]=203.0.113.10' \
+            --set-string 'config.ipAccess.trustedProxies[0]=10.42.0.0/16' \
+            >/tmp/dagu-ip-access-render.yaml
+
+          grep -Fq 'ip_access:' /tmp/dagu-ip-access-render.yaml
+          grep -Fq 'allowed_ips: ["203.0.113.10"]' /tmp/dagu-ip-access-render.yaml
+          grep -Fq 'trusted_proxies: ["10.42.0.0/16"]' /tmp/dagu-ip-access-render.yaml
+          test "$(grep -Fc 'tcpSocket:' /tmp/dagu-ip-access-render.yaml)" -eq 2
+          grep -Fq "command: ['nc']" /tmp/dagu-ip-access-render.yaml
+
+      - name: Render distributed mode
+        run: |
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --kube-version 1.35.0 \
+            --set deploymentMode=distributed \
+            --set persistence.accessMode=ReadWriteMany \
+            --set persistence.storageClass=nfs-client \
+            >/tmp/dagu-distributed-render.yaml
+
+          grep -Fq 'default_execution_mode: "distributed"' /tmp/dagu-distributed-render.yaml
+          grep -Fq 'name: dagu-coordinator' /tmp/dagu-distributed-render.yaml
+          grep -Fq 'name: dagu-scheduler' /tmp/dagu-distributed-render.yaml
+          grep -Fq 'name: dagu-worker-general' /tmp/dagu-distributed-render.yaml
+          grep -Fq -- '- ReadWriteMany' /tmp/dagu-distributed-render.yaml
+          test "$(grep -Fc 'serviceAccountName: dagu' /tmp/dagu-distributed-render.yaml)" -eq 4
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --kube-version 1.35.0 \
+            --set deploymentMode=distributed \
+            --set persistence.accessMode=ReadWriteMany \
+            --set persistence.storageClass=nfs-client \
+            --set coordinator.replicas=2 \
+            --show-only templates/coordinator-deployment.yaml \
+            >/tmp/dagu-coordinator-render.yaml
+
+          grep -Fq 'replicas: 2' /tmp/dagu-coordinator-render.yaml
+          grep -Fq 'type: RollingUpdate' /tmp/dagu-coordinator-render.yaml
+          grep -Fq 'maxUnavailable: 1' /tmp/dagu-coordinator-render.yaml
+          grep -Fq 'maxSurge: 0' /tmp/dagu-coordinator-render.yaml
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --kube-version 1.35.0 \
+            --set deploymentMode=distributed \
+            --set persistence.accessMode=ReadWriteMany \
+            --set persistence.storageClass=nfs-client \
+            --set-string priorityClassName=true \
+            --set-string 'workerPools.general.priorityClassName=null' \
+            >/tmp/dagu-priority-render.yaml
+
+          # Class names that resemble YAML literals must remain strings.
+          test "$(grep -Fc 'priorityClassName: "true"' /tmp/dagu-priority-render.yaml)" -eq 3
+          grep -Fq 'priorityClassName: "null"' /tmp/dagu-priority-render.yaml
+
+      - name: Smoke-render optional configurations
+        run: |
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set-string license.existingSecret=dagu-license \
+            --set auth.oidc.enabled=true \
+            --set-string auth.oidc.clientId=ci-client \
+            --set-string auth.oidc.clientUrl=https://dagu.example.com \
+            --set-string auth.oidc.issuer=https://idp.example.com \
+            --set-string auth.oidc.clientSecret.existingSecret=dagu-oidc \
+            --set-string 'auth.oidc.roleMapping.groupMappings.engineering=developer' \
+            --set-string 'auth.oidc.roleMapping.workspaceMappings.engineering[0].workspace=platform' \
+            --set-string 'auth.oidc.roleMapping.workspaceMappings.engineering[0].role=developer' \
+            --set ingress.enabled=true \
+            --set-string ingress.className=nginx \
+            --set-string ingress.host=dagu.example.com \
+            --set ingress.tls.enabled=true \
+            --set-string ingress.tls.secretName=dagu-tls \
+            --set-string 'config.corsAllowedOrigins[0]=https://app.example.com' \
+            >/tmp/dagu-optional-render.yaml
+
+          test "$(grep -Fc 'name: DAGU_LICENSE_KEY' /tmp/dagu-optional-render.yaml)" -eq 1
+          test "$(grep -Fc 'name: DAGU_AUTH_OIDC_CLIENT_SECRET' /tmp/dagu-optional-render.yaml)" -eq 1
+          grep -Fq 'name: "dagu-license"' /tmp/dagu-optional-render.yaml
+          grep -Fq 'name: "dagu-oidc"' /tmp/dagu-optional-render.yaml
+          grep -Fq 'cors_allowed_origins: ["https://app.example.com"]' /tmp/dagu-optional-render.yaml
+          grep -Fq 'engineering: developer' /tmp/dagu-optional-render.yaml
+          grep -Fq 'workspace: platform' /tmp/dagu-optional-render.yaml
+          grep -Fq 'secretName: "dagu-tls"' /tmp/dagu-optional-render.yaml
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set ui.service.type=LoadBalancer \
+            --set-string 'ui.service.annotations.example\.com/exposure=internal' \
+            >/tmp/dagu-loadbalancer-render.yaml
+
+          grep -Fq 'type: LoadBalancer' /tmp/dagu-loadbalancer-render.yaml
+          grep -Fq 'example.com/exposure: internal' /tmp/dagu-loadbalancer-render.yaml
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set auth.proxy.enabled=true \
+            --set-string auth.proxy.source=oauth2-proxy >/dev/null
+
+          expect_proxy_render_failure() {
+            expected_path="$1"
+            shift
+            if output="$(helm template dagu ./charts/dagu \
+              --namespace dagu \
+              --set auth.proxy.enabled=true \
+              "$@" 2>&1)"; then
+              echo "::error::Expected proxy-auth rendering to reject: $*"
+              exit 1
+            fi
+            if [[ "${output}" != *"${expected_path}"* ]]; then
+              echo "::error::Proxy-auth rendering failed for an unexpected reason: $*"
+              printf '%s\n' "${output}"
+              exit 1
+            fi
+          }
+
+          expect_proxy_render_failure \
+            "/ui/service/type" \
+            --set ui.service.type=LoadBalancer
+          expect_proxy_render_failure \
+            "/ui/service/type" \
+            --set ui.service.type=NodePort
+          expect_proxy_render_failure \
+            "/ingress/enabled" \
+            --set ingress.enabled=true
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set auth.mode=basic \
+            --set-string auth.basic.existingSecret=dagu-basic-auth >/dev/null
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set ui.service.port=80 \
+            --set persistence.retain=false \
+            --set-string persistence.existingClaim=existing-dagu-data >/dev/null
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set deploymentMode=distributed \
+            --set persistence.accessMode=ReadWriteMany \
+            --set-string persistence.existingClaim=existing-dagu-data >/dev/null
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set-string serviceAccount.name=dagu-runtime \
+            --set-string 'serviceAccount.annotations.workload\.example\.com/identity=dagu' \
+            >/tmp/dagu-service-account-render.yaml
+
+          grep -Fq 'name: dagu-runtime' /tmp/dagu-service-account-render.yaml
+          grep -Fq 'serviceAccountName: dagu-runtime' /tmp/dagu-service-account-render.yaml
+          grep -Fq 'workload.example.com/identity: dagu' /tmp/dagu-service-account-render.yaml
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set serviceAccount.create=false \
+            --set-string serviceAccount.name=existing-dagu-runtime \
+            >/tmp/dagu-existing-service-account-render.yaml
+
+          grep -Fq 'serviceAccountName: existing-dagu-runtime' /tmp/dagu-existing-service-account-render.yaml
+
+          helm template dagu ./charts/dagu \
+            --namespace dagu \
+            --set deploymentMode=distributed \
+            --set persistence.accessMode=ReadWriteMany \
+            --set-string 'extraVolumes[0].name=ca-bundle' \
+            --set-string 'extraVolumes[0].secret.secretName=dagu-ca-bundle' \
+            --set-string 'extraVolumeMounts[0].name=ca-bundle' \
+            --set-string 'extraVolumeMounts[0].mountPath=/etc/ssl/certs/dagu-ca-bundle.pem' \
+            --set-string 'extraVolumeMounts[0].subPath=ca-bundle.pem' \
+            --set 'extraVolumeMounts[0].readOnly=true' \
+            >/tmp/dagu-extra-volume-render.yaml
+
+          test "$(grep -Fc 'mountPath: /etc/ssl/certs/dagu-ca-bundle.pem' /tmp/dagu-extra-volume-render.yaml)" -eq 4
+          test "$(grep -Fc 'secretName: dagu-ca-bundle' /tmp/dagu-extra-volume-render.yaml)" -eq 4
 
       - name: Package chart
         run: |

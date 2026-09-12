@@ -6,28 +6,37 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestNewSSHExecutor(t *testing.T) {
 	t.Parallel()
 
-	step := core.Step{
+	step := ir.Step{
 		Name: "ssh-exec",
-		ExecutorConfig: core.ExecutorConfig{
+		ExecutorConfig: ir.ExecutorConfig{
 			Type: "ssh",
 			Config: map[string]any{
-				"User":     "testuser",
-				"IP":       "testip",
-				"Port":     25,
-				"Password": "testpassword",
+				"User":            "testuser",
+				"IP":              "testip",
+				"Port":            25,
+				"Password":        "testpassword",
+				"strict_host_key": false,
 			},
 		},
 	}
@@ -48,22 +57,24 @@ func TestNewSSHExecutor_WithShellConfig(t *testing.T) {
 		{
 			name: "ShellFromConfig",
 			config: map[string]any{
-				"user":     "testuser",
-				"ip":       "testip",
-				"port":     22,
-				"password": "testpassword",
-				"shell":    "/bin/bash",
+				"user":            "testuser",
+				"ip":              "testip",
+				"port":            22,
+				"password":        "testpassword",
+				"strict_host_key": false,
+				"shell":           "/bin/bash",
 			},
 			expectedShell: "/bin/bash",
 		},
 		{
 			name: "ShellFromConfigWithArgs",
 			config: map[string]any{
-				"user":     "testuser",
-				"ip":       "testip",
-				"port":     22,
-				"password": "testpassword",
-				"shell":    "/bin/bash -e",
+				"user":            "testuser",
+				"ip":              "testip",
+				"port":            22,
+				"password":        "testpassword",
+				"strict_host_key": false,
+				"shell":           "/bin/bash -e",
 			},
 			expectedShell: "/bin/bash",
 			expectedArgs:  []string{"-e"},
@@ -71,10 +82,11 @@ func TestNewSSHExecutor_WithShellConfig(t *testing.T) {
 		{
 			name: "NoShellInConfig",
 			config: map[string]any{
-				"user":     "testuser",
-				"ip":       "testip",
-				"port":     22,
-				"password": "testpassword",
+				"user":            "testuser",
+				"ip":              "testip",
+				"port":            22,
+				"password":        "testpassword",
+				"strict_host_key": false,
 			},
 			expectedShell: "/bin/sh", // Fallback to POSIX shell when no shell configured
 		},
@@ -82,9 +94,9 @@ func TestNewSSHExecutor_WithShellConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			step := core.Step{
+			step := ir.Step{
 				Name: "ssh-exec",
-				ExecutorConfig: core.ExecutorConfig{
+				ExecutorConfig: ir.ExecutorConfig{
 					Type:   "ssh",
 					Config: tt.config,
 				},
@@ -107,7 +119,7 @@ func TestSSHExecutor_ShellPriority(t *testing.T) {
 	tests := []struct {
 		name          string
 		client        *Client
-		step          core.Step
+		step          ir.Step
 		expectedShell string
 		expectedArgs  []string
 	}{
@@ -118,9 +130,9 @@ func TestSSHExecutor_ShellPriority(t *testing.T) {
 				Shell:     "/bin/bash",
 				ShellArgs: []string{"-e"},
 			},
-			step: core.Step{
+			step: ir.Step{
 				Name:           "ssh-step",
-				ExecutorConfig: core.ExecutorConfig{Type: "ssh", Config: nil},
+				ExecutorConfig: ir.ExecutorConfig{Type: "ssh", Config: nil},
 			},
 			expectedShell: "/bin/bash",
 			expectedArgs:  []string{"-e"},
@@ -132,16 +144,17 @@ func TestSSHExecutor_ShellPriority(t *testing.T) {
 				Shell:     "/bin/sh",
 				ShellArgs: []string{"-e"},
 			},
-			step: core.Step{
+			step: ir.Step{
 				Name: "ssh-step",
-				ExecutorConfig: core.ExecutorConfig{
+				ExecutorConfig: ir.ExecutorConfig{
 					Type: "ssh",
 					Config: map[string]any{
-						"user":     "testuser",
-						"ip":       "testip",
-						"port":     22,
-						"password": "testpassword",
-						"shell":    "/bin/zsh -o pipefail",
+						"user":            "testuser",
+						"ip":              "testip",
+						"port":            22,
+						"password":        "testpassword",
+						"strict_host_key": false,
+						"shell":           "/bin/zsh -o pipefail",
 					},
 				},
 			},
@@ -154,11 +167,11 @@ func TestSSHExecutor_ShellPriority(t *testing.T) {
 				hostPort: "localhost:22",
 				Shell:    "",
 			},
-			step: core.Step{
+			step: ir.Step{
 				Name:           "ssh-step",
 				Shell:          "/bin/bash",
 				ShellArgs:      []string{"-e"},
-				ExecutorConfig: core.ExecutorConfig{Type: "ssh", Config: nil},
+				ExecutorConfig: ir.ExecutorConfig{Type: "ssh", Config: nil},
 			},
 			expectedShell: "/bin/bash",
 			expectedArgs:  []string{"-e"},
@@ -170,11 +183,11 @@ func TestSSHExecutor_ShellPriority(t *testing.T) {
 				Shell:     "/bin/zsh",
 				ShellArgs: []string{"-e"},
 			},
-			step: core.Step{
+			step: ir.Step{
 				Name:           "ssh-step",
 				Shell:          "/bin/bash",
 				ShellArgs:      []string{"-o", "pipefail"},
-				ExecutorConfig: core.ExecutorConfig{Type: "ssh", Config: nil},
+				ExecutorConfig: ir.ExecutorConfig{Type: "ssh", Config: nil},
 			},
 			expectedShell: "/bin/zsh",
 			expectedArgs:  []string{"-e"},
@@ -185,15 +198,16 @@ func TestSSHExecutor_ShellPriority(t *testing.T) {
 				hostPort: "localhost:22",
 				Shell:    "/bin/zsh",
 			},
-			step: core.Step{
+			step: ir.Step{
 				Name: "ssh-step",
-				ExecutorConfig: core.ExecutorConfig{
+				ExecutorConfig: ir.ExecutorConfig{
 					Type: "ssh",
 					Config: map[string]any{
-						"user":     "stepuser",
-						"ip":       "step-host",
-						"port":     22,
-						"password": "steppassword",
+						"user":            "stepuser",
+						"ip":              "step-host",
+						"port":            22,
+						"password":        "steppassword",
+						"strict_host_key": false,
 					},
 				},
 			},
@@ -221,22 +235,22 @@ func TestSSHExecutorCommandResolution(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		step            core.Step
+		step            ir.Step
 		dagShell        string
 		expectSkipShell bool
 	}{
 		{
 			name: "StepShellSet",
-			step: core.Step{
+			step: ir.Step{
 				Shell:          "/bin/bash",
-				ExecutorConfig: core.ExecutorConfig{Type: "ssh"},
+				ExecutorConfig: ir.ExecutorConfig{Type: "ssh"},
 			},
 			expectSkipShell: false,
 		},
 		{
 			name: "StepConfigShellSet",
-			step: core.Step{
-				ExecutorConfig: core.ExecutorConfig{
+			step: ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{
 					Type:   "ssh",
 					Config: map[string]any{"shell": "/bin/bash"},
 				},
@@ -245,8 +259,8 @@ func TestSSHExecutorCommandResolution(t *testing.T) {
 		},
 		{
 			name: "StepConfigNoShell",
-			step: core.Step{
-				ExecutorConfig: core.ExecutorConfig{
+			step: ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{
 					Type:   "ssh",
 					Config: map[string]any{"user": "test"},
 				},
@@ -255,16 +269,16 @@ func TestSSHExecutorCommandResolution(t *testing.T) {
 		},
 		{
 			name: "DAGShellSet",
-			step: core.Step{
-				ExecutorConfig: core.ExecutorConfig{Type: "ssh"},
+			step: ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{Type: "ssh"},
 			},
 			dagShell:        "/bin/bash",
 			expectSkipShell: false,
 		},
 		{
 			name: "NoShellAnywhere",
-			step: core.Step{
-				ExecutorConfig: core.ExecutorConfig{Type: "ssh"},
+			step: ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{Type: "ssh"},
 			},
 			expectSkipShell: true,
 		},
@@ -277,7 +291,7 @@ func TestSSHExecutorCommandResolution(t *testing.T) {
 				ctx = WithSSHClient(ctx, &Client{Shell: tt.dagShell})
 			}
 
-			command := tt.step.CommandResolution(ctx)
+			command := registry.CommandResolution(ctx, tt.step)
 			require.Equal(t, cmnvalue.CommandTargetSSH, command.Target)
 			require.Equal(t, !tt.expectSkipShell, command.ShellConfigured)
 		})
@@ -288,9 +302,9 @@ func TestSSHExecutor_BuildScript_WithWorkingDir(t *testing.T) {
 	t.Parallel()
 
 	exec := &sshExecutor{
-		step: core.Step{
+		step: ir.Step{
 			Dir: "/app/src", // Working directory is taken from step.Dir
-			Commands: []core.CommandEntry{
+			Commands: []ir.CommandEntry{
 				{Command: "echo", Args: []string{"hello"}},
 			},
 		},
@@ -313,7 +327,7 @@ func TestSSHExecutor_BuildScript_WithScript(t *testing.T) {
 	t.Parallel()
 
 	exec := &sshExecutor{
-		step: core.Step{
+		step: ir.Step{
 			Script: "echo 'line1'\necho 'line2'",
 		},
 		shell: "/bin/bash",
@@ -332,8 +346,8 @@ func TestSSHExecutor_BuildScript_WithCommands(t *testing.T) {
 	t.Parallel()
 
 	exec := &sshExecutor{
-		step: core.Step{
-			Commands: []core.CommandEntry{
+		step: ir.Step{
+			Commands: []ir.CommandEntry{
 				{Command: "git", Args: []string{"pull"}},
 				{Command: "make", Args: []string{"build"}},
 				{Command: "./deploy.sh"},
@@ -355,8 +369,8 @@ func TestSSHExecutor_BuildScript_FunctionWrapper(t *testing.T) {
 	t.Parallel()
 
 	exec := &sshExecutor{
-		step: core.Step{
-			Commands: []core.CommandEntry{
+		step: ir.Step{
+			Commands: []ir.CommandEntry{
 				{Command: "echo", Args: []string{"test"}},
 			},
 		},
@@ -376,21 +390,21 @@ func TestSSHExecutor_ResolveShell_Fallback(t *testing.T) {
 
 	tests := []struct {
 		name          string
-		step          core.Step
+		step          ir.Step
 		client        *Client
 		expectedShell string
 		expectedArgs  []string
 	}{
 		{
 			name:          "FallbackToSh",
-			step:          core.Step{},
+			step:          ir.Step{},
 			client:        &Client{},
 			expectedShell: "/bin/sh",
 			expectedArgs:  nil,
 		},
 		{
 			name: "ClientShellTakesPriority",
-			step: core.Step{Shell: "/bin/zsh"},
+			step: ir.Step{Shell: "/bin/zsh"},
 			client: &Client{
 				Shell:     "/bin/bash",
 				ShellArgs: []string{"-e"},
@@ -400,7 +414,7 @@ func TestSSHExecutor_ResolveShell_Fallback(t *testing.T) {
 		},
 		{
 			name:          "StepShellWhenNoClient",
-			step:          core.Step{Shell: "/bin/zsh", ShellArgs: []string{"-x"}},
+			step:          ir.Step{Shell: "/bin/zsh", ShellArgs: []string{"-x"}},
 			client:        &Client{},
 			expectedShell: "/bin/zsh",
 			expectedArgs:  []string{"-x"},
@@ -423,22 +437,22 @@ func TestSSHExecutor_BuildCommandString(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		cmd      core.CommandEntry
+		cmd      ir.CommandEntry
 		expected string
 	}{
 		{
 			name:     "CommandOnly",
-			cmd:      core.CommandEntry{Command: "ls"},
+			cmd:      ir.CommandEntry{Command: "ls"},
 			expected: "ls",
 		},
 		{
 			name:     "CommandWithArgs",
-			cmd:      core.CommandEntry{Command: "ls", Args: []string{"-la", "/tmp"}},
+			cmd:      ir.CommandEntry{Command: "ls", Args: []string{"-la", "/tmp"}},
 			expected: "ls -la /tmp",
 		},
 		{
 			name:     "CommandWithSpacesInArgs",
-			cmd:      core.CommandEntry{Command: "echo", Args: []string{"hello world"}},
+			cmd:      ir.CommandEntry{Command: "echo", Args: []string{"hello world"}},
 			expected: "echo 'hello world'",
 		},
 	}
@@ -503,39 +517,43 @@ func TestSSHExecutor_TimeoutConfig(t *testing.T) {
 		{
 			name: "DefaultTimeout",
 			config: map[string]any{
-				"user":     "testuser",
-				"ip":       "testip",
-				"password": "testpassword",
+				"user":            "testuser",
+				"ip":              "testip",
+				"password":        "testpassword",
+				"strict_host_key": false,
 			},
 			expectedTimeout: 30 * time.Second, // Default timeout
 		},
 		{
 			name: "CustomTimeout",
 			config: map[string]any{
-				"user":     "testuser",
-				"ip":       "testip",
-				"password": "testpassword",
-				"timeout":  "1m",
+				"user":            "testuser",
+				"ip":              "testip",
+				"password":        "testpassword",
+				"strict_host_key": false,
+				"timeout":         "1m",
 			},
 			expectedTimeout: 1 * time.Minute,
 		},
 		{
 			name: "ShortTimeout",
 			config: map[string]any{
-				"user":     "testuser",
-				"ip":       "testip",
-				"password": "testpassword",
-				"timeout":  "5s",
+				"user":            "testuser",
+				"ip":              "testip",
+				"password":        "testpassword",
+				"strict_host_key": false,
+				"timeout":         "5s",
 			},
 			expectedTimeout: 5 * time.Second,
 		},
 		{
 			name: "InvalidTimeout",
 			config: map[string]any{
-				"user":     "testuser",
-				"ip":       "testip",
-				"password": "testpassword",
-				"timeout":  "invalid",
+				"user":            "testuser",
+				"ip":              "testip",
+				"password":        "testpassword",
+				"strict_host_key": false,
+				"timeout":         "invalid",
 			},
 			expectError: true,
 		},
@@ -559,12 +577,52 @@ func TestSSHExecutor_TimeoutConfig(t *testing.T) {
 	}
 }
 
+func TestFromMapConfigKeys(t *testing.T) {
+	t.Parallel()
+
+	t.Run("HostKey", func(t *testing.T) {
+		knownHostFile := filepath.Join(t.TempDir(), "known_hosts")
+		_, err := FromMapConfig(context.Background(), map[string]any{
+			"user":            "testuser",
+			"host":            "testhost",
+			"password":        "testpass",
+			"strict_host_key": true,
+			"known_host_file": knownHostFile,
+		})
+		require.ErrorContains(t, err, knownHostFile)
+	})
+
+	t.Run("DefaultHostKey", func(t *testing.T) {
+		knownHostFile := filepath.Join(t.TempDir(), "known_hosts")
+		_, err := FromMapConfig(context.Background(), map[string]any{
+			"user":            "testuser",
+			"host":            "testhost",
+			"password":        "testpass",
+			"known_host_file": knownHostFile,
+		})
+		require.ErrorContains(t, err, knownHostFile)
+	})
+
+	t.Run("ShellArgs", func(t *testing.T) {
+		client, err := FromMapConfig(context.Background(), map[string]any{
+			"user":            "testuser",
+			"host":            "testhost",
+			"password":        "testpass",
+			"strict_host_key": false,
+			"shell":           "/bin/bash",
+			"shell_args":      []any{"-x"},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"-x"}, client.ShellArgs)
+	})
+}
+
 func TestSSHExecutor_Run_NoCommands(t *testing.T) {
 	t.Parallel()
 
 	// Create executor with no commands or script
 	exec := &sshExecutor{
-		step: core.Step{
+		step: ir.Step{
 			Commands: nil,
 			Script:   "",
 		},
@@ -591,24 +649,13 @@ func TestSSHExecutor_SetStdout_SetStderr(t *testing.T) {
 	assert.Equal(t, stderr, exec.stderr)
 }
 
-func TestSSHExecutor_Kill_NoSession(t *testing.T) {
-	t.Parallel()
-
-	// Create executor without session
-	exec := &sshExecutor{}
-
-	// Kill should return nil when there's no session
-	err := exec.Kill(nil)
-	require.NoError(t, err)
-}
-
 func TestNewSSHExecutor_NoConfig(t *testing.T) {
 	t.Parallel()
 
 	// Create step without SSH config and without DAG-level SSH client
-	step := core.Step{
+	step := ir.Step{
 		Name: "ssh-exec",
-		ExecutorConfig: core.ExecutorConfig{
+		ExecutorConfig: ir.ExecutorConfig{
 			Type:   "ssh",
 			Config: nil,
 		},
@@ -618,24 +665,6 @@ func TestNewSSHExecutor_NoConfig(t *testing.T) {
 	_, err := NewSSHExecutor(ctx, step)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ssh configuration is not found")
-}
-
-func TestSSHExecutor_ClosedFlag(t *testing.T) {
-	t.Parallel()
-
-	// Verify that closed flag prevents double close issues
-	exec := &sshExecutor{
-		closed: false,
-	}
-
-	// First Kill should work (no session, so just returns nil)
-	err := exec.Kill(nil)
-	require.NoError(t, err)
-	assert.True(t, exec.closed)
-
-	// Second Kill should be no-op due to closed flag
-	err = exec.Kill(nil)
-	require.NoError(t, err)
 }
 
 func TestFromMapConfig_WithBastion(t *testing.T) {
@@ -684,10 +713,11 @@ func TestFromMapConfig_WithBastion(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			config := map[string]any{
-				"user":     "testuser",
-				"host":     "target.example.com",
-				"password": "targetpass",
-				"bastion":  tt.bastion,
+				"user":            "testuser",
+				"host":            "target.example.com",
+				"password":        "targetpass",
+				"strict_host_key": false,
+				"bastion":         tt.bastion,
 			}
 
 			client, err := FromMapConfig(context.Background(), config)
@@ -728,17 +758,18 @@ func TestNewClient_WithBastionConfig(t *testing.T) {
 func TestNewSFTPExecutor(t *testing.T) {
 	t.Parallel()
 
-	step := core.Step{
+	step := ir.Step{
 		Name: "sftp-transfer",
-		ExecutorConfig: core.ExecutorConfig{
+		ExecutorConfig: ir.ExecutorConfig{
 			Type: "sftp",
 			Config: map[string]any{
-				"user":        "testuser",
-				"host":        "testhost",
-				"password":    "testpass",
-				"direction":   "upload",
-				"source":      "/local/path",
-				"destination": "/remote/path",
+				"user":            "testuser",
+				"host":            "testhost",
+				"password":        "testpass",
+				"strict_host_key": false,
+				"direction":       "upload",
+				"source":          "/local/path",
+				"destination":     "/remote/path",
 			},
 		},
 	}
@@ -766,34 +797,37 @@ func TestNewSFTPExecutor_ValidationErrors(t *testing.T) {
 		{
 			name: "MissingSource",
 			config: map[string]any{
-				"user":        "testuser",
-				"host":        "testhost",
-				"password":    "testpass",
-				"direction":   "upload",
-				"destination": "/remote/path",
+				"user":            "testuser",
+				"host":            "testhost",
+				"password":        "testpass",
+				"strict_host_key": false,
+				"direction":       "upload",
+				"destination":     "/remote/path",
 			},
 			expectedErr: "source path is required",
 		},
 		{
 			name: "MissingDestination",
 			config: map[string]any{
-				"user":      "testuser",
-				"host":      "testhost",
-				"password":  "testpass",
-				"direction": "download",
-				"source":    "/remote/path",
+				"user":            "testuser",
+				"host":            "testhost",
+				"password":        "testpass",
+				"strict_host_key": false,
+				"direction":       "download",
+				"source":          "/remote/path",
 			},
 			expectedErr: "destination path is required",
 		},
 		{
 			name: "InvalidDirection",
 			config: map[string]any{
-				"user":        "testuser",
-				"host":        "testhost",
-				"password":    "testpass",
-				"direction":   "invalid",
-				"source":      "/local/path",
-				"destination": "/remote/path",
+				"user":            "testuser",
+				"host":            "testhost",
+				"password":        "testpass",
+				"strict_host_key": false,
+				"direction":       "invalid",
+				"source":          "/local/path",
+				"destination":     "/remote/path",
 			},
 			expectedErr: "invalid direction",
 		},
@@ -801,9 +835,9 @@ func TestNewSFTPExecutor_ValidationErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			step := core.Step{
+			step := ir.Step{
 				Name:           "sftp-transfer",
-				ExecutorConfig: core.ExecutorConfig{Type: "sftp", Config: tt.config},
+				ExecutorConfig: ir.ExecutorConfig{Type: "sftp", Config: tt.config},
 			}
 			_, err := NewSFTPExecutor(context.Background(), step)
 			require.Error(t, err)
@@ -815,16 +849,17 @@ func TestNewSFTPExecutor_ValidationErrors(t *testing.T) {
 func TestNewSFTPExecutor_DefaultDirection(t *testing.T) {
 	t.Parallel()
 
-	step := core.Step{
+	step := ir.Step{
 		Name: "sftp-transfer",
-		ExecutorConfig: core.ExecutorConfig{
+		ExecutorConfig: ir.ExecutorConfig{
 			Type: "sftp",
 			Config: map[string]any{
-				"user":        "testuser",
-				"host":        "testhost",
-				"password":    "testpass",
-				"source":      "/local/path",
-				"destination": "/remote/path",
+				"user":            "testuser",
+				"host":            "testhost",
+				"password":        "testpass",
+				"strict_host_key": false,
+				"source":          "/local/path",
+				"destination":     "/remote/path",
 				// direction not specified - should default to upload
 			},
 		},
@@ -854,14 +889,164 @@ func TestSFTPExecutor_SetStdout_SetStderr(t *testing.T) {
 	assert.Equal(t, stderr, exec.stderr)
 }
 
-func TestSFTPExecutor_Kill(t *testing.T) {
+func TestExecutorCancellationInterruptsSSHHandshake(t *testing.T) {
+	tests := []struct {
+		name    string
+		newExec func(*Client) runtimeexec.Executor
+	}{
+		{
+			name: "SSH",
+			newExec: func(client *Client) runtimeexec.Executor {
+				return &sshExecutor{
+					step:   ir.Step{Commands: []ir.CommandEntry{{Command: "true", CmdWithArgs: "true"}}},
+					client: client,
+					shell:  "/bin/sh",
+					stdout: io.Discard,
+					stderr: io.Discard,
+				}
+			},
+		},
+		{
+			name: "SFTP",
+			newExec: func(client *Client) runtimeexec.Executor {
+				return &sftpExecutor{
+					client:      client,
+					direction:   "download",
+					source:      "/remote/file",
+					destination: "/local/file",
+					stdout:      io.Discard,
+					stderr:      io.Discard,
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Run("ContextCancellation", func(t *testing.T) {
+				addr, accepted := startBlackholeSSHServer(t)
+				exec := tt.newExec(newBlackholeSSHClient(addr))
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				errCh := make(chan error, 1)
+				go func() { errCh <- exec.Run(ctx) }()
+				conn := receiveAcceptedConnection(t, accepted)
+				cancel()
+				assertConnectionCloses(t, conn)
+
+				select {
+				case err := <-errCh:
+					require.ErrorIs(t, err, context.Canceled)
+				case <-time.After(2 * time.Second):
+					t.Fatal("executor did not return after context cancellation")
+				}
+			})
+
+			t.Run("Kill", func(t *testing.T) {
+				addr, accepted := startBlackholeSSHServer(t)
+				exec := tt.newExec(newBlackholeSSHClient(addr))
+				errCh := make(chan error, 1)
+				go func() { errCh <- exec.Run(context.Background()) }()
+				conn := receiveAcceptedConnection(t, accepted)
+
+				require.NoError(t, exec.Kill(nil))
+				require.NoError(t, exec.Kill(nil))
+				assertConnectionCloses(t, conn)
+
+				select {
+				case err := <-errCh:
+					require.ErrorIs(t, err, context.Canceled)
+				case <-time.After(2 * time.Second):
+					t.Fatal("executor did not return after Kill")
+				}
+			})
+		})
+	}
+}
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error {
+	return f()
+}
+
+func TestExecutorLifecycleForcedShutdown(t *testing.T) {
 	t.Parallel()
 
-	exec := &sftpExecutor{}
+	var events []string
+	unexpectedErr := errors.New("unexpected close error")
+	lifecycle := executorLifecycle{
+		cancel: func() { events = append(events, "cancel") },
+		transport: closerFunc(func() error {
+			events = append(events, "transport")
+			return errors.Join(net.ErrClosed, unexpectedErr)
+		}),
+		resource: closerFunc(func() error {
+			events = append(events, "resource")
+			return io.EOF
+		}),
+	}
 
-	// Kill always returns nil for SFTP executor
-	err := exec.Kill(nil)
+	err := lifecycle.shutdown(true)
+	assert.Equal(t, []string{"cancel", "transport", "resource"}, events)
+	require.ErrorIs(t, err, unexpectedErr)
+	require.NotErrorIs(t, err, net.ErrClosed)
+	require.NotErrorIs(t, err, io.EOF)
+}
+
+func startBlackholeSSHServer(t *testing.T) (string, <-chan net.Conn) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+	return listener.Addr().String(), accepted
+}
+
+func newBlackholeSSHClient(addr string) *Client {
+	return &Client{
+		hostPort: addr,
+		cfg: &gossh.ClientConfig{
+			User:            "test",
+			Auth:            []gossh.AuthMethod{gossh.Password("test")},
+			HostKeyCallback: gossh.InsecureIgnoreHostKey(), //nolint:gosec
+			Timeout:         time.Second,
+		},
+	}
+}
+
+func receiveAcceptedConnection(t *testing.T, accepted <-chan net.Conn) net.Conn {
+	t.Helper()
+	select {
+	case conn := <-accepted:
+		t.Cleanup(func() { _ = conn.Close() })
+		return conn
+	case <-time.After(2 * time.Second):
+		t.Fatal("executor did not connect to test server")
+		return nil
+	}
+}
+
+func assertConnectionCloses(t *testing.T, conn net.Conn) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, conn)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executor did not close the underlying connection")
+	}
 }
 
 func TestGetStringConfig(t *testing.T) {

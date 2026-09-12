@@ -18,6 +18,13 @@ afterEach(() => {
 });
 
 describe('DAGRunGroupedView', () => {
+  it('shows a loading row instead of the empty state while the first page loads', () => {
+    render(<DAGRunGroupedView dagRuns={[]} isLoading />);
+
+    expect(screen.getByText('Loading DAG runs...')).toBeInTheDocument();
+    expect(screen.queryByText('No DAG runs found')).not.toBeInTheDocument();
+  });
+
   it('sorts grouped runs by schedule time before queued time', () => {
     render(
       <DAGRunGroupedView
@@ -97,6 +104,44 @@ describe('DAGRunGroupedView', () => {
       name: 'grouped-dag',
       dagRunId: 'run-1',
     });
+    expect(onSelectDAGRun).not.toHaveBeenCalled();
+  });
+
+  it('opens artifacts from an expanded run without opening its status view', () => {
+    const onSelectDAGRun = vi.fn();
+    const onViewArtifacts = vi.fn();
+
+    render(
+      <DAGRunGroupedView
+        dagRuns={[
+          {
+            dagRunId: 'run-1',
+            name: 'artifact-dag',
+            status: Status.Success,
+            statusLabel: StatusLabel.succeeded,
+            artifactsAvailable: true,
+            autoRetryCount: 0,
+            triggerType: TriggerType.manual,
+            queuedAt: '2026-03-13T10:00:00Z',
+            startedAt: '2026-03-13T10:01:00Z',
+            finishedAt: '2026-03-13T10:02:00Z',
+          },
+        ]}
+        onSelectDAGRun={onSelectDAGRun}
+        onViewArtifacts={onViewArtifacts}
+      />
+    );
+
+    fireEvent.click(screen.getByText('artifact-dag'));
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'View artifacts for artifact-dag run-1',
+      })
+    );
+
+    expect(onViewArtifacts).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'artifact-dag', dagRunId: 'run-1' })
+    );
     expect(onSelectDAGRun).not.toHaveBeenCalled();
   });
 });

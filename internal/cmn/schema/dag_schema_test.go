@@ -507,6 +507,70 @@ steps:
 `,
 		},
 		{
+			name: "TemplateRenderLiteral",
+			spec: `
+steps:
+  - action: template.render
+    with:
+      template: "Hello, {{ .name }}!"
+      data:
+        name: Alice
+`,
+		},
+		{
+			name: "TemplateRenderReference",
+			spec: `
+steps:
+  - action: template.render
+    with:
+      template_ref: ${env.TEMPLATE}
+      data:
+        name: Alice
+`,
+		},
+		{
+			name: "RejectTemplateRenderMissingSource",
+			spec: `
+steps:
+  - action: template.render
+    with:
+      data:
+        name: Alice
+`,
+			wantErr: "did not validate",
+		},
+		{
+			name: "RejectTemplateRenderBothSources",
+			spec: `
+steps:
+  - action: template.render
+    with:
+      template: "Hello"
+      template_ref: ${env.TEMPLATE}
+`,
+			wantErr: "did not validate",
+		},
+		{
+			name: "RejectTemplateRenderBareReference",
+			spec: `
+steps:
+  - action: template.render
+    with:
+      template_ref: TEMPLATE
+`,
+			wantErr: "did not validate",
+		},
+		{
+			name: "RejectTemplateRenderUnknownContextReference",
+			spec: `
+steps:
+  - action: template.render
+    with:
+      template_ref: ${context.unknown.value}
+`,
+			wantErr: "did not validate",
+		},
+		{
 			name: "ArtifactActions",
 			spec: `
 steps:
@@ -868,6 +932,98 @@ steps:
 	}
 }
 
+func TestDAGSchemaHumanTask(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveDAGSchema(t)
+
+	tests := []struct {
+		name  string
+		spec  string
+		valid bool
+	}{
+		{
+			name: "AcknowledgementOnly",
+			spec: `
+steps:
+  - id: acknowledge
+    action: human.task
+    with:
+      prompt: Confirm the maintenance notice was read
+`,
+			valid: true,
+		},
+		{
+			name: "FlatScalarForm",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review the deployment request
+      form:
+        type: object
+        properties:
+          retries:
+            type: integer
+            default: 0
+            minimum: 0
+            maximum: 5
+          confirmed:
+            type: boolean
+            default: false
+          decision:
+            oneOf:
+              - type: string
+                const: approve
+                title: Approve
+              - const: reject
+                title: Reject
+        required: [decision]
+`,
+			valid: true,
+		},
+		{
+			name: "MissingID",
+			spec: `
+steps:
+  - action: human.task
+    with:
+      prompt: Review
+`,
+		},
+		{
+			name: "RejectNestedProperty",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      form:
+        type: object
+        properties:
+          nested:
+            type: object
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			doc := mustParseYAMLDocument(t, tt.spec)
+			err := resolved.Validate(doc)
+			if tt.valid {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestDAGSchemaSchedule(t *testing.T) {
 	t.Parallel()
 
@@ -895,6 +1051,35 @@ schedule:
   start:
     kind: at
     at: "2026-03-29T02:10:00+01:00"
+steps:
+  - run: echo hi
+`,
+		},
+		{
+			name: "ExpressionWithProfile",
+			spec: `
+schedule:
+  - expression: "*/20 * * * *"
+    profile: prod
+steps:
+  - run: echo hi
+`,
+		},
+		{
+			name: "ProfileScopedControlSchedules",
+			spec: `
+schedule:
+  start:
+    - expression: "*/20 * * * *"
+      profile: dev
+    - at: "2026-03-29T02:10:00+01:00"
+      profile: prod
+  stop:
+    expression: "0 18 * * *"
+    profile: dev
+  restart:
+    - expression: "0 12 * * *"
+      profile: prod
 steps:
   - run: echo hi
 `,
@@ -938,6 +1123,47 @@ steps:
 schedule:
   stop:
     kind: cron
+steps:
+  - run: echo hi
+`,
+			wantErr: "schedule",
+		},
+		{
+			name: "RejectCronAlias",
+			spec: `
+schedule:
+  - cron: "0 * * * *"
+steps:
+  - run: echo hi
+`,
+			wantErr: "schedule",
+		},
+		{
+			name: "RejectProfileOnlySchedule",
+			spec: `
+schedule:
+  - profile: prod
+steps:
+  - run: echo hi
+`,
+			wantErr: "schedule",
+		},
+		{
+			name: "RejectInvalidScheduleProfileName",
+			spec: `
+schedule:
+  - expression: "0 * * * *"
+    profile: Prod
+steps:
+  - run: echo hi
+`,
+			wantErr: "schedule",
+		},
+		{
+			name: "RejectScheduleProfileWithoutEntries",
+			spec: `
+schedule:
+  profile: prod
 steps:
   - run: echo hi
 `,
@@ -2052,6 +2278,64 @@ func TestDAGSchemaRepoCopyMatchesEmbeddedSchema(t *testing.T) {
 	require.Equal(t, string(DAGSchemaJSON), string(repoSchemaJSON))
 }
 
+func TestDAGSchemaAcceptsFileDependencies(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveDAGSchema(t)
+	for _, spec := range []string{
+		"steps:\n  - run: echo scalar\n    dependencies: scripts/run.sh\n",
+		"steps:\n  - run: echo array\n    dependencies: [scripts/**, config/app.yaml]\n",
+	} {
+		doc := mustParseYAMLDocument(t, spec)
+		require.NoError(t, resolved.Validate(doc))
+	}
+}
+
+func TestDAGSchemaRequiresIDForBuildDeclarations(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveDAGSchema(t)
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{
+			name: "inputs require id",
+			spec: `
+steps:
+  - run: echo build
+    inputs:
+      - name: source
+        path: source.txt
+`,
+			wantErr: true,
+		},
+		{
+			name: "inputs with id are valid schema",
+			spec: `
+steps:
+  - id: build
+    run: echo build
+    inputs:
+      - name: source
+        path: source.txt
+`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := resolved.Validate(mustParseYAMLDocument(t, tt.spec))
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 func mustResolveDAGSchema(t *testing.T) *jsonschema.Resolved {
 	t.Helper()
 
@@ -2106,4 +2390,92 @@ func firstStepConfig(t *testing.T, doc map[string]any) map[string]any {
 	config, ok := step["config"].(map[string]any)
 	require.True(t, ok)
 	return config
+}
+
+func TestDAGSchemaHTTPRequestWithFields(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveDAGSchema(t)
+
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr string
+	}{
+		{
+			// Regression (#2602): output, form and files are documented `with`
+			// fields of http.request and supported by the executor, but the
+			// schema rejected them (additionalProperties: false).
+			name: "HTTPRequestOutputFormFiles",
+			spec: `
+steps:
+  - id: fetch
+    action: http.request
+    with:
+      method: POST
+      url: https://api.example.com/uploads
+      form:
+        description: nightly-report
+      files:
+        document: ./report.pdf
+      output: ./response.json
+`,
+		},
+		{
+			// The executor rejects body combined with the multipart fields;
+			// the schema mirrors that (#2602 review).
+			name: "RejectHTTPRequestBodyWithForm",
+			spec: `
+steps:
+  - id: upload
+    action: http.request
+    with:
+      method: POST
+      url: https://api.example.com/uploads
+      body: '{"key": "value"}'
+      form:
+        description: nightly-report
+`,
+			wantErr: "did not validate",
+		},
+		{
+			name: "HTTPRequestBodyOnly",
+			spec: `
+steps:
+  - id: fetch
+    action: http.request
+    with:
+      method: POST
+      url: https://api.example.com/data
+      body: '{"key": "value"}'
+`,
+		},
+		{
+			name: "HTTPRequestOutputOnly",
+			spec: `
+steps:
+  - id: fetch
+    action: http.request
+    with:
+      method: GET
+      url: https://api.example.com/data
+      output: ./data.json
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			doc := mustParseYAMLDocument(t, tt.spec)
+			err := resolved.Validate(doc)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
 }

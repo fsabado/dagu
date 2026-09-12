@@ -7,11 +7,14 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,27 +22,27 @@ import (
 func TestEnqueueDAGRunClosesStatusBeforeQueuePublish(t *testing.T) {
 	f := newEnqueueDAGRunFixture(t, nil)
 
-	require.NoError(t, enqueueDAGRun(f.ctx, f.dag, "run-1", core.TriggerTypeManual, "", ""))
+	require.NoError(t, enqueueDAGRun(f.ctx, f.dag, "run-1", runOptions{triggerType: ir.TriggerTypeManual}))
 	assert.True(t, f.queueStore.enqueued)
 	require.NotNil(t, f.attempt.status)
-	assert.Equal(t, core.Queued, f.attempt.status.Status)
+	assert.Equal(t, ir.Queued, f.attempt.status.Status)
 }
 
 func TestEnqueueDAGRunPublishesQueueWhenCloseFails(t *testing.T) {
 	f := newEnqueueDAGRunFixture(t, errors.New("sync failed"))
 
-	require.NoError(t, enqueueDAGRun(f.ctx, f.dag, "run-1", core.TriggerTypeManual, "", ""))
+	require.NoError(t, enqueueDAGRun(f.ctx, f.dag, "run-1", runOptions{triggerType: ir.TriggerTypeManual}))
 	assert.True(t, f.queueStore.enqueued)
 	assert.True(t, f.attempt.closed, "attempt should be closed even when Close returns an error")
 	require.NotNil(t, f.attempt.status)
-	assert.Equal(t, core.Queued, f.attempt.status.Status)
+	assert.Equal(t, ir.Queued, f.attempt.status.Status)
 }
 
 type enqueueDAGRunFixture struct {
 	attempt    *enqueueTrackingAttempt
 	queueStore *enqueueObservingQueueStore
 	ctx        *Context
-	dag        *core.DAG
+	dag        *ir.DAG
 }
 
 func newEnqueueDAGRunFixture(t *testing.T, closeErr error) enqueueDAGRunFixture {
@@ -60,10 +63,12 @@ func newEnqueueDAGRunFixture(t *testing.T, closeErr error) enqueueDAGRunFixture 
 `).DAG
 
 	ctx := &Context{
-		Context:     th.Context,
-		Config:      th.Config,
-		DAGRunStore: runStore,
-		QueueStore:  queueStore,
+		Context: th.Context,
+		Config:  th.Config,
+		Persistence: Persistence{
+			DAGRunRepository: persis.NewDAGRunRepository(runStore, nil, persis.DAGRunRepositoryOptions{}),
+			QueueStore:       queueStore,
+		},
 	}
 
 	return enqueueDAGRunFixture{
@@ -75,64 +80,25 @@ func newEnqueueDAGRunFixture(t *testing.T, closeErr error) enqueueDAGRunFixture 
 }
 
 type enqueueTrackingDAGRunStore struct {
+	testutil.DAGRunStoreStub
 	attempt *enqueueTrackingAttempt
 }
 
-func (s *enqueueTrackingDAGRunStore) CreateAttempt(context.Context, *core.DAG, time.Time, string, exec.NewDAGRunAttemptOptions) (exec.DAGRunAttempt, error) {
+func (s *enqueueTrackingDAGRunStore) CreateAttempt(context.Context, persis.DAGRunCreateAttemptRequest) (dagrun.Attempt, error) {
 	return s.attempt, nil
 }
 
-func (s *enqueueTrackingDAGRunStore) RecentAttempts(context.Context, string, int) []exec.DAGRunAttempt {
-	return nil
-}
-
-func (s *enqueueTrackingDAGRunStore) LatestAttempt(context.Context, string) (exec.DAGRunAttempt, error) {
-	return nil, exec.ErrDAGRunIDNotFound
-}
-
-func (s *enqueueTrackingDAGRunStore) ListStatuses(context.Context, ...exec.ListDAGRunStatusesOption) ([]*exec.DAGRunStatus, error) {
-	return nil, nil
-}
-
-func (s *enqueueTrackingDAGRunStore) ListStatusesPage(context.Context, ...exec.ListDAGRunStatusesOption) (exec.DAGRunStatusPage, error) {
-	return exec.DAGRunStatusPage{}, nil
-}
-
-func (s *enqueueTrackingDAGRunStore) CompareAndSwapLatestAttemptStatus(context.Context, exec.DAGRunRef, string, core.Status, func(*exec.DAGRunStatus) error, ...exec.CompareAndSwapStatusOption) (*exec.DAGRunStatus, bool, error) {
-	return nil, false, nil
-}
-
-func (s *enqueueTrackingDAGRunStore) FindAttempt(context.Context, exec.DAGRunRef) (exec.DAGRunAttempt, error) {
-	return nil, exec.ErrDAGRunIDNotFound
-}
-
-func (s *enqueueTrackingDAGRunStore) FindSubAttempt(context.Context, exec.DAGRunRef, string) (exec.DAGRunAttempt, error) {
-	return nil, exec.ErrDAGRunIDNotFound
-}
-
-func (s *enqueueTrackingDAGRunStore) CreateSubAttempt(context.Context, exec.DAGRunRef, string) (exec.DAGRunAttempt, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (s *enqueueTrackingDAGRunStore) RemoveOldDAGRuns(context.Context, string, int, ...exec.RemoveOldDAGRunsOption) ([]string, error) {
-	return nil, nil
-}
-
-func (s *enqueueTrackingDAGRunStore) RenameDAGRuns(context.Context, string, string) error {
-	return nil
-}
-
-func (s *enqueueTrackingDAGRunStore) RemoveDAGRun(context.Context, exec.DAGRunRef, ...exec.RemoveDAGRunOption) error {
-	return nil
+func (s *enqueueTrackingDAGRunStore) FindAttempt(context.Context, ir.DAGRunRef) (dagrun.Attempt, error) {
+	return nil, dagrun.ErrDAGRunIDNotFound
 }
 
 type enqueueTrackingAttempt struct {
 	id       string
-	dag      *core.DAG
+	dag      *ir.DAG
 	open     bool
 	closed   bool
 	closeErr error
-	status   *exec.DAGRunStatus
+	status   *ir.DAGRunStatus
 }
 
 func (a *enqueueTrackingAttempt) ID() string {
@@ -145,7 +111,7 @@ func (a *enqueueTrackingAttempt) Open(context.Context) error {
 	return nil
 }
 
-func (a *enqueueTrackingAttempt) Write(_ context.Context, status exec.DAGRunStatus) error {
+func (a *enqueueTrackingAttempt) Write(_ context.Context, status ir.DAGRunStatus) error {
 	if !a.open {
 		return errors.New("attempt is not open")
 	}
@@ -159,15 +125,19 @@ func (a *enqueueTrackingAttempt) Close(context.Context) error {
 	return a.closeErr
 }
 
-func (a *enqueueTrackingAttempt) ReadStatus(context.Context) (*exec.DAGRunStatus, error) {
+func (a *enqueueTrackingAttempt) ReadStatus(context.Context) (*ir.DAGRunStatus, error) {
 	return a.status, nil
 }
 
-func (a *enqueueTrackingAttempt) ReadDAG(context.Context) (*core.DAG, error) {
+func (a *enqueueTrackingAttempt) ReadStatusUncached(ctx context.Context) (*ir.DAGRunStatus, error) {
+	return a.ReadStatus(ctx)
+}
+
+func (a *enqueueTrackingAttempt) ReadDAG(context.Context) (*ir.DAG, error) {
 	return a.dag, nil
 }
 
-func (a *enqueueTrackingAttempt) SetDAG(dag *core.DAG) {
+func (a *enqueueTrackingAttempt) SetDAG(dag *ir.DAG) {
 	a.dag = dag
 }
 
@@ -187,24 +157,20 @@ func (a *enqueueTrackingAttempt) Hidden() bool {
 	return false
 }
 
-func (a *enqueueTrackingAttempt) WriteOutputs(context.Context, *exec.DAGRunOutputs) error {
+func (a *enqueueTrackingAttempt) WriteOutputs(context.Context, *ir.DAGRunOutputs) error {
 	return nil
 }
 
-func (a *enqueueTrackingAttempt) ReadOutputs(context.Context) (*exec.DAGRunOutputs, error) {
+func (a *enqueueTrackingAttempt) ReadOutputs(context.Context) (*ir.DAGRunOutputs, error) {
 	return nil, nil
 }
 
-func (a *enqueueTrackingAttempt) WriteStepMessages(context.Context, string, []exec.LLMMessage) error {
+func (a *enqueueTrackingAttempt) WriteStepMessages(context.Context, string, []ir.LLMMessage) error {
 	return nil
 }
 
-func (a *enqueueTrackingAttempt) ReadStepMessages(context.Context, string) ([]exec.LLMMessage, error) {
+func (a *enqueueTrackingAttempt) ReadStepMessages(context.Context, string) ([]ir.LLMMessage, error) {
 	return nil, nil
-}
-
-func (a *enqueueTrackingAttempt) WorkDir() string {
-	return ""
 }
 
 type enqueueObservingQueueStore struct {
@@ -212,23 +178,19 @@ type enqueueObservingQueueStore struct {
 	enqueued bool
 }
 
-func (s *enqueueObservingQueueStore) Enqueue(context.Context, string, exec.QueuePriority, exec.DAGRunRef) error {
+func (s *enqueueObservingQueueStore) Enqueue(context.Context, string, queue.QueuePriority, ir.DAGRunRef) error {
 	if !s.attempt.closed {
 		return errors.New("status attempt was not closed before queue enqueue")
 	}
-	if s.attempt.status == nil || s.attempt.status.Status != core.Queued {
+	if s.attempt.status == nil || s.attempt.status.Status != ir.Queued {
 		return errors.New("queued status was not written before queue enqueue")
 	}
 	s.enqueued = true
 	return nil
 }
 
-func (s *enqueueObservingQueueStore) DequeueByName(context.Context, string) (exec.QueuedItemData, error) {
-	return nil, exec.ErrQueueEmpty
-}
-
-func (s *enqueueObservingQueueStore) DequeueByDAGRunID(context.Context, string, exec.DAGRunRef) ([]exec.QueuedItemData, error) {
-	return nil, exec.ErrQueueItemNotFound
+func (s *enqueueObservingQueueStore) DequeueByDAGRunID(context.Context, string, ir.DAGRunRef) ([]queue.QueuedItemData, error) {
+	return nil, queue.ErrQueueItemNotFound
 }
 
 func (s *enqueueObservingQueueStore) DeleteByItemIDs(context.Context, string, []string) (int, error) {
@@ -239,19 +201,27 @@ func (s *enqueueObservingQueueStore) Len(context.Context, string) (int, error) {
 	return 0, nil
 }
 
-func (s *enqueueObservingQueueStore) List(context.Context, string) ([]exec.QueuedItemData, error) {
+func (s *enqueueObservingQueueStore) List(context.Context, string) ([]queue.QueuedItemData, error) {
 	return nil, nil
 }
 
-func (s *enqueueObservingQueueStore) ListCursor(context.Context, string, string, int) (exec.CursorResult[exec.QueuedItemData], error) {
-	return exec.CursorResult[exec.QueuedItemData]{}, nil
+func (s *enqueueObservingQueueStore) GetByItemID(context.Context, string, string) (queue.QueuedItemData, error) {
+	return nil, queue.ErrQueueItemNotFound
 }
 
-func (s *enqueueObservingQueueStore) All(context.Context) ([]exec.QueuedItemData, error) {
+func (s *enqueueObservingQueueStore) ListCursor(context.Context, string, string, int) (pagination.CursorResult[queue.QueuedItemData], error) {
+	return pagination.CursorResult[queue.QueuedItemData]{}, nil
+}
+
+func (s *enqueueObservingQueueStore) Revision(context.Context, string) (int64, error) {
+	return 0, nil
+}
+
+func (s *enqueueObservingQueueStore) All(context.Context) ([]queue.QueuedItemData, error) {
 	return nil, nil
 }
 
-func (s *enqueueObservingQueueStore) ListByDAGName(context.Context, string, string) ([]exec.QueuedItemData, error) {
+func (s *enqueueObservingQueueStore) ListByDAGName(context.Context, string, string) ([]queue.QueuedItemData, error) {
 	return nil, nil
 }
 
@@ -259,6 +229,6 @@ func (s *enqueueObservingQueueStore) QueueList(context.Context) ([]string, error
 	return nil, nil
 }
 
-func (s *enqueueObservingQueueStore) QueueWatcher(context.Context) exec.QueueWatcher {
+func (s *enqueueObservingQueueStore) QueueWatcher(context.Context) queue.QueueWatcher {
 	return nil
 }

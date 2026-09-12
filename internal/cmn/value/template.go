@@ -36,6 +36,7 @@ var supportedBuiltinContextBindings = map[string]struct{}{
 	"context.paths.log_file":                {},
 	"context.paths.work_dir":                {},
 	"context.paths.artifacts_dir":           {},
+	"context.paths.wiki_dir":                {},
 	"context.paths.docs_dir":                {},
 	"context.paths.step_stdout_file":        {},
 	"context.paths.step_stderr_file":        {},
@@ -62,6 +63,7 @@ var legacyBuiltinContextAliases = map[string]string{
 	"paths.log_file":                "context.paths.log_file",
 	"paths.work_dir":                "context.paths.work_dir",
 	"paths.artifacts_dir":           "context.paths.artifacts_dir",
+	"paths.wiki_dir":                "context.paths.wiki_dir",
 	"paths.docs_dir":                "context.paths.docs_dir",
 	"paths.step_stdout_file":        "context.paths.step_stdout_file",
 	"paths.step_stderr_file":        "context.paths.step_stderr_file",
@@ -310,6 +312,9 @@ func bindingValue(ctx context.Context, path string, scope RuntimeScope, requireV
 	case "consts":
 		return bindingMapValue("consts", segments[1], scope.Consts, requireValue)
 	case "params":
+		if len(segments) == 1 {
+			return bindingParamsJSONValue(scope.ParamsJSON, requireValue)
+		}
 		return bindingMapValue("params", segments[1], scope.Params, requireValue)
 	case "env":
 		return bindingEnvValue(segments[1], scope.Env, requireValue)
@@ -317,11 +322,44 @@ func bindingValue(ctx context.Context, path string, scope RuntimeScope, requireV
 		return bindingStepOutputValue(ctx, segments, scope.Steps, requireValue)
 	case "foreach":
 		return bindingForeachValue(path, segments, scope.Foreach, requireValue)
+	case "inputs":
+		return bindingScopedPathValue("inputs", segments[1], scope.Inputs, requireValue)
+	case "outputs":
+		return bindingScopedPathValue("outputs", segments[1], scope.Outputs, requireValue)
 	case "context", "dag", "run", "attempt", "step", "trigger", "paths", "profile", "pushback":
 		return bindingBuiltinContextValue(path, scope.BuiltinContext, requireValue)
 	default:
 		return nil, nil
 	}
+}
+
+func bindingScopedPathValue(namespace, name string, values Values, requireValue bool) (any, error) {
+	if value, ok := values[name]; ok {
+		return value, nil
+	}
+	if !requireValue {
+		return nil, nil
+	}
+	if len(values) > 0 {
+		return nil, fmt.Errorf("unknown %s.%s binding", namespace, name)
+	}
+	return nil, newNoticeReasonError(
+		ValueReferenceReasonNamespaceUnavailable,
+		fmt.Sprintf("%s.%s is unavailable in this context", namespace, name),
+	)
+}
+
+func bindingParamsJSONValue(value string, requireValue bool) (any, error) {
+	if value != "" {
+		return value, nil
+	}
+	if !requireValue {
+		return nil, nil
+	}
+	return nil, newNoticeReasonError(
+		ValueReferenceReasonNamespaceUnavailable,
+		"params is unavailable in this context",
+	)
 }
 
 func bindingBuiltinContextValue(path string, builtins BuiltinContext, requireValue bool) (any, error) {
@@ -333,7 +371,7 @@ func bindingBuiltinContextValue(path string, builtins BuiltinContext, requireVal
 	}
 	return nil, newNoticeReasonError(
 		ValueReferenceReasonNamespaceUnavailable,
-		fmt.Sprintf("%s is unavailable in this context", path),
+		fmt.Sprintf("%s is populated during a DAG run", path),
 	)
 }
 
@@ -360,7 +398,15 @@ func bindingMapValue(namespace, name string, values Values, requireValue bool) (
 	value, ok := values[name]
 	if !ok {
 		if namespace == "params" {
+			// A caller can pass a param the spec never declared, so an absent
+			// one says nothing about the spec being wrong.
 			return nil, fmt.Errorf("unknown params.%s binding", name)
+		}
+		if namespace == "consts" {
+			return nil, newNoticeReasonError(
+				ValueReferenceReasonUnknownConstName,
+				fmt.Sprintf("unknown consts.%s binding", name),
+			)
 		}
 		return nil, fmt.Errorf("unknown %s binding %q", namespace, name)
 	}
@@ -442,12 +488,20 @@ func bindingEnvValue(name string, scope *EnvScope, requireValue bool) (any, erro
 	if !requireValue {
 		return nil, nil
 	}
-	return nil, fmt.Errorf("unknown env.%s binding", name)
+	return nil, newNoticeReasonError(
+		ValueReferenceReasonUnknownEnvBinding,
+		fmt.Sprintf("unknown env.%s binding", name),
+	)
 }
 
 func supportedStrictBinding(segments []string) bool {
 	switch segments[0] {
-	case "consts", "params":
+	case "consts":
+		return len(segments) == 2 && bindingNamePattern.MatchString(segments[1])
+	case "params":
+		if len(segments) == 1 {
+			return true
+		}
 		return len(segments) == 2 && bindingNamePattern.MatchString(segments[1])
 	case "env":
 		return len(segments) == 2 && ValidEnvName(segments[1])
@@ -469,6 +523,8 @@ func supportedStrictBinding(segments []string) bool {
 			}
 		}
 		return true
+	case "inputs", "outputs":
+		return len(segments) == 2 && bindingNamePattern.MatchString(segments[1])
 	case "context":
 		if len(segments) != 3 {
 			return false

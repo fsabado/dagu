@@ -5,12 +5,26 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { LanguageSelector } from '@/components/LanguageSelector';
 import { setAuthSession } from '@/lib/authSession';
-import { AlertCircle, LogIn, KeyRound, CheckCircle } from 'lucide-react';
+import {
+  AlertCircle,
+  LogIn,
+  KeyRound,
+  CheckCircle,
+  ShieldCheck,
+} from 'lucide-react';
+import { useI18n } from '@/i18n/I18nProvider';
 
 export default function LoginPage() {
+  const { t } = useI18n();
   const config = useConfig();
-  const { login, isAuthenticated, isLoading: authLoading, setupRequired } = useAuth();
+  const {
+    login,
+    isAuthenticated,
+    isLoading: authLoading,
+    setupRequired,
+  } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -23,7 +37,8 @@ export default function LoginPage() {
 
   const from = (location.state as { from?: Location })?.from?.pathname || '/';
 
-  // Handle OIDC callback: token from hash fragment, error/welcome from query params
+  // Handle external authentication callbacks: token from the hash fragment,
+  // error/welcome from query parameters.
   useEffect(() => {
     // Token is in the hash fragment so it never appears in server access logs
     const hashParams = new URLSearchParams(location.hash.slice(1));
@@ -31,9 +46,9 @@ export default function LoginPage() {
     const errorParam = searchParams.get('error');
     const welcomeParam = searchParams.get('welcome');
 
-    // Handle OIDC callback token - store in localStorage and navigate to home
+    // Store the token and navigate home. AuthProvider validates it on the next page load.
     if (tokenParam) {
-      setAuthSession(tokenParam, null, 'oidc');
+      setAuthSession(tokenParam, null, 'external');
       // Navigate to home immediately - AuthProvider will validate token on next page load
       navigate(from, { replace: true });
       return;
@@ -43,9 +58,9 @@ export default function LoginPage() {
       setError(errorParam);
     }
     if (welcomeParam === 'true') {
-      setWelcomeMessage('Welcome! Your account has been created.');
+      setWelcomeMessage(t('auth.welcomeAccountCreated'));
     }
-  }, [searchParams, location.hash, navigate, from]);
+  }, [searchParams, location.hash, navigate, from, t]);
 
   // Redirect to setup page if initial admin account hasn't been created.
   // Wait for auth state to settle (isLoading=false) to avoid acting on
@@ -79,16 +94,19 @@ export default function LoginPage() {
   };
 
   const handleOIDCLogin = () => {
-    // Redirect to OIDC login endpoint
     window.location.href = `${config.basePath}/oidc-login`;
   };
+
+  const externalLoginEnabled = config.oidcEnabled || config.proxyEnabled;
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-muted/50">
       <div className="w-full max-w-sm p-6 space-y-6">
         <div className="text-center space-y-2">
           <h1 className="text-2xl font-bold">{config.title || 'Dagu'}</h1>
-          <p className="text-sm text-muted-foreground">Sign in to your account</p>
+          <p className="text-sm text-muted-foreground">
+            {t('auth.signInToAccount')}
+          </p>
         </div>
 
         <div className="space-y-4">
@@ -109,7 +127,7 @@ export default function LoginPage() {
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
               <Label htmlFor="username" className="text-sm">
-                Username
+                {t('auth.username')}
               </Label>
               <Input
                 id="username"
@@ -125,7 +143,7 @@ export default function LoginPage() {
 
             <div className="space-y-1.5">
               <Label htmlFor="password" className="text-sm">
-                Password
+                {t('auth.password')}
               </Label>
               <Input
                 id="password"
@@ -140,32 +158,48 @@ export default function LoginPage() {
 
             <Button type="submit" className="w-full h-9" disabled={isLoading}>
               <LogIn className="h-4 w-4" />
-              {isLoading ? 'Signing in...' : 'Sign In'}
+              {isLoading ? t('auth.signingIn') : t('auth.signIn')}
             </Button>
           </form>
 
-          {config.oidcEnabled && (
+          {externalLoginEnabled && (
             <>
               <div className="relative">
                 <div className="absolute inset-0 flex items-center">
                   <span className="w-full border-t" />
                 </div>
                 <div className="relative flex justify-center text-xs uppercase">
-                  <span className="bg-background px-2 text-muted-foreground">or</span>
+                  <span className="bg-background px-2 text-muted-foreground">
+                    {t('auth.or')}
+                  </span>
                 </div>
               </div>
 
-              <Button
-                type="button"
-                variant="outline"
-                className="w-full h-9"
-                onClick={handleOIDCLogin}
-              >
-                <KeyRound className="h-4 w-4" />
-                {config.oidcButtonLabel || 'Login with SSO'}
-              </Button>
+              {config.oidcEnabled && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full h-9"
+                  onClick={handleOIDCLogin}
+                >
+                  <KeyRound className="h-4 w-4" />
+                  {config.oidcButtonLabel || t('auth.loginWithSso')}
+                </Button>
+              )}
+
+              {config.proxyEnabled && (
+                <Button asChild variant="outline" className="w-full h-9">
+                  <a href={`${config.basePath}/proxy-login`}>
+                    <ShieldCheck className="h-4 w-4" />
+                    {config.proxyButtonLabel || t('auth.continueWithSso')}
+                  </a>
+                </Button>
+              )}
             </>
           )}
+        </div>
+        <div className="flex justify-center">
+          <LanguageSelector />
         </div>
       </div>
     </div>

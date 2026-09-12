@@ -23,10 +23,11 @@ import LoadingIndicator from '@/components/ui/loading-indicator';
 import type { components } from '@/api/v1/schema';
 import { RootDAGRunContext } from '../../contexts/RootDAGRunContext';
 import DAGDetailsContent from './DAGDetailsContent';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 type DAGDetailsResponse = {
   dag?: components['schemas']['DAGDetails'];
-  filePath?: string;
   latestDAGRun?: components['schemas']['DAGRunDetails'];
   localDags?: components['schemas']['LocalDag'][];
 };
@@ -37,7 +38,8 @@ type EnqueueHandler = (
   params: string,
   dagRunId?: string,
   immediate?: boolean,
-  profile?: string
+  profile?: string,
+  noReuse?: boolean
 ) => string | void | Promise<string | void>;
 
 type Props = {
@@ -104,6 +106,7 @@ function getLoadState(
 }
 
 function buildFullscreenUrl(fileName: string, activeTab: string): string {
+  if (activeTab === 'docs') activeTab = 'wiki';
   return activeTab === 'status'
     ? `/dags/${fileName}`
     : `/dags/${fileName}/${activeTab}`;
@@ -125,7 +128,9 @@ function DAGDetailsSidePanel({
 
   const [shouldRender, setShouldRender] = React.useState(isOpen);
   const [isVisible, setIsVisible] = React.useState(false);
-  const [activeTab, setActiveTab] = React.useState(initialTab);
+  const [activeTab, setActiveTab] = React.useState(
+    initialTab === 'docs' ? 'wiki' : initialTab
+  );
   const [trackedDagRunId, setTrackedDagRunId] = React.useState<string>();
   const [currentDAGRun, setCurrentDAGRun] = React.useState<
     components['schemas']['DAGRunDetails'] | undefined
@@ -173,7 +178,7 @@ function DAGDetailsSidePanel({
       return;
     }
 
-    setActiveTab(initialTab);
+    setActiveTab(initialTab === 'docs' ? 'wiki' : initialTab);
     setTrackedDagRunId(undefined);
     setCurrentDAGRun(undefined);
   }, [fileName, initialTab, isOpen, remoteNode]);
@@ -233,12 +238,18 @@ function DAGDetailsSidePanel({
   }, [mutate]);
 
   const handleEnqueue = React.useCallback<EnqueueHandler>(
-    async (params, dagRunId, immediate, profile) => {
+    async (params, dagRunId, immediate, profile, noReuse) => {
       if (!onEnqueue) {
         return;
       }
 
-      const result = await onEnqueue(params, dagRunId, immediate, profile);
+      const result = await onEnqueue(
+        params,
+        dagRunId,
+        immediate,
+        profile,
+        noReuse
+      );
       setActiveTab('status');
       if (typeof result === 'string' && result) {
         setTrackedDagRunId(result);
@@ -349,7 +360,7 @@ function DAGDetailsSidePanel({
                     {toolbarHint}
                   </div>
                   <div className="flex gap-2">
-                    <Button
+                    <I18nProps><Button
                       variant="outline"
                       size="icon"
                       onClick={handleFullscreenClick}
@@ -358,10 +369,10 @@ function DAGDetailsSidePanel({
                     >
                       <Maximize2 className="h-4 w-4" />
                       <span className="absolute -bottom-1 -right-1 bg-muted text-muted-foreground text-xs font-medium px-1 rounded-sm border opacity-0 group-hover:opacity-100 transition-opacity">
-                        F
+                        <I18nText text={"F"} />
                       </span>
-                    </Button>
-                    <Button
+                    </Button></I18nProps>
+                    <I18nProps><Button
                       variant="outline"
                       size="icon"
                       onClick={onClose}
@@ -370,9 +381,9 @@ function DAGDetailsSidePanel({
                     >
                       <X className="h-4 w-4" />
                       <span className="absolute -bottom-1 -right-1 bg-muted text-muted-foreground text-xs font-medium px-1 rounded-sm border opacity-0 group-hover:opacity-100 transition-opacity">
-                        Esc
+                        <I18nText text={"Esc"} />
                       </span>
-                    </Button>
+                    </Button></I18nProps>
                   </div>
                 </div>
 
@@ -380,7 +391,7 @@ function DAGDetailsSidePanel({
                   {loadState.state === 'loading' && (
                     <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
                       <LoadingIndicator />
-                      <p>Loading DAG details...</p>
+                      <p><I18nText text={"Loading DAG details..."} /></p>
                     </div>
                   )}
 
@@ -390,7 +401,7 @@ function DAGDetailsSidePanel({
                         {loadState.message}
                       </p>
                       <Button variant="outline" size="sm" onClick={onClose}>
-                        Close
+                        <I18nText text={"Close"} />
                       </Button>
                     </div>
                   )}
@@ -406,10 +417,10 @@ function DAGDetailsSidePanel({
                           size="sm"
                           onClick={() => void mutate()}
                         >
-                          Retry
+                          <I18nText text={"Retry"} />
                         </Button>
                         <Button variant="ghost" size="sm" onClick={onClose}>
-                          Close
+                          <I18nText text={"Close"} />
                         </Button>
                       </div>
                     </div>
@@ -418,7 +429,6 @@ function DAGDetailsSidePanel({
                   {loadState.state === 'ready' && data?.dag && (
                     <DAGDetailsContent
                       fileName={stableFileName}
-                      filePath={data.filePath}
                       dag={data.dag}
                       currentDAGRun={currentDAGRun}
                       dagRunId={trackedDagRunId ?? 'latest'}

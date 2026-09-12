@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	runtimepkg "github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/agent"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	runtimepkg "github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/agent"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -72,9 +72,9 @@ func TestBaseDAGSpecialEnvVarsInHandler(t *testing.T) {
 	dagRunID := uuid.New().String()
 	logDir := th.Config.Paths.LogDir
 	logFile := filepath.Join(logDir, dagRunID+".log")
-	root := exec.NewDAGRunRef(dag.Name, dagRunID)
+	root := ir.NewDAGRunRef(dag.Name, dagRunID)
 
-	drm := runtimepkg.NewManager(th.DAGRunStore, th.ProcStore, th.Config)
+	drm := runtimepkg.NewManager(th.DAGRunRepository, th.ProcRepository, th.Config)
 
 	a := agent.New(
 		dagRunID,
@@ -82,9 +82,9 @@ func TestBaseDAGSpecialEnvVarsInHandler(t *testing.T) {
 		logDir,
 		logFile,
 		drm,
-		th.DAGStore,
+		th.DAGRepository,
 		agent.Options{
-			DAGRunStore:     th.DAGRunStore,
+			RunStateStore:   persis.NewRunStateStore(th.DAGRunRepository, nil),
 			ServiceRegistry: th.ServiceRegistry,
 			RootDAGRun:      root,
 			PeerConfig:      th.Config.Core.Peer,
@@ -97,7 +97,7 @@ func TestBaseDAGSpecialEnvVarsInHandler(t *testing.T) {
 
 	// Verify the DAG failed
 	status := a.Status(th.Context)
-	require.Equal(t, core.Failed, status.Status)
+	require.Equal(t, ir.Failed, status.Status)
 
 	// Read the output file and verify special env vars were available
 	output, err := os.ReadFile(outputFile)
@@ -190,9 +190,9 @@ steps:
 	dagRunID := uuid.New().String()
 	logDir := th.Config.Paths.LogDir
 	logFile := filepath.Join(logDir, dagRunID+".log")
-	root := exec.NewDAGRunRef(dag.Name, dagRunID)
+	root := ir.NewDAGRunRef(dag.Name, dagRunID)
 
-	drm := runtimepkg.NewManager(th.DAGRunStore, th.ProcStore, th.Config)
+	drm := runtimepkg.NewManager(th.DAGRunRepository, th.ProcRepository, th.Config)
 
 	a := agent.New(
 		dagRunID,
@@ -200,9 +200,9 @@ steps:
 		logDir,
 		logFile,
 		drm,
-		th.DAGStore,
+		th.DAGRepository,
 		agent.Options{
-			DAGRunStore:     th.DAGRunStore,
+			RunStateStore:   persis.NewRunStateStore(th.DAGRunRepository, nil),
 			ServiceRegistry: th.ServiceRegistry,
 			RootDAGRun:      root,
 			PeerConfig:      th.Config.Core.Peer,

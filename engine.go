@@ -9,16 +9,18 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	coreexec "github.com/dagucloud/dagu/internal/core/exec"
-	iengine "github.com/dagucloud/dagu/internal/engine"
-	"github.com/dagucloud/dagu/internal/persis/file"
-	"github.com/dagucloud/dagu/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	iengine "github.com/dagucloud/dagu/v2/internal/engine"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	filematerialization "github.com/dagucloud/dagu/v2/internal/persis/file/materialization"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
 
-	_ "github.com/dagucloud/dagu/internal/runtime/builtin" // Register built-in executors for embedded use.
+	_ "github.com/dagucloud/dagu/v2/internal/runtime/builtin" // Register built-in executors for embedded use.
 )
 
 // ExecutionMode controls how a DAG run is dispatched.
@@ -152,6 +154,7 @@ type runOptions struct {
 	workerSelector    map[string]string
 	labels            []string
 	dryRun            bool
+	noReuse           bool
 }
 
 // New creates an embedded Dagu engine.
@@ -398,6 +401,13 @@ func WithDryRun(enabled bool) RunOption {
 	}
 }
 
+// WithNoReuse forces build steps to recompute for this run.
+func WithNoReuse(enabled bool) RunOption {
+	return func(o *runOptions) {
+		o.noReuse = enabled
+	}
+}
+
 func internalOptions(opts Options) iengine.Options {
 	out := iengine.Options{
 		HomeDir:            opts.HomeDir,
@@ -425,36 +435,38 @@ func filePersistenceFactory(ctx context.Context, cfg *config.Config) (iengine.Pe
 	if err := os.MkdirAll(cfg.Paths.DAGStateDir, 0o750); err != nil {
 		return iengine.Persistence{}, fmt.Errorf("create DAG state directory: %w", err)
 	}
+	backend := file.NewBackend(cfg.Paths)
 
-	procStore := file.NewProcStore(cfg)
-	dagStore, err := fileEngineDAGStore(ctx, cfg, iengine.DAGStoreFactoryOptions{})
+	procRepository := file.NewProcRepository(cfg)
+	dagRepository, err := fileEngineDAGRepository(ctx, cfg, iengine.DAGRepositoryFactoryOptions{})
 	if err != nil {
 		return iengine.Persistence{}, err
 	}
 
 	return iengine.Persistence{
-		DAGStore:        dagStore,
-		DAGRunStore:     file.NewDAGRunStore(cfg, file.WithDAGRunLatestStatusToday(false)),
-		ProcStore:       procStore,
-		StateStore:      store.NewDAGStateStore(file.NewCollection(cfg.Paths.DAGStateDir)),
-		ServiceRegistry: file.NewServiceRegistry(cfg),
+		DAGRepository:    dagRepository,
+		DAGRunRepository: file.NewDAGRunRepository(cfg, file.WithDAGRunLatestStatusToday(false)),
+		ProcRepository:   procRepository,
+		StateStore:       store.NewDAGStateStore(backend.Collection(persis.CollectionDAGState)),
+		ServiceRegistry:  file.NewServiceRegistry(cfg),
 
-		DAGStoreFactory:      fileEngineDAGStore,
-		AgentStoresFactory:   fileEngineAgentStores,
-		SnapshotStoreFactory: file.NewSnapshotStores,
+		DAGRepositoryFactory: fileEngineDAGRepository,
+		RuntimeStoresFactory: func(ctx context.Context, cfg *config.Config) iengine.RuntimeStores {
+			return iengine.RuntimeStores{
+				SecretStore:          file.NewSecretStore(ctx, cfg, backend.Collection(persis.CollectionSecrets)),
+				ProfileStore:         file.NewProfileStore(ctx, cfg, backend.Collection(persis.CollectionProfiles)),
+				MaterializationStore: filematerialization.New(filepath.Join(cfg.Paths.DataDir, "materializations")),
+			}
+		},
 	}, nil
 }
 
-func fileEngineDAGStore(_ context.Context, cfg *config.Config, opts iengine.DAGStoreFactoryOptions) (coreexec.DAGStore, error) {
-	var fileOpts []file.DAGStoreOption
+func fileEngineDAGRepository(_ context.Context, cfg *config.Config, opts iengine.DAGRepositoryFactoryOptions) (*persis.DAGRepository, error) {
+	var fileOpts []file.DAGRepositoryOption
 	if len(opts.SearchPaths) > 0 {
 		fileOpts = append(fileOpts, file.WithDAGSearchPaths(opts.SearchPaths))
 	}
-	return file.NewDAGStore(cfg, fileOpts...)
-}
-
-func fileEngineAgentStores(ctx context.Context, cfg *config.Config) iengine.AgentStores {
-	return file.NewAgentStores(ctx, cfg, file.WithAgentContextResolverFromConfig())
+	return file.NewDAGRepository(cfg, fileOpts...)
 }
 
 func internalDistributedOptions(opts DistributedOptions) iengine.DistributedOptions {
@@ -488,6 +500,7 @@ func internalRunOptions(opts runOptions) iengine.RunOptions {
 		WorkerSelector:    opts.workerSelector,
 		Labels:            opts.labels,
 		DryRun:            opts.dryRun,
+		NoReuse:           opts.noReuse,
 	}
 }
 

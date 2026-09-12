@@ -10,9 +10,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,7 +49,7 @@ steps:
 	attempt, dag := test.WaitForAttemptSnapshotWithDAG(t, server, dagName, enqBody.DagRunId)
 	require.NotNil(t, attempt)
 	require.Empty(t, dag.Location)
-	require.Equal(t, dagPath, dag.SourceFile)
+	requireSameFile(t, dagPath, dag.SourceFile)
 
 	assertQueuedRunSpecFromFile(t, server, dagName, enqBody.DagRunId, true)
 
@@ -73,7 +74,16 @@ steps:
 
 	_, rescheduledDAG := test.WaitForAttemptSnapshotWithDAG(t, server, dagName, rescheduleBody.DagRunId)
 	require.Contains(t, string(rescheduledDAG.YamlData), "echo current file")
-	require.Equal(t, dagPath, rescheduledDAG.SourceFile)
+	requireSameFile(t, dagPath, rescheduledDAG.SourceFile)
+}
+
+func requireSameFile(t *testing.T, expected, actual string) {
+	t.Helper()
+	expectedInfo, err := fileutil.Stat(expected)
+	require.NoError(t, err)
+	actualInfo, err := fileutil.Stat(actual)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(expectedInfo, actualInfo), "%q and %q do not identify the same file", expected, actual)
 }
 
 func assertQueuedRunSpecFromFile(t *testing.T, server test.Server, dagName, dagRunID string, want bool) {

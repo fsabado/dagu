@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 var attemptIDFlag = commandLineFlag{
@@ -37,12 +39,12 @@ func requireWorkerAttemptID(ctx *Context, workerID string) (string, error) {
 
 func resolveWorkerPreparedAttempt(
 	ctx context.Context,
-	dagRunStore exec.DAGRunStore,
+	dagRunRepository *persis.DAGRunRepository,
 	dagName, dagRunID string,
-	root exec.DAGRunRef,
+	root ir.DAGRunRef,
 	requestedAttemptID string,
-) (exec.DAGRunAttempt, *exec.DAGRunStatus, error) {
-	attempt, runStatus, err := readLatestAttempt(ctx, dagRunStore, dagName, dagRunID, root)
+) (dagrun.Attempt, *ir.DAGRunStatus, error) {
+	attempt, runStatus, err := readLatestAttempt(ctx, dagRunRepository, dagName, dagRunID, root)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -52,20 +54,30 @@ func resolveWorkerPreparedAttempt(
 	return attempt, runStatus, nil
 }
 
+func agentAttemptID(requested string, prepared dagrun.Attempt) string {
+	if requested != "" {
+		return requested
+	}
+	if prepared != nil {
+		return prepared.ID()
+	}
+	return ""
+}
+
 func readLatestAttempt(
 	ctx context.Context,
-	dagRunStore exec.DAGRunStore,
+	dagRunRepository *persis.DAGRunRepository,
 	dagName, dagRunID string,
-	root exec.DAGRunRef,
-) (exec.DAGRunAttempt, *exec.DAGRunStatus, error) {
+	root ir.DAGRunRef,
+) (dagrun.Attempt, *ir.DAGRunStatus, error) {
 	var (
-		attempt exec.DAGRunAttempt
+		attempt dagrun.Attempt
 		err     error
 	)
 	if root.ID != "" && root.ID != dagRunID {
-		attempt, err = dagRunStore.FindSubAttempt(ctx, root, dagRunID)
+		attempt, err = dagRunRepository.FindSubAttempt(ctx, root, dagRunID)
 	} else {
-		attempt, err = dagRunStore.FindAttempt(ctx, exec.NewDAGRunRef(dagName, dagRunID))
+		attempt, err = dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dagName, dagRunID))
 	}
 	if err != nil {
 		return nil, nil, err
@@ -80,8 +92,8 @@ func readLatestAttempt(
 
 func validateWorkerAttemptBinding(
 	dagRunID, requestedAttemptID string,
-	attempt exec.DAGRunAttempt,
-	runStatus *exec.DAGRunStatus,
+	attempt dagrun.Attempt,
+	runStatus *ir.DAGRunStatus,
 ) error {
 	currentAttemptID := requestedAttemptID
 	if runStatus != nil && runStatus.AttemptID != "" {

@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/stretchr/testify/require"
 )
 
-func TestExecution_QueuedDispatch_ConsumesOneThousandItems(t *testing.T) {
+func TestExecution_QueuedDispatch_ConsumesBulkItems(t *testing.T) {
 	const (
 		queueName = "bulk-q"
 	)
@@ -29,7 +29,7 @@ worker_selector:
   tier: "queue"
 steps:
   - name: step1
-    run: echo "executed"
+    action: noop
 `,
 		withWorkerCount(queuedDispatchWorkerCount()),
 		withWorkerMaxActiveRuns(queuedDispatchWorkerMaxActiveRuns()),
@@ -59,11 +59,17 @@ func queuedDispatchBulkRunCount() int {
 	if runtime.GOOS == "windows" {
 		return 5
 	}
+	if raceEnabled() {
+		return 20
+	}
 	return 1000
 }
 
 func queuedDispatchWorkerCount() int {
 	if runtime.GOOS == "windows" {
+		return 2
+	}
+	if raceEnabled() {
 		return 2
 	}
 	return 10
@@ -73,12 +79,18 @@ func queuedDispatchWorkerMaxActiveRuns() int {
 	if runtime.GOOS == "windows" {
 		return 1
 	}
+	if raceEnabled() {
+		return 2
+	}
 	return 10
 }
 
 func queuedDispatchBulkTimeout() time.Duration {
 	if runtime.GOOS == "windows" {
 		return 5 * time.Minute
+	}
+	if raceEnabled() {
+		return 2 * time.Minute
 	}
 	return 10 * time.Minute
 }
@@ -103,7 +115,7 @@ steps:
 
 	f.setupWorker("late-worker", map[string]string{"tier": "queue"}, "")
 
-	status := f.waitForStatus(core.Succeeded, 20*time.Second)
+	status := f.waitForStatus(ir.Succeeded, 20*time.Second)
 	require.Equal(t, "late-worker", status.WorkerID)
 	requireQueueEventuallyEmpty(t, f)
 }
@@ -130,7 +142,7 @@ steps:
 
 	f.setupWorker("matching-worker", map[string]string{"tier": "queue"}, "")
 
-	status := f.waitForStatus(core.Succeeded, 20*time.Second)
+	status := f.waitForStatus(ir.Succeeded, 20*time.Second)
 	require.Equal(t, "matching-worker", status.WorkerID)
 	requireQueueEventuallyEmpty(t, f)
 }
@@ -143,7 +155,7 @@ func requireQueuedRunStillPending(t *testing.T, f *testFixture, duration time.Du
 		if err != nil {
 			return false
 		}
-		if status.Status != core.Queued {
+		if status.Status != ir.Queued {
 			return false
 		}
 		count, err := queuedItemCount(f)
@@ -162,7 +174,7 @@ func requireQueuedRunStillPending(t *testing.T, f *testFixture, duration time.Du
 		if err != nil {
 			return false
 		}
-		return status.Status != core.Queued || count != 1
+		return status.Status != ir.Queued || count != 1
 	}, duration, 100*time.Millisecond, "queued run should not disappear before a matching worker is available")
 }
 
@@ -212,15 +224,15 @@ func requireAllQueuedRunsConsumed(t *testing.T, f *testFixture, expectedRuns int
 
 		if total == expectedRuns &&
 			queueCount == 0 &&
-			counts[core.Succeeded] == expectedRuns &&
-			counts[core.Queued] == 0 &&
-			counts[core.Running] == 0 &&
-			counts[core.NotStarted] == 0 &&
-			counts[core.Failed] == 0 &&
-			counts[core.Aborted] == 0 &&
-			counts[core.Waiting] == 0 &&
-			counts[core.Rejected] == 0 &&
-			counts[core.PartiallySucceeded] == 0 {
+			counts[ir.Succeeded] == expectedRuns &&
+			counts[ir.Queued] == 0 &&
+			counts[ir.Running] == 0 &&
+			counts[ir.NotStarted] == 0 &&
+			counts[ir.Failed] == 0 &&
+			counts[ir.Aborted] == 0 &&
+			counts[ir.Waiting] == 0 &&
+			counts[ir.Rejected] == 0 &&
+			counts[ir.PartiallySucceeded] == 0 {
 			return
 		}
 
@@ -230,17 +242,15 @@ func requireAllQueuedRunsConsumed(t *testing.T, f *testFixture, expectedRuns int
 	t.Fatalf("expected %d queued runs to be fully consumed; last state: %s", expectedRuns, lastSummary)
 }
 
-func dagRunStatusCounts(f *testFixture) (map[core.Status]int, int, error) {
-	statuses, err := f.coord.DAGRunStore.ListStatuses(
-		f.coord.Context,
-		exec.WithExactName(f.dagWrapper.Name),
-		exec.WithoutLimit(),
+func dagRunStatusCounts(f *testFixture) (map[ir.Status]int, int, error) {
+	statuses, err := f.coord.DAGRunRepository.ListStatuses(
+		f.coord.Context, persis.DAGRunListOptions{ExactName: f.dagWrapper.Name, Unbounded: true},
 	)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	counts := make(map[core.Status]int)
+	counts := make(map[ir.Status]int)
 	for _, status := range statuses {
 		if status == nil {
 			continue
@@ -251,18 +261,18 @@ func dagRunStatusCounts(f *testFixture) (map[core.Status]int, int, error) {
 	return counts, len(statuses), nil
 }
 
-func formatStatusSummary(counts map[core.Status]int, total, queueCount int) string {
+func formatStatusSummary(counts map[ir.Status]int, total, queueCount int) string {
 	return "total=" + itoa(total) +
 		" queue=" + itoa(queueCount) +
-		" succeeded=" + itoa(counts[core.Succeeded]) +
-		" queued=" + itoa(counts[core.Queued]) +
-		" running=" + itoa(counts[core.Running]) +
-		" not_started=" + itoa(counts[core.NotStarted]) +
-		" failed=" + itoa(counts[core.Failed]) +
-		" aborted=" + itoa(counts[core.Aborted]) +
-		" waiting=" + itoa(counts[core.Waiting]) +
-		" rejected=" + itoa(counts[core.Rejected]) +
-		" partial=" + itoa(counts[core.PartiallySucceeded])
+		" succeeded=" + itoa(counts[ir.Succeeded]) +
+		" queued=" + itoa(counts[ir.Queued]) +
+		" running=" + itoa(counts[ir.Running]) +
+		" not_started=" + itoa(counts[ir.NotStarted]) +
+		" failed=" + itoa(counts[ir.Failed]) +
+		" aborted=" + itoa(counts[ir.Aborted]) +
+		" waiting=" + itoa(counts[ir.Waiting]) +
+		" rejected=" + itoa(counts[ir.Rejected]) +
+		" partial=" + itoa(counts[ir.PartiallySucceeded])
 }
 
 func itoa(v int) string {

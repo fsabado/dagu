@@ -5,7 +5,6 @@ package proc
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -15,17 +14,18 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/backoff"
-	"github.com/dagucloud/dagu/internal/cmn/dirlock"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/proc"
 )
 
 const (
@@ -39,10 +39,9 @@ const (
 )
 
 var (
-	errInvalidProcFile       = errors.New("invalid proc file")
-	procFileRegex            = regexp.MustCompile(`^proc_(\d{8}_\d{6}Z)_([0-9a-f]+)_([0-9a-f]+)\.proc$`)
-	procLegacyFileRegex      = regexp.MustCompile(`^proc_(\d{8}_\d{6}Z)_([-a-zA-Z0-9_]+)\.proc$`)
-	procSafeAttemptIDPattern = regexp.MustCompile(`^[-a-zA-Z0-9_]+$`)
+	errInvalidProcFile  = errors.New("invalid proc file")
+	procFileRegex       = regexp.MustCompile(`^proc_(\d{8}_\d{6}Z)_([0-9a-f]+)_([0-9a-f]+)\.proc$`)
+	procLegacyFileRegex = regexp.MustCompile(`^proc_(\d{8}_\d{6}Z)_([-a-zA-Z0-9_]+)\.proc$`)
 )
 
 type procDiskMeta struct {
@@ -70,13 +69,13 @@ type procFileName struct {
 }
 
 type observedProcEntry struct {
-	entry      exec.ProcEntry
+	entry      proc.ProcEntry
 	observedAt time.Time
 }
 
 var (
-	_ exec.ProcStore  = (*Store)(nil)
-	_ exec.ProcHandle = (*ProcHandle)(nil)
+	_ persis.ProcStore = (*Store)(nil)
+	_ proc.ProcHandle  = (*ProcHandle)(nil)
 )
 
 // Store reads and writes the file-backed .proc layout.
@@ -108,11 +107,6 @@ func WithHeartbeatInterval(d time.Duration) StoreOption {
 	}
 }
 
-// WithHeartbeatSyncInterval preserves the file proc store configuration surface.
-func WithHeartbeatSyncInterval(_ time.Duration) StoreOption {
-	return func(_ *Store) {}
-}
-
 // New creates a Store rooted at dir.
 func New(root string, opts ...StoreOption) *Store {
 	s := &Store{
@@ -129,20 +123,13 @@ func New(root string, opts ...StoreOption) *Store {
 // ProcHandle is a file-backed process heartbeat handle.
 type ProcHandle struct {
 	fileName          string
-	meta              exec.ProcMeta
+	meta              proc.ProcMeta
 	heartbeatInterval time.Duration
 	started           atomic.Bool
 	canceled          atomic.Bool
 	cancel            context.CancelFunc
 	mu                sync.Mutex
 	wg                sync.WaitGroup
-}
-
-// GetMeta returns this process metadata.
-func (p *ProcHandle) GetMeta() exec.ProcMeta {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.meta
 }
 
 // Stop stops the heartbeat and removes the proc file.
@@ -206,36 +193,34 @@ func (p *ProcHandle) writeHeartbeat(now time.Time) error {
 	return writeProcFile(p.fileName, now.Unix(), p.meta)
 }
 
-// Lock locks a process group.
-func (s *Store) Lock(ctx context.Context, groupName string) error {
+// WithLock runs fn while holding the process-group lock.
+func (s *Store) WithLock(ctx context.Context, groupName string, fn func() error) error {
 	basePolicy := backoff.NewExponentialBackoffPolicy(500 * time.Millisecond)
 	basePolicy.BackoffFactor = 2.0
 	basePolicy.MaxInterval = time.Minute
 	basePolicy.MaxRetries = 10
 
 	policy := backoff.WithJitter(basePolicy, backoff.Jitter)
-	return backoff.Retry(ctx, func(_ context.Context) error {
+	if err := backoff.Retry(ctx, func(_ context.Context) error {
 		return s.groupLock(groupName).TryLock()
 	}, policy, func(_ error) bool {
 		return ctx.Err() == nil
-	})
-}
-
-// Unlock unlocks a process group.
-func (s *Store) Unlock(ctx context.Context, groupName string) {
-	if err := s.groupLock(groupName).Unlock(); err != nil {
-		logger.Error(ctx, "Failed to unlock the proc group", tag.Error(err))
+	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		return persis.NewProcLockError(err)
 	}
+	defer func() {
+		if err := s.groupLock(groupName).Unlock(); err != nil {
+			logger.Error(ctx, "Failed to unlock the proc group", tag.Error(err))
+		}
+	}()
+	return fn()
 }
 
 // Acquire creates and starts a proc heartbeat.
-func (s *Store) Acquire(ctx context.Context, groupName string, meta exec.ProcMeta) (exec.ProcHandle, error) {
-	if meta.StartedAt <= 0 {
-		meta.StartedAt = time.Now().UTC().Unix()
-	}
-	if err := validateProcMeta(meta); err != nil {
-		return nil, err
-	}
+func (s *Store) Acquire(ctx context.Context, groupName string, meta proc.ProcMeta) (proc.ProcHandle, error) {
 	handle := &ProcHandle{
 		fileName:          s.filePath(groupName, meta, time.Now().UTC()),
 		meta:              meta,
@@ -247,133 +232,10 @@ func (s *Store) Acquire(ctx context.Context, groupName string, meta exec.ProcMet
 	return handle, nil
 }
 
-// CountAlive returns the number of fresh DAG runs in a group.
-func (s *Store) CountAlive(ctx context.Context, groupName string) (int, error) {
-	entries, err := s.ListEntries(ctx, groupName)
-	if err != nil {
-		return 0, err
-	}
-	seen := make(map[string]struct{})
-	for _, entry := range entries {
-		if entry.Fresh {
-			seen[entry.Meta.DAGRun().String()] = struct{}{}
-		}
-	}
-	return len(seen), nil
-}
-
-// CountAliveByDAGName returns the number of fresh DAG runs for dagName in a group.
-func (s *Store) CountAliveByDAGName(ctx context.Context, groupName, dagName string) (int, error) {
-	entries, err := s.ListEntries(ctx, groupName)
-	if err != nil {
-		return 0, err
-	}
-	seen := make(map[string]struct{})
-	for _, entry := range entries {
-		if entry.Fresh && entry.Meta.Name == dagName {
-			seen[entry.Meta.DAGRun().String()] = struct{}{}
-		}
-	}
-	return len(seen), nil
-}
-
-// IsRunAlive reports whether dagRun has a fresh proc entry in groupName.
-func (s *Store) IsRunAlive(ctx context.Context, groupName string, dagRun exec.DAGRunRef) (bool, error) {
-	entries, err := s.ListEntries(ctx, groupName)
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if entry.Fresh && entry.Meta.Name == dagRun.Name && entry.Meta.DAGRunID == dagRun.ID {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// IsAttemptAlive reports whether a specific attempt has a fresh proc entry.
-func (s *Store) IsAttemptAlive(ctx context.Context, groupName string, dagRun exec.DAGRunRef, attemptID string) (bool, error) {
-	entries, err := s.ListEntries(ctx, groupName)
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if entry.Fresh && entry.Meta.Name == dagRun.Name && entry.Meta.DAGRunID == dagRun.ID && entry.Meta.AttemptID == attemptID {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// ListAlive returns fresh DAG runs in a group.
-func (s *Store) ListAlive(ctx context.Context, groupName string) ([]exec.DAGRunRef, error) {
-	entries, err := s.ListEntries(ctx, groupName)
-	if err != nil {
-		return nil, err
-	}
-	return freshRefs(entries), nil
-}
-
-// LatestFreshEntryByDAGName returns the newest fresh proc entry for dagName.
-func (s *Store) LatestFreshEntryByDAGName(ctx context.Context, groupName, dagName string) (*exec.ProcEntry, error) {
-	entries, err := s.ListEntries(ctx, groupName)
-	if err != nil {
-		return nil, err
-	}
-	var freshest *exec.ProcEntry
-	for i := range entries {
-		entry := entries[i]
-		if !entry.Fresh || entry.Meta.Name != dagName {
-			continue
-		}
-		if freshest == nil ||
-			entry.Meta.StartedAt > freshest.Meta.StartedAt ||
-			(entry.Meta.StartedAt == freshest.Meta.StartedAt && entry.LastHeartbeatAt > freshest.LastHeartbeatAt) {
-			copy := entry
-			freshest = &copy
-		}
-	}
-	return freshest, nil
-}
-
-// ListAllAlive returns all fresh DAG runs grouped by process group.
-func (s *Store) ListAllAlive(ctx context.Context) (map[string][]exec.DAGRunRef, error) {
-	entries, err := s.ListAllEntries(ctx)
-	if err != nil {
-		return nil, err
-	}
-	result := make(map[string][]exec.DAGRunRef)
-	seen := make(map[string]map[string]struct{})
-	for _, entry := range entries {
-		if !entry.Fresh {
-			continue
-		}
-		if _, ok := seen[entry.GroupName]; !ok {
-			seen[entry.GroupName] = make(map[string]struct{})
-		}
-		ref := entry.Meta.DAGRun()
-		key := ref.String()
-		if _, ok := seen[entry.GroupName][key]; ok {
-			continue
-		}
-		seen[entry.GroupName][key] = struct{}{}
-		result[entry.GroupName] = append(result[entry.GroupName], ref)
-	}
-	for groupName := range result {
-		sort.Slice(result[groupName], func(i, j int) bool {
-			if result[groupName][i].Name == result[groupName][j].Name {
-				return result[groupName][i].ID < result[groupName][j].ID
-			}
-			return result[groupName][i].Name < result[groupName][j].Name
-		})
-	}
-	return result, nil
-}
-
-// Validate fails if any proc entry cannot be decoded.
-func (s *Store) Validate(ctx context.Context) error {
-	_, err := s.ListAllEntries(ctx)
-	if err != nil {
+// Validate fails if the proc directory cannot be read. Individual proc files
+// are not decoded here, so a damaged one does not make the store unusable.
+func (s *Store) Validate(_ context.Context) error {
+	if _, err := fileutil.ReadDir(s.root); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("validate proc store: %w", err)
 	}
 	return nil
@@ -392,34 +254,7 @@ func (s *Store) groupLock(groupName string) dirlock.DirLock {
 	return actual.(dirlock.DirLock)
 }
 
-func validateProcMeta(meta exec.ProcMeta) error {
-	if meta.Name == "" {
-		return fmt.Errorf("proc meta name is required")
-	}
-	if err := exec.ValidateDAGRunID(meta.DAGRunID); err != nil {
-		return fmt.Errorf("invalid proc meta dag run id: %w", err)
-	}
-	if meta.AttemptID == "" {
-		return fmt.Errorf("proc meta attempt id is required")
-	}
-	if !procSafeAttemptIDPattern.MatchString(meta.AttemptID) {
-		return fmt.Errorf("proc meta attempt id must only contain alphanumeric characters, dashes, and underscores")
-	}
-	if meta.StartedAt <= 0 {
-		return fmt.Errorf("proc meta started at must be > 0")
-	}
-	if (meta.RootName == "") != (meta.RootDAGRunID == "") {
-		return fmt.Errorf("proc meta root name and root dag run id must both be set or both be empty")
-	}
-	if meta.RootDAGRunID != "" {
-		if err := exec.ValidateDAGRunID(meta.RootDAGRunID); err != nil {
-			return fmt.Errorf("invalid proc meta root dag run id: %w", err)
-		}
-	}
-	return nil
-}
-
-func procRecordName(meta exec.ProcMeta, t time.Time) string {
+func procRecordName(meta proc.ProcMeta, t time.Time) string {
 	return fmt.Sprintf("%s%sZ_%s_%s",
 		procFilePrefix,
 		t.UTC().Format(procDateTimeUTC),
@@ -428,12 +263,12 @@ func procRecordName(meta exec.ProcMeta, t time.Time) string {
 	)
 }
 
-func (s *Store) filePath(groupName string, meta exec.ProcMeta, t time.Time) string {
+func (s *Store) filePath(groupName string, meta proc.ProcMeta, t time.Time) string {
 	return filepath.Join(s.root, groupName, meta.Name, procRecordName(meta, t)+procFileExt)
 }
 
-func writeProcFile(path string, heartbeatUnix int64, meta exec.ProcMeta) error {
-	if err := validateProcMeta(meta); err != nil {
+func writeProcFile(path string, heartbeatUnix int64, meta proc.ProcMeta) error {
+	if err := meta.Validate(); err != nil {
 		return err
 	}
 	metaBytes, err := json.Marshal(procDiskMeta{
@@ -523,7 +358,7 @@ func removeProcFile(path string) error {
 }
 
 func removeEmptyProcDirs(dir string) {
-	entries, err := os.ReadDir(dir)
+	entries, err := fileutil.ReadDir(dir)
 	if err != nil || len(entries) > 0 {
 		return
 	}
@@ -531,9 +366,9 @@ func removeEmptyProcDirs(dir string) {
 }
 
 // ListEntries returns proc entries for a group.
-func (s *Store) ListEntries(_ context.Context, groupName string) ([]exec.ProcEntry, error) {
+func (s *Store) ListEntries(_ context.Context, groupName string) ([]proc.ProcEntry, error) {
 	groupDir := filepath.Join(s.root, groupName)
-	if _, err := os.Stat(groupDir); errors.Is(err, os.ErrNotExist) {
+	if _, err := fileutil.Stat(groupDir); errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	files, err := procFilesInGroup(groupDir)
@@ -544,8 +379,8 @@ func (s *Store) ListEntries(_ context.Context, groupName string) ([]exec.ProcEnt
 }
 
 // ListAllEntries returns all proc entries under the store root.
-func (s *Store) ListAllEntries(_ context.Context) ([]exec.ProcEntry, error) {
-	dirEntries, err := os.ReadDir(s.root)
+func (s *Store) ListAllEntries(_ context.Context) ([]proc.ProcEntry, error) {
+	dirEntries, err := fileutil.ReadDir(s.root)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -553,7 +388,7 @@ func (s *Store) ListAllEntries(_ context.Context) ([]exec.ProcEntry, error) {
 		return nil, err
 	}
 
-	var entries []exec.ProcEntry
+	var entries []proc.ProcEntry
 	for _, entry := range dirEntries {
 		if !entry.IsDir() {
 			continue
@@ -573,9 +408,9 @@ func (s *Store) ListAllEntries(_ context.Context) ([]exec.ProcEntry, error) {
 }
 
 // LatestHeartbeat returns the latest heartbeat for dagRun.
-func (s *Store) LatestHeartbeat(_ context.Context, groupName string, dagRun exec.DAGRunRef) (*exec.ProcHeartbeat, error) {
+func (s *Store) LatestHeartbeat(_ context.Context, groupName string, dagRun ir.DAGRunRef) (*proc.ProcHeartbeat, error) {
 	groupDir := filepath.Join(s.root, groupName)
-	if _, err := os.Stat(groupDir); errors.Is(err, os.ErrNotExist) {
+	if _, err := fileutil.Stat(groupDir); errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	files, err := procFilesInGroup(groupDir)
@@ -583,23 +418,29 @@ func (s *Store) LatestHeartbeat(_ context.Context, groupName string, dagRun exec
 		return nil, err
 	}
 	now := time.Now().UTC()
-	var latest *exec.ProcHeartbeat
+	var latest *proc.ProcHeartbeat
 	for _, file := range files {
-		observed, err := readProcEntryObservedWithRetry(file, groupName, s.staleTime, now)
+		if !procFileMayBelongTo(file, dagRun) {
+			continue
+		}
+		observed, err := readProcEntryWithRetry(file, groupName, s.staleTime, now)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errInvalidProcFile) {
-				// Heartbeat observation should not fail because an unrelated
-				// proc file is concurrently removed or corrupt.
+			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
+			if errors.Is(err, errInvalidProcFile) && s.abandoned(file, now) {
+				continue
+			}
+			// The file may be this run's and is still being written, so report
+			// that rather than an absence the caller reads as an exit.
 			return nil, err
 		}
 		entry := observed.entry
 		if entry.Meta.Name != dagRun.Name || entry.Meta.DAGRunID != dagRun.ID {
 			continue
 		}
-		heartbeat := procHeartbeatFromEntry(entry, observed.observedAt)
-		if latest == nil || procHeartbeatPreferred(heartbeat, *latest) {
+		heartbeat := entry.Heartbeat(observed.observedAt)
+		if latest == nil || heartbeat.PreferredTo(*latest) {
 			latest = &heartbeat
 		}
 	}
@@ -607,7 +448,7 @@ func (s *Store) LatestHeartbeat(_ context.Context, groupName string, dagRun exec
 }
 
 func procFilesInGroup(groupDir string) ([]string, error) {
-	dagEntries, err := os.ReadDir(groupDir)
+	dagEntries, err := fileutil.ReadDir(groupDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -619,7 +460,7 @@ func procFilesInGroup(groupDir string) ([]string, error) {
 		if !dagEntry.IsDir() || dagEntry.Name() == "" || dagEntry.Name()[0] == '.' {
 			continue
 		}
-		procEntries, err := os.ReadDir(filepath.Join(groupDir, dagEntry.Name()))
+		procEntries, err := fileutil.ReadDir(filepath.Join(groupDir, dagEntry.Name()))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -637,36 +478,62 @@ func procFilesInGroup(groupDir string) ([]string, error) {
 	return files, nil
 }
 
-func (s *Store) entriesFromFiles(groupName string, files []string) ([]exec.ProcEntry, error) {
+func (s *Store) entriesFromFiles(groupName string, files []string) ([]proc.ProcEntry, error) {
 	now := time.Now().UTC()
-	entries := make([]exec.ProcEntry, 0, len(files))
+	entries := make([]proc.ProcEntry, 0, len(files))
 	for _, file := range files {
-		entry, err := readProcEntryWithRetry(file, groupName, s.staleTime, now)
+		observed, err := readProcEntryWithRetry(file, groupName, s.staleTime, now)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
+			if errors.Is(err, errInvalidProcFile) && s.abandoned(file, now) {
+				continue
+			}
 			return nil, err
 		}
-		entries = append(entries, entry)
+		entries = append(entries, observed.entry)
 	}
 	return entries, nil
 }
 
+// procFileMayBelongTo reports whether path can hold an entry for dagRun,
+// judging by the DAG directory and the identifiers carried in the file name.
+// A name that cannot be parsed is a possible match, because attributing such a
+// file needs its contents.
+func procFileMayBelongTo(path string, dagRun ir.DAGRunRef) bool {
+	if filepath.Base(filepath.Dir(path)) != dagRun.Name {
+		return false
+	}
+	parsed, err := parseProcFileName(filepath.Base(path))
+	if err != nil {
+		return true
+	}
+	return parsed.dagRunID == dagRun.ID
+}
+
+// abandoned reports whether path has gone untouched for at least the stale
+// threshold. A damaged file that is still being written may belong to a run
+// that is alive, and reporting the group without it would undercount.
+func (s *Store) abandoned(path string, now time.Time) bool {
+	info, err := fileutil.Stat(path)
+	return err == nil && now.Sub(info.ModTime()) >= s.staleTime
+}
+
 // RemoveIfStale deletes entry when the on-disk proc file is still stale.
-func (s *Store) RemoveIfStale(ctx context.Context, entry exec.ProcEntry) error {
-	path, ok := procEntryIdentityValue(entry, procEntryIdentityFile)
+func (s *Store) RemoveIfStale(ctx context.Context, entry proc.ProcEntry) error {
+	path, ok := entry.Identity.StoreValue(procEntryIdentityFile)
 	if !ok {
 		return nil
 	}
-	current, err := readProcEntryWithRetry(path, entry.GroupName, s.staleTime, time.Now().UTC())
+	observed, err := readProcEntryWithRetry(path, entry.GroupName, s.staleTime, time.Now().UTC())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if current.Fresh || !sameProcEntry(current, entry) {
+	if observed.entry.Fresh || !observed.entry.SameObservation(entry) {
 		return nil
 	}
 	if err := removeProcFile(path); err != nil {
@@ -676,31 +543,7 @@ func (s *Store) RemoveIfStale(ctx context.Context, entry exec.ProcEntry) error {
 	return nil
 }
 
-func readProcEntry(path, groupName string, staleTime time.Duration, now time.Time) (exec.ProcEntry, error) {
-	observed, err := readProcEntryObserved(path, groupName, staleTime, now)
-	if err != nil {
-		return exec.ProcEntry{}, err
-	}
-	return observed.entry, nil
-}
-
-func readProcEntryWithRetry(path, groupName string, staleTime time.Duration, now time.Time) (exec.ProcEntry, error) {
-	var lastErr error
-	for attempt := range procFileRetries {
-		entry, err := readProcEntry(path, groupName, staleTime, now)
-		if err == nil || errors.Is(err, os.ErrNotExist) {
-			return entry, err
-		}
-		if !fileutil.IsTransientFileError(err) {
-			return exec.ProcEntry{}, err
-		}
-		lastErr = err
-		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
-	}
-	return exec.ProcEntry{}, lastErr
-}
-
-func readProcEntryObservedWithRetry(path, groupName string, staleTime time.Duration, now time.Time) (observedProcEntry, error) {
+func readProcEntryWithRetry(path, groupName string, staleTime time.Duration, now time.Time) (observedProcEntry, error) {
 	var lastErr error
 	for attempt := range procFileRetries {
 		observed, err := readProcEntryObserved(path, groupName, staleTime, now)
@@ -711,7 +554,9 @@ func readProcEntryObservedWithRetry(path, groupName string, staleTime time.Durat
 			return observedProcEntry{}, err
 		}
 		lastErr = err
-		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+		if attempt < procFileRetries-1 {
+			time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+		}
 	}
 	return observedProcEntry{}, lastErr
 }
@@ -723,7 +568,7 @@ func readProcEntryObserved(path, groupName string, staleTime time.Duration, now 
 		return observedProcEntry{}, err
 	}
 
-	info, err := os.Stat(path)
+	info, err := fileutil.Stat(path)
 	if err != nil {
 		return observedProcEntry{}, err
 	}
@@ -738,20 +583,21 @@ func readProcEntryObserved(path, groupName string, staleTime time.Duration, now 
 
 	lastHeartbeatAt := int64(binary.BigEndian.Uint64(data[:procHeartbeatSize])) //nolint:gosec // heartbeat unix time.
 	heartbeatTime := time.Unix(lastHeartbeatAt, 0).UTC()
-	if heartbeatTime.After(now.Add(5 * time.Minute)) {
-		return observedProcEntry{}, fmt.Errorf("%w: proc heartbeat timestamp is in the future for %s", errInvalidProcFile, path)
-	}
 
-	meta, err := procMetaFromLegacyData(path, parsedName, data[procHeartbeatSize:], heartbeatTime, info)
+	meta, err := procMetaFromData(path, parsedName, data[procHeartbeatSize:], heartbeatTime, info)
 	if err != nil {
 		return observedProcEntry{}, err
 	}
 
+	// The heartbeat carries the writing process's clock, so it is only trusted
+	// when it is not ahead of the reader. A skewed or garbled timestamp leaves
+	// the entry stale rather than alive forever.
 	fresh := now.Sub(info.ModTime()) < staleTime
 	if !fresh {
-		fresh = now.Sub(heartbeatTime) < staleTime
+		age := now.Sub(heartbeatTime)
+		fresh = age >= 0 && age < staleTime
 	}
-	entry := exec.ProcEntry{
+	entry := proc.ProcEntry{
 		GroupName:       groupName,
 		Identity:        fileProcEntryID(path),
 		Meta:            meta,
@@ -761,20 +607,20 @@ func readProcEntryObserved(path, groupName string, staleTime time.Duration, now 
 	return observedProcEntry{entry: entry, observedAt: info.ModTime()}, nil
 }
 
-func procMetaFromLegacyData(path string, parsedName procFileName, payload []byte, heartbeatTime time.Time, info os.FileInfo) (exec.ProcMeta, error) {
+func procMetaFromData(path string, parsedName procFileName, payload []byte, heartbeatTime time.Time, info os.FileInfo) (proc.ProcMeta, error) {
 	switch parsedName.format {
 	case procFileFormatCurrent:
 		if len(payload) == 0 {
-			return exec.ProcMeta{}, fmt.Errorf("%w: proc file %s is missing metadata payload", errInvalidProcFile, path)
+			return proc.ProcMeta{}, fmt.Errorf("%w: proc file %s is missing metadata payload", errInvalidProcFile, path)
 		}
 		var diskMeta procDiskMeta
 		if err := json.Unmarshal(payload, &diskMeta); err != nil {
-			return exec.ProcMeta{}, fmt.Errorf("%w: decode proc metadata: %w", errInvalidProcFile, err)
+			return proc.ProcMeta{}, fmt.Errorf("%w: decode proc metadata: %w", errInvalidProcFile, err)
 		}
 		if diskMeta.Version != procFileVersion {
-			return exec.ProcMeta{}, fmt.Errorf("%w: unsupported proc version %d", errInvalidProcFile, diskMeta.Version)
+			return proc.ProcMeta{}, fmt.Errorf("%w: unsupported proc version %d", errInvalidProcFile, diskMeta.Version)
 		}
-		meta := exec.ProcMeta{
+		meta := proc.ProcMeta{
 			StartedAt:    diskMeta.StartedAt,
 			Name:         diskMeta.DAGName,
 			DAGRunID:     diskMeta.DAGRunID,
@@ -782,23 +628,23 @@ func procMetaFromLegacyData(path string, parsedName procFileName, payload []byte
 			RootName:     diskMeta.RootName,
 			RootDAGRunID: diskMeta.RootDAGRunID,
 		}
-		if err := validateProcMeta(meta); err != nil {
-			return exec.ProcMeta{}, fmt.Errorf("%w: %w", errInvalidProcFile, err)
+		if err := meta.Validate(); err != nil {
+			return proc.ProcMeta{}, fmt.Errorf("%w: %w", errInvalidProcFile, err)
 		}
 		if parsedName.dagRunID != meta.DAGRunID || parsedName.attemptID != meta.AttemptID {
-			return exec.ProcMeta{}, fmt.Errorf("%w: proc filename/body mismatch for %s", errInvalidProcFile, path)
+			return proc.ProcMeta{}, fmt.Errorf("%w: proc filename/body mismatch for %s", errInvalidProcFile, path)
 		}
 		if filepath.Base(filepath.Dir(path)) != meta.Name {
-			return exec.ProcMeta{}, fmt.Errorf("%w: proc path/body DAG name mismatch for %s", errInvalidProcFile, path)
+			return proc.ProcMeta{}, fmt.Errorf("%w: proc path/body DAG name mismatch for %s", errInvalidProcFile, path)
 		}
 		return meta, nil
 	case procFileFormatLegacy:
 		if len(payload) != 0 {
-			return exec.ProcMeta{}, fmt.Errorf("%w: legacy proc file %s must only contain the heartbeat header", errInvalidProcFile, path)
+			return proc.ProcMeta{}, fmt.Errorf("%w: legacy proc file %s must only contain the heartbeat header", errInvalidProcFile, path)
 		}
 		return legacyProcMeta(path, parsedName, heartbeatTime, info)
 	default:
-		return exec.ProcMeta{}, fmt.Errorf("%w: unsupported proc filename format for %s", errInvalidProcFile, path)
+		return proc.ProcMeta{}, fmt.Errorf("%w: unsupported proc filename format for %s", errInvalidProcFile, path)
 	}
 }
 
@@ -828,7 +674,7 @@ func parseProcFileName(filename string) (procFileName, error) {
 		if err != nil {
 			return procFileName{}, fmt.Errorf("%w: parse legacy proc timestamp: %w", errInvalidProcFile, err)
 		}
-		if err := exec.ValidateDAGRunID(matches[2]); err != nil {
+		if err := ir.ValidateDAGRunID(matches[2]); err != nil {
 			return procFileName{}, fmt.Errorf("%w: invalid legacy dag-run id: %w", errInvalidProcFile, err)
 		}
 		return procFileName{
@@ -847,103 +693,14 @@ func legacyProcAttemptID(dagRunID string) string {
 
 const procEntryIdentityFile = "file"
 
-func fileProcEntryID(path string) exec.ProcEntryID {
-	return procEntryID(procEntryIdentityFile, path)
+func fileProcEntryID(path string) proc.ProcEntryID {
+	return proc.NewStoreEntryID(procEntryIdentityFile, path)
 }
 
-func procEntryID(kind, value string) exec.ProcEntryID {
-	if kind == "" || value == "" {
-		return exec.ProcEntryID{}
-	}
-	encoded := base64.RawURLEncoding.EncodeToString([]byte(value))
-	return exec.NewProcEntryID(kind + ":" + encoded)
-}
-
-func procEntryIdentityValue(entry exec.ProcEntry, expectedKind string) (string, bool) {
-	kind, value, ok := splitProcEntryID(entry.Identity)
-	if !ok || kind != expectedKind {
-		return "", false
-	}
-	return value, true
-}
-
-func splitProcEntryID(id exec.ProcEntryID) (kind, value string, ok bool) {
-	if id.IsZero() {
-		return "", "", false
-	}
-	raw := id.String()
-	kind, encoded, found := strings.Cut(raw, ":")
-	if !found || kind == "" || encoded == "" {
-		return "", "", false
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || len(decoded) == 0 {
-		return "", "", false
-	}
-	return kind, string(decoded), true
-}
-
-func sameProcEntry(a, b exec.ProcEntry) bool {
-	return a.GroupName == b.GroupName &&
-		a.Identity == b.Identity &&
-		a.LastHeartbeatAt == b.LastHeartbeatAt &&
-		a.Meta == b.Meta
-}
-
-func freshRefs(entries []exec.ProcEntry) []exec.DAGRunRef {
-	seen := make(map[string]exec.DAGRunRef)
-	for _, entry := range entries {
-		if !entry.Fresh {
-			continue
-		}
-		ref := entry.Meta.DAGRun()
-		seen[ref.String()] = ref
-	}
-	refs := make([]exec.DAGRunRef, 0, len(seen))
-	for _, ref := range seen {
-		refs = append(refs, ref)
-	}
-	sort.Slice(refs, func(i, j int) bool {
-		if refs[i].Name == refs[j].Name {
-			return refs[i].ID < refs[j].ID
-		}
-		return refs[i].Name < refs[j].Name
-	})
-	return refs
-}
-
-func procHeartbeatFromEntry(entry exec.ProcEntry, observedAt time.Time) exec.ProcHeartbeat {
-	return exec.ProcHeartbeat{
-		GroupName:       entry.GroupName,
-		DAGRun:          entry.Meta.DAGRun(),
-		AttemptID:       entry.Meta.AttemptID,
-		StartedAt:       entry.Meta.StartedAt,
-		LastHeartbeatAt: entry.LastHeartbeatAt,
-		ObservedAt:      observedAt,
-		Fresh:           entry.Fresh,
-	}
-}
-
-func procHeartbeatPreferred(candidate, existing exec.ProcHeartbeat) bool {
-	if candidate.Fresh != existing.Fresh {
-		return candidate.Fresh
-	}
-	if candidate.StartedAt != existing.StartedAt {
-		return candidate.StartedAt > existing.StartedAt
-	}
-	if candidate.LastHeartbeatAt != existing.LastHeartbeatAt {
-		return candidate.LastHeartbeatAt > existing.LastHeartbeatAt
-	}
-	if !candidate.ObservedAt.Equal(existing.ObservedAt) {
-		return candidate.ObservedAt.After(existing.ObservedAt)
-	}
-	return candidate.AttemptID < existing.AttemptID
-}
-
-func legacyProcMeta(path string, parsedName procFileName, heartbeatTime time.Time, info os.FileInfo) (exec.ProcMeta, error) {
+func legacyProcMeta(path string, parsedName procFileName, heartbeatTime time.Time, info os.FileInfo) (proc.ProcMeta, error) {
 	dagName := filepath.Base(filepath.Dir(path))
 	if dagName == "" || dagName == "." || dagName == string(filepath.Separator) {
-		return exec.ProcMeta{}, fmt.Errorf("%w: invalid legacy proc path %s", errInvalidProcFile, path)
+		return proc.ProcMeta{}, fmt.Errorf("%w: invalid legacy proc path %s", errInvalidProcFile, path)
 	}
 
 	startedAt := parsedName.createdAt.UTC().Unix()
@@ -954,7 +711,7 @@ func legacyProcMeta(path string, parsedName procFileName, heartbeatTime time.Tim
 		startedAt = info.ModTime().UTC().Unix()
 	}
 
-	meta := exec.ProcMeta{
+	meta := proc.ProcMeta{
 		StartedAt:    startedAt,
 		Name:         dagName,
 		DAGRunID:     parsedName.dagRunID,
@@ -962,8 +719,8 @@ func legacyProcMeta(path string, parsedName procFileName, heartbeatTime time.Tim
 		RootName:     dagName,
 		RootDAGRunID: parsedName.dagRunID,
 	}
-	if err := validateProcMeta(meta); err != nil {
-		return exec.ProcMeta{}, fmt.Errorf("%w: %w", errInvalidProcFile, err)
+	if err := meta.Validate(); err != nil {
+		return proc.ProcMeta{}, fmt.Errorf("%w: %w", errInvalidProcFile, err)
 	}
 	return meta, nil
 }

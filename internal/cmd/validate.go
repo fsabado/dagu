@@ -6,16 +6,17 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/goccy/go-yaml/ast"
 	"github.com/goccy/go-yaml/parser"
 	"github.com/spf13/cobra"
@@ -39,24 +40,32 @@ func Validate() *cobra.Command {
 
 Prints a human-readable result instead of structured logs.
 Checks structural correctness and references (e.g., step dependencies)
-similar to the server-side spec validation.`,
+similar to the server-side spec validation.
+
+References whose value only exists during a run, such as ${context.paths.*}
+or an environment variable supplied by the operator, are not reported by
+default. Pass --show-unresolved to list them as well.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, err := NewContext(cmd, nil)
 			if err != nil {
 				return fmt.Errorf("initialization error: %w", err)
 			}
-			return runValidate(ctx, args)
+			showUnresolved, err := cmd.Flags().GetBool("show-unresolved")
+			if err != nil {
+				return fmt.Errorf("initialization error: %w", err)
+			}
+			return runValidate(ctx, args, showUnresolved)
 		},
 	}
 
 	// Initialize flags required by NewContext
-	initFlags(cmd)
+	initFlags(cmd, showUnresolvedFlag)
 
 	return cmd
 }
 
-func runValidate(ctx *Context, args []string) error {
+func runValidate(ctx *Context, args []string, showUnresolved bool) error {
 	validatedInput, err := validateWorkflowFile(args[0])
 	if err != nil {
 		return errors.New(formatValidationErrors(args[0], err))
@@ -91,21 +100,35 @@ func runValidate(ctx *Context, args []string) error {
 	}
 
 	logValidationWarnings(ctx, args[0], append(dag.BuildWarnings, collectDeprecatedSyntaxWarnings(dag)...))
-	logValueReferenceNotices(ctx, args[0], loadResult.ValueReferenceNotices)
+	logValueReferenceNotices(ctx, args[0], loadResult.ValueReferenceNotices, showUnresolved)
 
 	return nil
 }
 
-func logValueReferenceNotices(ctx *Context, file string, notices []cmnvalue.ValueReferenceNotice) {
+// logValueReferenceNotices reports value-reference notices, separating the ones
+// that name something the spec does not define from the ones that only lack a
+// value because validation evaluates the spec outside a run.
+func logValueReferenceNotices(ctx *Context, file string, notices []cmnvalue.ValueReferenceNotice, showUnresolved bool) {
 	for _, notice := range notices {
 		if notice.Message == "" {
 			continue
 		}
-		if notice.Reason != "" {
-			logger.Info(ctx, notice.Message, tag.File(file), tag.Reason(string(notice.Reason)))
+		class := notice.Class
+		if class == "" {
+			class = notice.Reason.Class()
+		}
+		if class == cmnvalue.NoticeClassRuntimeOnly && !showUnresolved {
 			continue
 		}
-		logger.Info(ctx, notice.Message, tag.File(file))
+		fields := []slog.Attr{tag.File(file)}
+		if notice.Reason != "" {
+			fields = append(fields, tag.Reason(string(notice.Reason)))
+		}
+		if class == cmnvalue.NoticeClassDefect {
+			logger.Warn(ctx, notice.Message, fields...)
+			continue
+		}
+		logger.Info(ctx, notice.Message, fields...)
 	}
 }
 
@@ -263,7 +286,7 @@ func (e workflowValidationErrors) Error() string {
 	return b.String()
 }
 
-func collectDeprecatedSyntaxWarnings(dag *core.DAG) []string {
+func collectDeprecatedSyntaxWarnings(dag *ir.DAG) []string {
 	if dag == nil {
 		return nil
 	}
@@ -288,8 +311,7 @@ func collectDeprecatedSyntaxWarnings(dag *core.DAG) []string {
 func formatValidationErrors(file string, err error) string {
 	// Collect message strings
 	var msgs []string
-	var list core.ErrorList
-	if errors.As(err, &list) {
+	if list, ok := errors.AsType[ir.ErrorList](err); ok {
 		msgs = list.ToStringList()
 	} else {
 		msgs = []string{err.Error()}

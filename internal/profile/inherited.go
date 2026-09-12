@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/google/uuid"
 )
 
@@ -95,6 +95,10 @@ func IsInheritedStorageName(name string) bool {
 	if name == inheritedGlobalStorageName {
 		return true
 	}
+	return IsWorkspaceInheritedStorageName(name)
+}
+
+func IsWorkspaceInheritedStorageName(name string) bool {
 	if !strings.HasPrefix(name, inheritedWorkspaceNamePrefix) {
 		return false
 	}

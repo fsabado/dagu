@@ -4,18 +4,20 @@
 package frontend
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"sync"
 	"testing"
+	"text/template"
 	"time"
 
-	apiv1 "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/license"
-	workspacepkg "github.com/dagucloud/dagu/internal/workspace"
+	apiv1 "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/license"
+	workspacepkg "github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -123,6 +125,50 @@ func TestDefaultFunctionsExposeInitialWorkspacesJSON(t *testing.T) {
 	assert.True(t, workspaces[0].UpdatedAt.Equal(updatedAt))
 }
 
+func TestDefaultFunctionsExposeLicensedTrustedProxyLogin(t *testing.T) {
+	t.Parallel()
+
+	licensed := license.NewTestManager(license.FeatureSSO)
+	funcs := defaultFunctions(&funcsConfig{
+		ProxyEnabled:     true,
+		ProxyButtonLabel: "Continue with Corporate SSO",
+		LicenseChecker:   licensed.Checker(),
+	})
+
+	enabled, ok := funcs["proxyEnabled"].(func() string)
+	require.True(t, ok)
+	assert.Equal(t, "true", enabled())
+	label, ok := funcs["proxyButtonLabel"].(func() string)
+	require.True(t, ok)
+	assert.Equal(t, "Continue with Corporate SSO", label())
+
+	unlicensed := license.NewTestManager(license.FeatureRBAC)
+	funcs = defaultFunctions(&funcsConfig{
+		ProxyEnabled:   true,
+		LicenseChecker: unlicensed.Checker(),
+	})
+	enabled = funcs["proxyEnabled"].(func() string)
+	assert.Equal(t, "false", enabled())
+}
+
+func TestBaseTemplateEscapesProxyButtonLabelForJavaScript(t *testing.T) {
+	t.Parallel()
+
+	const label = `</script><script>alert("injected")</script>`
+	tmpl, err := template.New("base").Funcs(defaultFunctions(&funcsConfig{
+		ProxyEnabled:     true,
+		ProxyButtonLabel: label,
+	})).ParseFS(assetsFS, "templates/base.gohtml")
+	require.NoError(t, err)
+	tmpl, err = tmpl.Parse(`{{define "content"}}{{end}}`)
+	require.NoError(t, err)
+
+	var output bytes.Buffer
+	require.NoError(t, tmpl.ExecuteTemplate(&output, "base", nil))
+	assert.NotContains(t, output.String(), label)
+	assert.NotContains(t, output.String(), `</script><script>alert`)
+}
+
 func TestDefaultFunctionsExposeLicenseGraceEndsAt(t *testing.T) {
 	expiry := time.Date(2026, time.March, 15, 12, 0, 0, 0, time.UTC)
 
@@ -157,4 +203,20 @@ func TestDefaultFunctionsExposeLicenseGraceEndsAt(t *testing.T) {
 
 		assert.Equal(t, "2026-03-29T12:00:00Z", graceEndsAtFn())
 	})
+}
+
+func TestDefaultFunctionsExposeConfiguredLicenseFailure(t *testing.T) {
+	t.Setenv("DAGU_LICENSE", "invalid-license-token")
+	t.Setenv("DAGU_LICENSE_KEY", "")
+	t.Setenv("DAGU_LICENSE_FILE", "")
+
+	pubKey, err := license.PublicKey()
+	require.NoError(t, err)
+	manager := license.NewManager(license.ManagerConfig{LicenseDir: t.TempDir()}, pubKey, nil, nil)
+	require.NoError(t, manager.Start(context.Background()))
+
+	funcs := defaultFunctions(&funcsConfig{LicenseManager: manager})
+	licenseError, ok := funcs["licenseError"].(func() string)
+	require.True(t, ok)
+	assert.Contains(t, licenseError(), "License token verification failed")
 }

@@ -1,0 +1,15 @@
+working_dir: .
+env:
+  - LLM_BASE_URL: ${LLM_BASE_URL}
+steps:
+  - action: chat.completion
+    stdout: result.out
+    with:
+      prompt: "hello"
+      model:
+        - provider: local
+          name: bad-model
+          base_url: $LLM_BASE_URL
+        - provider: local
+          name: good-model
+          base_url: $LLM_BASE_URL

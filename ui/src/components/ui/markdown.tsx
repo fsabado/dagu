@@ -41,7 +41,7 @@ export function Markdown({ content, className }: MarkdownProps) {
         'prose-h1:text-sm prose-h2:text-sm prose-h3:text-xs',
         'prose-blockquote:my-1 prose-blockquote:pl-2 prose-blockquote:border-l-2',
         'prose-table:my-1 prose-table:text-xs',
-        'prose-a:text-blue-600 dark:prose-a:text-blue-400',
+        'prose-a:text-violet-700 dark:prose-a:text-violet-400',
         className
       )}
     >

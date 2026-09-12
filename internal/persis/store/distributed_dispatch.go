@@ -19,13 +19,15 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 const (
 	dispatchTaskStoreVersion      = 1
-	defaultDispatchReservationTTL = exec.DefaultStaleLeaseThreshold
+	defaultDispatchReservationTTL = dagrun.DefaultStaleLeaseThreshold
 	minDispatchCleanupInterval    = 100 * time.Millisecond
 	maxDispatchCleanupInterval    = time.Second
 
@@ -39,24 +41,35 @@ var (
 
 const dispatchNoMatchCacheLimit = 1024
 
-var _ exec.DispatchTaskStore = (*DispatchTaskStore)(nil)
-var _ exec.DispatchAdmissionStore = (*DispatchTaskStore)(nil)
+var _ dispatch.DispatchTaskStore = (*DispatchTaskStore)(nil)
+var _ dispatch.DispatchAdmissionStore = (*DispatchTaskStore)(nil)
 
 // DispatchTaskStoreOption configures a DispatchTaskStore.
 type DispatchTaskStoreOption func(*DispatchTaskStore)
 
-// DispatchTaskStore implements [exec.DispatchTaskStore] on top of a
+// WithDispatchTransitionLock serializes task transitions with external users
+// of the same shared lock.
+func WithDispatchTransitionLock(
+	lock func(context.Context, func(context.Context) error) error,
+) DispatchTaskStoreOption {
+	return func(store *DispatchTaskStore) {
+		store.transitionLock = lock
+	}
+}
+
+// DispatchTaskStore implements [dispatch.DispatchTaskStore] on top of a
 // [persis.Collection]. Record IDs use "pending/" and "claims/" prefixes so a
 // file collection rooted at the distributed directory uses the existing
 // on-disk layout directly.
 type DispatchTaskStore struct {
 	col                      persis.Collection
 	reservationTTL           time.Duration
-	admissionLeaseStore      exec.DAGRunLeaseStore
-	admissionActiveRunStore  exec.ActiveDistributedRunStore
+	admissionLeaseStore      dispatch.DAGRunLeaseStore
+	admissionActiveRunStore  dispatch.ActiveDistributedRunStore
 	lastReservationCleanupAt time.Time
 	index                    *dispatchTaskIndex
-	// mu serializes the in-process recycle+scan+claim sequence;
+	transitionLock           func(context.Context, func(context.Context) error) error
+	// mu protects the in-memory index and serializes dispatch transitions;
 	// per-record CompareAndDelete provides cross-process safety.
 	mu sync.Mutex
 }
@@ -75,6 +88,7 @@ type dispatchTaskIndexEntry struct {
 	queueName      string
 	attemptKey     string
 	claimToken     string
+	targetWorkerID string
 	workerSelector map[string]string
 	hasTask        bool
 	enqueuedAt     int64
@@ -84,16 +98,16 @@ type dispatchTaskIndexEntry struct {
 }
 
 type dispatchTaskPayload struct {
-	Version                   int                      `json:"version"`
-	Task                      *exec.DispatchTask       `json:"task"`
-	TaskFileName              string                   `json:"taskFileName"`
-	EnqueuedAt                int64                    `json:"enqueuedAt"`
-	ClaimToken                string                   `json:"claimToken,omitempty"`
-	ClaimedAt                 int64                    `json:"claimedAt,omitempty"`
-	WorkerID                  string                   `json:"workerId,omitempty"`
-	PollerID                  string                   `json:"pollerId,omitempty"`
-	Owner                     exec.CoordinatorEndpoint `json:"owner,omitzero"`
-	AdmissionReservationToken string                   `json:"admissionReservationToken,omitempty"`
+	Version                   int                          `json:"version"`
+	Task                      *dispatch.DispatchTask       `json:"task"`
+	TaskFileName              string                       `json:"taskFileName"`
+	EnqueuedAt                int64                        `json:"enqueuedAt"`
+	ClaimToken                string                       `json:"claimToken,omitempty"`
+	ClaimedAt                 int64                        `json:"claimedAt,omitempty"`
+	WorkerID                  string                       `json:"workerId,omitempty"`
+	PollerID                  string                       `json:"pollerId,omitempty"`
+	Owner                     dispatch.CoordinatorEndpoint `json:"owner,omitzero"`
+	AdmissionReservationToken string                       `json:"admissionReservationToken,omitempty"`
 }
 
 type legacyDAGRunStatusProto struct {
@@ -110,6 +124,7 @@ var legacyDispatchTaskJSONFields = map[string]string{
 	"target":                        "Target",
 	"definition":                    "Definition",
 	"worker_id":                     "WorkerID",
+	"target_worker_id":              "TargetWorkerID",
 	"attempt_id":                    "AttemptID",
 	"attempt_key":                   "AttemptKey",
 	"step":                          "Step",
@@ -120,8 +135,8 @@ var legacyDispatchTaskJSONFields = map[string]string{
 	"schedule_time":                 "ScheduleTime",
 	"source_file":                   "SourceFile",
 	"worker_selector":               "WorkerSelector",
-	"agent_snapshot":                "AgentSnapshot",
 	"external_step_retry":           "ExternalStepRetry",
+	"include_downstream":            "IncludeDownstream",
 	"workspace_bundle_digest":       "WorkspaceBundleDigest",
 	"workspace_bundle_size":         "WorkspaceBundleSize",
 	"workspace_bundle_dag_path":     "WorkspaceBundleDAGPath",
@@ -254,14 +269,14 @@ func (idx *dispatchTaskIndex) invalidateDerivedState() {
 	clear(idx.noMatch)
 }
 
-func (idx *dispatchTaskIndex) candidatePendingIDs(workerLabels map[string]string) []string {
+func (idx *dispatchTaskIndex) candidatePendingIDs(workerID string, workerLabels map[string]string) []string {
 	ids := make([]string, 0, len(idx.pendingIDs))
 	for _, id := range idx.pendingIDs {
 		entry, ok := idx.pending[id]
 		if !ok {
 			continue
 		}
-		if matchesDispatchSelector(workerLabels, entry.workerSelector) {
+		if (entry.targetWorkerID == "" || entry.targetWorkerID == workerID) && matchesDispatchSelector(workerLabels, entry.workerSelector) {
 			ids = append(ids, id)
 		}
 	}
@@ -287,22 +302,22 @@ func (idx *dispatchTaskIndex) hasExpired(now time.Time, ttl time.Duration) bool 
 	return false
 }
 
-func (idx *dispatchTaskIndex) rememberNoMatch(labels map[string]string) {
+func (idx *dispatchTaskIndex) rememberNoMatch(workerID string, labels map[string]string) {
 	if idx == nil {
 		return
 	}
-	key := dispatchClaimLabelsKey(labels)
+	key := workerID + "\x00" + dispatchClaimLabelsKey(labels)
 	if _, ok := idx.noMatch[key]; !ok && len(idx.noMatch) >= dispatchNoMatchCacheLimit {
 		clear(idx.noMatch)
 	}
 	idx.noMatch[key] = struct{}{}
 }
 
-func (idx *dispatchTaskIndex) hasNoMatch(labels map[string]string) bool {
+func (idx *dispatchTaskIndex) hasNoMatch(workerID string, labels map[string]string) bool {
 	if idx == nil {
 		return false
 	}
-	_, ok := idx.noMatch[dispatchClaimLabelsKey(labels)]
+	_, ok := idx.noMatch[workerID+"\x00"+dispatchClaimLabelsKey(labels)]
 	return ok
 }
 
@@ -320,6 +335,7 @@ func dispatchTaskIndexEntryFromRecord(rec *persis.Record, payload dispatchTaskPa
 		entry.hasTask = true
 		entry.queueName = payload.Task.QueueName
 		entry.attemptKey = payload.Task.AttemptKey
+		entry.targetWorkerID = payload.Task.TargetWorkerID
 		entry.workerSelector = maps.Clone(payload.Task.WorkerSelector)
 	}
 	return entry
@@ -358,8 +374,8 @@ func WithDispatchReservationTTL(ttl time.Duration) DispatchTaskStoreOption {
 // WithDispatchAdmissionLiveness enables admission cleanup against shared
 // distributed liveness stores.
 func WithDispatchAdmissionLiveness(
-	leaseStore exec.DAGRunLeaseStore,
-	activeRunStore exec.ActiveDistributedRunStore,
+	leaseStore dispatch.DAGRunLeaseStore,
+	activeRunStore dispatch.ActiveDistributedRunStore,
 ) DispatchTaskStoreOption {
 	return func(store *DispatchTaskStore) {
 		store.admissionLeaseStore = leaseStore
@@ -377,6 +393,16 @@ func NewDispatchTaskStore(col persis.Collection, opts ...DispatchTaskStoreOption
 		opt(s)
 	}
 	return s
+}
+
+func (s *DispatchTaskStore) withTransitionLock(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	if s.transitionLock == nil {
+		return fn(ctx)
+	}
+	return s.transitionLock(ctx, fn)
 }
 
 func (s *DispatchTaskStore) ensureDispatchIndex(ctx context.Context) error {
@@ -478,7 +504,7 @@ func dispatchIndexIDsMatch(ids []string, indexed map[string]dispatchTaskIndexEnt
 	return true
 }
 
-func (s *DispatchTaskStore) Enqueue(ctx context.Context, task *exec.DispatchTask) error {
+func (s *DispatchTaskStore) Enqueue(ctx context.Context, task *dispatch.DispatchTask) error {
 	if task == nil {
 		return fmt.Errorf("task is required")
 	}
@@ -502,21 +528,27 @@ func (s *DispatchTaskStore) Enqueue(ctx context.Context, task *exec.DispatchTask
 	if err != nil {
 		return err
 	}
-	if err := s.col.Put(ctx, rec); err != nil {
-		return err
+	write := func(lockCtx context.Context) error {
+		if err := s.col.Put(lockCtx, rec); err != nil {
+			return err
+		}
+		if s.index == nil {
+			s.index = newDispatchTaskIndex()
+		}
+		s.index.addPending(rec, payload)
+		return nil
 	}
-	if s.index == nil {
-		s.index = newDispatchTaskIndex()
+	if task.WorkspaceBundleDigest == "" {
+		return write(ctx)
 	}
-	s.index.addPending(rec, payload)
-	return nil
+	return s.withTransitionLock(ctx, write)
 }
 
 // ClaimNext atomically transitions one matching pending record into a
 // claim. CompareAndDelete(pending) is the per-task atomicity point;
 // concurrent pollers racing on the same pending see one winner and the
 // losers clean up their orphan claim and continue to the next pending.
-func (s *DispatchTaskStore) ClaimNext(ctx context.Context, claim exec.DispatchTaskClaim) (*exec.ClaimedDispatchTask, error) {
+func (s *DispatchTaskStore) ClaimNext(ctx context.Context, claim dispatch.DispatchTaskClaim) (*dispatch.ClaimedDispatchTask, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -550,18 +582,18 @@ func (s *DispatchTaskStore) ClaimNext(ctx context.Context, claim exec.DispatchTa
 	return nil, nil
 }
 
-func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim exec.DispatchTaskClaim) (*exec.ClaimedDispatchTask, bool, error) {
+func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch.DispatchTaskClaim) (*dispatch.ClaimedDispatchTask, bool, error) {
 	if s.index == nil {
 		if err := s.rebuildDispatchIndex(ctx); err != nil {
 			return nil, false, err
 		}
 	}
-	if s.index.hasNoMatch(claim.Labels) {
+	if s.index.hasNoMatch(claim.WorkerID, claim.Labels) {
 		return nil, false, nil
 	}
-	ids := s.index.candidatePendingIDs(claim.Labels)
+	ids := s.index.candidatePendingIDs(claim.WorkerID, claim.Labels)
 	if len(ids) == 0 {
-		s.index.rememberNoMatch(claim.Labels)
+		s.index.rememberNoMatch(claim.WorkerID, claim.Labels)
 		return nil, false, nil
 	}
 
@@ -595,51 +627,67 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim exec.Dis
 			s.index.removePending(id)
 			continue
 		}
+		if payload.Task.TargetWorkerID != "" && payload.Task.TargetWorkerID != claim.WorkerID {
+			s.index.addPending(rec, payload)
+			continue
+		}
 		if !matchesDispatchSelector(claim.Labels, payload.Task.WorkerSelector) {
 			s.index.addPending(rec, payload)
 			continue
 		}
 
-		claimToken := uuid.NewString()
-		claimedAt := now
-		task, err := applyDispatchTaskClaim(payload.Task, claim.Owner, claimToken)
-		if err != nil {
-			return nil, false, err
-		}
-		payload.Task = task
-		payload.ClaimToken = claimToken
-		payload.ClaimedAt = claimedAt.UnixMilli()
-		payload.WorkerID = claim.WorkerID
-		payload.PollerID = claim.PollerID
-		payload.Owner = claim.Owner
-
-		claimRec, err := s.newDispatchRecord(claimDispatchRecordID(claimToken), payload, rec.CreatedAt, claimedAt)
-		if err != nil {
-			return nil, false, err
-		}
-		if err := s.col.Put(ctx, claimRec); err != nil {
-			return nil, false, err
-		}
-		if err := s.col.CompareAndDelete(ctx, rec); err != nil {
-			_ = s.col.CompareAndDelete(context.WithoutCancel(ctx), claimRec)
-			if errors.Is(err, persis.ErrNotFound) || errors.Is(err, persis.ErrConflict) {
-				s.index.removePending(id)
-				return nil, true, nil
+		var claimed *dispatch.ClaimedDispatchTask
+		var stale bool
+		transition := func(lockCtx context.Context) error {
+			claimToken := uuid.NewString()
+			claimedAt := time.Now().UTC()
+			task, err := applyDispatchTaskClaim(payload.Task, claim.Owner, claimToken)
+			if err != nil {
+				return err
 			}
-			return nil, false, err
-		}
-		s.index.replacePendingWithClaim(id, claimRec, payload)
+			payload.Task = task
+			payload.ClaimToken = claimToken
+			payload.ClaimedAt = claimedAt.UnixMilli()
+			payload.WorkerID = claim.WorkerID
+			payload.PollerID = claim.PollerID
+			payload.Owner = claim.Owner
 
-		return &exec.ClaimedDispatchTask{
-			Task:       cloneDispatchTask(task),
-			ClaimToken: claimToken,
-			ClaimedAt:  claimedAt,
-			WorkerID:   claim.WorkerID,
-			PollerID:   claim.PollerID,
-			Owner:      claim.Owner,
-		}, false, nil
+			claimRec, err := s.newDispatchRecord(claimDispatchRecordID(claimToken), payload, rec.CreatedAt, claimedAt)
+			if err != nil {
+				return err
+			}
+			if err := s.col.Put(lockCtx, claimRec); err != nil {
+				return err
+			}
+			if err := s.col.CompareAndDelete(lockCtx, rec); err != nil {
+				_ = s.col.CompareAndDelete(context.WithoutCancel(lockCtx), claimRec)
+				if errors.Is(err, persis.ErrNotFound) || errors.Is(err, persis.ErrConflict) {
+					s.index.removePending(id)
+					stale = true
+					return nil
+				}
+				return err
+			}
+			s.index.replacePendingWithClaim(id, claimRec, payload)
+
+			claimed = &dispatch.ClaimedDispatchTask{
+				Task:       cloneDispatchTask(task),
+				ClaimToken: claimToken,
+				ClaimedAt:  claimedAt,
+				WorkerID:   claim.WorkerID,
+				PollerID:   claim.PollerID,
+				Owner:      claim.Owner,
+			}
+			return nil
+		}
+		if payload.Task.WorkspaceBundleDigest != "" {
+			err = s.withTransitionLock(ctx, transition)
+		} else {
+			err = transition(ctx)
+		}
+		return claimed, stale, err
 	}
-	s.index.rememberNoMatch(claim.Labels)
+	s.index.rememberNoMatch(claim.WorkerID, claim.Labels)
 	return nil, false, nil
 }
 
@@ -658,11 +706,11 @@ func (s *DispatchTaskStore) maybeRecycleExpiredReservations(ctx context.Context)
 	return true, nil
 }
 
-func (s *DispatchTaskStore) GetClaim(ctx context.Context, claimToken string) (*exec.ClaimedDispatchTask, error) {
+func (s *DispatchTaskStore) GetClaim(ctx context.Context, claimToken string) (*dispatch.ClaimedDispatchTask, error) {
 	rec, err := s.col.Get(ctx, claimDispatchRecordID(claimToken))
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return nil, exec.ErrDispatchTaskNotFound
+			return nil, dispatch.ErrDispatchTaskNotFound
 		}
 		return nil, err
 	}
@@ -671,9 +719,9 @@ func (s *DispatchTaskStore) GetClaim(ctx context.Context, claimToken string) (*e
 		return nil, err
 	}
 	if payload.Task == nil || payload.ClaimToken == "" || payload.ClaimToken != claimToken || payload.ClaimedAt == 0 {
-		return nil, exec.ErrDispatchTaskNotFound
+		return nil, dispatch.ErrDispatchTaskNotFound
 	}
-	return &exec.ClaimedDispatchTask{
+	return &dispatch.ClaimedDispatchTask{
 		Task:       cloneDispatchTask(payload.Task),
 		ClaimToken: payload.ClaimToken,
 		ClaimedAt:  time.UnixMilli(payload.ClaimedAt).UTC(),
@@ -690,7 +738,7 @@ func (s *DispatchTaskStore) ReleaseClaim(ctx context.Context, claimToken string)
 	rec, err := s.col.Get(ctx, claimDispatchRecordID(claimToken))
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return exec.ErrDispatchTaskNotFound
+			return dispatch.ErrDispatchTaskNotFound
 		}
 		return err
 	}
@@ -699,23 +747,55 @@ func (s *DispatchTaskStore) ReleaseClaim(ctx context.Context, claimToken string)
 		return err
 	}
 	if payload.Task == nil || payload.ClaimToken == "" || payload.ClaimToken != claimToken || payload.ClaimedAt == 0 {
-		return exec.ErrDispatchTaskNotFound
+		return dispatch.ErrDispatchTaskNotFound
 	}
-	return s.releaseClaimRecord(ctx, rec, payload, time.Now().UTC())
+	return s.releaseClaim(ctx, rec, payload, time.Now().UTC())
 }
 
 func (s *DispatchTaskStore) DeleteClaim(ctx context.Context, claimToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	claimID := claimDispatchRecordID(claimToken)
-	if err := s.col.Delete(ctx, claimID); err != nil && !errors.Is(err, persis.ErrNotFound) {
-		return err
+	return s.withTransitionLock(ctx, func(lockCtx context.Context) error {
+		claimID := claimDispatchRecordID(claimToken)
+		if err := s.col.Delete(lockCtx, claimID); err != nil && !errors.Is(err, persis.ErrNotFound) {
+			return err
+		}
+		if s.index != nil {
+			s.index.removeClaim(claimID)
+		}
+		return nil
+	})
+}
+
+// ListBundleDigests returns bundle digests referenced by outstanding tasks.
+func (s *DispatchTaskStore) ListBundleDigests(ctx context.Context) ([]string, error) {
+	digests := make(map[string]struct{})
+
+	// Cleanup holds the shared transition lock while taking this snapshot.
+	for _, prefix := range []string{dispatchPendingPrefix, dispatchClaimsPrefix} {
+		recs, err := s.listDispatchRecords(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range recs {
+			payload, err := dispatchTaskPayloadFromRecord(rec)
+			if err != nil {
+				return nil, err
+			}
+			if payload.Task == nil || payload.Task.WorkspaceBundleDigest == "" {
+				continue
+			}
+			digests[payload.Task.WorkspaceBundleDigest] = struct{}{}
+		}
 	}
-	if s.index != nil {
-		s.index.removeClaim(claimID)
+
+	result := make([]string, 0, len(digests))
+	for digest := range digests {
+		result = append(result, digest)
 	}
-	return nil
+	sort.Strings(result)
+	return result, nil
 }
 
 // CountOutstandingByQueue returns the number of pending+claimed dispatch
@@ -843,7 +923,7 @@ func (s *DispatchTaskStore) recycleExpiredClaims(ctx context.Context) error {
 			continue
 		}
 
-		if err := s.releaseClaimRecord(ctx, rec, payload, now); err != nil {
+		if err := s.releaseClaim(ctx, rec, payload, now); err != nil {
 			if errors.Is(err, persis.ErrNotFound) || errors.Is(err, persis.ErrConflict) {
 				s.index.removeClaim(id)
 				continue
@@ -852,6 +932,21 @@ func (s *DispatchTaskStore) recycleExpiredClaims(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *DispatchTaskStore) releaseClaim(
+	ctx context.Context,
+	rec *persis.Record,
+	payload dispatchTaskPayload,
+	now time.Time,
+) error {
+	transition := func(lockCtx context.Context) error {
+		return s.releaseClaimRecord(lockCtx, rec, payload, now)
+	}
+	if payload.Task == nil || payload.Task.WorkspaceBundleDigest == "" {
+		return transition(ctx)
+	}
+	return s.withTransitionLock(ctx, transition)
 }
 
 func (s *DispatchTaskStore) releaseClaimRecord(ctx context.Context, rec *persis.Record, payload dispatchTaskPayload, now time.Time) error {
@@ -866,7 +961,7 @@ func (s *DispatchTaskStore) releaseClaimRecord(ctx context.Context, rec *persis.
 	payload.ClaimedAt = 0
 	payload.WorkerID = ""
 	payload.PollerID = ""
-	payload.Owner = exec.CoordinatorEndpoint{}
+	payload.Owner = dispatch.CoordinatorEndpoint{}
 	payload.Task = clearDispatchTaskClaim(payload.Task)
 
 	pendingID, err := pendingDispatchRecordID(payload.TaskFileName)
@@ -1014,7 +1109,7 @@ func (s *DispatchTaskStore) listDispatchRecords(ctx context.Context, prefix stri
 }
 
 func (s *DispatchTaskStore) listDispatchRecordIDs(ctx context.Context, prefix string) ([]string, error) {
-	if idCol, ok := s.col.(strictRecordIDsCollection); ok {
+	if idCol, ok := s.col.(recordIDsCollection); ok {
 		ids, err := idCol.RecordIDs(ctx, prefix)
 		if err != nil {
 			return nil, err
@@ -1074,7 +1169,7 @@ func hasLegacyDispatchTaskJSON(data []byte) bool {
 	return false
 }
 
-func legacyDispatchTaskFromRecord(data []byte) (*exec.DispatchTask, error) {
+func legacyDispatchTaskFromRecord(data []byte) (*dispatch.DispatchTask, error) {
 	var raw struct {
 		Task map[string]json.RawMessage `json:"task"`
 	}
@@ -1121,7 +1216,7 @@ func legacyDispatchTaskFromRecord(data []byte) (*exec.DispatchTask, error) {
 	if err != nil {
 		return nil, err
 	}
-	var task exec.DispatchTask
+	var task dispatch.DispatchTask
 	if err := json.Unmarshal(encoded, &task); err != nil {
 		return nil, err
 	}
@@ -1136,7 +1231,7 @@ func legacyPreviousStatusJSON(data json.RawMessage) (json.RawMessage, error) {
 	if status.JSONData == "" {
 		return nil, nil
 	}
-	var decoded exec.DAGRunStatus
+	var decoded ir.DAGRunStatus
 	if err := json.Unmarshal([]byte(status.JSONData), &decoded); err != nil {
 		return nil, fmt.Errorf("decode previous status: %w", err)
 	}
@@ -1144,7 +1239,7 @@ func legacyPreviousStatusJSON(data json.RawMessage) (json.RawMessage, error) {
 }
 
 func legacyOwnerJSON(fields map[string]json.RawMessage) (json.RawMessage, bool, error) {
-	var owner exec.CoordinatorEndpoint
+	var owner dispatch.CoordinatorEndpoint
 	var ok bool
 	if err := decodeLegacyOwnerField(fields, "owner_coordinator_id", &owner.ID, &ok); err != nil {
 		return nil, false, err
@@ -1220,17 +1315,16 @@ func dispatchRecordTimestamp(unixMillis int64, fallback time.Time) time.Time {
 	return time.Now().UTC()
 }
 
-func cloneDispatchTask(task *exec.DispatchTask) *exec.DispatchTask {
+func cloneDispatchTask(task *dispatch.DispatchTask) *dispatch.DispatchTask {
 	if task == nil {
 		return nil
 	}
 	cloned := *task
 	cloned.WorkerSelector = maps.Clone(task.WorkerSelector)
-	cloned.AgentSnapshot = append([]byte(nil), task.AgentSnapshot...)
 	return &cloned
 }
 
-func applyDispatchTaskClaim(task *exec.DispatchTask, owner exec.CoordinatorEndpoint, claimToken string) (*exec.DispatchTask, error) {
+func applyDispatchTaskClaim(task *dispatch.DispatchTask, owner dispatch.CoordinatorEndpoint, claimToken string) (*dispatch.DispatchTask, error) {
 	task = cloneDispatchTask(task)
 	if task == nil {
 		return nil, nil
@@ -1240,12 +1334,12 @@ func applyDispatchTaskClaim(task *exec.DispatchTask, owner exec.CoordinatorEndpo
 	return task, nil
 }
 
-func clearDispatchTaskClaim(task *exec.DispatchTask) *exec.DispatchTask {
+func clearDispatchTaskClaim(task *dispatch.DispatchTask) *dispatch.DispatchTask {
 	task = cloneDispatchTask(task)
 	if task == nil {
 		return nil
 	}
-	task.Owner = exec.CoordinatorEndpoint{}
+	task.Owner = dispatch.CoordinatorEndpoint{}
 	task.ClaimToken = ""
 	task.WorkerID = ""
 	return task

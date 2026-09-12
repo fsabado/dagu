@@ -4,26 +4,22 @@
 package chatbridge
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/agent"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/service/eventstore"
+	"github.com/dagucloud/dagu/v2/internal/eventstore"
 )
 
 func TestNotificationSeenKeyIncludesStatus(t *testing.T) {
 	t.Parallel()
 
-	waiting := &exec.DAGRunStatus{DAGRunID: "run-1", AttemptID: "attempt-1", Status: core.Waiting}
-	succeeded := &exec.DAGRunStatus{DAGRunID: "run-1", AttemptID: "attempt-1", Status: core.Succeeded}
+	waiting := &ir.DAGRunStatus{DAGRunID: "run-1", AttemptID: "attempt-1", Status: ir.Waiting}
+	succeeded := &ir.DAGRunStatus{DAGRunID: "run-1", AttemptID: "attempt-1", Status: ir.Succeeded}
 
 	assert.NotEqual(t, NotificationSeenKey(waiting), NotificationSeenKey(succeeded))
 }
@@ -34,9 +30,9 @@ func TestNotificationBatcher_SuccessBurstFlushesSingleDigest(t *testing.T) {
 	batcher := NewNotificationBatcher(10*time.Millisecond, 20*time.Millisecond)
 	defer batcher.Stop()
 
-	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&exec.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: core.Succeeded})))
-	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&exec.DAGRunStatus{Name: "briefing", DAGRunID: "run-2", AttemptID: "a2", Status: core.Succeeded})))
-	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&exec.DAGRunStatus{Name: "sync", DAGRunID: "run-3", AttemptID: "a3", Status: core.PartiallySucceeded})))
+	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&ir.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: ir.Succeeded})))
+	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&ir.DAGRunStatus{Name: "briefing", DAGRunID: "run-2", AttemptID: "a2", Status: ir.Succeeded})))
+	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&ir.DAGRunStatus{Name: "sync", DAGRunID: "run-3", AttemptID: "a3", Status: ir.PartiallySucceeded})))
 
 	ready := waitForReadyBatch(t, batcher)
 	assert.Equal(t, "dest-1", ready.Destination)
@@ -54,13 +50,13 @@ func TestNotificationBatcher_ReplacesWaitingWithSuccessBeforeFlush(t *testing.T)
 	batcher := NewNotificationBatcher(15*time.Millisecond, 25*time.Millisecond)
 	defer batcher.Stop()
 
-	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&exec.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: core.Waiting})))
-	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&exec.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: core.Succeeded})))
+	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&ir.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: ir.Waiting})))
+	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(&ir.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: ir.Succeeded})))
 
 	ready := waitForReadyBatch(t, batcher)
 	assert.Equal(t, NotificationClassSuccessDigest, ready.Batch.Class)
 	require.Len(t, ready.Batch.Events, 1)
-	assert.Equal(t, core.Succeeded, ready.Batch.Events[0].Status.Status)
+	assert.Equal(t, ir.Succeeded, ready.Batch.Events[0].Status.Status)
 }
 
 func TestNotificationBatcher_DuplicateStatusDoesNotDuplicateBatch(t *testing.T) {
@@ -69,14 +65,14 @@ func TestNotificationBatcher_DuplicateStatusDoesNotDuplicateBatch(t *testing.T) 
 	batcher := NewNotificationBatcher(20*time.Millisecond, 40*time.Millisecond)
 	defer batcher.Stop()
 
-	status := &exec.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: core.Failed, Error: "boom"}
+	status := &ir.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: ir.Failed, Error: "boom"}
 	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(status)))
 	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(status)))
 
 	ready := waitForReadyBatch(t, batcher)
 	assert.Equal(t, NotificationClassUrgent, ready.Batch.Class)
 	require.Len(t, ready.Batch.Events, 1)
-	assert.Equal(t, core.Failed, ready.Batch.Events[0].Status.Status)
+	assert.Equal(t, ir.Failed, ready.Batch.Events[0].Status.Status)
 }
 
 func TestNotificationBatcher_SkipsFailedRunWithAutoRetryRemaining(t *testing.T) {
@@ -85,11 +81,11 @@ func TestNotificationBatcher_SkipsFailedRunWithAutoRetryRemaining(t *testing.T) 
 	batcher := NewNotificationBatcher(10*time.Millisecond, 20*time.Millisecond)
 	defer batcher.Stop()
 
-	status := &exec.DAGRunStatus{
+	status := &ir.DAGRunStatus{
 		Name:           "briefing",
 		DAGRunID:       "run-1",
 		AttemptID:      "a1",
-		Status:         core.Failed,
+		Status:         ir.Failed,
 		Error:          "boom",
 		AutoRetryCount: 0,
 		AutoRetryLimit: 2,
@@ -107,11 +103,11 @@ func TestNotificationBatcher_RunningEventsUseInformationalClass(t *testing.T) {
 	batcher := NewNotificationBatcher(10*time.Millisecond, 20*time.Millisecond)
 	defer batcher.Stop()
 
-	event := testNotificationEvent(&exec.DAGRunStatus{
+	event := testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "briefing",
 		DAGRunID:  "run-1",
 		AttemptID: "a1",
-		Status:    core.Running,
+		Status:    ir.Running,
 	})
 	event.Type = eventstore.TypeDAGRunRunning
 
@@ -130,11 +126,11 @@ func TestNotificationBatcher_AbortedEventsUseUrgentClass(t *testing.T) {
 	batcher := NewNotificationBatcher(10*time.Millisecond, 20*time.Millisecond)
 	defer batcher.Stop()
 
-	event := testNotificationEvent(&exec.DAGRunStatus{
+	event := testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "briefing",
 		DAGRunID:  "run-1",
 		AttemptID: "a1",
-		Status:    core.Aborted,
+		Status:    ir.Aborted,
 	})
 	event.Type = eventstore.TypeDAGRunAborted
 
@@ -153,27 +149,27 @@ func TestNotificationBatcher_DrainAndStopReturnsPendingBatchesOrderedAndStopsFlu
 	batcher := NewNotificationBatcher(80*time.Millisecond, 120*time.Millisecond)
 	baseTime := time.Now().UTC()
 
-	successEvent := testNotificationEvent(&exec.DAGRunStatus{
+	successEvent := testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "briefing",
 		DAGRunID:  "run-1",
 		AttemptID: "a1",
-		Status:    core.Succeeded,
+		Status:    ir.Succeeded,
 	})
 	successEvent.ObservedAt = baseTime.Add(2 * time.Millisecond)
 
-	urgentOldEvent := testNotificationEvent(&exec.DAGRunStatus{
+	urgentOldEvent := testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "sync",
 		DAGRunID:  "run-2",
 		AttemptID: "a2",
-		Status:    core.Failed,
+		Status:    ir.Failed,
 	})
 	urgentOldEvent.ObservedAt = baseTime
 
-	urgentNewEvent := testNotificationEvent(&exec.DAGRunStatus{
+	urgentNewEvent := testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "sync",
 		DAGRunID:  "run-3",
 		AttemptID: "a3",
-		Status:    core.Waiting,
+		Status:    ir.Waiting,
 	})
 	urgentNewEvent.ObservedAt = baseTime.Add(time.Millisecond)
 
@@ -193,11 +189,11 @@ func TestNotificationBatcher_DrainAndStopReturnsPendingBatchesOrderedAndStopsFlu
 	require.Never(t, func() bool {
 		return len(batcher.TakeReady()) > 0
 	}, 200*time.Millisecond, 20*time.Millisecond)
-	assert.False(t, batcher.Enqueue("ignored", testNotificationEvent(&exec.DAGRunStatus{
+	assert.False(t, batcher.Enqueue("ignored", testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "ignored",
 		DAGRunID:  "run-4",
 		AttemptID: "a4",
-		Status:    core.Succeeded,
+		Status:    ir.Succeeded,
 	})))
 }
 
@@ -207,23 +203,23 @@ func TestNotificationBatcher_DiscardDestinationsRemovesReadyAndBufferedBatches(t
 	batcher := NewNotificationBatcher(80*time.Millisecond, 20*time.Millisecond)
 	defer batcher.Stop()
 
-	require.True(t, batcher.Enqueue("ready-remove", testNotificationEvent(&exec.DAGRunStatus{
+	require.True(t, batcher.Enqueue("ready-remove", testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "briefing",
 		DAGRunID:  "run-1",
 		AttemptID: "a1",
-		Status:    core.Succeeded,
+		Status:    ir.Succeeded,
 	})))
-	require.True(t, batcher.Enqueue("ready-keep", testNotificationEvent(&exec.DAGRunStatus{
+	require.True(t, batcher.Enqueue("ready-keep", testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "sync",
 		DAGRunID:  "run-2",
 		AttemptID: "a2",
-		Status:    core.Succeeded,
+		Status:    ir.Succeeded,
 	})))
-	require.True(t, batcher.Enqueue("buffered-remove", testNotificationEvent(&exec.DAGRunStatus{
+	require.True(t, batcher.Enqueue("buffered-remove", testNotificationEvent(&ir.DAGRunStatus{
 		Name:      "alerts",
 		DAGRunID:  "run-3",
 		AttemptID: "a3",
-		Status:    core.Failed,
+		Status:    ir.Failed,
 	})))
 
 	// Synchronously flush success-class buckets to ready
@@ -244,30 +240,49 @@ func TestNotificationBatcher_DiscardDestinationsRemovesReadyAndBufferedBatches(t
 	}, 200*time.Millisecond, 20*time.Millisecond)
 }
 
-func TestGenerateNotificationMessage_UrgentSingleUsesLLMAndFallsBack(t *testing.T) {
+func TestNotificationBatcher_DiscardEventsRemovesReadyAndBufferedEvents(t *testing.T) {
 	t.Parallel()
 
-	batch := NotificationBatch{
-		Class: NotificationClassUrgent,
-		Events: []NotificationEvent{
-			{Status: &exec.DAGRunStatus{Name: "briefing", DAGRunID: "run-1", AttemptID: "a1", Status: core.Failed, Error: "boom"}},
-		},
-		WindowStart: time.Now().Add(-10 * time.Second),
-		WindowEnd:   time.Now(),
-	}
+	batcher := NewNotificationBatcher(80*time.Millisecond, 20*time.Millisecond)
+	defer batcher.Stop()
 
-	service := &fakeAgentService{
-		generatedMessage: agent.Message{Type: agent.MessageTypeAssistant, Content: "ai notification"},
-	}
-	msg, err := GenerateNotificationMessage(context.Background(), service, "sess-1", agent.UserIdentity{UserID: "u1"}, batch)
-	require.NoError(t, err)
-	assert.Equal(t, "ai notification", msg.Content)
+	readyEvent := testNotificationEvent(&ir.DAGRunStatus{
+		Name:      "ready",
+		DAGRunID:  "run-ready",
+		AttemptID: "a1",
+		Status:    ir.Succeeded,
+	})
+	bufferedDrop := testNotificationEvent(&ir.DAGRunStatus{
+		Name:      "buffered-drop",
+		DAGRunID:  "run-buffered-drop",
+		AttemptID: "a1",
+		Status:    ir.Failed,
+	})
+	bufferedKeep := testNotificationEvent(&ir.DAGRunStatus{
+		Name:      "buffered-keep",
+		DAGRunID:  "run-buffered-keep",
+		AttemptID: "a1",
+		Status:    ir.Failed,
+	})
 
-	service.generateErr = errors.New("llm unavailable")
-	msg, err = GenerateNotificationMessage(context.Background(), service, "sess-1", agent.UserIdentity{UserID: "u1"}, batch)
-	require.Error(t, err)
-	assert.Contains(t, msg.Content, "DAG `briefing` failed")
-	assert.NotContains(t, msg.Content, "llm unavailable")
+	require.True(t, batcher.Enqueue("dest-1", readyEvent))
+	batcher.flushBucketsLocked(NotificationClassSuccessDigest)
+	require.True(t, batcher.Enqueue("dest-1", bufferedDrop))
+	require.True(t, batcher.Enqueue("dest-1", bufferedKeep))
+
+	batcher.discardEvents("dest-1", map[string]struct{}{
+		readyEvent.Key:   {},
+		bufferedDrop.Key: {},
+	})
+
+	assert.Empty(t, batcher.TakeReady())
+	select {
+	case <-batcher.ReadyC():
+	default:
+	}
+	ready := waitForReadyBatch(t, batcher)
+	require.Len(t, ready.Batch.Events, 1)
+	assert.Equal(t, bufferedKeep.Key, ready.Batch.Events[0].Key)
 }
 
 func TestFormatNotificationBatch_CapsVisibleGroups(t *testing.T) {
@@ -277,11 +292,11 @@ func TestFormatNotificationBatch_CapsVisibleGroups(t *testing.T) {
 	base := time.Now()
 	for i := range maxNotificationGroups + 2 {
 		events = append(events, NotificationEvent{
-			Status: &exec.DAGRunStatus{
+			Status: &ir.DAGRunStatus{
 				Name:      fmt.Sprintf("dag-%d", i),
 				DAGRunID:  fmt.Sprintf("run-%d", i),
 				AttemptID: "a1",
-				Status:    core.Succeeded,
+				Status:    ir.Succeeded,
 			},
 			ObservedAt: base.Add(-time.Duration(i) * time.Second),
 		})
@@ -304,36 +319,43 @@ func TestNotificationBatcher_ClonesStatusSnapshot(t *testing.T) {
 	batcher := NewNotificationBatcher(10*time.Millisecond, 20*time.Millisecond)
 	defer batcher.Stop()
 
-	status := &exec.DAGRunStatus{
+	status := &ir.DAGRunStatus{
 		Name:      "briefing",
+		Labels:    []string{"workspace=ops"},
 		DAGRunID:  "run-1",
 		AttemptID: "a1",
-		Status:    core.Failed,
+		Status:    ir.Failed,
 		Error:     "original error",
-		Nodes: []*exec.Node{
+		Nodes: []*ir.Node{
 			{
-				Step:   core.Step{Name: "fetch"},
-				Status: core.NodeFailed,
+				Step:   ir.Step{Name: "fetch"},
+				Status: ir.NodeFailed,
 				Error:  "node failed",
 			},
 		},
-		OnFailure: &exec.Node{
-			Step:  core.Step{Name: "notify"},
+		OnFailure: &ir.Node{
+			Step:  ir.Step{Name: "notify"},
 			Error: "handler failed",
 		},
 	}
-	require.True(t, batcher.Enqueue("dest-1", testNotificationEvent(status)))
+	event := testNotificationEvent(status)
+	event.DAGFile = "briefing-file"
+	require.True(t, batcher.Enqueue("dest-1", event))
 
 	status.Error = "mutated error"
+	status.Labels[0] = "workspace=mutated"
 	status.Nodes[0].Error = "mutated node error"
 	status.Nodes[0].Step.Name = "mutated"
 	status.OnFailure.Error = "mutated handler error"
 
 	ready := waitForReadyBatch(t, batcher)
 	require.Len(t, ready.Batch.Events, 1)
-	got := ready.Batch.Events[0].Status
+	gotEvent := ready.Batch.Events[0]
+	assert.Equal(t, "briefing-file", gotEvent.DAGFile)
+	got := gotEvent.Status
 	require.NotNil(t, got)
 	assert.Equal(t, "original error", got.Error)
+	assert.Equal(t, []string{"workspace=ops"}, got.Labels)
 	require.Len(t, got.Nodes, 1)
 	assert.Equal(t, "fetch", got.Nodes[0].Step.Name)
 	assert.Equal(t, "node failed", got.Nodes[0].Error)
@@ -355,7 +377,7 @@ func waitForReadyBatch(t *testing.T, batcher *NotificationBatcher) NotificationP
 	}
 }
 
-func testNotificationEvent(status *exec.DAGRunStatus) NotificationEvent {
+func testNotificationEvent(status *ir.DAGRunStatus) NotificationEvent {
 	return NotificationEvent{
 		Key:        NotificationSeenKey(status),
 		Status:     status,

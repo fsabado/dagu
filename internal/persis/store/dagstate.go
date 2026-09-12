@@ -5,31 +5,25 @@ package store
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
-	"sync"
+	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/dagstate"
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
-var _ dagstate.Store = (*DAGStateStore)(nil)
+const dagStateRecordIDVersion = "v1"
+
+var _ dagrun.StateStore = (*DAGStateStore)(nil)
 
 // DAGStateStore persists DAG state entries in a persis collection.
 type DAGStateStore struct {
 	col persis.Collection
-	mu  sync.Mutex
-}
-
-type lockableCollection interface {
-	WithLock(ctx context.Context, key string, fn func() error) error
-}
-
-type recordIDCollection interface {
-	RecordIDs(ctx context.Context, prefix string) ([]string, error)
 }
 
 // NewDAGStateStore returns a DAG state store backed by the provided collection.
@@ -37,8 +31,8 @@ func NewDAGStateStore(col persis.Collection) *DAGStateStore {
 	return &DAGStateStore{col: col}
 }
 
-func (s *DAGStateStore) Get(ctx context.Context, ref dagstate.Ref) (*dagstate.Entry, error) {
-	id, err := ref.RecordID()
+func (s *DAGStateStore) Get(ctx context.Context, ref dagrun.StateRef) (*dagrun.StateEntry, error) {
+	id, err := dagStateRecordID(ref)
 	if err != nil {
 		return nil, err
 	}
@@ -49,18 +43,18 @@ func (s *DAGStateStore) Get(ctx context.Context, ref dagstate.Ref) (*dagstate.En
 	return decodeDAGStateRecord(rec)
 }
 
-func (s *DAGStateStore) Put(ctx context.Context, ref dagstate.Ref, value json.RawMessage, opts dagstate.PutOptions) (*dagstate.Entry, error) {
-	id, err := ref.RecordID()
+func (s *DAGStateStore) Put(ctx context.Context, ref dagrun.StateRef, value json.RawMessage, opts dagrun.StatePutOptions) (*dagrun.StateEntry, error) {
+	id, err := dagStateRecordID(ref)
 	if err != nil {
 		return nil, err
 	}
-	normalized, err := dagstate.NormalizeValue(value)
+	normalized, err := dagrun.NormalizeStateValue(value)
 	if err != nil {
 		return nil, err
 	}
 
-	var out *dagstate.Entry
-	err = s.withRecordLock(ctx, id, func() error {
+	var out *dagrun.StateEntry
+	err = retryConflict(ctx, func(ctx context.Context) error {
 		now := time.Now().UTC()
 		rec, getErr := s.col.Get(ctx, id)
 		if getErr != nil {
@@ -68,18 +62,18 @@ func (s *DAGStateStore) Put(ctx context.Context, ref dagstate.Ref, value json.Ra
 				return mapDAGStateStoreError(getErr)
 			}
 			if opts.ExpectedVersion != nil && *opts.ExpectedVersion != 0 {
-				return dagstate.ErrConflict
+				return dagrun.ErrStateConflict
 			}
-			entry := &dagstate.Entry{
-				Ref:       ref,
+			entry := &dagrun.StateEntry{
+				StateRef:  ref,
 				Value:     append(json.RawMessage(nil), normalized...),
 				Version:   1,
-				Hash:      dagstate.HashValue(normalized),
+				Hash:      dagrun.HashStateValue(normalized),
 				CreatedAt: now,
 				UpdatedAt: now,
 				UpdatedBy: opts.UpdatedBy.Clone(),
 			}
-			if err := s.putEntry(ctx, id, entry, now, now); err != nil {
+			if err := s.saveEntry(ctx, nil, id, entry, now, now); err != nil {
 				return err
 			}
 			out = entry.Clone()
@@ -91,22 +85,22 @@ func (s *DAGStateStore) Put(ctx context.Context, ref dagstate.Ref, value json.Ra
 			return err
 		}
 		if opts.CreateOnly {
-			return dagstate.ErrConflict
+			return dagrun.ErrStateConflict
 		}
 		if opts.ExpectedVersion != nil && existing.Version != *opts.ExpectedVersion {
-			return dagstate.ErrConflict
+			return dagrun.ErrStateConflict
 		}
 
-		entry := &dagstate.Entry{
-			Ref:       ref,
+		entry := &dagrun.StateEntry{
+			StateRef:  ref,
 			Value:     append(json.RawMessage(nil), normalized...),
 			Version:   existing.Version + 1,
-			Hash:      dagstate.HashValue(normalized),
+			Hash:      dagrun.HashStateValue(normalized),
 			CreatedAt: existing.CreatedAt,
 			UpdatedAt: now,
 			UpdatedBy: opts.UpdatedBy.Clone(),
 		}
-		if err := s.putEntry(ctx, id, entry, existing.CreatedAt, now); err != nil {
+		if err := s.saveEntry(ctx, rec, id, entry, existing.CreatedAt, now); err != nil {
 			return err
 		}
 		out = entry.Clone()
@@ -118,22 +112,29 @@ func (s *DAGStateStore) Put(ctx context.Context, ref dagstate.Ref, value json.Ra
 	return out, nil
 }
 
-func (s *DAGStateStore) Delete(ctx context.Context, ref dagstate.Ref) (bool, error) {
-	id, err := ref.RecordID()
+func (s *DAGStateStore) Delete(ctx context.Context, ref dagrun.StateRef) (bool, error) {
+	id, err := dagStateRecordID(ref)
 	if err != nil {
 		return false, err
 	}
 
 	var deleted bool
-	err = s.withRecordLock(ctx, id, func() error {
-		if _, err := s.col.Get(ctx, id); err != nil {
+	err = retryConflict(ctx, func(ctx context.Context) error {
+		rec, err := s.col.Get(ctx, id)
+		if err != nil {
 			if errors.Is(err, persis.ErrNotFound) {
 				deleted = false
 				return nil
 			}
 			return mapDAGStateStoreError(err)
 		}
-		if err := s.col.Delete(ctx, id); err != nil {
+		if err := s.col.CompareAndDelete(ctx, rec); err != nil {
+			if errors.Is(err, persis.ErrNotFound) {
+				return persis.ErrConflict
+			}
+			if errors.Is(err, persis.ErrConflict) {
+				return err
+			}
 			return mapDAGStateStoreError(err)
 		}
 		deleted = true
@@ -145,16 +146,16 @@ func (s *DAGStateStore) Delete(ctx context.Context, ref dagstate.Ref) (bool, err
 	return deleted, nil
 }
 
-func (s *DAGStateStore) List(ctx context.Context, opts dagstate.ListOptions) ([]*dagstate.Entry, error) {
+func (s *DAGStateStore) List(ctx context.Context, opts dagrun.StateListOptions) ([]*dagrun.StateEntry, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
 
-	prefix, err := opts.RecordIDPrefix()
+	prefix, err := dagStateRecordIDPrefix(opts)
 	if err != nil {
 		return nil, err
 	}
-	if idCol, ok := s.col.(recordIDCollection); ok {
+	if idCol, ok := s.col.(recordIDsCollection); ok {
 		ids, err := idCol.RecordIDs(ctx, prefix)
 		if err != nil {
 			return nil, mapDAGStateStoreError(err)
@@ -163,7 +164,7 @@ func (s *DAGStateStore) List(ctx context.Context, opts dagstate.ListOptions) ([]
 		if opts.Limit > 0 && len(ids) > opts.Limit {
 			ids = ids[:opts.Limit]
 		}
-		entries := make([]*dagstate.Entry, 0, len(ids))
+		entries := make([]*dagrun.StateEntry, 0, len(ids))
 		for _, id := range ids {
 			rec, err := s.col.Get(ctx, id)
 			if err != nil {
@@ -185,7 +186,7 @@ func (s *DAGStateStore) List(ctx context.Context, opts dagstate.ListOptions) ([]
 	if err != nil {
 		return nil, mapDAGStateStoreError(err)
 	}
-	entries := make([]*dagstate.Entry, 0, len(recs))
+	entries := make([]*dagrun.StateEntry, 0, len(recs))
 	for _, rec := range recs {
 		entry, err := decodeDAGStateRecord(rec)
 		if err != nil {
@@ -208,39 +209,79 @@ func (s *DAGStateStore) List(ctx context.Context, opts dagstate.ListOptions) ([]
 	return entries, nil
 }
 
-func (s *DAGStateStore) withRecordLock(ctx context.Context, id string, fn func() error) error {
-	if locked, ok := s.col.(lockableCollection); ok {
-		return locked.WithLock(ctx, id, fn)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return fn()
-}
-
-func (s *DAGStateStore) putEntry(ctx context.Context, id string, entry *dagstate.Entry, createdAt, updatedAt time.Time) error {
+func (s *DAGStateStore) saveEntry(
+	ctx context.Context,
+	current *persis.Record,
+	id string,
+	entry *dagrun.StateEntry,
+	createdAt, updatedAt time.Time,
+) error {
 	data, err := persis.Encode(entry)
 	if err != nil {
 		return err
 	}
-	return mapDAGStateStoreError(s.col.Put(ctx, &persis.Record{
+	return createOrSwap(ctx, s.col, current, &persis.Record{
 		ID:        id,
 		Data:      data,
 		CreatedAt: createdAt,
 		UpdatedAt: updatedAt,
-	}))
+	})
 }
 
-func decodeDAGStateRecord(rec *persis.Record) (*dagstate.Entry, error) {
-	var entry dagstate.Entry
+func decodeDAGStateRecord(rec *persis.Record) (*dagrun.StateEntry, error) {
+	var entry dagrun.StateEntry
 	if err := persis.Decode(rec, &entry); err != nil {
 		return nil, fmt.Errorf("dag state store: decode %q: %w", rec.ID, err)
 	}
-	ref, err := dagstate.RefFromRecordID(rec.ID)
+	ref, err := dagStateRefFromRecordID(rec.ID)
 	if err != nil {
 		return nil, fmt.Errorf("dag state store: decode %q: %w", rec.ID, err)
 	}
-	entry.Ref = ref
+	entry.StateRef = ref
 	return entry.Clone(), nil
+}
+
+func dagStateRecordID(ref dagrun.StateRef) (string, error) {
+	if err := ref.Validate(); err != nil {
+		return "", err
+	}
+	return dagStateRecordIDVersion + "/" + string(ref.Scope) + "/" + encodeDAGStateRecordIDPart(ref.Namespace) + "/" + encodeDAGStateRecordIDPart(ref.Key), nil
+}
+
+func dagStateRefFromRecordID(id string) (dagrun.StateRef, error) {
+	parts := strings.SplitN(id, "/", 4)
+	if len(parts) != 4 || parts[0] != dagStateRecordIDVersion {
+		return dagrun.StateRef{}, fmt.Errorf("%w: malformed record id", dagrun.ErrInvalidStateRef)
+	}
+	namespace, err := decodeDAGStateRecordIDPart(parts[2])
+	if err != nil {
+		return dagrun.StateRef{}, err
+	}
+	key, err := decodeDAGStateRecordIDPart(parts[3])
+	if err != nil {
+		return dagrun.StateRef{}, err
+	}
+	ref := dagrun.StateRef{Scope: dagrun.StateScope(parts[1]), Namespace: namespace, Key: key}
+	return ref, ref.Validate()
+}
+
+func dagStateRecordIDPrefix(opts dagrun.StateListOptions) (string, error) {
+	if err := opts.Validate(); err != nil {
+		return "", err
+	}
+	return dagStateRecordIDVersion + "/" + string(opts.Scope) + "/" + encodeDAGStateRecordIDPart(opts.Namespace) + "/" + encodeDAGStateRecordIDPart(opts.KeyPrefix), nil
+}
+
+func encodeDAGStateRecordIDPart(value string) string {
+	return hex.EncodeToString([]byte(value))
+}
+
+func decodeDAGStateRecordIDPart(value string) (string, error) {
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return "", fmt.Errorf("%w: malformed record id", dagrun.ErrInvalidStateRef)
+	}
+	return string(decoded), nil
 }
 
 func mapDAGStateStoreError(err error) error {
@@ -248,9 +289,9 @@ func mapDAGStateStoreError(err error) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, persis.ErrNotFound):
-		return dagstate.ErrNotFound
+		return dagrun.ErrStateNotFound
 	case errors.Is(err, persis.ErrConflict):
-		return dagstate.ErrConflict
+		return dagrun.ErrStateConflict
 	default:
 		return err
 	}

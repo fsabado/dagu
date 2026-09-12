@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">Dagu: turn scripts into reliable workflows</title>
+  <desc id="description">A mouse pilots a small spacecraft beside the Dagu name and product message.</desc>
+  <image href="social-card-art.png" width="1280" height="640" />
+  <defs>
+    <linearGradient id="copy-backdrop" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#070911" stop-opacity="0" />
+      <stop offset="0.22" stop-color="#070911" stop-opacity="0.58" />
+      <stop offset="1" stop-color="#070911" stop-opacity="0.12" />
+    </linearGradient>
+  </defs>
+  <rect x="540" width="740" height="640" fill="url(#copy-backdrop)" />
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+    <image href="brand-mark.png" x="649" y="125" width="52" height="52" />
+    <text x="718" y="166" fill="#ffffff" font-size="42" font-weight="700" letter-spacing="-1">Dagu</text>
+    <text x="650" y="278" fill="#ffffff" font-size="53" font-weight="700" letter-spacing="-1.7">Turn scripts into</text>
+    <text x="650" y="342" fill="#ffffff" font-size="53" font-weight="700" letter-spacing="-1.7">reliable workflows.</text>
+    <text x="653" y="426" fill="#cbc8e8" font-size="25" font-weight="500">One open-source binary.</text>
+    <text x="653" y="463" fill="#cbc8e8" font-size="25" font-weight="500">No external database.</text>
+  </g>
+</svg>

@@ -6,11 +6,11 @@ package main
 import (
 	"os"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/spf13/cobra"
 
-	_ "github.com/dagucloud/dagu/internal/runtime/builtin" // Register built-in executors
+	_ "github.com/dagucloud/dagu/v2/internal/runtime/builtin" // Register built-in executors
 )
 
 var rootCmd = &cobra.Command{
@@ -42,6 +42,9 @@ func init() {
 	rootCmd.AddCommand(cmd.Validate())
 	rootCmd.AddCommand(cmd.Status())
 	rootCmd.AddCommand(cmd.History())
+	rootCmd.AddCommand(cmd.Ls())
+	rootCmd.AddCommand(cmd.Rm())
+	rootCmd.AddCommand(cmd.Ps())
 	rootCmd.AddCommand(cmd.Version())
 	rootCmd.AddCommand(cmd.Server())
 	rootCmd.AddCommand(cmd.Scheduler())
@@ -49,7 +52,6 @@ func init() {
 	rootCmd.AddCommand(cmd.CmdWorker())
 	rootCmd.AddCommand(cmd.Retry())
 	rootCmd.AddCommand(cmd.StartAll())
-	rootCmd.AddCommand(cmd.Migrate())
 	rootCmd.AddCommand(cmd.Cleanup())
 	rootCmd.AddCommand(cmd.Sync())
 	rootCmd.AddCommand(cmd.Upgrade())
@@ -59,7 +61,7 @@ func init() {
 	rootCmd.AddCommand(cmd.Config())
 	rootCmd.AddCommand(cmd.ContextCommand())
 	rootCmd.AddCommand(cmd.Profile())
-	rootCmd.AddCommand(cmd.Agent())
+	rootCmd.AddCommand(cmd.HumanTask())
 
 	config.Version = version
 }

@@ -9,6 +9,7 @@ import { toMermaidNodeId } from '@/lib/utils';
 import Graph from '../Graph';
 
 const mermaidRenderMock = vi.hoisted(() => vi.fn());
+const downloadBlobMock = vi.hoisted(() => vi.fn());
 
 vi.mock('mermaid', () => ({
   default: {
@@ -17,12 +18,17 @@ vi.mock('mermaid', () => ({
   },
 }));
 
+vi.mock('@/lib/download', () => ({
+  downloadBlob: downloadBlobMock,
+}));
+
 vi.mock('@/contexts/UserPreference', () => ({
   useUserPreferences: () => ({ preferences: { theme: 'light' } }),
 }));
 
 beforeEach(() => {
   mermaidRenderMock.mockReset();
+  downloadBlobMock.mockReset();
 });
 
 function node(
@@ -57,7 +63,6 @@ describe('Graph', () => {
           node('prepare', NodeStatus.Success),
           node('load', NodeStatus.Success, ['prepare']),
         ]}
-        showIcons={false}
       />
     );
 
@@ -71,10 +76,10 @@ describe('Graph', () => {
     }
     const definition = firstCall[1] as string;
     expect(definition).toContain(
-      'classDef done color:#0f1129,fill:#ffffff,stroke:#166534'
+      'classDef done color:#14161b,fill:#fbfaf6,stroke:#22c55e'
     );
     expect(definition).toContain(
-      'linkStyle 0 stroke:#5f8f64,stroke-width:1.8px'
+      'linkStyle 0 stroke:#3fa76b,stroke-width:1.8px'
     );
     expect(definition).not.toContain('#1e8e3e');
     expect(definition).not.toContain('#7da87d');
@@ -90,7 +95,6 @@ describe('Graph', () => {
       <Graph
         type="status"
         steps={[node('load', NodeStatus.Running)]}
-        showIcons={false}
       />
     );
 
@@ -104,7 +108,7 @@ describe('Graph', () => {
     }
     const definition = firstCall[1] as string;
     expect(definition).toContain(
-      'classDef running color:#0f1129,fill:#ffffff,stroke:#43a047'
+      'classDef running color:#14161b,fill:#fbfaf6,stroke:#7c6ef4'
     );
     expect(definition).not.toContain('#81c784');
   });
@@ -127,16 +131,15 @@ describe('Graph', () => {
           node('prepare', NodeStatus.Success),
           node('load', NodeStatus.Running),
         ]}
-        showIcons={false}
       />
     );
 
     const doneNode = await screen.findByTestId('done-node');
     const runningNode = await screen.findByTestId('running-node');
 
-    expect(doneNode).toHaveAttribute('stroke', '#166534');
+    expect(doneNode).toHaveAttribute('stroke', '#22c55e');
     expect(doneNode).toHaveAttribute('stroke-width', '2.5px');
-    expect(runningNode).toHaveAttribute('stroke', '#43a047');
+    expect(runningNode).toHaveAttribute('stroke', '#7c6ef4');
     expect(runningNode).toHaveAttribute('stroke-width', '2.5px');
   });
 
@@ -174,6 +177,56 @@ describe('Graph', () => {
     });
   });
 
+  it('exports the rendered graph as a self-contained SVG', async () => {
+    mermaidRenderMock.mockResolvedValueOnce({
+      svg: '<svg viewBox="0 0 200 100" style="transform: scale(1.5)"><g class="node done"><rect></rect><foreignObject x="10" y="6" width="60" height="20"><div xmlns="http://www.w3.org/1999/xhtml">prepare</div></foreignObject></g></svg>',
+      bindFunctions: vi.fn(),
+    });
+
+    render(
+      <Graph
+        type="status"
+        steps={[node('prepare', NodeStatus.Success)]}
+        name="mydag"
+      />
+    );
+
+    await waitFor(() => {
+      expect(mermaidRenderMock).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Export as SVG' }));
+
+    expect(downloadBlobMock).toHaveBeenCalledTimes(1);
+    const call = downloadBlobMock.mock.calls[0];
+    if (!call) {
+      throw new Error('Expected downloadBlob to be called');
+    }
+    const [blob, filename] = call as [Blob, string];
+    expect(filename).toBe('mydag-graph.svg');
+    expect(blob.type).toBe('image/svg+xml');
+    const markup = await blob.text();
+    expect(markup).toContain('width="200"');
+    expect(markup).toContain('height="100"');
+    expect(markup).toContain('<rect');
+    expect(markup).not.toContain('transform: scale');
+    // HTML labels become native text so PNG rasterization is not tainted
+    // and non-browser SVG tools render the labels.
+    expect(markup).toContain('>prepare</text>');
+    expect(markup).not.toContain('foreignObject');
+    // Centered inside the source foreignObject rectangle (x + w/2, y + h/2).
+    expect(markup).toContain('x="40"');
+    expect(markup).toContain('y="16"');
+    // Inline styles beat mermaid's shape-oriented stylesheet inside the SVG.
+    expect(markup).toContain('stroke: none');
+
+    // PNG export needs canvas rasterization, unavailable in jsdom; the
+    // control itself must still be present.
+    expect(
+      screen.getByRole('button', { name: 'Export as PNG' })
+    ).toBeInTheDocument();
+  });
+
   it('keeps graph controls constrained above the graph on narrow screens', async () => {
     mermaidRenderMock.mockResolvedValueOnce({
       svg: '<svg></svg>',
@@ -186,7 +239,6 @@ describe('Graph', () => {
         steps={[node('load', NodeStatus.Running)]}
         flowchart="LR"
         onChangeFlowchart={vi.fn()}
-        showIcons={false}
       />
     );
 

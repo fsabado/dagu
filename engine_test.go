@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu"
+	"github.com/dagucloud/dagu/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -83,7 +83,7 @@ func TestEngineRunYAML(t *testing.T) {
 name: embedded-yaml
 steps:
   - name: hello
-    command: echo hello
+    action: noop
 `))
 	require.NoError(t, err, "RunYAML()")
 	status, err := run.Wait(ctx)

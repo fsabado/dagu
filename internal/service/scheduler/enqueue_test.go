@@ -4,16 +4,20 @@
 package scheduler_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/service/scheduler"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmn/buildenv"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	runtimeenvtransport "github.com/dagucloud/dagu/v2/internal/runtimeenv/transport"
+	secretref "github.com/dagucloud/dagu/v2/internal/secret/ref"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,27 +37,29 @@ steps:
 
 	err := scheduler.EnqueueCatchupRun(
 		th.Context,
-		th.DAGRunStore,
+		th.DAGRunRepository,
 		th.QueueStore,
 		th.Config.Paths.LogDir,
 		th.Config.Paths.ArtifactDir,
 		th.Config.Paths.BaseConfig,
+		"",
+		"test-dag",
 		dag.DAG,
 		runID,
-		core.TriggerTypeCatchUp,
+		ir.TriggerTypeCatchUp,
 		scheduleTime,
 		"prod",
 	)
 	require.NoError(t, err)
 
-	attempt, err := th.DAGRunStore.FindAttempt(th.Context, exec.NewDAGRunRef(dag.Name, runID))
+	attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, runID))
 	require.NoError(t, err)
 
 	status, err := attempt.ReadStatus(th.Context)
 	require.NoError(t, err)
 
-	require.Equal(t, core.Queued, status.Status)
-	require.Equal(t, core.TriggerTypeCatchUp, status.TriggerType)
+	require.Equal(t, ir.Queued, status.Status)
+	require.Equal(t, ir.TriggerTypeCatchUp, status.TriggerType)
 	require.Equal(t, stringutil.FormatTime(scheduleTime), status.ScheduleTime)
 	require.Equal(t, "prod", status.ProfileName)
 	require.NotEmpty(t, status.Log)
@@ -65,7 +71,7 @@ steps:
 
 	ref, err := items[0].Data()
 	require.NoError(t, err)
-	assert.Equal(t, exec.NewDAGRunRef(dag.Name, runID), *ref)
+	assert.Equal(t, ir.NewDAGRunRef(dag.Name, runID), *ref)
 }
 
 func TestEnqueueCatchupRun_RehydratesFullDAGBeforePersisting(t *testing.T) {
@@ -99,29 +105,100 @@ steps:
 
 	err = scheduler.EnqueueCatchupRun(
 		th.Context,
-		th.DAGRunStore,
+		th.DAGRunRepository,
 		th.QueueStore,
 		th.Config.Paths.LogDir,
 		th.Config.Paths.ArtifactDir,
 		th.Config.Paths.BaseConfig,
+		"",
+		metadataOnly.FileName(),
 		metadataOnly,
 		runID,
-		core.TriggerTypeCatchUp,
+		ir.TriggerTypeCatchUp,
 		scheduleTime,
 		"",
 	)
 	require.NoError(t, err)
 
-	attempt, err := th.DAGRunStore.FindAttempt(th.Context, exec.NewDAGRunRef(dag.Name, runID))
+	attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, runID))
 	require.NoError(t, err)
 
 	persisted, err := attempt.ReadDAG(th.Context)
 	require.NoError(t, err)
 	require.Len(t, persisted.Secrets, 1)
-	assert.Equal(t, core.SecretRef{
+	assert.Equal(t, secretref.Ref{
 		Name:     "EXPORTED_SECRET",
 		Provider: "env",
 		Key:      "SECRET_SOURCE",
 	}, persisted.Secrets[0])
 	require.Equal(t, []string{".env", ".env.secret"}, persisted.Dotenv)
+}
+
+func TestEnqueueCatchupRun_RehydratesWorkspaceBaseConfig(t *testing.T) {
+	t.Parallel()
+
+	th := test.Setup(t)
+	workspaceBaseConfigDir := workspace.BaseConfigDir(th.Config.Paths.DAGsDir)
+	require.NoError(t, os.MkdirAll(filepath.Join(workspaceBaseConfigDir, "ops"), 0o750))
+	require.NoError(t, os.WriteFile(th.Config.Paths.BaseConfig, []byte(`
+env:
+  - GREETING: from-global
+`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(workspaceBaseConfigDir, "ops", "base.yaml"), []byte(`
+env:
+  - GREETING: from-workspace
+  - OPS_ONLY: only-in-workspace
+actions:
+  ops.hello:
+    input_schema:
+      type: object
+      additionalProperties: false
+    template:
+      run: echo hello
+`), 0o600))
+
+	dag := th.DAG(t, `name: enqueue-catchup-workspace
+labels:
+  - workspace=ops
+steps:
+  - id: hello
+    action: ops.hello
+`)
+	metadataOnly, err := spec.Load(
+		th.Context,
+		dag.Location,
+		spec.OnlyMetadata(),
+		spec.WithoutEval(),
+		spec.SkipSchemaValidation(),
+	)
+	require.NoError(t, err)
+
+	runID := "catchup-run-workspace"
+	err = scheduler.EnqueueCatchupRun(
+		th.Context,
+		th.DAGRunRepository,
+		th.QueueStore,
+		th.Config.Paths.LogDir,
+		th.Config.Paths.ArtifactDir,
+		th.Config.Paths.BaseConfig,
+		workspaceBaseConfigDir,
+		metadataOnly.FileName(),
+		metadataOnly,
+		runID,
+		ir.TriggerTypeCatchUp,
+		time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC),
+		"",
+	)
+	require.NoError(t, err)
+
+	attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, runID))
+	require.NoError(t, err)
+	persisted, err := attempt.ReadDAG(th.Context)
+	require.NoError(t, err)
+
+	resolvedEnv, err := runtimeenvtransport.Resolve(th.Context, persisted, nil, runtimeenvtransport.Options{})
+	require.NoError(t, err)
+	env := buildenv.ToMap(resolvedEnv.Env)
+	require.Equal(t, "from-workspace", env["GREETING"])
+	require.Equal(t, "only-in-workspace", env["OPS_ONLY"])
 }

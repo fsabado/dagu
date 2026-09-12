@@ -1,18 +1,32 @@
+{{- if eq .Values.deploymentMode "distributed" }}
+{{- $podAnnotations := deepCopy .Values.podAnnotations }}
+{{- $_ := set $podAnnotations "checksum/config" (include "dagu.distributedConfigChecksum" .) }}
+{{- if .Values.serviceAccount.create }}
+{{- $_ = set $podAnnotations "checksum/service-account" (.Values.serviceAccount.annotations | toJson | sha256sum) }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "dagu.fullname" . }}-coordinator
+  name: {{ include "dagu.componentName" (dict "root" . "component" "coordinator") }}
   labels:
     {{- include "dagu.labels" . | nindent 4 }}
     app.kubernetes.io/component: coordinator
 spec:
   replicas: {{ .Values.coordinator.replicas }}
+  # Replace one coordinator at a time without exceeding the requested replica count.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels:
-      {{- include "dagu.labels" . | nindent 6 }}
+      {{- include "dagu.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: coordinator
   template:
     metadata:
+      annotations:
+        {{- toYaml $podAnnotations | nindent 8 }}
       labels:
         {{- include "dagu.labels" . | nindent 8 }}
         app.kubernetes.io/component: coordinator
@@ -20,13 +34,18 @@ spec:
       # Disable Kubernetes Service env var injection to avoid overriding
       # dagu config values (e.g., scheduler.port) with Service URLs
       enableServiceLinks: false
+      serviceAccountName: {{ include "dagu.serviceAccountName" . }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: coordinator
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "dagu.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - dagu
@@ -39,7 +58,7 @@ spec:
             - name: DAGU_COORDINATOR_HOST
               value: "0.0.0.0"
             - name: DAGU_COORDINATOR_ADVERTISE
-              value: "{{ include "dagu.fullname" . }}-coordinator.{{ .Release.Namespace }}.svc.cluster.local"
+              value: {{ include "dagu.componentName" (dict "root" . "component" "coordinator") | quote }}
 {{- with include "dagu.extraEnv" . }}
 {{ . | nindent 12 }}
 {{- end }}
@@ -55,6 +74,9 @@ spec:
               mountPath: /data
             - name: config
               mountPath: /etc/dagu
+{{- with .Values.extraVolumeMounts }}
+{{ toYaml . | nindent 12 }}
+{{- end }}
           livenessProbe:
             httpGet:
               path: /health
@@ -69,10 +91,29 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "dagu.fullname" . }}-data
+            claimName: {{ include "dagu.pvcName" . | quote }}
         - name: config
           configMap:
-            name: {{ include "dagu.fullname" . }}-config
+            name: {{ include "dagu.componentName" (dict "root" . "component" "config") }}
+{{- with .Values.extraVolumes }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}

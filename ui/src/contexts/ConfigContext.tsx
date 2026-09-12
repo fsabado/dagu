@@ -7,6 +7,9 @@ export type PathsConfig = {
   suspendFlagsDir: string;
   adminLogsDir: string;
   baseConfig: string;
+  wikiDir?: string;
+  /** @deprecated Use wikiDir. */
+  docsDir?: string;
   dagRunsDir: string;
   queueDir: string;
   procDir: string;
@@ -28,6 +31,7 @@ export type LicenseStatus = {
   community: boolean;
   source: string;
   warningCode: string;
+  error?: string;
 };
 
 export type WorkspaceResponse = components['schemas']['WorkspaceResponse'];
@@ -47,9 +51,10 @@ export type Config = {
   setupRequired: boolean;
   oidcEnabled: boolean;
   oidcButtonLabel: string;
+  proxyEnabled: boolean;
+  proxyButtonLabel: string;
   terminalEnabled: boolean;
   gitSyncEnabled: boolean;
-  agentEnabled: boolean;
   updateAvailable: boolean;
   latestVersion: string;
   permissions: {
@@ -62,7 +67,9 @@ export type Config = {
 
 export const ConfigContext = createContext<Config>(null!);
 
-export const ConfigUpdateContext = createContext<(patch: Partial<Config>) => void>(() => {});
+export const ConfigUpdateContext = createContext<
+  (patch: Partial<Config>) => void
+>(() => {});
 
 /**
  * Access the application configuration from the nearest ConfigContext provider.

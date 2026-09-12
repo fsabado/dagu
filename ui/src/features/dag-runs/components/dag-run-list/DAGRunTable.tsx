@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Checkbox } from '@/components/ui/checkbox';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { SlidersHorizontal } from 'lucide-react';
 import { components, Status } from '../../../../api/v1/schema';
 import {
@@ -16,6 +16,7 @@ import {
 } from '@/components/ui/table';
 import { useConfig } from '../../../../contexts/ConfigContext';
 import dayjs from '../../../../lib/dayjs';
+import RelativeTime from '@/components/ui/relative-time';
 import StatusChip from '@/components/ui/status-chip';
 import AutoRetryBadge from '../common/AutoRetryBadge';
 import { TriggerTypeIndicator } from '../../../dags/components/common/TriggerTypeIndicator';
@@ -24,12 +25,17 @@ import {
   getDAGRunSelectionKey,
 } from '../../hooks/useBulkDAGRunSelection';
 import { StepDetailsTooltip } from './StepDetailsTooltip';
+import { DAGRunArtifactsButton } from './DAGRunArtifactsButton';
+import { I18nText } from '@/i18n/I18nText';
 
 interface DAGRunTableProps {
   dagRuns: components['schemas']['DAGRunSummary'][];
+  /** True while the first page is being fetched; suppresses the empty state. */
+  isLoading?: boolean;
   selectedRunKeys?: Set<string>;
   selectedDAGRun?: { name: string; dagRunId: string } | null;
   onSelectDAGRun?: (dagRun: { name: string; dagRunId: string } | null) => void;
+  onViewArtifacts?: (dagRun: DAGRunSelectionItem) => void;
   onToggleBulkSelect?: (dagRun: DAGRunSelectionItem) => void;
 }
 
@@ -51,9 +57,11 @@ function isInteractiveEventTarget(target: EventTarget | null): boolean {
 
 function DAGRunTable({
   dagRuns,
+  isLoading = false,
   selectedRunKeys,
   selectedDAGRun = null,
   onSelectDAGRun,
+  onViewArtifacts,
   onToggleBulkSelect,
 }: DAGRunTableProps) {
   const config = useConfig();
@@ -251,6 +259,14 @@ function DAGRunTable({
   };
 
   const timezoneInfo = getTimezoneInfo();
+  const formatScheduleTime = (scheduleTime: string): string => {
+    const value = dayjs(scheduleTime);
+    const configuredTime =
+      config.tzOffsetInSec === undefined
+        ? value
+        : value.utcOffset(config.tzOffsetInSec / 60);
+    return configuredTime.format('YYYY-MM-DD HH:mm:ss');
+  };
   const showScheduleColumn = dagRuns.some((dagRun) =>
     Boolean(dagRun.scheduleTime)
   );
@@ -265,17 +281,23 @@ function DAGRunTable({
     <div className="flex flex-col items-center justify-center py-12 px-4 border rounded-md bg-card">
       <div className="text-6xl mb-4">🔍</div>
       <h3 className="text-lg font-normal text-foreground mb-2">
-        No DAG runs found
+        <I18nText text={"No DAG runs found"} />
       </h3>
       <p className="text-sm text-muted-foreground text-center max-w-md mb-4">
-        There are no DAG runs matching your current filters. Try adjusting your
-        search criteria or date range.
+        <I18nText text={"No DAG runs in the selected time range. Adjust the date range or filters, or start a workflow from the Workflows page."} />
       </p>
     </div>
   );
 
-  // If there are no DAG runs, show empty state
+  // If there are no DAG runs, show empty state (unless the first page is still loading)
   if (dagRuns.length === 0) {
+    if (isLoading) {
+      return (
+        <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+          <I18nText text={"Loading DAG runs..."} />
+        </div>
+      );
+    }
     return <EmptyState />;
   }
 
@@ -331,21 +353,35 @@ function DAGRunTable({
                     />
                   </div>
                 )}
-                <div className="font-normal text-sm">{dagRun.name}</div>
+                <Link
+                  to={`/dag-runs/${dagRun.name}/${dagRun.dagRunId}`}
+                  className="font-normal text-sm hover:underline"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  {dagRun.name}
+                </Link>
               </div>
-              <StepDetailsTooltip dagRun={dagRun}>
-                <div className="flex flex-col items-end gap-1">
-                  <StatusChip status={dagRun.status} size="xs">
-                    {dagRun.statusLabel}
-                  </StatusChip>
-                  <AutoRetryBadge
-                    status={dagRun.status}
-                    count={dagRun.autoRetryCount}
-                    limit={dagRun.autoRetryLimit}
-                    className="text-[10px]"
+              <div className="flex items-start gap-2">
+                {onViewArtifacts && (
+                  <DAGRunArtifactsButton
+                    dagRun={dagRun}
+                    onClick={() => onViewArtifacts(dagRun)}
                   />
-                </div>
-              </StepDetailsTooltip>
+                )}
+                <StepDetailsTooltip dagRun={dagRun}>
+                  <div className="flex flex-col items-end gap-1">
+                    <StatusChip status={dagRun.status} size="xs">
+                      {dagRun.statusLabel}
+                    </StatusChip>
+                    <AutoRetryBadge
+                      status={dagRun.status}
+                      count={dagRun.autoRetryCount}
+                      limit={dagRun.autoRetryLimit}
+                      className="text-[10px]"
+                    />
+                  </div>
+                </StepDetailsTooltip>
+              </div>
             </div>
 
             {/* DAG-run ID and Trigger */}
@@ -353,7 +389,10 @@ function DAGRunTable({
               <span className="font-mono text-muted-foreground truncate">
                 {dagRun.dagRunId}
               </span>
-              <TriggerTypeIndicator type={dagRun.triggerType} />
+              <TriggerTypeIndicator
+                type={dagRun.triggerType}
+                actor={dagRun.triggerActor}
+              />
             </div>
 
             {/* Timestamps */}
@@ -361,23 +400,31 @@ function DAGRunTable({
               {dagRun.scheduleTime && (
                 <div className="flex justify-between items-center">
                   <div className="whitespace-normal break-words">
-                    <span className="text-muted-foreground">Scheduled: </span>
-                    {dagRun.scheduleTime}
+                    <span className="text-muted-foreground"><I18nText text={"Scheduled:"} /> </span>
+                    <span title={dagRun.scheduleTime}>
+                      {formatScheduleTime(dagRun.scheduleTime)}
+                    </span>
                   </div>
                 </div>
               )}
               <div className="flex justify-between items-center">
                 <div>
-                  <span className="text-muted-foreground">Queued: </span>
-                  {dagRun.queuedAt || '-'}
+                  <span className="text-muted-foreground"><I18nText text={"Queued:"} /> </span>
+                  <RelativeTime
+                    timestamp={dagRun.queuedAt}
+                    absolute={dagRun.queuedAt}
+                  />
                 </div>
                 <div>
-                  <span className="text-muted-foreground">Started: </span>
-                  {dagRun.startedAt || '-'}
+                  <span className="text-muted-foreground"><I18nText text={"Started:"} /> </span>
+                  <RelativeTime
+                    timestamp={dagRun.startedAt}
+                    absolute={dagRun.startedAt}
+                  />
                 </div>
               </div>
               <div className="text-left flex items-center gap-1.5">
-                <span className="text-muted-foreground">Duration: </span>
+                <span className="text-muted-foreground"><I18nText text={"Duration:"} /> </span>
                 <span className="flex items-center gap-1">
                   {calculateDuration(
                     dagRun.startedAt,
@@ -391,13 +438,13 @@ function DAGRunTable({
               </div>
               {dagRun.workerId && (
                 <div className="text-left">
-                  <span className="text-muted-foreground">Worker: </span>
+                  <span className="text-muted-foreground"><I18nText text={"Worker:"} /> </span>
                   {dagRun.workerId}
                 </div>
               )}
               {dagRun.profileName && (
                 <div className="text-left flex min-w-0 items-center gap-1.5">
-                  <span className="text-muted-foreground">Profile: </span>
+                  <span className="text-muted-foreground"><I18nText text={"Profile:"} /> </span>
                   <span
                     className="inline-flex min-w-0 items-center gap-1 font-mono"
                     title={dagRun.profileName}
@@ -426,35 +473,35 @@ function DAGRunTable({
         <TableHeader>
           <TableRow>
             {onToggleBulkSelect && (
-              <TableHead className="w-10">Select</TableHead>
+              <TableHead className="w-10"><I18nText text={"Select"} /></TableHead>
             )}
-            <TableHead>DAG Name</TableHead>
-            <TableHead>Run ID</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Trigger</TableHead>
-            {showProfileColumn && <TableHead>Profile</TableHead>}
+            <TableHead><I18nText text={"DAG Name"} /></TableHead>
+            <TableHead><I18nText text={"Run ID"} /></TableHead>
+            <TableHead><I18nText text={"Status"} /></TableHead>
+            <TableHead><I18nText text={"Trigger"} /></TableHead>
+            {showProfileColumn && <TableHead><I18nText text={"Profile"} /></TableHead>}
             {showScheduleColumn && (
               <TableHead>
-                <div>Scheduled At</div>
+                <div><I18nText text={"Scheduled At"} /></div>
                 <div className="text-xs text-muted-foreground font-normal">
                   {timezoneInfo}
                 </div>
               </TableHead>
             )}
             <TableHead>
-              <div>Queued At</div>
+              <div><I18nText text={"Queued At"} /></div>
               <div className="text-xs text-muted-foreground font-normal">
                 {timezoneInfo}
               </div>
             </TableHead>
             <TableHead>
-              <div>Started At</div>
+              <div><I18nText text={"Started At"} /></div>
               <div className="text-xs text-muted-foreground font-normal">
                 {timezoneInfo}
               </div>
             </TableHead>
-            <TableHead>Duration</TableHead>
-            <TableHead>Worker</TableHead>
+            <TableHead><I18nText text={"Duration"} /></TableHead>
+            <TableHead><I18nText text={"Worker"} /></TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -517,7 +564,21 @@ function DAGRunTable({
                 </TableCell>
               )}
               <TableCell className="py-1 px-2 font-normal">
-                {dagRun.name}
+                <div className="flex items-center gap-2">
+                  <Link
+                    to={`/dag-runs/${dagRun.name}/${dagRun.dagRunId}`}
+                    className="min-w-0 truncate hover:underline"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    {dagRun.name}
+                  </Link>
+                  {onViewArtifacts && (
+                    <DAGRunArtifactsButton
+                      dagRun={dagRun}
+                      onClick={() => onViewArtifacts(dagRun)}
+                    />
+                  )}
+                </div>
               </TableCell>
               <TableCell className="py-1 px-2 font-mono text-muted-foreground">
                 {dagRun.dagRunId}
@@ -538,7 +599,10 @@ function DAGRunTable({
                 </StepDetailsTooltip>
               </TableCell>
               <TableCell className="py-1 px-2">
-                <TriggerTypeIndicator type={dagRun.triggerType} />
+                <TriggerTypeIndicator
+                  type={dagRun.triggerType}
+                  actor={dagRun.triggerActor}
+                />
               </TableCell>
               {showProfileColumn && (
                 <TableCell className="py-1 px-2">
@@ -557,14 +621,26 @@ function DAGRunTable({
               )}
               {showScheduleColumn && (
                 <TableCell className="py-1 px-2 text-left whitespace-normal break-words">
-                  {dagRun.scheduleTime || '-'}
+                  {dagRun.scheduleTime ? (
+                    <span title={dagRun.scheduleTime}>
+                      {formatScheduleTime(dagRun.scheduleTime)}
+                    </span>
+                  ) : (
+                    '-'
+                  )}
                 </TableCell>
               )}
               <TableCell className="py-1 px-2 text-left">
-                {dagRun.queuedAt || '-'}
+                <RelativeTime
+                  timestamp={dagRun.queuedAt}
+                  absolute={dagRun.queuedAt}
+                />
               </TableCell>
               <TableCell className="py-1 px-2 text-left">
-                {dagRun.startedAt || '-'}
+                <RelativeTime
+                  timestamp={dagRun.startedAt}
+                  absolute={dagRun.startedAt}
+                />
               </TableCell>
               <TableCell className="py-1 px-2 text-left">
                 <div className="flex items-center gap-1">

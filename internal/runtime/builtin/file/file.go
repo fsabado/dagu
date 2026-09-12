@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -20,10 +21,11 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
 const (
@@ -93,10 +95,10 @@ type opResult struct {
 }
 
 func init() {
-	executor.RegisterExecutor(executorType, newExecutor, validateStep, core.ExecutorCapabilities{Command: true})
+	executor.RegisterExecutor(executorType, newExecutor, validateStep, registry.ExecutorCapabilities{Command: true})
 }
 
-func newExecutor(ctx context.Context, step core.Step) (executor.Executor, error) {
+func newExecutor(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	cfg := defaultConfig()
 	if err := decodeConfig(step.ExecutorConfig.Config, &cfg); err != nil {
 		return nil, err
@@ -117,7 +119,7 @@ func newExecutor(ctx context.Context, step core.Step) (executor.Executor, error)
 	}, nil
 }
 
-func validateStep(step core.Step) error {
+func validateStep(step ir.Step) error {
 	if step.ExecutorConfig.Type != executorType {
 		return nil
 	}
@@ -128,7 +130,7 @@ func validateStep(step core.Step) error {
 	return validateConfig(stepOperation(step), cfg)
 }
 
-func stepOperation(step core.Step) string {
+func stepOperation(step ir.Step) string {
 	if len(step.Commands) == 0 {
 		return ""
 	}
@@ -816,8 +818,8 @@ func canonicalPath(path string) (string, error) {
 	for {
 		resolved, err := filepath.EvalSymlinks(current)
 		if err == nil {
-			for i := len(missing) - 1; i >= 0; i-- {
-				resolved = filepath.Join(resolved, missing[i])
+			for _, m := range slices.Backward(missing) {
+				resolved = filepath.Join(resolved, m)
 			}
 			return filepath.Clean(resolved), nil
 		}

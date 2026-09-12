@@ -7,25 +7,27 @@ package config
 // Fields are organized into logical groups for clarity.
 type Definition struct {
 	// Server settings
-	Host               string   `mapstructure:"host"`
-	Port               int      `mapstructure:"port"`
-	PublicURL          string   `mapstructure:"public_url"`
-	BasePath           string   `mapstructure:"base_path"`
-	APIBasePath        string   `mapstructure:"api_base_path"`
-	APIBaseURL         string   `mapstructure:"api_base_url"` // Deprecated: use APIBasePath
-	Headless           *bool    `mapstructure:"headless"`
-	CheckUpdates       *bool    `mapstructure:"check_updates"`
-	TLS                *TLSDef  `mapstructure:"tls"`
-	CORSAllowedOrigins []string `mapstructure:"cors_allowed_origins"`
+	Host               string       `mapstructure:"host"`
+	Port               int          `mapstructure:"port"`
+	PublicURL          string       `mapstructure:"public_url"`
+	BasePath           string       `mapstructure:"base_path"`
+	APIBasePath        string       `mapstructure:"api_base_path"`
+	APIBaseURL         string       `mapstructure:"api_base_url"` // Deprecated: use APIBasePath
+	Headless           *bool        `mapstructure:"headless"`
+	CheckUpdates       *bool        `mapstructure:"check_updates"`
+	TLS                *TLSDef      `mapstructure:"tls"`
+	CORSAllowedOrigins []string     `mapstructure:"cors_allowed_origins"`
+	IPAccess           *IPAccessDef `mapstructure:"ip_access"`
 
 	// Core settings
-	Debug                  bool     `mapstructure:"debug"`
-	DefaultShell           string   `mapstructure:"default_shell"`
-	LogFormat              string   `mapstructure:"log_format"`      // "json" or "text"
-	AccessLog              *string  `mapstructure:"access_log_mode"` // "all" (default), "non-public", or "none"
-	TZ                     string   `mapstructure:"tz"`
-	EnvPassthrough         []string `mapstructure:"env_passthrough"`
-	EnvPassthroughPrefixes []string `mapstructure:"env_passthrough_prefixes"`
+	Debug                  bool         `mapstructure:"debug"`
+	DefaultShell           string       `mapstructure:"default_shell"`
+	LogFormat              string       `mapstructure:"log_format"`      // "json" or "text"
+	AccessLog              *string      `mapstructure:"access_log_mode"` // "all", "non-public", or "none" (default)
+	TZ                     string       `mapstructure:"tz"`
+	EnvPassthrough         []string     `mapstructure:"env_passthrough"`
+	EnvPassthroughPrefixes []string     `mapstructure:"env_passthrough_prefixes"`
+	OpenCode               *OpenCodeDef `mapstructure:"opencode"`
 
 	// Authentication
 	Auth *AuthDef `mapstructure:"auth"`
@@ -49,6 +51,9 @@ type Definition struct {
 
 	// Paths (structured)
 	Paths *PathsDef `mapstructure:"paths"`
+
+	// DAG discovery
+	DAGDiscovery *DAGDiscoveryDef `mapstructure:"dag_discovery"`
 
 	// Secrets
 	Secrets *SecretsDef `mapstructure:"secrets"`
@@ -87,12 +92,22 @@ type Definition struct {
 	Audit      *AuditDef      `mapstructure:"audit"`
 	EventStore *EventStoreDef `mapstructure:"event_store"`
 	Webhooks   *WebhooksDef   `mapstructure:"webhooks"`
-	Session    *SessionDef    `mapstructure:"session"`
 	SSE        *SSEDef        `mapstructure:"sse"`
 	GitSync    *GitSyncDef    `mapstructure:"git_sync"`
 	Tunnel     *TunnelDef     `mapstructure:"tunnel"`
-	Bots       *BotsDef       `mapstructure:"bots"`
 	License    *LicenseDef    `mapstructure:"license"`
+}
+
+// OpenCodeDef configures the process-local managed OpenCode service.
+type OpenCodeDef struct {
+	Executable     string   `mapstructure:"executable"`
+	EnvPassthrough []string `mapstructure:"env_passthrough"`
+}
+
+// DAGDiscoveryDef configures DAG definition discovery.
+type DAGDiscoveryDef struct {
+	Recursive *bool `mapstructure:"recursive"`
+	Symlinks  *bool `mapstructure:"symlinks"`
 }
 
 // -----------------------------------------------------------------------------
@@ -106,16 +121,23 @@ type TLSDef struct {
 	CAFile   string `mapstructure:"ca_file"`
 }
 
+// IPAccessDef configures server-wide HTTP client IP filtering.
+type IPAccessDef struct {
+	AllowedIPs     []string `mapstructure:"allowed_ips"`
+	TrustedProxies []string `mapstructure:"trusted_proxies"`
+}
+
 // -----------------------------------------------------------------------------
 // Authentication Configuration
 // -----------------------------------------------------------------------------
 
 // AuthDef configures authentication for the application.
 type AuthDef struct {
-	Mode    *string         `mapstructure:"mode"` // "none", "basic", or "builtin"
-	Basic   *AuthBasicDef   `mapstructure:"basic"`
-	OIDC    *AuthOIDCDef    `mapstructure:"oidc"`
-	Builtin *AuthBuiltinDef `mapstructure:"builtin"`
+	Mode    *string              `mapstructure:"mode"` // "none", "basic", or "builtin"
+	Basic   *AuthBasicDef        `mapstructure:"basic"`
+	OIDC    *AuthOIDCDef         `mapstructure:"oidc"`
+	Proxy   *AuthTrustedProxyDef `mapstructure:"proxy"`
+	Builtin *AuthBuiltinDef      `mapstructure:"builtin"`
 }
 
 // AuthBasicDef configures basic authentication credentials.
@@ -163,12 +185,40 @@ type AuthOIDCDef struct {
 
 // OIDCRoleMappingDef maps OIDC claims to Dagu roles.
 type OIDCRoleMappingDef struct {
-	DefaultRole         string            `mapstructure:"default_role"`          // Default: "viewer"
-	GroupsClaim         string            `mapstructure:"groups_claim"`          // Default: "groups"
-	GroupMappings       map[string]string `mapstructure:"group_mappings"`        // IdP group -> Dagu role
-	RoleAttributePath   string            `mapstructure:"role_attribute_path"`   // jq expression for role extraction
-	RoleAttributeStrict *bool             `mapstructure:"role_attribute_strict"` // Deny login if no valid role found
-	SkipOrgRoleSync     *bool             `mapstructure:"skip_org_role_sync"`    // Only assign roles on first login
+	DefaultRole            string                          `mapstructure:"default_role"`             // Default: "viewer"
+	GroupsClaim            string                          `mapstructure:"groups_claim"`             // Default: "groups"
+	GroupMappings          map[string]string               `mapstructure:"group_mappings"`           // IdP group -> Dagu role
+	WorkspaceMappings      map[string][]OIDCWorkspaceGrant `mapstructure:"workspace_mappings"`       // IdP group -> workspace grants
+	DefaultWorkspaceAccess string                          `mapstructure:"default_workspace_access"` // Default: "all"; required with workspace mappings
+	RoleAttributePath      string                          `mapstructure:"role_attribute_path"`      // jq expression for role extraction
+	RoleAttributeStrict    *bool                           `mapstructure:"role_attribute_strict"`    // Deny login if no global or workspace mapping matches
+	SkipOrgRoleSync        *bool                           `mapstructure:"skip_org_role_sync"`       // Keep first-login authorization assignments
+}
+
+// AuthTrustedProxyDef configures authentication delegated to an authenticating reverse proxy.
+type AuthTrustedProxyDef struct {
+	Enabled     *bool                       `mapstructure:"enabled" yaml:"enabled"`
+	Source      *string                     `mapstructure:"source" yaml:"source"`
+	ButtonLabel *string                     `mapstructure:"button_label" yaml:"button_label"`
+	Headers     *TrustedProxyHeadersDef     `mapstructure:"headers" yaml:"headers"`
+	AutoSignup  *bool                       `mapstructure:"auto_signup" yaml:"auto_signup"`
+	RoleMapping *TrustedProxyRoleMappingDef `mapstructure:"role_mapping" yaml:"role_mapping"`
+}
+
+// TrustedProxyHeadersDef identifies the headers populated by the authenticating proxy.
+type TrustedProxyHeadersDef struct {
+	User   string `mapstructure:"user" yaml:"user"`
+	Groups string `mapstructure:"groups" yaml:"groups"`
+}
+
+// TrustedProxyRoleMappingDef maps proxy groups to Dagu authorization.
+type TrustedProxyRoleMappingDef struct {
+	DefaultRole            *string                                 `mapstructure:"default_role" yaml:"default_role"`
+	GroupMappings          map[string]string                       `mapstructure:"group_mappings" yaml:"group_mappings"`
+	WorkspaceMappings      map[string][]TrustedProxyWorkspaceGrant `mapstructure:"workspace_mappings" yaml:"workspace_mappings"`
+	DefaultWorkspaceAccess *string                                 `mapstructure:"default_workspace_access" yaml:"default_workspace_access"`
+	RequireMapping         *bool                                   `mapstructure:"require_mapping" yaml:"require_mapping"`
+	SkipOrgRoleSync        *bool                                   `mapstructure:"skip_org_role_sync" yaml:"skip_org_role_sync"`
 }
 
 // PermissionsDef configures UI and API permissions.
@@ -183,7 +233,9 @@ type PermissionsDef struct {
 
 // PathsDef configures file system paths.
 type PathsDef struct {
-	DAGsDir            string `mapstructure:"dags_dir"`
+	DAGsDir string `mapstructure:"dags_dir"`
+	WikiDir string `mapstructure:"wiki_dir"`
+	// DocsDir is the deprecated name for WikiDir.
 	DocsDir            string `mapstructure:"docs_dir"`
 	Executable         string `mapstructure:"executable"`
 	LogDir             string `mapstructure:"log_dir"`
@@ -197,13 +249,13 @@ type PathsDef struct {
 	BaseConfig         string `mapstructure:"base_config"`
 	AltDagsDir         string `mapstructure:"alt_dags_dir"`
 	DAGRunsDir         string `mapstructure:"dag_runs_dir"`
+	DAGRunWorkDir      string `mapstructure:"dag_run_work_dir"`
 	QueueDir           string `mapstructure:"queue_dir"`
 	ProcDir            string `mapstructure:"proc_dir"`
 	ServiceRegistryDir string `mapstructure:"service_registry_dir"`
 	UsersDir           string `mapstructure:"users_dir"`
 	APIKeysDir         string `mapstructure:"api_keys_dir"`
 	WebhooksDir        string `mapstructure:"webhooks_dir"`
-	SessionsDir        string `mapstructure:"sessions_dir"`
 	ContextsDir        string `mapstructure:"contexts_dir"`
 	RemoteNodesDir     string `mapstructure:"remote_nodes_dir"`
 	WorkspacesDir      string `mapstructure:"workspaces_dir"`
@@ -214,12 +266,42 @@ type PathsDef struct {
 type SecretsDef struct {
 	Vault      *VaultSecretsDef      `mapstructure:"vault"`
 	Kubernetes *KubernetesSecretsDef `mapstructure:"kubernetes"`
+	AWS        *AWSSecretsDef        `mapstructure:"aws"`
+	GCP        *GCPSecretsDef        `mapstructure:"gcp"`
+	Azure      *AzureSecretsDef      `mapstructure:"azure"`
+	Alibaba    *AlibabaSecretsDef    `mapstructure:"alibaba"`
+}
+
+// AWSSecretsDef configures global AWS Secrets Manager client defaults.
+type AWSSecretsDef struct {
+	Region string `mapstructure:"region"`
+}
+
+// GCPSecretsDef configures global GCP Secret Manager client defaults.
+type GCPSecretsDef struct {
+	ProjectID string `mapstructure:"project_id"`
+	Location  string `mapstructure:"location"`
+}
+
+// AzureSecretsDef configures global Azure Key Vault client defaults.
+type AzureSecretsDef struct {
+	VaultURL string `mapstructure:"vault_url"`
+}
+
+// AlibabaSecretsDef configures global Alibaba Cloud KMS client defaults.
+type AlibabaSecretsDef struct {
+	Region   string `mapstructure:"region"`
+	Endpoint string `mapstructure:"endpoint"`
+	CAFile   string `mapstructure:"ca_file"`
 }
 
 // VaultSecretsDef configures global HashiCorp Vault client defaults.
 type VaultSecretsDef struct {
-	Address string `mapstructure:"address"`
-	Token   string `mapstructure:"token"`
+	Address    string `mapstructure:"address"`
+	Token      string `mapstructure:"token"`
+	CACert     string `mapstructure:"ca_cert"`
+	ClientCert string `mapstructure:"client_cert"`
+	ClientKey  string `mapstructure:"client_key"`
 }
 
 // KubernetesSecretsDef configures global Kubernetes client defaults.
@@ -314,9 +396,8 @@ type PostgresPoolDef struct {
 
 // ProcDef configures local proc-file heartbeat behavior.
 type ProcDef struct {
-	HeartbeatInterval     string `mapstructure:"heartbeat_interval"`      // Default: 5s
-	HeartbeatSyncInterval string `mapstructure:"heartbeat_sync_interval"` // Default: 10s
-	StaleThreshold        string `mapstructure:"stale_threshold"`         // Default: 90s
+	HeartbeatInterval string `mapstructure:"heartbeat_interval"` // Default: 5s
+	StaleThreshold    string `mapstructure:"stale_threshold"`    // Default: 90s
 }
 
 // SchedulerDef configures the scheduler.
@@ -327,7 +408,6 @@ type SchedulerDef struct {
 	ZombieDetectionInterval string `mapstructure:"zombie_detection_interval"` // Default: 45s, 0 to disable
 	RetryFailureWindow      string `mapstructure:"retry_failure_window"`      // Default: 24h, 0 to disable retry scanning. Current limitation: the window is evaluated from the original DAG-run timestamp/day bucket, not the latest failed attempt timestamp.
 	HeartbeatInterval       string `mapstructure:"heartbeat_interval"`        // Deprecated: use proc.heartbeat_interval
-	HeartbeatSyncInterval   string `mapstructure:"heartbeat_sync_interval"`   // Deprecated: use proc.heartbeat_sync_interval
 	StaleThreshold          string `mapstructure:"stale_threshold"`           // Deprecated: use proc.stale_threshold
 	FailureThreshold        int    `mapstructure:"failure_threshold"`         // Default: 3
 }
@@ -376,11 +456,6 @@ type EventStoreDef struct {
 // WebhooksDef configures webhook trigger endpoints.
 type WebhooksDef struct {
 	MaxPayloadSize *int `mapstructure:"max_payload_size"` // Default: 1MiB
-}
-
-// SessionDef configures agent session storage.
-type SessionDef struct {
-	MaxPerUser *int `mapstructure:"max_per_user"` // Default: 100; 0 = unlimited
 }
 
 // SSEDef configures multiplexed SSE streaming.
@@ -457,53 +532,6 @@ type TunnelRateLimitDef struct {
 	LoginAttempts        int   `mapstructure:"login_attempts"`         // Default: 5
 	WindowSeconds        int   `mapstructure:"window_seconds"`         // Default: 300
 	BlockDurationSeconds int   `mapstructure:"block_duration_seconds"` // Default: 900
-}
-
-// -----------------------------------------------------------------------------
-// Bots Configuration
-// -----------------------------------------------------------------------------
-
-// BotsDef configures bot integrations.
-type BotsDef struct {
-	Provider string          `mapstructure:"provider"`  // "telegram", "slack", "discord", etc.
-	SafeMode *bool           `mapstructure:"safe_mode"` // Default: true
-	Telegram *TelegramBotDef `mapstructure:"telegram"`
-	Slack    *SlackBotDef    `mapstructure:"slack"`
-	Discord  *DiscordBotDef  `mapstructure:"discord"`
-	Line     *LineBotDef     `mapstructure:"line"`
-}
-
-// TelegramBotDef configures the Telegram bot.
-type TelegramBotDef struct {
-	Token                string   `mapstructure:"token"`
-	AllowedChatIDs       []int64  `mapstructure:"allowed_chat_ids"`
-	InterestedEventTypes []string `mapstructure:"interested_event_types"`
-}
-
-// SlackBotDef configures the Slack bot.
-type SlackBotDef struct {
-	BotToken             string   `mapstructure:"bot_token"`
-	AppToken             string   `mapstructure:"app_token"`
-	AllowedChannelIDs    []string `mapstructure:"allowed_channel_ids"`
-	InterestedEventTypes []string `mapstructure:"interested_event_types"`
-	RespondToAll         *bool    `mapstructure:"respond_to_all"` // Default: true
-}
-
-// DiscordBotDef configures the Discord bot.
-type DiscordBotDef struct {
-	Token                string   `mapstructure:"token"`
-	AllowedChannelIDs    []string `mapstructure:"allowed_channel_ids"`
-	InterestedEventTypes []string `mapstructure:"interested_event_types"`
-	RespondToAll         *bool    `mapstructure:"respond_to_all"` // Default: true
-}
-
-// LineBotDef configures the LINE bot.
-type LineBotDef struct {
-	ChannelAccessToken   string   `mapstructure:"channel_access_token"`
-	ChannelSecret        string   `mapstructure:"channel_secret"`
-	AllowedSourceIDs     []string `mapstructure:"allowed_source_ids"`
-	InterestedEventTypes []string `mapstructure:"interested_event_types"`
-	RespondToAll         *bool    `mapstructure:"respond_to_all"` // Default: true
 }
 
 // -----------------------------------------------------------------------------

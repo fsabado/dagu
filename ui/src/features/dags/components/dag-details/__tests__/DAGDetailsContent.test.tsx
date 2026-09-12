@@ -41,6 +41,10 @@ vi.mock('../DAGSettingsTab', () => ({
   default: () => null,
 }));
 
+vi.mock('../DAGWikiTab', () => ({
+  default: () => null,
+}));
+
 vi.mock('../IncidentsTab', () => ({
   default: () => null,
 }));
@@ -66,7 +70,7 @@ const currentDAGRun = {
   artifactsAvailable: true,
 } as never;
 
-function renderContent() {
+function renderContent(activeTab = 'status', isModal = true) {
   render(
     <MemoryRouter>
       <DAGDetailsContent
@@ -75,8 +79,8 @@ function renderContent() {
         currentDAGRun={currentDAGRun}
         refreshFn={vi.fn()}
         formatDuration={vi.fn()}
-        activeTab="status"
-        isModal
+        activeTab={activeTab}
+        isModal={isModal}
         fillHeight
       />
     </MemoryRouter>
@@ -91,5 +95,36 @@ describe('DAGDetailsContent', () => {
       'data-fill-height',
       'true'
     );
+  });
+
+  it('keeps compact navigation labels visible', () => {
+    renderContent();
+
+    for (const label of [
+      'Latest Run',
+      'Incidents',
+      'Spec',
+      'Webhook',
+      'Settings',
+      'Notifications',
+      'History',
+      'Wiki',
+    ]) {
+      expect(screen.getAllByText(label)).toHaveLength(2);
+    }
+  });
+
+  it.each(['log', 'dagRun-log'])(
+    'keeps both %s navigation labels visible',
+    (activeTab) => {
+      renderContent(activeTab);
+
+      expect(screen.getAllByText('Log')).toHaveLength(2);
+    }
+  );
+
+  it('does not link the modal-only Wiki tab from the DAG page', () => {
+    renderContent('status', false);
+    expect(screen.queryByText('Wiki')).not.toBeInTheDocument();
   });
 });

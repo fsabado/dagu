@@ -61,6 +61,41 @@ func TestNewAPIError(t *testing.T) {
 	}
 }
 
+func TestNewAPIError_ClassifiesContextOverflow(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{
+		`{"error":{"code":"context_length_exceeded","message":"request is too large"}}`,
+		`{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 120000 tokens > 100000 maximum"}}`,
+		`{"error":{"code":400,"message":"The input token count exceeds the maximum number of tokens allowed."}}`,
+		`{"error":"request exceeds the available context size"}`,
+	}
+	for _, body := range tests {
+		err := NewAPIError("test", 400, body)
+		require.ErrorIs(t, err, ErrContextTooLong)
+		assert.False(t, err.Retryable)
+	}
+
+	err := NewAPIError("test", 413,
+		`{"error":{"code":"context_length_exceeded","message":"request payload too large"}}`)
+	require.ErrorIs(t, err, ErrContextTooLong)
+}
+
+func TestNewAPIError_DoesNotClassifyOtherInvalidRequestsAsContextOverflow(t *testing.T) {
+	t.Parallel()
+
+	err := NewAPIError("test", 400,
+		`{"error":{"type":"invalid_request_error","message":"temperature must be between zero and two"}}`)
+	assert.NotErrorIs(t, err, ErrContextTooLong)
+
+	err = NewAPIError("test", 400,
+		`{"error":{"message":"validation failed","details":{"prompt":"prompt is too long"}}}`)
+	assert.NotErrorIs(t, err, ErrContextTooLong)
+
+	err = NewAPIError("test", 413, "request payload too large")
+	assert.NotErrorIs(t, err, ErrContextTooLong)
+}
+
 func TestIsRetryable(t *testing.T) {
 	t.Parallel()
 

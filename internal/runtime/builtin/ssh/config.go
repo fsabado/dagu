@@ -10,8 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/google/jsonschema-go/jsonschema"
 )
@@ -50,10 +51,10 @@ type sshMapConfig struct {
 	Port          string
 	Key           string
 	Password      string
-	StrictHostKey bool
-	KnownHostFile string
+	StrictHostKey bool   `mapstructure:"strict_host_key"`
+	KnownHostFile string `mapstructure:"known_host_file"`
 	Shell         string
-	ShellArgs     []string
+	ShellArgs     []string `mapstructure:"shell_args"`
 	Timeout       string
 	Bastion       *struct {
 		Host     string
@@ -65,7 +66,7 @@ type sshMapConfig struct {
 }
 
 func FromMapConfig(_ context.Context, mapCfg map[string]any) (*Client, error) {
-	var def sshMapConfig
+	def := sshMapConfig{StrictHostKey: true}
 	md, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
 		Result:           &def,
 		WeaklyTypedInput: true,
@@ -236,6 +237,6 @@ var sftpConfigSchema = &jsonschema.Schema{
 }
 
 func init() {
-	core.RegisterExecutorConfigSchema("ssh", configSchema)
-	core.RegisterExecutorConfigSchema("sftp", sftpConfigSchema)
+	registry.RegisterExecutorConfigSchema("ssh", configSchema)
+	registry.RegisterExecutorConfigSchema("sftp", sftpConfigSchema)
 }

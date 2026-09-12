@@ -5,6 +5,7 @@ package dagrun
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,36 +13,43 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestStorePreservesDAGRunFileCompatibilityLayout(t *testing.T) {
+func TestStoreWritesCurrentDAGRunFileCompatibilityLayout(t *testing.T) {
 	ctx := context.Background()
 	baseDir := t.TempDir()
-	store := New(baseDir, WithArtifactDir(filepath.Join(baseDir, "artifacts")))
+	workRoot := filepath.Join(baseDir, ".dag-run-work")
+	store := NewStore(baseDir, WithArtifactDir(filepath.Join(baseDir, "artifacts")))
+	repository := persis.NewDAGRunRepository(store, NewWorkDirStore(workRoot, baseDir), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 
-	parentDAG := &core.DAG{
+	parentDAG := &ir.DAG{
 		Name:     "compat-dag",
 		Location: filepath.Join(baseDir, "compat-dag.yaml"),
 	}
 	parentTS := time.Date(2026, 5, 27, 1, 2, 3, 456_000_000, time.UTC)
-	parentAttempt, err := store.CreateAttempt(ctx, parentDAG, parentTS, "run-compat", exec.NewDAGRunAttemptOptions{
+	parentAttempt, err := repository.CreateAttempt(ctx, parentDAG, parentTS, "run-compat", persis.DAGRunCreateAttemptOptions{
 		AttemptID: "attempt-compat",
 	})
 	require.NoError(t, err)
+	rootRef := ir.NewDAGRunRef(parentDAG.Name, "run-compat")
+	parentWorkDir, err := repository.MaterializeWorkDir(ctx, dagrun.WorkDirRef{DAGRun: rootRef})
+	require.NoError(t, err)
 	require.NoError(t, parentAttempt.Open(ctx))
 
-	parentStatus := exec.InitialStatus(parentDAG)
+	parentStatus := ir.InitialStatus(parentDAG)
 	parentStatus.DAGRunID = "run-compat"
 	parentStatus.AttemptID = parentAttempt.ID()
-	parentStatus.Status = core.Succeeded
+	parentStatus.Status = ir.Succeeded
 	require.NoError(t, parentAttempt.Write(ctx, parentStatus))
 
-	parentOutputs := &exec.DAGRunOutputs{
-		Metadata: exec.OutputsMetadata{
+	parentOutputs := &ir.DAGRunOutputs{
+		Metadata: ir.OutputsMetadata{
 			DAGName:     parentDAG.Name,
 			DAGRunID:    parentStatus.DAGRunID,
 			AttemptID:   parentStatus.AttemptID,
@@ -51,49 +59,83 @@ func TestStorePreservesDAGRunFileCompatibilityLayout(t *testing.T) {
 		Outputs: map[string]string{"step-one": "ok"},
 	}
 	require.NoError(t, parentAttempt.WriteOutputs(ctx, parentOutputs))
-	require.NoError(t, parentAttempt.WriteStepMessages(ctx, "step-one", []exec.LLMMessage{
-		{Role: exec.RoleUser, Content: "hello"},
+	require.NoError(t, parentAttempt.WriteStepMessages(ctx, "step-one", []ir.LLMMessage{
+		{Role: ir.LLMRoleUser, Content: "hello"},
 	}))
 	require.NoError(t, parentAttempt.Close(ctx))
 
-	rootRef := exec.NewDAGRunRef(parentDAG.Name, parentStatus.DAGRunID)
-	childDAG := &core.DAG{
+	childDAG := &ir.DAG{
 		Name:     "child-dag",
 		Location: filepath.Join(baseDir, "child-dag.yaml"),
 	}
 	childTS := time.Date(2026, 5, 27, 1, 2, 4, 789_000_000, time.UTC)
-	childAttempt, err := store.CreateAttempt(ctx, childDAG, childTS, "child-run", exec.NewDAGRunAttemptOptions{
-		RootDAGRun: &rootRef,
+	childAttempt, err := repository.CreateAttempt(ctx, childDAG, childTS, "child-run", persis.DAGRunCreateAttemptOptions{
+		RootDAGRun: rootRef,
 		AttemptID:  "child-attempt",
+	})
+	require.NoError(t, err)
+	childWorkDir, err := repository.MaterializeWorkDir(ctx, dagrun.WorkDirRef{
+		RootDAGRun: rootRef,
+		DAGRun:     ir.NewDAGRunRef(childDAG.Name, "child-run"),
 	})
 	require.NoError(t, err)
 	require.NoError(t, childAttempt.Open(ctx))
 
-	childStatus := exec.InitialStatus(childDAG)
+	childStatus := ir.InitialStatus(childDAG)
 	childStatus.Root = rootRef
 	childStatus.DAGRunID = "child-run"
 	childStatus.AttemptID = childAttempt.ID()
-	childStatus.Status = core.Succeeded
+	childStatus.Status = ir.Succeeded
 	require.NoError(t, childAttempt.Write(ctx, childStatus))
 	require.NoError(t, childAttempt.Close(ctx))
 
 	runDir := filepath.Join(baseDir, "compat-dag", "dag-runs", "2026", "05", "27", "dag-run_20260527_010203Z_run-compat")
-	attemptDir := filepath.Join(runDir, "attempt_20260527_010203_456Z_attempt-compat")
+	rootWorkDir := filepath.Join(workRoot, "compat-dag", workDirName(rootRef.ID))
+	attemptDir := filepath.Join(runDir, "a_20260527_010203_456Z_attempt-compat")
 	statusFile := filepath.Join(attemptDir, JSONLStatusFile)
-	assert.Equal(t, statusFile, parentAttempt.(*Attempt).file)
+	assert.Equal(t, filepath.Join(rootWorkDir, "root"), parentWorkDir)
 	require.DirExists(t, runDir)
 	require.DirExists(t, attemptDir)
 	require.FileExists(t, statusFile)
 	require.FileExists(t, filepath.Join(attemptDir, DAGDefinition))
 	require.FileExists(t, filepath.Join(attemptDir, OutputsFile))
-	require.DirExists(t, filepath.Join(runDir, "work"))
+	require.DirExists(t, parentWorkDir)
 	require.FileExists(t, filepath.Join(runDir, MessagesDir, "step-one.json"))
 
-	childAttemptDir := filepath.Join(runDir, SubDAGRunsDir, "child_child-run", "attempt_20260527_010204_789Z_child-attempt")
+	childAttemptDir := filepath.Join(runDir, SubDAGRunsDir, "child-run", "a_20260527_010204_789Z_child-attempt")
 	require.DirExists(t, childAttemptDir)
 	require.FileExists(t, filepath.Join(childAttemptDir, JSONLStatusFile))
 	require.FileExists(t, filepath.Join(childAttemptDir, DAGDefinition))
-	require.DirExists(t, filepath.Join(runDir, SubDAGRunsDir, "child_child-run", "work"))
+	assert.Equal(t, filepath.Join(rootWorkDir, workDirName("child-run")), childWorkDir)
+	require.DirExists(t, childWorkDir)
+
+	sharedIDChildDAG := &ir.DAG{Name: "child-with-shared-id"}
+	sharedIDChildAttempt, err := repository.CreateAttempt(ctx, sharedIDChildDAG, childTS, rootRef.ID, persis.DAGRunCreateAttemptOptions{
+		RootDAGRun: rootRef,
+		AttemptID:  "shared-id-child-attempt",
+	})
+	require.NoError(t, err)
+	require.NoError(t, sharedIDChildAttempt.Open(ctx))
+	sharedIDChildStatus := ir.InitialStatus(sharedIDChildDAG)
+	sharedIDChildStatus.Root = rootRef
+	sharedIDChildStatus.DAGRunID = rootRef.ID
+	sharedIDChildStatus.AttemptID = sharedIDChildAttempt.ID()
+	sharedIDChildStatus.Status = ir.Succeeded
+	require.NoError(t, sharedIDChildAttempt.Write(ctx, sharedIDChildStatus))
+	require.NoError(t, sharedIDChildAttempt.Close(ctx))
+	sharedIDChildWorkDir, err := repository.MaterializeWorkDir(ctx, dagrun.WorkDirRef{
+		RootDAGRun: rootRef,
+		DAGRun:     ir.NewDAGRunRef(sharedIDChildDAG.Name, rootRef.ID),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(rootWorkDir, workDirName(rootRef.ID)), sharedIDChildWorkDir)
+
+	runStateStore := persis.NewRunStateStore(repository, nil)
+	sharedIDChild, err := runStateStore.OpenChildAttempt(ctx, rootRef, rootRef.ID)
+	require.NoError(t, err)
+	openedSharedIDChildWorkDir, err := sharedIDChild.MaterializeWorkDir(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, sharedIDChildWorkDir, openedSharedIDChildWorkDir)
 
 	assert.NoDirExists(t, filepath.Join(baseDir, "dag_runs"))
 	assert.NoDirExists(t, filepath.Join(baseDir, "dagruns"))
@@ -111,7 +153,7 @@ func TestStorePreservesDAGRunFileCompatibilityLayout(t *testing.T) {
 	assert.Contains(t, statusShape, "attemptId")
 	assert.Contains(t, statusShape, "status")
 
-	foundParent, err := store.FindAttempt(ctx, rootRef)
+	foundParent, err := repository.FindAttempt(ctx, rootRef)
 	require.NoError(t, err)
 	foundStatus, err := foundParent.ReadStatus(ctx)
 	require.NoError(t, err)
@@ -125,9 +167,9 @@ func TestStorePreservesDAGRunFileCompatibilityLayout(t *testing.T) {
 
 	foundMessages, err := foundParent.ReadStepMessages(ctx, "step-one")
 	require.NoError(t, err)
-	assert.Equal(t, []exec.LLMMessage{{Role: exec.RoleUser, Content: "hello"}}, foundMessages)
+	assert.Equal(t, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, foundMessages)
 
-	foundChild, err := store.FindSubAttempt(ctx, rootRef, "child-run")
+	foundChild, err := repository.FindSubAttempt(ctx, rootRef, "child-run")
 	require.NoError(t, err)
 	foundChildStatus, err := foundChild.ReadStatus(ctx)
 	require.NoError(t, err)
@@ -135,154 +177,305 @@ func TestStorePreservesDAGRunFileCompatibilityLayout(t *testing.T) {
 	assert.Equal(t, childStatus.AttemptID, foundChildStatus.AttemptID)
 }
 
-func TestJSONDB(t *testing.T) {
-	t.Run("RecentRecords", func(t *testing.T) {
-		th := setupTestStore(t)
-
-		// Create timestamps for the records
-		ts1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-		ts2 := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
-		ts3 := time.Date(2021, 1, 3, 0, 0, 0, 0, time.UTC)
-
-		// Create records with different statuses
-		th.CreateAttempt(t, ts1, "dagrun-id-1", core.Running)
-		th.CreateAttempt(t, ts2, "dagrun-id-2", core.Failed)
-		th.CreateAttempt(t, ts3, "dagrun-id-3", core.Succeeded)
-
-		// Request 2 most recent attempts
-		attempts := th.Store.RecentAttempts(th.Context, "test_DAG", 2)
-		require.Len(t, attempts, 2)
-
-		// Verify the first record is the most recent
-		status0, err := attempts[0].ReadStatus(th.Context)
+func TestWorkDirStoreUsesSeparateRoot(t *testing.T) {
+	ctx := context.Background()
+	workRoot := t.TempDir()
+	store := NewWorkDirStore(workRoot, filepath.Join(t.TempDir(), "dag-runs"))
+	rootRef := ir.NewDAGRunRef("../../daily.yaml", "../root-run")
+	refs := []dagrun.WorkDirRef{
+		{RootDAGRun: rootRef, DAGRun: rootRef},
+		{RootDAGRun: rootRef, DAGRun: ir.DAGRunRef{ID: "../../child-run"}},
+	}
+	expected := []string{
+		filepath.Join(workRoot, "daily", workDirName("../root-run"), "root"),
+		filepath.Join(workRoot, "daily", workDirName("../root-run"), workDirName("../../child-run")),
+	}
+	workDirs := make([]string, len(refs))
+	for i, ref := range refs {
+		dir, err := store.Materialize(ctx, ref)
 		require.NoError(t, err)
-		assert.Equal(t, "dagrun-id-3", status0.DAGRunID)
-
-		// Verify the second record is the second most recent
-		status1, err := attempts[1].ReadStatus(th.Context)
+		require.DirExists(t, dir)
+		assert.Equal(t, expected[i], dir)
+		rel, err := filepath.Rel(workRoot, dir)
 		require.NoError(t, err)
-		assert.Equal(t, "dagrun-id-2", status1.DAGRunID)
+		assert.NotContains(t, rel, "..")
+		workDirs[i] = dir
+	}
+	assert.NotEqual(t, workDirs[0], workDirs[1])
 
-		// Verify all records are returned if the number requested is equal to the number of records
-		attempts = th.Store.RecentAttempts(th.Context, "test_DAG", 3)
-		require.Len(t, attempts, 3)
+	retryWorkDir, err := store.Materialize(ctx, refs[0])
+	require.NoError(t, err)
+	assert.Equal(t, workDirs[0], retryWorkDir)
 
-		// Verify all records are returned if the number requested is greater than the number of records
-		attempts = th.Store.RecentAttempts(th.Context, "test_DAG", 4)
-		require.Len(t, attempts, 3)
+	require.NoError(t, store.Remove(ctx, refs[0]))
+	for _, dir := range workDirs {
+		require.NoDirExists(t, dir)
+	}
+	require.DirExists(t, workRoot)
+	require.NoError(t, store.Remove(ctx, refs[0]))
+}
+
+func TestStoreRetriesLegacySubDAGRunInSameDirectory(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	store := NewStore(baseDir, WithArtifactDir(filepath.Join(baseDir, "artifacts")))
+	repository := persis.NewDAGRunRepository(store, NewWorkDirStore(filepath.Join(baseDir, ".dag-run-work"), baseDir), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+
+	parentDAG := &ir.DAG{
+		Name:     "compat-dag",
+		Location: filepath.Join(baseDir, "compat-dag.yaml"),
+	}
+	parentTS := time.Date(2026, 5, 27, 1, 2, 3, 456_000_000, time.UTC)
+	_, err := repository.CreateAttempt(ctx, parentDAG, parentTS, "run-compat", persis.DAGRunCreateAttemptOptions{
+		AttemptID: "attempt-compat",
 	})
-	t.Run("LatestRecord", func(t *testing.T) {
-		th := setupTestStore(t)
+	require.NoError(t, err)
 
-		// Create timestamps for the records
+	runDir := filepath.Join(baseDir, "compat-dag", "dag-runs", "2026", "05", "27", "dag-run_20260527_010203Z_run-compat")
+	legacyRootWorkDir := filepath.Join(runDir, "work")
+	legacyChildWorkDir := filepath.Join(runDir, subDAGWorkDirName("child-run"))
+	require.NoError(t, os.MkdirAll(legacyRootWorkDir, 0o750))
+	require.NoError(t, os.MkdirAll(legacyChildWorkDir, 0o750))
+	legacyChildDir := filepath.Join(runDir, LegacySubDAGRunsDir, LegacySubDAGRunDirPrefix+"child-run")
+	require.NoError(t, os.MkdirAll(legacyChildDir, 0750))
+
+	rootRef := ir.NewDAGRunRef(parentDAG.Name, "run-compat")
+	childDAG := &ir.DAG{
+		Name:     "child-dag",
+		Location: filepath.Join(baseDir, "child-dag.yaml"),
+	}
+	childTS := time.Date(2026, 5, 27, 1, 2, 4, 789_000_000, time.UTC)
+	_, err = repository.CreateAttempt(ctx, childDAG, childTS, "child-run", persis.DAGRunCreateAttemptOptions{
+		RootDAGRun: rootRef,
+		Retry:      true,
+		AttemptID:  "child-retry",
+	})
+	require.NoError(t, err)
+
+	expectedAttemptDir := filepath.Join(legacyChildDir, "a_20260527_010204_789Z_child-retry")
+	require.DirExists(t, expectedAttemptDir)
+	require.NoDirExists(t, filepath.Join(runDir, SubDAGRunsDir, "child-run"))
+
+	rootWorkDir, err := repository.MaterializeWorkDir(ctx, dagrun.WorkDirRef{DAGRun: rootRef})
+	require.NoError(t, err)
+	assert.Equal(t, legacyRootWorkDir, rootWorkDir)
+	childWorkDir, err := repository.MaterializeWorkDir(ctx, dagrun.WorkDirRef{
+		RootDAGRun: rootRef,
+		DAGRun:     ir.NewDAGRunRef(childDAG.Name, "child-run"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, legacyChildWorkDir, childWorkDir)
+}
+
+func TestRepository(t *testing.T) {
+	t.Run("RecentStatuses", func(t *testing.T) {
+		th := setupTestRepository(t)
+
+		// Create timestamps for the attempts
 		ts1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		ts2 := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
 		ts3 := time.Date(2021, 1, 3, 0, 0, 0, 0, time.UTC)
 
-		// Create records with different statuses
-		th.CreateAttempt(t, ts1, "dagrun-id-1", core.Running)
-		th.CreateAttempt(t, ts2, "dagrun-id-2", core.Failed)
-		th.CreateAttempt(t, ts3, "dagrun-id-3", core.Succeeded)
+		// Create attempts with different statuses
+		th.CreateAttempt(t, ts1, "dagrun-id-1", ir.Running)
+		unreadable := th.CreateAttempt(t, ts2, "dagrun-id-2", ir.Failed)
+		th.CreateAttempt(t, ts3, "dagrun-id-3", ir.Succeeded)
 
-		// Set the database to return the latest status (even if it was created today)
-		// Verify that record created before today is returned
-		obj := th.Store.(*Store)
-		obj.latestStatusToday = false
-		attempt, err := th.Store.LatestAttempt(th.Context, "test_DAG")
+		// Request 2 most recent statuses
+		statuses, err := th.Repository.RecentStatuses(th.Context, "test_DAG", 2)
+		require.NoError(t, err)
+		require.Len(t, statuses, 2)
+		assert.Equal(t, "dagrun-id-3", statuses[0].DAGRunID)
+		assert.Equal(t, "dagrun-id-2", statuses[1].DAGRunID)
+
+		// Verify all attempts are returned if the number requested is equal to the number of attempts
+		statuses, err = th.Repository.RecentStatuses(th.Context, "test_DAG", 3)
+		require.NoError(t, err)
+		require.Len(t, statuses, 3)
+
+		// Verify all attempts are returned if the number requested is greater than the number of attempts
+		statuses, err = th.Repository.RecentStatuses(th.Context, "test_DAG", 4)
+		require.NoError(t, err)
+		require.Len(t, statuses, 3)
+
+		require.NoError(t, os.WriteFile(unreadable.file, []byte("{"), 0o600))
+		statuses, err = th.Repository.RecentStatuses(th.Context, "test_DAG", 4)
+		require.NoError(t, err)
+		require.Len(t, statuses, 2)
+		assert.Equal(t, []string{"dagrun-id-3", "dagrun-id-1"}, []string{
+			statuses[0].DAGRunID,
+			statuses[1].DAGRunID,
+		})
+	})
+	t.Run("LatestAttempt", func(t *testing.T) {
+		th := setupTestRepository(t)
+
+		// Create timestamps for the attempts
+		ts1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+		ts2 := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
+		ts3 := time.Date(2021, 1, 3, 0, 0, 0, 0, time.UTC)
+
+		// Create attempts with different statuses
+		th.CreateAttempt(t, ts1, "dagrun-id-1", ir.Running)
+		th.CreateAttempt(t, ts2, "dagrun-id-2", ir.Failed)
+		th.CreateAttempt(t, ts3, "dagrun-id-3", ir.Succeeded)
+
+		repository := persis.NewDAGRunRepository(th.Backend, nil, persis.DAGRunRepositoryOptions{
+			LatestStatusToday: false,
+			Location:          time.Local,
+		})
+		attempt, err := repository.LatestAttempt(th.Context, "test_DAG", persis.DAGRunLatestAttemptOptions{})
 		require.NoError(t, err)
 
-		// Verify the record is the most recent
+		// Verify the attempt is the most recent.
 		dagRunStatus, err := attempt.ReadStatus(th.Context)
 		require.NoError(t, err)
 
 		assert.Equal(t, "dagrun-id-3", dagRunStatus.DAGRunID)
 	})
 	t.Run("FindByDAGRunID", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create timestamps for the records
+		// Create timestamps for the attempts
 		ts1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		ts2 := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
 		ts3 := time.Date(2021, 1, 3, 0, 0, 0, 0, time.UTC)
 
-		// Create records with different statuses
-		th.CreateAttempt(t, ts1, "dagrun-id-1", core.Running)
-		th.CreateAttempt(t, ts2, "dagrun-id-2", core.Failed)
-		th.CreateAttempt(t, ts3, "dagrun-id-3", core.Succeeded)
+		// Create attempts with different statuses
+		th.CreateAttempt(t, ts1, "dagrun-id-1", ir.Running)
+		th.CreateAttempt(t, ts2, "dagrun-id-2", ir.Failed)
+		th.CreateAttempt(t, ts3, "dagrun-id-3", ir.Succeeded)
 
-		// Find the record with dag-run ID "dagrun-id-2"
-		ref := exec.NewDAGRunRef("test_DAG", "dagrun-id-2")
-		attempt, err := th.Store.FindAttempt(th.Context, ref)
+		// Find the attempt with dag-run ID "dagrun-id-2"
+		ref := ir.NewDAGRunRef("test_DAG", "dagrun-id-2")
+		attempt, err := th.Repository.FindAttempt(th.Context, ref)
 		require.NoError(t, err)
 
-		// Verify the record is the correct one
+		// Verify the attempt is the correct one
 		dagRunStatus, err := attempt.ReadStatus(th.Context)
 		require.NoError(t, err)
 		assert.Equal(t, "dagrun-id-2", dagRunStatus.DAGRunID)
 
 		// Verify an error is returned if the dag-run ID does not exist
-		refNonExist := exec.NewDAGRunRef("test_DAG", "nonexistent-id")
-		_, err = th.Store.FindAttempt(th.Context, refNonExist)
-		assert.ErrorIs(t, err, exec.ErrDAGRunIDNotFound)
+		refNonExist := ir.NewDAGRunRef("test_DAG", "nonexistent-id")
+		_, err = th.Repository.FindAttempt(th.Context, refNonExist)
+		assert.ErrorIs(t, err, dagrun.ErrDAGRunIDNotFound)
 	})
 	t.Run("RemoveOld", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create timestamps for the records
+		// Create timestamps for the attempts
 		ts1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		ts2 := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
 		ts3 := time.Date(2021, 1, 3, 0, 0, 0, 0, time.UTC)
 
-		// Create records with different statuses
-		th.CreateAttempt(t, ts1, "dagrun-id-1", core.Running)
-		th.CreateAttempt(t, ts2, "dagrun-id-2", core.Failed)
-		th.CreateAttempt(t, ts3, "dagrun-id-3", core.Succeeded)
+		// Create attempts with different statuses
+		th.CreateAttempt(t, ts1, "dagrun-id-1", ir.Running)
+		th.CreateAttempt(t, ts2, "dagrun-id-2", ir.Failed)
+		th.CreateAttempt(t, ts3, "dagrun-id-3", ir.Succeeded)
+		workDirs := make(map[string]string, 3)
+		for _, id := range []string{"dagrun-id-1", "dagrun-id-2", "dagrun-id-3"} {
+			ref := ir.NewDAGRunRef("test_DAG", id)
+			workDir, err := th.Repository.MaterializeWorkDir(th.Context, dagrun.WorkDirRef{DAGRun: ref})
+			require.NoError(t, err)
+			workDirs[id] = workDir
+		}
 
 		// Verify attempts are present
-		attempts := th.Store.RecentAttempts(th.Context, "test_DAG", 3)
-		require.Len(t, attempts, 3)
+		statuses, err := th.Repository.RecentStatuses(th.Context, "test_DAG", 3)
+		require.NoError(t, err)
+		require.Len(t, statuses, 3)
 
-		// Remove records older than 0 days
-		// It should remove all records
-		removedIDs, err := th.Store.RemoveOldDAGRuns(th.Context, "test_DAG", 0)
+		// Remove attempts older than 0 days
+		// It should remove all attempts
+		removedIDs, err := th.Repository.RemoveOldDAGRuns(th.Context, "test_DAG", 0, persis.DAGRunRetentionOptions{})
 		require.NoError(t, err)
 		assert.Len(t, removedIDs, 2) // 2 non-active runs should be removed
 
 		// Verify non active attempts are removed
-		attempts = th.Store.RecentAttempts(th.Context, "test_DAG", 3)
-		require.Len(t, attempts, 1)
-
-		// Verify the remaining attempt is the active one
-		dagRunStatus, err := attempts[0].ReadStatus(th.Context)
+		statuses, err = th.Repository.RecentStatuses(th.Context, "test_DAG", 3)
 		require.NoError(t, err)
-		assert.Equal(t, "dagrun-id-1", dagRunStatus.DAGRunID)
-		assert.Equal(t, core.Running, dagRunStatus.Status)
+		require.Len(t, statuses, 1)
+
+		// Verify the remaining status is the active one
+		assert.Equal(t, "dagrun-id-1", statuses[0].DAGRunID)
+		assert.Equal(t, ir.Running, statuses[0].Status)
+		require.DirExists(t, workDirs["dagrun-id-1"])
+		require.NoDirExists(t, workDirs["dagrun-id-2"])
+		require.NoDirExists(t, workDirs["dagrun-id-3"])
+	})
+	t.Run("RemoveOldWithOlderThanCutoff", func(t *testing.T) {
+		th := setupTestRepository(t)
+
+		tsOld := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+		tsRecent := time.Date(2021, 1, 3, 12, 0, 0, 0, time.UTC)
+		cutoff := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
+
+		oldAttempt := th.CreateAttempt(t, tsOld, "old-run", ir.Succeeded)
+		recentAttempt := th.CreateAttempt(t, tsRecent, "recent-run", ir.Succeeded)
+		// canRemoveDAGRun gates on status-file mtime as well as recorded run time.
+		require.NoError(t, os.Chtimes(oldAttempt.file, tsOld, tsOld))
+		require.NoError(t, os.Chtimes(recentAttempt.file, tsRecent, tsRecent))
+
+		removedIDs, err := th.Repository.RemoveOldDAGRuns(
+			th.Context,
+			"test_DAG",
+			30, // ignored when OlderThan is set
+			persis.DAGRunRetentionOptions{OlderThan: &cutoff},
+		)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"old-run"}, removedIDs)
+
+		statuses, err := th.Repository.RecentStatuses(th.Context, "test_DAG", 3)
+		require.NoError(t, err)
+		require.Len(t, statuses, 1)
+		assert.Equal(t, "recent-run", statuses[0].DAGRunID)
+	})
+	t.Run("RemoveOldWithZeroOlderThanCutoff", func(t *testing.T) {
+		th := setupTestRepository(t)
+
+		th.CreateAttempt(t, time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC), "completed-run", ir.Succeeded)
+
+		zeroCutoff := time.Time{}
+		removedIDs, err := th.Repository.RemoveOldDAGRuns(
+			th.Context,
+			"test_DAG",
+			30,
+			persis.DAGRunRetentionOptions{OlderThan: &zeroCutoff},
+		)
+		require.NoError(t, err)
+		assert.Empty(t, removedIDs)
+
+		statuses, err := th.Repository.RecentStatuses(th.Context, "test_DAG", 1)
+		require.NoError(t, err)
+		require.Len(t, statuses, 1)
+		assert.Equal(t, "completed-run", statuses[0].DAGRunID)
 	})
 	t.Run("RemoveDAGRunRejectsActiveWhenRequested", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-		ref := exec.NewDAGRunRef("test_DAG", "active-id")
+		ref := ir.NewDAGRunRef("test_DAG", "active-id")
 
-		th.CreateAttempt(t, ts, ref.ID, core.Running)
+		th.CreateAttempt(t, ts, ref.ID, ir.Running)
 
-		err := th.Store.RemoveDAGRun(th.Context, ref, exec.WithRejectActiveDAGRun())
-		require.ErrorIs(t, err, exec.ErrDAGRunActive)
+		err := th.Repository.RemoveDAGRun(th.Context, ref, persis.DAGRunRemoveOptions{RejectActive: true})
+		require.ErrorIs(t, err, dagrun.ErrDAGRunActive)
 
-		attempt, err := th.Store.FindAttempt(th.Context, ref)
+		attempt, err := th.Repository.FindAttempt(th.Context, ref)
 		require.NoError(t, err)
 		status, err := attempt.ReadStatus(th.Context)
 		require.NoError(t, err)
 		require.NotNil(t, status)
-		assert.Equal(t, core.Running, status.Status)
+		assert.Equal(t, ir.Running, status.Status)
 
-		err = th.Store.RemoveDAGRun(th.Context, ref)
+		err = th.Repository.RemoveDAGRun(th.Context, ref, persis.DAGRunRemoveOptions{})
 		require.NoError(t, err)
 
-		_, err = th.Store.FindAttempt(th.Context, ref)
-		assert.ErrorIs(t, err, exec.ErrDAGRunIDNotFound)
+		_, err = th.Repository.FindAttempt(th.Context, ref)
+		assert.ErrorIs(t, err, dagrun.ErrDAGRunIDNotFound)
 	})
-	t.Run("RemoveDAGRunRemovesArtifactDirsIncludingSubDAGRuns", func(t *testing.T) {
-		th := setupTestStore(t)
+	t.Run("RemoveDAGRunRemovesArtifactAndWorkDirsIncludingSubDAGRuns", func(t *testing.T) {
+		th := setupTestRepository(t)
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 
 		artifactRoot := filepath.Join(th.TmpDir, "artifacts")
@@ -294,46 +487,57 @@ func TestJSONDB(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(subArtifactDir, "summary.md"), []byte("child"), 0o600))
 
 		dag := th.DAG("test_DAG")
-		parentAttempt, err := th.Store.CreateAttempt(th.Context, dag.DAG, ts, "parent-id", exec.NewDAGRunAttemptOptions{})
+		parentAttempt, err := th.Repository.CreateAttempt(th.Context, dag.DAG, ts, "parent-id", persis.DAGRunCreateAttemptOptions{})
 		require.NoError(t, err)
 		require.NoError(t, parentAttempt.Open(th.Context))
 
-		parentStatus := exec.InitialStatus(dag.DAG)
+		parentStatus := ir.InitialStatus(dag.DAG)
 		parentStatus.DAGRunID = "parent-id"
-		parentStatus.Status = core.Succeeded
+		parentStatus.Status = ir.Succeeded
 		parentStatus.ArchiveDir = parentArtifactDir
 		require.NoError(t, parentAttempt.Write(th.Context, parentStatus))
 		require.NoError(t, parentAttempt.Close(th.Context))
 
-		rootRef := exec.NewDAGRunRef("test_DAG", "parent-id")
+		rootRef := ir.NewDAGRunRef("test_DAG", "parent-id")
 		subDAG := th.DAG("child")
-		subAttempt, err := th.Store.CreateAttempt(th.Context, subDAG.DAG, ts, "sub-id", exec.NewDAGRunAttemptOptions{
-			RootDAGRun: &rootRef,
+		subAttempt, err := th.Repository.CreateAttempt(th.Context, subDAG.DAG, ts, "sub-id", persis.DAGRunCreateAttemptOptions{
+			RootDAGRun: rootRef,
 		})
 		require.NoError(t, err)
 		require.NoError(t, subAttempt.Open(th.Context))
 
-		subStatus := exec.InitialStatus(subDAG.DAG)
+		subStatus := ir.InitialStatus(subDAG.DAG)
 		subStatus.DAGRunID = "sub-id"
-		subStatus.Status = core.Succeeded
+		subStatus.Status = ir.Succeeded
 		subStatus.ArchiveDir = subArtifactDir
 		require.NoError(t, subAttempt.Write(th.Context, subStatus))
 		require.NoError(t, subAttempt.Close(th.Context))
+		parentWorkDir, err := th.Repository.MaterializeWorkDir(th.Context, dagrun.WorkDirRef{DAGRun: rootRef})
+		require.NoError(t, err)
+		subWorkDir, err := th.Repository.MaterializeWorkDir(th.Context, dagrun.WorkDirRef{
+			RootDAGRun: rootRef,
+			DAGRun:     ir.NewDAGRunRef(subDAG.Name, "sub-id"),
+		})
+		require.NoError(t, err)
 
 		require.DirExists(t, parentArtifactDir)
 		require.DirExists(t, subArtifactDir)
+		require.DirExists(t, parentWorkDir)
+		require.DirExists(t, subWorkDir)
 
-		err = th.Store.RemoveDAGRun(th.Context, rootRef)
+		err = th.Repository.RemoveDAGRun(th.Context, rootRef, persis.DAGRunRemoveOptions{})
 		require.NoError(t, err)
 
 		assert.NoDirExists(t, parentArtifactDir)
 		assert.NoDirExists(t, subArtifactDir)
+		assert.NoDirExists(t, parentWorkDir)
+		assert.NoDirExists(t, subWorkDir)
 
-		_, err = th.Store.FindAttempt(th.Context, rootRef)
-		assert.ErrorIs(t, err, exec.ErrDAGRunIDNotFound)
+		_, err = th.Repository.FindAttempt(th.Context, rootRef)
+		assert.ErrorIs(t, err, dagrun.ErrDAGRunIDNotFound)
 	})
 	t.Run("RemoveDAGRunSkipsArtifactDirsOutsideTrustedRoot", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 
 		outsideArtifactDir := filepath.Join(t.TempDir(), "outside-artifacts")
@@ -341,41 +545,41 @@ func TestJSONDB(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(outsideArtifactDir, "summary.md"), []byte("outside"), 0o600))
 
 		dag := th.DAG("test_DAG")
-		attempt, err := th.Store.CreateAttempt(th.Context, dag.DAG, ts, "outside-id", exec.NewDAGRunAttemptOptions{})
+		attempt, err := th.Repository.CreateAttempt(th.Context, dag.DAG, ts, "outside-id", persis.DAGRunCreateAttemptOptions{})
 		require.NoError(t, err)
 		require.NoError(t, attempt.Open(th.Context))
 
-		status := exec.InitialStatus(dag.DAG)
+		status := ir.InitialStatus(dag.DAG)
 		status.DAGRunID = "outside-id"
-		status.Status = core.Succeeded
+		status.Status = ir.Succeeded
 		status.ArchiveDir = outsideArtifactDir
 		require.NoError(t, attempt.Write(th.Context, status))
 		require.NoError(t, attempt.Close(th.Context))
 
-		rootRef := exec.NewDAGRunRef("test_DAG", "outside-id")
+		rootRef := ir.NewDAGRunRef("test_DAG", "outside-id")
 		require.DirExists(t, outsideArtifactDir)
 
-		err = th.Store.RemoveDAGRun(th.Context, rootRef)
+		err = th.Repository.RemoveDAGRun(th.Context, rootRef, persis.DAGRunRemoveOptions{})
 		require.NoError(t, err)
 
 		require.DirExists(t, outsideArtifactDir)
-		_, err = th.Store.FindAttempt(th.Context, rootRef)
-		assert.ErrorIs(t, err, exec.ErrDAGRunIDNotFound)
+		_, err = th.Repository.FindAttempt(th.Context, rootRef)
+		assert.ErrorIs(t, err, dagrun.ErrDAGRunIDNotFound)
 	})
 	t.Run("SubDAGRun", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create a timestamp for the parent record
+		// Create a timestamp for the parent attempt
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 
-		// Create a parent record
-		_ = th.CreateAttempt(t, ts, "parent-id", core.Running)
+		// Create a parent attempt
+		_ = th.CreateAttempt(t, ts, "parent-id", ir.Running)
 
 		// Create a child attempt
-		rootDAGRun := exec.NewDAGRunRef("test_DAG", "parent-id")
+		rootDAGRun := ir.NewDAGRunRef("test_DAG", "parent-id")
 		subDAG := th.DAG("child")
-		subAttempt, err := th.Store.CreateAttempt(th.Context, subDAG.DAG, ts, "sub-id", exec.NewDAGRunAttemptOptions{
-			RootDAGRun: &rootDAGRun,
+		subAttempt, err := th.Repository.CreateAttempt(th.Context, subDAG.DAG, ts, "sub-id", persis.DAGRunCreateAttemptOptions{
+			RootDAGRun: rootDAGRun,
 		})
 		require.NoError(t, err)
 
@@ -386,14 +590,14 @@ func TestJSONDB(t *testing.T) {
 			_ = subAttempt.Close(th.Context)
 		}()
 
-		statusToWrite := exec.InitialStatus(subDAG.DAG)
+		statusToWrite := ir.InitialStatus(subDAG.DAG)
 		statusToWrite.DAGRunID = "sub-id"
 		err = subAttempt.Write(th.Context, statusToWrite)
 		require.NoError(t, err)
 
-		// Verify record is created
-		dagRunRef := exec.NewDAGRunRef("test_DAG", "parent-id")
-		existingAttempt, err := th.Store.FindSubAttempt(th.Context, dagRunRef, "sub-id")
+		// Verify attempt is created
+		dagRunRef := ir.NewDAGRunRef("test_DAG", "parent-id")
+		existingAttempt, err := th.Repository.FindSubAttempt(th.Context, dagRunRef, "sub-id")
 		require.NoError(t, err)
 
 		dagRunStatus, err := existingAttempt.ReadStatus(th.Context)
@@ -401,22 +605,22 @@ func TestJSONDB(t *testing.T) {
 		assert.Equal(t, "sub-id", dagRunStatus.DAGRunID)
 	})
 	t.Run("SubDAGRunRetry", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create a timestamp for the parent record
+		// Create a timestamp for the parent attempt
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 
-		// Create a parent record
-		_ = th.CreateAttempt(t, ts, "parent-id", core.Running)
+		// Create a parent attempt
+		_ = th.CreateAttempt(t, ts, "parent-id", ir.Running)
 
 		// Create a sub dag-run
 		const subDAGRunID = "sub-dagrun-id"
 		const parentDAGRunID = "parent-id"
 
-		rootDAGRun := exec.NewDAGRunRef("test_DAG", parentDAGRunID)
+		rootDAGRun := ir.NewDAGRunRef("test_DAG", parentDAGRunID)
 		subDAG := th.DAG("child")
-		attempt, err := th.Store.CreateAttempt(th.Context, subDAG.DAG, ts, subDAGRunID, exec.NewDAGRunAttemptOptions{
-			RootDAGRun: &rootDAGRun,
+		attempt, err := th.Repository.CreateAttempt(th.Context, subDAG.DAG, ts, subDAGRunID, persis.DAGRunCreateAttemptOptions{
+			RootDAGRun: rootDAGRun,
 		})
 		require.NoError(t, err)
 
@@ -427,67 +631,67 @@ func TestJSONDB(t *testing.T) {
 			_ = attempt.Close(th.Context)
 		}()
 
-		statusToWrite := exec.InitialStatus(subDAG.DAG)
+		statusToWrite := ir.InitialStatus(subDAG.DAG)
 		statusToWrite.DAGRunID = subDAGRunID
-		statusToWrite.Status = core.Running
+		statusToWrite.Status = ir.Running
 		err = attempt.Write(th.Context, statusToWrite)
 		require.NoError(t, err)
 
-		// Find the sub dag-run record
+		// Find the sub dag-run attempt
 		ts = time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
-		dagRunRef := exec.NewDAGRunRef("test_DAG", parentDAGRunID)
-		existingAttempt, err := th.Store.FindSubAttempt(th.Context, dagRunRef, subDAGRunID)
+		dagRunRef := ir.NewDAGRunRef("test_DAG", parentDAGRunID)
+		existingAttempt, err := th.Repository.FindSubAttempt(th.Context, dagRunRef, subDAGRunID)
 		require.NoError(t, err)
 		existingAttemptStatus, err := existingAttempt.ReadStatus(th.Context)
 		require.NoError(t, err)
 		assert.Equal(t, subDAGRunID, existingAttemptStatus.DAGRunID)
-		assert.Equal(t, core.Running.String(), existingAttemptStatus.Status.String())
+		assert.Equal(t, ir.Running.String(), existingAttemptStatus.Status.String())
 
-		// Create a retry record and write different status
-		retryAttempt, err := th.Store.CreateAttempt(th.Context, subDAG.DAG, ts, subDAGRunID, exec.NewDAGRunAttemptOptions{
-			RootDAGRun: &rootDAGRun,
+		// Create a retry attempt and write different status
+		retryAttempt, err := th.Repository.CreateAttempt(th.Context, subDAG.DAG, ts, subDAGRunID, persis.DAGRunCreateAttemptOptions{
+			RootDAGRun: rootDAGRun,
 			Retry:      true,
 		})
 		require.NoError(t, err)
-		statusToWrite.Status = core.Succeeded
+		statusToWrite.Status = ir.Succeeded
 		_ = retryAttempt.Open(th.Context)
 		_ = retryAttempt.Write(th.Context, statusToWrite)
 		_ = retryAttempt.Close(th.Context)
 
-		// Verify the retry record is created
-		existingAttempt, err = th.Store.FindSubAttempt(th.Context, dagRunRef, subDAGRunID)
+		// Verify the retry attempt is created
+		existingAttempt, err = th.Repository.FindSubAttempt(th.Context, dagRunRef, subDAGRunID)
 		require.NoError(t, err)
 		existingAttemptStatus, err = existingAttempt.ReadStatus(th.Context)
 		require.NoError(t, err)
 		assert.Equal(t, subDAGRunID, existingAttemptStatus.DAGRunID)
-		assert.Equal(t, core.Succeeded.String(), existingAttemptStatus.Status.String())
+		assert.Equal(t, ir.Succeeded.String(), existingAttemptStatus.Status.String())
 	})
-	t.Run("CreateSubAttempt", func(t *testing.T) {
-		th := setupTestStore(t)
+	t.Run("CreateChildAttempt", func(t *testing.T) {
+		th := setupTestRepository(t)
 
-		// Create a parent record first
+		// Create a parent attempt first
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-		th.CreateAttempt(t, ts, "parent-id", core.Running)
+		th.CreateAttempt(t, ts, "parent-id", ir.Running)
 
-		// Create sub-attempt using CreateSubAttempt
-		rootRef := exec.NewDAGRunRef("test_DAG", "parent-id")
-		subAttempt, err := th.Store.CreateSubAttempt(th.Context, rootRef, "sub-id")
+		rootRef := ir.NewDAGRunRef("test_DAG", "parent-id")
+		subDAG := th.DAG("child")
+		subAttempt, err := th.Repository.CreateAttempt(th.Context, subDAG.DAG, ts, "sub-id", persis.DAGRunCreateAttemptOptions{
+			RootDAGRun: rootRef,
+		})
 		require.NoError(t, err)
 
 		// Write status to the sub-attempt
-		subDAG := th.DAG("child")
-		subAttempt.SetDAG(subDAG.DAG)
 		err = subAttempt.Open(th.Context)
 		require.NoError(t, err)
 		defer func() { _ = subAttempt.Close(th.Context) }()
 
-		statusToWrite := exec.InitialStatus(subDAG.DAG)
+		statusToWrite := ir.InitialStatus(subDAG.DAG)
 		statusToWrite.DAGRunID = "sub-id"
 		err = subAttempt.Write(th.Context, statusToWrite)
 		require.NoError(t, err)
 
 		// Verify sub-attempt can be found
-		foundAttempt, err := th.Store.FindSubAttempt(th.Context, rootRef, "sub-id")
+		foundAttempt, err := th.Repository.FindSubAttempt(th.Context, rootRef, "sub-id")
 		require.NoError(t, err)
 
 		status, err := foundAttempt.ReadStatus(th.Context)
@@ -495,71 +699,71 @@ func TestJSONDB(t *testing.T) {
 		assert.Equal(t, "sub-id", status.DAGRunID)
 	})
 	t.Run("CompareAndSwapLatestAttemptStatusUpdatesSubAttempt", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-		th.CreateAttempt(t, ts, "parent-id", core.Running)
+		th.CreateAttempt(t, ts, "parent-id", ir.Running)
 
-		rootRef := exec.NewDAGRunRef("test_DAG", "parent-id")
-		subRef := exec.NewDAGRunRef("child", "parent-id")
-		subAttempt, err := th.Store.CreateSubAttempt(th.Context, rootRef, subRef.ID)
+		rootRef := ir.NewDAGRunRef("test_DAG", "parent-id")
+		subRef := ir.NewDAGRunRef("child", "parent-id")
+		subDAG := th.DAG(subRef.Name)
+		subAttempt, err := th.Repository.CreateAttempt(th.Context, subDAG.DAG, ts, subRef.ID, persis.DAGRunCreateAttemptOptions{
+			RootDAGRun: rootRef,
+		})
 		require.NoError(t, err)
 
-		subDAG := th.DAG(subRef.Name)
-		subAttempt.SetDAG(subDAG.DAG)
 		require.NoError(t, subAttempt.Open(th.Context))
-		statusToWrite := exec.InitialStatus(subDAG.DAG)
+		statusToWrite := ir.InitialStatus(subDAG.DAG)
 		statusToWrite.DAGRunID = subRef.ID
 		statusToWrite.Root = rootRef
 		statusToWrite.AttemptID = subAttempt.ID()
-		statusToWrite.AttemptKey = exec.GenerateAttemptKey(rootRef.Name, rootRef.ID, subRef.Name, subRef.ID, subAttempt.ID())
-		statusToWrite.Status = core.Running
-		statusToWrite.Nodes = []*exec.Node{{Status: core.NodeRunning}}
+		statusToWrite.AttemptKey = ir.GenerateAttemptKey(rootRef.Name, rootRef.ID, subRef.Name, subRef.ID, subAttempt.ID())
+		statusToWrite.Status = ir.Running
+		statusToWrite.Nodes = []*ir.Node{{Status: ir.NodeRunning}}
 		require.NoError(t, subAttempt.Write(th.Context, statusToWrite))
 		require.NoError(t, subAttempt.Close(th.Context))
 
-		updated, swapped, err := th.Store.CompareAndSwapLatestAttemptStatus(
+		updated, swapped, err := th.Repository.CompareAndSwapLatestAttemptStatus(
 			th.Context,
 			subRef,
 			subAttempt.ID(),
-			core.Running,
-			func(status *exec.DAGRunStatus) error {
-				status.Status = core.Failed
+			ir.Running,
+			func(status *ir.DAGRunStatus) error {
+				status.Status = ir.Failed
 				status.Error = "lease expired"
-				status.Nodes[0].Status = core.NodeFailed
+				status.Nodes[0].Status = ir.NodeFailed
 				return nil
-			},
-			exec.WithCompareAndSwapRootDAGRun(rootRef),
-			exec.WithCompareAndSwapExpectedAttemptKey(statusToWrite.AttemptKey),
+			}, persis.DAGRunCompareAndSwapOptions{RootDAGRun: rootRef, ExpectedAttemptKey: statusToWrite.AttemptKey},
 		)
 		require.NoError(t, err)
 		require.True(t, swapped)
-		require.Equal(t, core.Failed, updated.Status)
+		require.Equal(t, ir.Failed, updated.Status)
 
-		foundAttempt, err := th.Store.FindSubAttempt(th.Context, rootRef, subRef.ID)
+		foundAttempt, err := th.Repository.FindSubAttempt(th.Context, rootRef, subRef.ID)
 		require.NoError(t, err)
 		foundStatus, err := foundAttempt.ReadStatus(th.Context)
 		require.NoError(t, err)
-		require.Equal(t, core.Failed, foundStatus.Status)
+		require.Equal(t, ir.Failed, foundStatus.Status)
 		require.Equal(t, "lease expired", foundStatus.Error)
-		require.Equal(t, core.NodeFailed, foundStatus.Nodes[0].Status)
+		require.Equal(t, ir.NodeFailed, foundStatus.Nodes[0].Status)
 	})
-	t.Run("CreateSubAttemptEmptyRootID", func(t *testing.T) {
-		th := setupTestStore(t)
+	t.Run("CreateChildAttemptEmptyRootID", func(t *testing.T) {
+		th := setupTestRepository(t)
 
-		// Try to create sub-attempt with empty root ID
-		rootRef := exec.NewDAGRunRef("test_DAG", "")
-		_, err := th.Store.CreateSubAttempt(th.Context, rootRef, "sub-id")
-		require.ErrorIs(t, err, ErrDAGRunIDEmpty)
+		rootRef := ir.NewDAGRunRef("test_DAG", "")
+		_, err := th.Repository.CreateAttempt(th.Context, th.DAG("child").DAG, time.Now(), "sub-id", persis.DAGRunCreateAttemptOptions{
+			RootDAGRun: rootRef,
+		})
+		require.ErrorIs(t, err, dagrun.ErrDAGRunIDEmpty)
 	})
 	t.Run("ReadDAG", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create a timestamp for the parent record
+		// Create a timestamp for the parent attempt
 		ts := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
 
-		// Create a parent record
-		rec := th.CreateAttempt(t, ts, "parent-id", core.Running)
+		// Create a parent attempt
+		rec := th.CreateAttempt(t, ts, "parent-id", ir.Running)
 
 		// Write the status
 		err := rec.Open(th.Context)
@@ -568,7 +772,7 @@ func TestJSONDB(t *testing.T) {
 			_ = rec.Close(th.Context)
 		}()
 
-		statusToWrite := exec.InitialStatus(rec.dag)
+		statusToWrite := ir.InitialStatus(rec.dag)
 		statusToWrite.DAGRunID = "parent-id"
 
 		err = rec.Write(th.Context, statusToWrite)
@@ -707,25 +911,22 @@ func TestListRootCanceledContext(t *testing.T) {
 
 func TestListStatuses(t *testing.T) {
 	t.Run("FilterByTimeRange", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create records with different timestamps
+		// Create attempts with different timestamps
 		ts1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		ts2 := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
 		ts3 := time.Date(2021, 1, 3, 0, 0, 0, 0, time.UTC)
 
-		th.CreateAttempt(t, ts1, "dagrun-id-1", core.Succeeded)
-		th.CreateAttempt(t, ts2, "dagrun-id-2", core.Succeeded)
-		th.CreateAttempt(t, ts3, "dagrun-id-3", core.Succeeded)
+		th.CreateAttempt(t, ts1, "dagrun-id-1", ir.Succeeded)
+		th.CreateAttempt(t, ts2, "dagrun-id-2", ir.Succeeded)
+		th.CreateAttempt(t, ts3, "dagrun-id-3", ir.Succeeded)
 
 		// Filter by time range (only ts2 should be included)
-		from := exec.NewUTC(time.Date(2021, 1, 1, 12, 0, 0, 0, time.UTC))
-		to := exec.NewUTC(time.Date(2021, 1, 2, 12, 0, 0, 0, time.UTC))
+		from := persis.NewUTC(time.Date(2021, 1, 1, 12, 0, 0, 0, time.UTC))
+		to := persis.NewUTC(time.Date(2021, 1, 2, 12, 0, 0, 0, time.UTC))
 
-		statuses, err := th.Store.ListStatuses(th.Context,
-			exec.WithFrom(from),
-			exec.WithTo(to),
-		)
+		statuses, err := th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{From: from, To: to})
 
 		require.NoError(t, err)
 		require.Len(t, statuses, 1)
@@ -733,60 +934,54 @@ func TestListStatuses(t *testing.T) {
 	})
 
 	t.Run("FilterByStatus", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create records with different statuses
+		// Create attempts with different statuses
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-		th.CreateAttempt(t, ts, "dagrun-id-1", core.Running)
-		th.CreateAttempt(t, ts, "dagrun-id-2", core.Failed)
-		th.CreateAttempt(t, ts, "dagrun-id-3", core.Succeeded)
+		th.CreateAttempt(t, ts, "dagrun-id-1", ir.Running)
+		th.CreateAttempt(t, ts, "dagrun-id-2", ir.Failed)
+		th.CreateAttempt(t, ts, "dagrun-id-3", ir.Succeeded)
 
 		// Filter by status (only StatusError should be included)
-		statuses, err := th.Store.ListStatuses(th.Context,
-			exec.WithStatuses([]core.Status{core.Failed}),
-			exec.WithFrom(exec.NewUTC(ts)),
-		)
+		statuses, err := th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Statuses: []ir.Status{ir.Failed}, From: persis.NewUTC(ts)})
 
 		require.NoError(t, err)
 		require.Len(t, statuses, 1)
 		assert.Equal(t, "dagrun-id-2", statuses[0].DAGRunID)
-		assert.Equal(t, core.Failed, statuses[0].Status)
+		assert.Equal(t, ir.Failed, statuses[0].Status)
 	})
 
 	t.Run("LimitResults", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
-		// Create multiple records
+		// Create multiple attempts
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		for i := 1; i <= 5; i++ {
-			th.CreateAttempt(t, ts, fmt.Sprintf("dagrun-id-%d", i), core.Succeeded)
+			th.CreateAttempt(t, ts, fmt.Sprintf("dagrun-id-%d", i), ir.Succeeded)
 		}
 
 		// Limit to 3 results
-		options := &exec.ListDAGRunStatusesOptions{Limit: 3}
-		statuses, err := th.Store.ListStatuses(th.Context, func(o *exec.ListDAGRunStatusesOptions) {
-			o.Limit = options.Limit
-		}, exec.WithFrom(exec.NewUTC(ts)))
+		statuses, err := th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Limit: 3, From: persis.NewUTC(ts)})
 
 		require.NoError(t, err)
 		require.Len(t, statuses, 3)
 	})
 
 	t.Run("SortByCreatedAt", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
 		// Use different timestamps to ensure deterministic sort order
 		ts1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		ts2 := time.Date(2021, 1, 1, 0, 0, 1, 0, time.UTC) // 1 second later
 		ts3 := time.Date(2021, 1, 1, 0, 0, 2, 0, time.UTC) // 2 seconds later
 
-		th.CreateAttempt(t, ts1, "dagrun-id-1", core.Succeeded)
-		th.CreateAttempt(t, ts2, "dagrun-id-2", core.Succeeded)
-		th.CreateAttempt(t, ts3, "dagrun-id-3", core.Succeeded)
+		th.CreateAttempt(t, ts1, "dagrun-id-1", ir.Succeeded)
+		th.CreateAttempt(t, ts2, "dagrun-id-2", ir.Succeeded)
+		th.CreateAttempt(t, ts3, "dagrun-id-3", ir.Succeeded)
 
 		// Get all statuses
-		statuses, err := th.Store.ListStatuses(
-			th.Context, exec.WithFrom(exec.NewUTC(ts1)),
+		statuses, err := th.Repository.ListStatuses(
+			th.Context, persis.DAGRunListOptions{From: persis.NewUTC(ts1)},
 		)
 
 		require.NoError(t, err)
@@ -799,73 +994,61 @@ func TestListStatuses(t *testing.T) {
 	})
 
 	t.Run("FilterByLabels", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 
 		// Create runs with different labels
 		run1 := th.DAG("dag1")
-		run1.Labels = core.NewLabels([]string{"prod", "batch"})
-		th.CreateAttemptWithDAG(t, ts, "run-1", core.Succeeded, run1.DAG)
+		run1.Labels = ir.NewLabels([]string{"prod", "batch"})
+		th.CreateAttemptWithDAG(t, ts, "run-1", ir.Succeeded, run1.DAG)
 
 		run2 := th.DAG("dag2")
-		run2.Labels = core.NewLabels([]string{"prod", "api"})
-		th.CreateAttemptWithDAG(t, ts, "run-2", core.Succeeded, run2.DAG)
+		run2.Labels = ir.NewLabels([]string{"prod", "api"})
+		th.CreateAttemptWithDAG(t, ts, "run-2", ir.Succeeded, run2.DAG)
 
 		run3 := th.DAG("dag3")
-		run3.Labels = core.NewLabels([]string{"dev"})
-		th.CreateAttemptWithDAG(t, ts, "run-3", core.Succeeded, run3.DAG)
+		run3.Labels = ir.NewLabels([]string{"dev"})
+		th.CreateAttemptWithDAG(t, ts, "run-3", ir.Succeeded, run3.DAG)
 
 		// Filter by label "prod" (should match run-1 and run-2)
-		statuses, err := th.Store.ListStatuses(th.Context,
-			exec.WithLabels([]string{"prod"}),
-			exec.WithFrom(exec.NewUTC(ts)),
-		)
+		statuses, err := th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Labels: []string{"prod"}, From: persis.NewUTC(ts)})
 		require.NoError(t, err)
 		assert.Len(t, statuses, 2)
 
 		// Filter by labels "prod" AND "batch" (should match only run-1)
-		statuses, err = th.Store.ListStatuses(th.Context,
-			exec.WithLabels([]string{"prod", "batch"}),
-			exec.WithFrom(exec.NewUTC(ts)),
-		)
+		statuses, err = th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Labels: []string{"prod", "batch"}, From: persis.NewUTC(ts)})
 		require.NoError(t, err)
 		assert.Len(t, statuses, 1)
 		assert.Equal(t, "run-1", statuses[0].DAGRunID)
 
 		// Filter by label "dev" (should match only run-3)
-		statuses, err = th.Store.ListStatuses(th.Context,
-			exec.WithLabels([]string{"dev"}),
-			exec.WithFrom(exec.NewUTC(ts)),
-		)
+		statuses, err = th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Labels: []string{"dev"}, From: persis.NewUTC(ts)})
 		require.NoError(t, err)
 		assert.Len(t, statuses, 1)
 		assert.Equal(t, "run-3", statuses[0].DAGRunID)
 
 		// Filter by label "nonexistent" (should match nothing)
-		statuses, err = th.Store.ListStatuses(th.Context,
-			exec.WithLabels([]string{"nonexistent"}),
-			exec.WithFrom(exec.NewUTC(ts)),
-		)
+		statuses, err = th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Labels: []string{"nonexistent"}, From: persis.NewUTC(ts)})
 		require.NoError(t, err)
 		assert.Empty(t, statuses)
 	})
 
 	t.Run("IncludesAutoRetryLimit", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
 		ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 		dag := th.DAG("retry_dag")
-		dag.RetryPolicy = &core.DAGRetryPolicy{
+		dag.RetryPolicy = &ir.DAGRetryPolicy{
 			Limit:       3,
 			Interval:    time.Minute,
 			Backoff:     2.0,
 			MaxInterval: 10 * time.Minute,
 		}
 
-		th.CreateAttemptWithDAG(t, ts, "retry-run", core.Failed, dag.DAG)
+		th.CreateAttemptWithDAG(t, ts, "retry-run", ir.Failed, dag.DAG)
 
-		statuses, err := th.Store.ListStatuses(th.Context, exec.WithFrom(exec.NewUTC(ts)))
+		statuses, err := th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{From: persis.NewUTC(ts)})
 		require.NoError(t, err)
 		require.Len(t, statuses, 1)
 		assert.Equal(t, 3, statuses[0].AutoRetryLimit)
@@ -874,138 +1057,56 @@ func TestListStatuses(t *testing.T) {
 }
 
 func TestLatestStatusTimezone(t *testing.T) {
-	t.Run("LatestStatusTodayTimezoneIssue", func(t *testing.T) {
-		// Simulate Europe/Paris timezone (UTC+2 in summer, UTC+1 in winter)
-		parisLoc, err := time.LoadLocation("Europe/Paris")
-		require.NoError(t, err)
+	paris, err := time.LoadLocation("Europe/Paris")
+	require.NoError(t, err)
 
-		// Create a test store with Paris timezone
-		tmpDir, err := os.MkdirTemp("", "test")
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			_ = os.RemoveAll(tmpDir)
-		})
-
-		store := New(tmpDir,
-			WithLatestStatusToday(true),
-			WithLocation(parisLoc),
-		)
-
-		th := StoreTest{
-			Context: context.Background(),
-			Store:   store,
-			TmpDir:  tmpDir,
-		}
-
-		// Create a DAG run at 00:00 Paris time on June 8, 2025
-		// This is 22:00 UTC on June 7, 2025 (during DST, Paris is UTC+2)
-		parisTime := time.Date(2025, 6, 8, 0, 0, 0, 0, parisLoc)
-		utcTime := parisTime.UTC()
-
-		// Verify our assumption about the time conversion
-		assert.Equal(t, "2025-06-07 22:00:00 +0000 UTC", utcTime.String())
-
-		// Create the DAG run at 00:00 Paris time
-		th.CreateAttempt(t, utcTime, "midnight-run", core.Succeeded)
-
-		// Simulate checking the status on June 8, 2025 at 10:00 UTC
-		// (which is 12:00 Paris time on the same day)
-		// The bug is that LatestAttempt uses time.Now() without considering the configured timezone
-		// It will think "today" is June 8 in server time, but the run was at June 7 22:00 UTC
-		// So it won't find the run that happened at 00:00 Paris time (June 7 22:00 UTC)
-
-		// To simulate this, we'd need to mock time.Now(), but we can demonstrate the issue
-		// by showing that when we look for runs "today" using UTC, we miss the Paris midnight run
-
-		// With the fix, when we look for "today's" runs using Paris timezone,
-		// it should find the run that happened at 00:00 Paris time (22:00 UTC previous day)
-		// because it's "today" in Paris timezone.
-
-		// To properly test this, we'd need to mock time.Now() to be on June 8, 2025
-		// For now, let's verify that the timezone is properly set in the store
-		obj := th.Store.(*Store)
-		assert.Equal(t, parisLoc, obj.location)
-		assert.True(t, obj.latestStatusToday)
-
-		// Verify the run exists when checking without latestStatusToday
-		obj.latestStatusToday = false
-		attempt, err := th.Store.LatestAttempt(th.Context, "test_DAG")
-		require.NoError(t, err)
-
-		dagRunStatus, err := attempt.ReadStatus(th.Context)
-		require.NoError(t, err)
-		assert.Equal(t, "midnight-run", dagRunStatus.DAGRunID)
+	now := time.Date(2025, 6, 8, 10, 0, 0, 0, time.UTC)
+	backend := NewStore(t.TempDir())
+	repository := persis.NewDAGRunRepository(backend, nil, persis.DAGRunRepositoryOptions{
+		LatestStatusToday: true,
+		Location:          paris,
+		Now:               func() time.Time { return now },
 	})
+	th := RepositoryTest{
+		Context:    context.Background(),
+		Repository: repository,
+		Backend:    backend,
+		TmpDir:     backend.baseDir,
+	}
 
-	t.Run("LatestStatusTodayVerifyFix", func(t *testing.T) {
-		// This test verifies that when we create runs at different times,
-		// the "today" calculation uses the configured timezone correctly
+	startOfDay := time.Date(2025, 6, 8, 0, 0, 0, 0, paris)
+	th.CreateAttempt(t, startOfDay, "midnight-run", ir.Succeeded)
 
-		// Use Asia/Tokyo timezone (UTC+9)
-		tokyoLoc, err := time.LoadLocation("Asia/Tokyo")
-		require.NoError(t, err)
-
-		// Create a test store with Tokyo timezone
-		tmpDir, err := os.MkdirTemp("", "test")
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			_ = os.RemoveAll(tmpDir)
-		})
-
-		store := New(tmpDir,
-			WithLatestStatusToday(true),
-			WithLocation(tokyoLoc),
-		)
-
-		th := StoreTest{
-			Context: context.Background(),
-			Store:   store,
-			TmpDir:  tmpDir,
-		}
-
-		// Create a run "today" in the configured timezone
-		now := time.Now().In(tokyoLoc)
-		todayInTokyo := time.Date(now.Year(), now.Month(), now.Day(), 1, 0, 0, 0, tokyoLoc)
-
-		th.CreateAttempt(t, todayInTokyo, "tokyo-today-run", core.Succeeded)
-
-		// This should find the run because it's "today" in Tokyo timezone
-		attempt, err := th.Store.LatestAttempt(th.Context, "test_DAG")
-		require.NoError(t, err)
-
-		dagRunStatus, err := attempt.ReadStatus(th.Context)
-		require.NoError(t, err)
-		assert.Equal(t, "tokyo-today-run", dagRunStatus.DAGRunID)
-	})
+	attempt, err := repository.LatestAttempt(th.Context, "test_DAG", persis.DAGRunLatestAttemptOptions{})
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(th.Context)
+	require.NoError(t, err)
+	assert.Equal(t, "midnight-run", status.DAGRunID)
 }
 
 func TestListStatuses_RemainingCountWithFilters(t *testing.T) {
-	th := setupTestStore(t)
+	th := setupTestRepository(t)
 
 	ts := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Create 10 runs: 5 succeeded, 5 failed.
 	for i := range 5 {
-		th.CreateAttempt(t, ts.Add(time.Duration(i)*time.Second), fmt.Sprintf("success-%d", i), core.Succeeded)
+		th.CreateAttempt(t, ts.Add(time.Duration(i)*time.Second), fmt.Sprintf("success-%d", i), ir.Succeeded)
 	}
 	for i := range 5 {
-		th.CreateAttempt(t, ts.Add(time.Duration(i+5)*time.Second), fmt.Sprintf("failed-%d", i), core.Failed)
+		th.CreateAttempt(t, ts.Add(time.Duration(i+5)*time.Second), fmt.Sprintf("failed-%d", i), ir.Failed)
 	}
 
 	// Filter by Succeeded status with limit 10.
 	// Before the fix, len(dagRuns) would consume the budget even for filtered-out runs,
 	// potentially returning fewer results than expected.
-	statuses, err := th.Store.ListStatuses(th.Context,
-		exec.WithStatuses([]core.Status{core.Succeeded}),
-		exec.WithFrom(exec.NewUTC(ts)),
-		func(o *exec.ListDAGRunStatusesOptions) { o.Limit = 10 },
-	)
+	statuses, err := th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Statuses: []ir.Status{ir.Succeeded}, From: persis.NewUTC(ts), Limit: 10})
 	require.NoError(t, err)
 	// Should return all 5 succeeded runs, not fewer.
 	assert.Len(t, statuses, 5)
 
 	for _, s := range statuses {
-		assert.Equal(t, core.Succeeded, s.Status)
+		assert.Equal(t, ir.Succeeded, s.Status)
 	}
 }
 
@@ -1023,7 +1124,7 @@ func TestResolveStatus_FastPath(t *testing.T) {
 		summary: &DAGRunSummary{
 			Name:           "test-dag",
 			DagRunID:       "test-run",
-			Status:         core.Succeeded,
+			Status:         ir.Succeeded,
 			StartedAtUnix:  1705320000,
 			FinishedAtUnix: 1705320060,
 			Labels:         []string{"env=prod"},
@@ -1031,7 +1132,7 @@ func TestResolveStatus_FastPath(t *testing.T) {
 			Params:         "key=val",
 			QueuedAt:       "2024-01-15T12:00:00Z",
 			ScheduleTime:   "2024-01-15T11:55:00Z",
-			TriggerType:    core.TriggerType(1),
+			TriggerType:    ir.TriggerType(1),
 			CreatedAt:      1705320000000,
 			LeaseAt:        1705320030000,
 		},
@@ -1041,7 +1142,7 @@ func TestResolveStatus_FastPath(t *testing.T) {
 	require.NotNil(t, status)
 	assert.Equal(t, "test-dag", status.Name)
 	assert.Equal(t, "test-run", status.DAGRunID)
-	assert.Equal(t, core.Succeeded, status.Status)
+	assert.Equal(t, ir.Succeeded, status.Status)
 	assert.Equal(t, []string{"env=prod"}, status.Labels)
 	assert.Equal(t, "2024-01-15T12:00:00Z", status.StartedAt)
 	assert.Equal(t, "2024-01-15T12:01:00Z", status.FinishedAt)
@@ -1059,12 +1160,12 @@ func TestResolveStatus_FastPath_StatusFilterReject(t *testing.T) {
 
 	dagRun := &DAGRun{
 		summary: &DAGRunSummary{
-			Status: core.Succeeded,
+			Status: ir.Succeeded,
 		},
 	}
 
 	// Filter only for Failed — should reject Succeeded.
-	statusesFilter := map[core.Status]struct{}{core.Failed: {}}
+	statusesFilter := map[ir.Status]struct{}{ir.Failed: {}}
 	status := store.resolveStatus(ctx, dagRun, nil, nil, statusesFilter, true)
 	assert.Nil(t, status)
 }
@@ -1075,50 +1176,50 @@ func TestResolveStatus_FastPath_LabelFilterReject(t *testing.T) {
 
 	dagRun := &DAGRun{
 		summary: &DAGRunSummary{
-			Status: core.Succeeded,
+			Status: ir.Succeeded,
 			Labels: []string{"env=dev"},
 		},
 	}
 
-	labelFilters := []core.LabelFilter{core.ParseLabelFilter("env=prod")}
+	labelFilters := []ir.LabelFilter{ir.ParseLabelFilter("env=prod")}
 	status := store.resolveStatus(ctx, dagRun, labelFilters, nil, nil, false)
 	assert.Nil(t, status)
 }
 
 func TestResolveStatus_StandardPath(t *testing.T) {
-	th := setupTestStore(t)
+	th := setupTestRepository(t)
 
 	ts := time.Date(2021, 6, 1, 0, 0, 0, 0, time.UTC)
 	dag := th.DAG("std-path-dag")
-	dag.Labels = core.NewLabels([]string{"env=prod"})
-	th.CreateAttemptWithDAG(t, ts, "std-run-1", core.Succeeded, dag.DAG)
+	dag.Labels = ir.NewLabels([]string{"env=prod"})
+	th.CreateAttemptWithDAG(t, ts, "std-run-1", ir.Succeeded, dag.DAG)
 
-	store := th.Store.(*Store)
+	store := th.Backend
 	ctx := context.Background()
 
 	root := NewDataRoot(th.TmpDir, "std-path-dag")
-	start := exec.NewUTC(ts)
-	end := exec.NewUTC(ts.Add(24 * time.Hour))
+	start := persis.NewUTC(ts)
+	end := persis.NewUTC(ts.Add(24 * time.Hour))
 	dagRuns := root.listDAGRunsInRange(ctx, start, end, nil)
 	require.NotEmpty(t, dagRuns)
 
 	// Standard path (no summary) with matching label filter.
-	labelFilters := []core.LabelFilter{core.ParseLabelFilter("env=prod")}
+	labelFilters := []ir.LabelFilter{ir.ParseLabelFilter("env=prod")}
 	status := store.resolveStatus(ctx, dagRuns[0], labelFilters, nil, nil, false)
 	require.NotNil(t, status, "should resolve status via standard path with matching label")
 
 	// Standard path with non-matching label filter.
-	labelFilters = []core.LabelFilter{core.ParseLabelFilter("env=staging")}
+	labelFilters = []ir.LabelFilter{ir.ParseLabelFilter("env=staging")}
 	status = store.resolveStatus(ctx, dagRuns[0], labelFilters, nil, nil, false)
 	assert.Nil(t, status, "should reject via standard path when label doesn't match")
 
 	// Standard path with matching status filter.
-	statusFilter := map[core.Status]struct{}{core.Succeeded: {}}
+	statusFilter := map[ir.Status]struct{}{ir.Succeeded: {}}
 	status = store.resolveStatus(ctx, dagRuns[0], nil, nil, statusFilter, true)
 	require.NotNil(t, status, "should resolve via standard path with matching status")
 
 	// Standard path with non-matching status filter.
-	statusFilter = map[core.Status]struct{}{core.Failed: {}}
+	statusFilter = map[ir.Status]struct{}{ir.Failed: {}}
 	status = store.resolveStatus(ctx, dagRuns[0], nil, nil, statusFilter, true)
 	assert.Nil(t, status, "should reject via standard path when status doesn't match")
 }
@@ -1140,89 +1241,76 @@ func TestResolveStatus_StandardPath_NoAttempt(t *testing.T) {
 }
 
 func TestListStatuses_WithAllHistoryBypassesDefaultTodayWindow(t *testing.T) {
-	th := setupTestStore(t)
+	th := setupTestRepository(t)
 
 	oldTs := time.Now().UTC().Add(-48 * time.Hour)
-	th.CreateAttempt(t, oldTs, "old-run", core.Running)
+	th.CreateAttempt(t, oldTs, "old-run", ir.Running)
 
-	statuses, err := th.Store.ListStatuses(th.Context,
-		exec.WithStatuses([]core.Status{core.Running}),
-		exec.WithoutLimit(),
-	)
+	statuses, err := th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Statuses: []ir.Status{ir.Running}, Unbounded: true})
 	require.NoError(t, err)
 	require.Empty(t, statuses)
 
-	statuses, err = th.Store.ListStatuses(th.Context,
-		exec.WithStatuses([]core.Status{core.Running}),
-		exec.WithoutLimit(),
-		exec.WithAllHistory(),
-	)
+	statuses, err = th.Repository.ListStatuses(th.Context, persis.DAGRunListOptions{Statuses: []ir.Status{ir.Running}, Unbounded: true, AllHistory: true})
 	require.NoError(t, err)
 	require.Len(t, statuses, 1)
 	assert.Equal(t, "old-run", statuses[0].DAGRunID)
 }
 
 func TestListStatusesPage(t *testing.T) {
-	t.Run("IndexPathPreservesArchiveDir", func(t *testing.T) {
-		th := setupTestStore(t)
+	t.Run("IndexPathPreservesRunSummary", func(t *testing.T) {
+		th := setupTestRepository(t)
 
 		base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 		dag := th.DAG("artifact-dag")
 		artifactDir := filepath.Join(th.TmpDir, "artifacts", "artifact-dag", "artifact-run")
 
-		attempt, err := th.Store.CreateAttempt(th.Context, dag.DAG, base, "artifact-run", exec.NewDAGRunAttemptOptions{})
+		attempt, err := th.Repository.CreateAttempt(th.Context, dag.DAG, base, "artifact-run", persis.DAGRunCreateAttemptOptions{})
 		require.NoError(t, err)
 		require.NoError(t, attempt.Open(th.Context))
 		defer func() {
 			require.NoError(t, attempt.Close(th.Context))
 		}()
 
-		status := exec.InitialStatus(dag.DAG)
+		status := ir.InitialStatus(dag.DAG)
 		status.DAGRunID = "artifact-run"
-		status.Status = core.Succeeded
+		status.Status = ir.Succeeded
 		status.ArchiveDir = artifactDir
+		status.TriggerActor = "alice"
 		require.NoError(t, attempt.Write(th.Context, status))
 
 		for i := range 9 {
-			th.CreateAttemptWithDAG(t, base.Add(time.Duration(i+1)*time.Second), fmt.Sprintf("filler-run-%d", i), core.Succeeded, dag.DAG)
+			th.CreateAttemptWithDAG(t, base.Add(time.Duration(i+1)*time.Second), fmt.Sprintf("filler-run-%d", i), ir.Succeeded, dag.DAG)
 		}
 
-		_, err = th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithDAGRunID("artifact-run"),
-			exec.WithLimit(20),
+		_, err = th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, DAGRunID: "artifact-run", Limit: 20},
 		)
 		require.NoError(t, err)
 
-		page, err := th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithDAGRunID("artifact-run"),
-			exec.WithLimit(20),
+		page, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, DAGRunID: "artifact-run", Limit: 20},
 		)
 		require.NoError(t, err)
 		require.Len(t, page.Items, 1)
 		assert.Equal(t, artifactDir, page.Items[0].ArchiveDir)
+		assert.Equal(t, "alice", page.Items[0].TriggerActor)
 	})
 
 	t.Run("ForwardPaginationHasDeterministicOrderWithoutDuplicates", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
 		base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 		alpha := th.DAG("alpha")
 		beta := th.DAG("beta")
 
-		th.CreateAttemptWithDAG(t, base.Add(3*time.Second), "run-4", core.Succeeded, beta.DAG)
-		th.CreateAttemptWithDAG(t, base.Add(2*time.Second), "run-3", core.Succeeded, alpha.DAG)
-		th.CreateAttemptWithDAG(t, base.Add(1*time.Second), "run-2", core.Succeeded, beta.DAG)
-		th.CreateAttemptWithDAG(t, base.Add(1*time.Second), "run-1", core.Succeeded, alpha.DAG)
-		th.CreateAttemptWithDAG(t, base, "run-0", core.Succeeded, alpha.DAG)
+		th.CreateAttemptWithDAG(t, base.Add(3*time.Second), "run-4", ir.Succeeded, beta.DAG)
+		th.CreateAttemptWithDAG(t, base.Add(2*time.Second), "run-3", ir.Succeeded, alpha.DAG)
+		th.CreateAttemptWithDAG(t, base.Add(1*time.Second), "run-2", ir.Succeeded, beta.DAG)
+		th.CreateAttemptWithDAG(t, base.Add(1*time.Second), "run-1", ir.Succeeded, alpha.DAG)
+		th.CreateAttemptWithDAG(t, base, "run-0", ir.Succeeded, alpha.DAG)
 
-		page1, err := th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithLimit(2),
+		page1, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Limit: 2},
 		)
 		require.NoError(t, err)
 		require.Len(t, page1.Items, 2)
@@ -1232,11 +1320,8 @@ func TestListStatusesPage(t *testing.T) {
 			page1.Items[1].Name + "/" + page1.Items[1].DAGRunID,
 		})
 
-		page2, err := th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithLimit(2),
-			exec.WithCursor(page1.NextCursor),
+		page2, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Limit: 2, Cursor: page1.NextCursor},
 		)
 		require.NoError(t, err)
 		require.Len(t, page2.Items, 2)
@@ -1246,11 +1331,8 @@ func TestListStatusesPage(t *testing.T) {
 			page2.Items[1].Name + "/" + page2.Items[1].DAGRunID,
 		})
 
-		page3, err := th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithLimit(2),
-			exec.WithCursor(page2.NextCursor),
+		page3, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Limit: 2, Cursor: page2.NextCursor},
 		)
 		require.NoError(t, err)
 		require.Len(t, page3.Items, 1)
@@ -1258,7 +1340,7 @@ func TestListStatusesPage(t *testing.T) {
 		assert.Equal(t, "run-0", page3.Items[0].DAGRunID)
 
 		seen := make(map[string]struct{})
-		for _, page := range [][]*exec.DAGRunStatus{page1.Items, page2.Items, page3.Items} {
+		for _, page := range [][]*ir.DAGRunStatus{page1.Items, page2.Items, page3.Items} {
 			for _, item := range page {
 				key := item.Name + "/" + item.DAGRunID
 				if _, ok := seen[key]; ok {
@@ -1270,55 +1352,119 @@ func TestListStatusesPage(t *testing.T) {
 	})
 
 	t.Run("CursorRejectsChangedFilters", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
 		ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
-		th.CreateAttempt(t, ts, "run-1", core.Succeeded)
-		th.CreateAttempt(t, ts.Add(-time.Second), "run-0", core.Succeeded)
+		th.CreateAttempt(t, ts, "run-1", ir.Succeeded)
+		th.CreateAttempt(t, ts.Add(-time.Second), "run-0", ir.Succeeded)
 
-		page, err := th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithStatuses([]core.Status{core.Succeeded}),
-			exec.WithLimit(1),
+		page, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Statuses: []ir.Status{ir.Succeeded}, Limit: 1},
 		)
 		require.NoError(t, err)
 		require.NotEmpty(t, page.NextCursor)
 
-		_, err = th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithStatuses([]core.Status{core.Failed}),
-			exec.WithLimit(1),
-			exec.WithCursor(page.NextCursor),
+		_, err = th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Statuses: []ir.Status{ir.Failed}, Limit: 1, Cursor: page.NextCursor},
 		)
-		require.ErrorIs(t, err, ErrInvalidQueryCursor)
+		require.ErrorIs(t, err, persis.ErrInvalidDAGRunQueryCursor)
+	})
+
+	t.Run("CursorRejectsVersionTwo", func(t *testing.T) {
+		th := setupTestRepository(t)
+		payload, err := json.Marshal(queryCursorPayload{
+			Version:    2,
+			FilterHash: "legacy",
+			Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+			Name:       "daily",
+			DAGRunID:   "run-1",
+		})
+		require.NoError(t, err)
+
+		_, err = th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Cursor: base64.RawURLEncoding.EncodeToString(payload)},
+		)
+		require.ErrorIs(t, err, persis.ErrInvalidDAGRunQueryCursor)
+	})
+
+	t.Run("CursorTracksWorkspaceVisibility", func(t *testing.T) {
+		th := setupTestRepository(t)
+
+		ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+		th.CreateAttempt(t, ts, "run-1", ir.Succeeded)
+		th.CreateAttempt(t, ts.Add(-time.Second), "run-0", ir.Succeeded)
+
+		page, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, WorkspaceFilter: &workspace.WorkspaceFilter{
+				Enabled:           true,
+				Workspaces:        []string{"ops", "dev"},
+				IncludeUnlabelled: true,
+			}, Limit: 1},
+		)
+		require.NoError(t, err)
+		require.NotEmpty(t, page.NextCursor)
+
+		continued, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, WorkspaceFilter: &workspace.WorkspaceFilter{
+				Enabled:           true,
+				Workspaces:        []string{"dev", "ops"},
+				IncludeUnlabelled: true,
+			}, Limit: 1, Cursor: page.NextCursor},
+		)
+		require.NoError(t, err)
+		require.Len(t, continued.Items, 1)
+
+		_, err = th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, WorkspaceFilter: &workspace.WorkspaceFilter{
+				Enabled:    true,
+				Workspaces: []string{"dev", "ops"},
+			}, Limit: 1, Cursor: page.NextCursor},
+		)
+		require.ErrorIs(t, err, persis.ErrInvalidDAGRunQueryCursor)
+	})
+
+	t.Run("CursorTreatsDisabledWorkspaceFilterAsUnrestricted", func(t *testing.T) {
+		th := setupTestRepository(t)
+
+		ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+		th.CreateAttempt(t, ts, "run-1", ir.Succeeded)
+		th.CreateAttempt(t, ts.Add(-time.Second), "run-0", ir.Succeeded)
+
+		page, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Limit: 1},
+		)
+		require.NoError(t, err)
+		require.NotEmpty(t, page.NextCursor)
+
+		continued, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, WorkspaceFilter: &workspace.WorkspaceFilter{
+				Workspaces:        []string{"ignored"},
+				IncludeUnlabelled: true,
+			}, Limit: 1, Cursor: page.NextCursor},
+		)
+		require.NoError(t, err)
+		require.Len(t, continued.Items, 1)
 	})
 
 	t.Run("NewerRunsAfterPageOneDoNotCorruptContinuation", func(t *testing.T) {
-		th := setupTestStore(t)
+		th := setupTestRepository(t)
 
 		base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
-		th.CreateAttempt(t, base.Add(2*time.Second), "run-2", core.Succeeded)
-		th.CreateAttempt(t, base.Add(1*time.Second), "run-1", core.Succeeded)
-		th.CreateAttempt(t, base, "run-0", core.Succeeded)
+		th.CreateAttempt(t, base.Add(2*time.Second), "run-2", ir.Succeeded)
+		th.CreateAttempt(t, base.Add(1*time.Second), "run-1", ir.Succeeded)
+		th.CreateAttempt(t, base, "run-0", ir.Succeeded)
 
-		page1, err := th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithLimit(2),
+		page1, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Limit: 2},
 		)
 		require.NoError(t, err)
 		require.Len(t, page1.Items, 2)
 		require.NotEmpty(t, page1.NextCursor)
 
-		th.CreateAttempt(t, base.Add(3*time.Second), "run-3", core.Succeeded)
+		th.CreateAttempt(t, base.Add(3*time.Second), "run-3", ir.Succeeded)
 
-		page2, err := th.Store.ListStatusesPage(
-			th.Context,
-			exec.WithAllHistory(),
-			exec.WithLimit(2),
-			exec.WithCursor(page1.NextCursor),
+		page2, err := th.Repository.ListStatusesPage(
+			th.Context, persis.DAGRunListOptions{AllHistory: true, Limit: 2, Cursor: page1.NextCursor},
 		)
 		require.NoError(t, err)
 		require.Len(t, page2.Items, 1)

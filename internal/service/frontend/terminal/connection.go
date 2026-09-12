@@ -18,8 +18,8 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/creack/pty"
-	"github.com/dagucloud/dagu/internal/auth"
-	"github.com/dagucloud/dagu/internal/service/audit"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/google/uuid"
 )
 
@@ -402,8 +402,7 @@ func classifyProcessExit(err error) runEvent {
 		}
 	}
 
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[*exec.ExitError](err); ok {
 		return runEvent{
 			reason:        terminalEndReasonShellExit,
 			sendError:     "Shell closed: " + err.Error(),

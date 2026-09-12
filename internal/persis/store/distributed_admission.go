@@ -13,8 +13,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 const (
@@ -38,7 +39,7 @@ type dispatchAdmissionAttemptPayload struct {
 	QueueName        string                 `json:"queueName"`
 	AttemptKey       string                 `json:"attemptKey"`
 	AttemptID        string                 `json:"attemptId"`
-	DAGRun           exec.DAGRunRef         `json:"dagRun"`
+	DAGRun           ir.DAGRunRef           `json:"dagRun"`
 	State            dispatchAdmissionState `json:"state"`
 	ReservationToken string                 `json:"reservationToken"`
 	SlotID           string                 `json:"slotId,omitempty"`
@@ -52,13 +53,13 @@ type dispatchAdmissionAttemptPayload struct {
 }
 
 type dispatchAdmissionSlotPayload struct {
-	Version          int            `json:"version"`
-	QueueName        string         `json:"queueName"`
-	AttemptKey       string         `json:"attemptKey"`
-	AttemptID        string         `json:"attemptId"`
-	DAGRun           exec.DAGRunRef `json:"dagRun"`
-	ReservationToken string         `json:"reservationToken"`
-	CreatedAt        int64          `json:"createdAt"`
+	Version          int          `json:"version"`
+	QueueName        string       `json:"queueName"`
+	AttemptKey       string       `json:"attemptKey"`
+	AttemptID        string       `json:"attemptId"`
+	DAGRun           ir.DAGRunRef `json:"dagRun"`
+	ReservationToken string       `json:"reservationToken"`
+	CreatedAt        int64        `json:"createdAt"`
 }
 
 type dispatchAdmissionTokenPayload struct {
@@ -71,8 +72,8 @@ type dispatchAdmissionTokenPayload struct {
 
 func (s *DispatchTaskStore) ReserveAdmission(
 	ctx context.Context,
-	req exec.DispatchAdmissionRequest,
-) (*exec.DispatchAdmissionDecision, error) {
+	req dispatch.DispatchAdmissionRequest,
+) (*dispatch.DispatchAdmissionDecision, error) {
 	if err := s.validateAdmissionRequest(req); err != nil {
 		return nil, err
 	}
@@ -87,7 +88,7 @@ func (s *DispatchTaskStore) ReserveAdmission(
 		return nil, err
 	}
 	if occupied >= req.MaxConcurrency {
-		return &exec.DispatchAdmissionDecision{Reason: exec.DispatchAdmissionRejectedNoCapacity}, nil
+		return &dispatch.DispatchAdmissionDecision{Reason: dispatch.DispatchAdmissionRejectedNoCapacity}, nil
 	}
 
 	now := time.Now().UTC()
@@ -118,7 +119,7 @@ func (s *DispatchTaskStore) ReserveAdmission(
 	}
 	if err := s.col.Create(ctx, attemptRec); err != nil {
 		if errors.Is(err, persis.ErrConflict) {
-			return &exec.DispatchAdmissionDecision{Reason: exec.DispatchAdmissionRejectedDuplicate}, nil
+			return &dispatch.DispatchAdmissionDecision{Reason: dispatch.DispatchAdmissionRejectedDuplicate}, nil
 		}
 		return nil, err
 	}
@@ -139,7 +140,7 @@ func (s *DispatchTaskStore) ReserveAdmission(
 			if err := s.deleteAdmissionRecordIfPresent(context.WithoutCancel(ctx), attemptID); err != nil {
 				return nil, err
 			}
-			return &exec.DispatchAdmissionDecision{Reason: exec.DispatchAdmissionRejectedNoCapacity}, nil
+			return &dispatch.DispatchAdmissionDecision{Reason: dispatch.DispatchAdmissionRejectedNoCapacity}, nil
 		}
 
 		for slotNo := 0; slotNo < req.MaxConcurrency; slotNo++ {
@@ -200,12 +201,12 @@ func (s *DispatchTaskStore) ReserveAdmission(
 					return nil, errors.Join(err, cleanupErr)
 				}
 				if errors.Is(err, persis.ErrConflict) || errors.Is(err, persis.ErrNotFound) {
-					return &exec.DispatchAdmissionDecision{Reason: exec.DispatchAdmissionRejectedDuplicate}, nil
+					return &dispatch.DispatchAdmissionDecision{Reason: dispatch.DispatchAdmissionRejectedDuplicate}, nil
 				}
 				return nil, err
 			}
 
-			return &exec.DispatchAdmissionDecision{
+			return &dispatch.DispatchAdmissionDecision{
 				Reserved:         true,
 				ReservationToken: token,
 			}, nil
@@ -213,7 +214,7 @@ func (s *DispatchTaskStore) ReserveAdmission(
 	}
 }
 
-func (s *DispatchTaskStore) BindAdmission(ctx context.Context, req exec.DispatchAdmissionBindRequest) error {
+func (s *DispatchTaskStore) BindAdmission(ctx context.Context, req dispatch.DispatchAdmissionBindRequest) error {
 	if err := s.validateAdmissionConfigured(); err != nil {
 		return err
 	}
@@ -229,18 +230,18 @@ func (s *DispatchTaskStore) BindAdmission(ctx context.Context, req exec.Dispatch
 		return err
 	}
 
-	return retryCAS(ctx, func(ctx context.Context) error {
+	return retryConflict(ctx, func(ctx context.Context) error {
 		attemptRec, attemptPayload, err := s.loadAdmissionAttemptByToken(ctx, req.ReservationToken)
 		if err != nil {
 			return err
 		}
 		if attemptPayload.ReservationToken != req.ReservationToken {
-			return exec.ErrDispatchAdmissionConflict
+			return dispatch.ErrDispatchAdmissionConflict
 		}
 		if attemptPayload.QueueName != req.Task.QueueName ||
 			attemptPayload.AttemptKey != req.Task.AttemptKey ||
 			attemptPayload.AttemptID != "" && req.Task.AttemptID != "" && attemptPayload.AttemptID != req.Task.AttemptID {
-			return exec.ErrDispatchAdmissionConflict
+			return dispatch.ErrDispatchAdmissionConflict
 		}
 		if err := s.verifyAdmissionSlot(ctx, attemptPayload); err != nil {
 			return err
@@ -255,19 +256,19 @@ func (s *DispatchTaskStore) BindAdmission(ctx context.Context, req exec.Dispatch
 				if err := s.deleteAdmissionReservationRecords(ctx, attemptPayload, attemptRec.ID); err != nil {
 					return err
 				}
-				return exec.ErrDispatchAdmissionNotFound
+				return dispatch.ErrDispatchAdmissionNotFound
 			}
 		}
 
 		switch attemptPayload.State {
 		case dispatchAdmissionBound:
 			if attemptPayload.TaskFingerprint != taskFingerprint {
-				return exec.ErrDispatchAdmissionConflict
+				return dispatch.ErrDispatchAdmissionConflict
 			}
 			return nil
 		case dispatchAdmissionBinding:
 			if attemptPayload.TaskFingerprint != taskFingerprint {
-				return exec.ErrDispatchAdmissionConflict
+				return dispatch.ErrDispatchAdmissionConflict
 			}
 			evidence, err := s.dispatchAdmissionHasExecutionEvidence(ctx, attemptPayload, s.reservationTTL)
 			if err != nil {
@@ -293,7 +294,7 @@ func (s *DispatchTaskStore) BindAdmission(ctx context.Context, req exec.Dispatch
 			attemptRec.Data = nextData
 			attemptPayload = nextPayload
 		default:
-			return exec.ErrDispatchAdmissionConflict
+			return dispatch.ErrDispatchAdmissionConflict
 		}
 
 		if err := s.createAdmissionPendingRecord(ctx, attemptPayload, req.Task, taskFingerprint); err != nil {
@@ -317,7 +318,7 @@ func (s *DispatchTaskStore) ReleaseAdmissionToken(ctx context.Context, reservati
 			return err
 		}
 		if evidence {
-			return exec.ErrDispatchAdmissionConflict
+			return dispatch.ErrDispatchAdmissionConflict
 		}
 	}
 	return s.deleteAdmissionReservationRecords(ctx, attemptPayload, attemptRec.ID)
@@ -376,7 +377,7 @@ func (s *DispatchTaskStore) CleanupAdmissions(ctx context.Context, staleThreshol
 	return s.cleanupOrphanAdmissionSlots(ctx, staleThreshold, now)
 }
 
-func (s *DispatchTaskStore) validateAdmissionRequest(req exec.DispatchAdmissionRequest) error {
+func (s *DispatchTaskStore) validateAdmissionRequest(req dispatch.DispatchAdmissionRequest) error {
 	if err := s.validateAdmissionConfigured(); err != nil {
 		return err
 	}
@@ -403,7 +404,7 @@ func (s *DispatchTaskStore) validateAdmissionRequest(req exec.DispatchAdmissionR
 
 func (s *DispatchTaskStore) validateAdmissionConfigured() error {
 	if s.admissionLeaseStore == nil || s.admissionActiveRunStore == nil {
-		return exec.ErrDispatchAdmissionLivenessNotConfigured
+		return dispatch.ErrDispatchAdmissionLivenessNotConfigured
 	}
 	return nil
 }
@@ -509,7 +510,7 @@ func (s *DispatchTaskStore) loadAdmissionAttemptByToken(
 	tokenRec, err := s.col.Get(ctx, dispatchAdmissionTokenRecordID(token))
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return nil, dispatchAdmissionAttemptPayload{}, exec.ErrDispatchAdmissionNotFound
+			return nil, dispatchAdmissionAttemptPayload{}, dispatch.ErrDispatchAdmissionNotFound
 		}
 		return nil, dispatchAdmissionAttemptPayload{}, err
 	}
@@ -518,13 +519,13 @@ func (s *DispatchTaskStore) loadAdmissionAttemptByToken(
 		return nil, dispatchAdmissionAttemptPayload{}, fmt.Errorf("dispatch admission token: decode %q: %w", tokenRec.ID, err)
 	}
 	if tokenPayload.ReservationToken != token || tokenPayload.AttemptRecordID == "" {
-		return nil, dispatchAdmissionAttemptPayload{}, exec.ErrDispatchAdmissionConflict
+		return nil, dispatchAdmissionAttemptPayload{}, dispatch.ErrDispatchAdmissionConflict
 	}
 
 	attemptRec, err := s.col.Get(ctx, tokenPayload.AttemptRecordID)
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return nil, dispatchAdmissionAttemptPayload{}, exec.ErrDispatchAdmissionNotFound
+			return nil, dispatchAdmissionAttemptPayload{}, dispatch.ErrDispatchAdmissionNotFound
 		}
 		return nil, dispatchAdmissionAttemptPayload{}, err
 	}
@@ -537,12 +538,12 @@ func (s *DispatchTaskStore) loadAdmissionAttemptByToken(
 
 func (s *DispatchTaskStore) verifyAdmissionSlot(ctx context.Context, attempt dispatchAdmissionAttemptPayload) error {
 	if attempt.SlotID == "" {
-		return exec.ErrDispatchAdmissionConflict
+		return dispatch.ErrDispatchAdmissionConflict
 	}
 	slotRec, err := s.col.Get(ctx, attempt.SlotID)
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return exec.ErrDispatchAdmissionNotFound
+			return dispatch.ErrDispatchAdmissionNotFound
 		}
 		return err
 	}
@@ -553,7 +554,7 @@ func (s *DispatchTaskStore) verifyAdmissionSlot(ctx context.Context, attempt dis
 	if slot.QueueName != attempt.QueueName ||
 		slot.AttemptKey != attempt.AttemptKey ||
 		slot.ReservationToken != attempt.ReservationToken {
-		return exec.ErrDispatchAdmissionConflict
+		return dispatch.ErrDispatchAdmissionConflict
 	}
 	return nil
 }
@@ -561,7 +562,23 @@ func (s *DispatchTaskStore) verifyAdmissionSlot(ctx context.Context, attempt dis
 func (s *DispatchTaskStore) createAdmissionPendingRecord(
 	ctx context.Context,
 	attempt dispatchAdmissionAttemptPayload,
-	task *exec.DispatchTask,
+	task *dispatch.DispatchTask,
+	taskFingerprint string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if task.WorkspaceBundleDigest == "" {
+		return s.createPendingRecord(ctx, attempt, task, taskFingerprint)
+	}
+	return s.withTransitionLock(ctx, func(lockCtx context.Context) error {
+		return s.createPendingRecord(lockCtx, attempt, task, taskFingerprint)
+	})
+}
+
+func (s *DispatchTaskStore) createPendingRecord(
+	ctx context.Context,
+	attempt dispatchAdmissionAttemptPayload,
+	task *dispatch.DispatchTask,
 	taskFingerprint string,
 ) error {
 	now := time.Now().UTC()
@@ -592,21 +609,19 @@ func (s *DispatchTaskStore) createAdmissionPendingRecord(
 			return err
 		}
 		if existingPayload.AdmissionReservationToken != attempt.ReservationToken {
-			return exec.ErrDispatchAdmissionConflict
+			return dispatch.ErrDispatchAdmissionConflict
 		}
 		existingFingerprint, err := dispatchAdmissionTaskFingerprint(existingPayload.Task)
 		if err != nil {
 			return err
 		}
 		if existingFingerprint != taskFingerprint {
-			return exec.ErrDispatchAdmissionConflict
+			return dispatch.ErrDispatchAdmissionConflict
 		}
 		return nil
 	}
 	if s.index != nil {
-		s.mu.Lock()
 		s.index.addPending(rec, payload)
-		s.mu.Unlock()
 	}
 	return nil
 }
@@ -659,7 +674,7 @@ func (s *DispatchTaskStore) dispatchAdmissionHasExecutionEvidence(
 		if lease.IsFresh(time.Now().UTC(), staleThreshold) {
 			return true, nil
 		}
-	case errors.Is(err, exec.ErrDAGRunLeaseNotFound):
+	case errors.Is(err, dispatch.ErrDAGRunLeaseNotFound):
 	default:
 		return false, err
 	}
@@ -668,7 +683,7 @@ func (s *DispatchTaskStore) dispatchAdmissionHasExecutionEvidence(
 	switch {
 	case err == nil:
 		return true, nil
-	case errors.Is(err, exec.ErrActiveRunNotFound):
+	case errors.Is(err, dispatch.ErrActiveRunNotFound):
 		return false, nil
 	default:
 		return false, err
@@ -845,12 +860,12 @@ func dispatchLegacyOccupancyKey(kind, key string) string {
 	return kind + "\x00" + key
 }
 
-func dispatchAdmissionTaskFingerprint(task *exec.DispatchTask) (string, error) {
+func dispatchAdmissionTaskFingerprint(task *dispatch.DispatchTask) (string, error) {
 	if task == nil {
 		return "", fmt.Errorf("dispatch task is required")
 	}
 	stable := cloneDispatchTask(task)
-	stable.Owner = exec.CoordinatorEndpoint{}
+	stable.Owner = dispatch.CoordinatorEndpoint{}
 	stable.ClaimToken = ""
 	data, err := json.Marshal(stable)
 	if err != nil {

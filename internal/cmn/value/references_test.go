@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,6 +60,82 @@ func TestScanReferencesMarksExactStepOutputRefs(t *testing.T) {
 	assert.Equal(t, "${steps.extract.outputs.user}", outputRefs[0].Expression)
 }
 
+func TestIsExactRef(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		token string
+		want  bool
+	}{
+		{token: "${consts.template}", want: true},
+		{token: "${params.template}", want: true},
+		{token: "${env.TEMPLATE}", want: true},
+		{token: "${steps.fetch.outputs.template}", want: true},
+		{token: "${foreach.item}", want: true},
+		{token: "${foreach.item.template}", want: true},
+		{token: "${context.run.id}", want: true},
+		{token: "${params}", want: false},
+		{token: "${run.id}", want: false},
+		{token: "${TEMPLATE}", want: false},
+		{token: "$env.TEMPLATE", want: false},
+		{token: "${ env.TEMPLATE }", want: false},
+		{token: "prefix-${env.TEMPLATE}", want: false},
+		{token: "${env.TEMPLATE}-${params.suffix}", want: false},
+		{token: `\${env.TEMPLATE}`, want: false},
+	}
+
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, value.IsExactRef(tt.token), tt.token)
+	}
+}
+
+func TestHasStepRuntimeOutputReference(t *testing.T) {
+	t.Parallel()
+
+	for _, input := range []string{
+		"${build.stdout}",
+		"${build.stderr:1:2}",
+		"${build.exitCode}",
+		"${build.exit_code}",
+		"${build.output}",
+		"${build.output.result}",
+		"${build.outputs}",
+		"$build.outputs.result",
+	} {
+		assert.True(t, value.HasStepRuntimeOutputReference(input, "build"), input)
+	}
+
+	for _, input := range []string{
+		"${steps.build.outputs.artifact}",
+		"${other.stdout}",
+		"${build.status}",
+		"${build.stdout:-1}",
+	} {
+		assert.False(t, value.HasStepRuntimeOutputReference(input, "build"), input)
+	}
+}
+
+func TestHasReferenceToNamespace(t *testing.T) {
+	t.Parallel()
+
+	for _, input := range []string{
+		"${inputs.source}",
+		"$inputs.source",
+		"prefix ${outputs.artifact}",
+		"prefix $outputs.artifact",
+	} {
+		assert.True(t, value.HasReferenceToNamespace(input, "inputs", "outputs"), input)
+	}
+
+	for _, input := range []string{
+		"${params.source}",
+		"$build.output",
+		`\${inputs.source}`,
+	} {
+		assert.False(t, value.HasReferenceToNamespace(input, "inputs", "outputs"), input)
+	}
+}
+
 func TestResolverStringResolvesParamsAndPreservesOtherNamespaces(t *testing.T) {
 	t.Parallel()
 
@@ -85,6 +161,42 @@ func TestResolverStringResolvesParamsAndPreservesOtherNamespaces(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "api:prod:/workspace:repo/api:v1", got)
+}
+
+func TestResolverStringResolvesRootParamsPayload(t *testing.T) {
+	t.Parallel()
+
+	const paramsJSON = `{"environment":"prod","tag":"v1"}`
+	resolver := value.NewResolver(
+		value.StaticScope{
+			Params: value.Values{"environment": nil, "tag": nil},
+		},
+		value.RuntimeScope{
+			Params:     value.Values{"environment": "prod", "tag": "v1"},
+			ParamsJSON: paramsJSON,
+		},
+	)
+
+	got, err := resolver.String(context.Background(), "${params}", value.WorkflowField("run"))
+	require.NoError(t, err)
+	assert.Equal(t, paramsJSON, got)
+}
+
+func TestResolverStringResolvesRootParamsPayloadWithStaticConsts(t *testing.T) {
+	t.Parallel()
+
+	resolver := value.NewResolver(
+		value.StaticScope{
+			Consts: value.Values{"service": "api"},
+		},
+		value.RuntimeScope{
+			ParamsJSON: `{"environment":"prod"}`,
+		},
+	)
+
+	got, err := resolver.String(context.Background(), "${consts.service}:${params}", value.WorkflowField("run"))
+	require.NoError(t, err)
+	assert.Equal(t, `api:{"environment":"prod"}`, got)
 }
 
 func TestResolverWorkflowFieldPreservesCommandSubstitution(t *testing.T) {

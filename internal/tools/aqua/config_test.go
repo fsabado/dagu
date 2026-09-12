@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	aquaconfig "github.com/aquaproj/aqua/v2/pkg/config/aqua"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/tools"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/tools"
 	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,14 +17,14 @@ import (
 func TestRenderConfigUsesAquaPackageNames(t *testing.T) {
 	t.Parallel()
 
-	data, err := RenderConfigForPlatform(&core.ToolConfig{
+	data, err := RenderConfigForPlatform(&ir.ToolConfig{
 		Provider: "aqua",
-		Registry: &core.ToolRegistry{
+		Registry: &ir.ToolRegistry{
 			Name: "standard",
 			Type: "standard",
 			Ref:  "v4.233.0",
 		},
-		Packages: []core.ToolPackage{{
+		Packages: []ir.ToolPackage{{
 			Name:     "jq",
 			Package:  "jqlang/jq",
 			Version:  "jq-1.7.1",
@@ -53,9 +53,9 @@ func TestRenderConfigUsesAquaPackageNames(t *testing.T) {
 func TestRenderConfigDefaultsStandardRegistry(t *testing.T) {
 	t.Parallel()
 
-	data, err := RenderConfigForPlatform(&core.ToolConfig{
+	data, err := RenderConfigForPlatform(&ir.ToolConfig{
 		Provider: "aqua",
-		Packages: []core.ToolPackage{{
+		Packages: []ir.ToolPackage{{
 			Name:     "jq",
 			Package:  "jqlang/jq",
 			Version:  "jq-1.7.1",
@@ -67,7 +67,7 @@ func TestRenderConfigDefaultsStandardRegistry(t *testing.T) {
 	var parsed aquaconfig.Config
 	require.NoError(t, yaml.Unmarshal(data, &parsed))
 	require.Contains(t, parsed.Registries, "standard")
-	assert.Equal(t, core.DefaultAquaStandardRegistryRef, parsed.Registries["standard"].Ref)
+	assert.Equal(t, ir.DefaultAquaStandardRegistryRef, parsed.Registries["standard"].Ref)
 	assert.Regexp(t, `^[0-9a-f]{40}$`, parsed.Registries["standard"].Ref)
 	require.Len(t, parsed.Packages, 1)
 	assert.Equal(t, "standard", parsed.Packages[0].Registry)
@@ -76,9 +76,9 @@ func TestRenderConfigDefaultsStandardRegistry(t *testing.T) {
 func TestEffectiveToolConfigDeepCopiesPackageCommands(t *testing.T) {
 	t.Parallel()
 
-	cfg := &core.ToolConfig{
+	cfg := &ir.ToolConfig{
 		Provider: "aqua",
-		Packages: []core.ToolPackage{{
+		Packages: []ir.ToolPackage{{
 			Name:     "jq",
 			Package:  "jqlang/jq",
 			Version:  "jq-1.7.1",
@@ -95,9 +95,9 @@ func TestEffectiveToolConfigDeepCopiesPackageCommands(t *testing.T) {
 func TestRenderConfigAcceptsPackageCommitSHA(t *testing.T) {
 	t.Parallel()
 
-	data, err := RenderConfigForPlatform(&core.ToolConfig{
+	data, err := RenderConfigForPlatform(&ir.ToolConfig{
 		Provider: "aqua",
-		Packages: []core.ToolPackage{{
+		Packages: []ir.ToolPackage{{
 			Name:     "pprof",
 			Package:  "google/pprof",
 			Version:  "d04f2422c8a17569c14e84da0fae252d9529826b",
@@ -111,6 +111,40 @@ func TestRenderConfigAcceptsPackageCommitSHA(t *testing.T) {
 	require.Len(t, parsed.Packages, 1)
 	assert.Equal(t, "google/pprof", parsed.Packages[0].Name)
 	assert.Equal(t, "d04f2422c8a17569c14e84da0fae252d9529826b", parsed.Packages[0].Version)
+}
+
+func TestStandardRefDefaulted(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, standardRefDefaulted(nil))
+	assert.True(t, standardRefDefaulted(&ir.ToolConfig{}))
+	assert.True(t, standardRefDefaulted(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "standard"}}))
+	assert.False(t, standardRefDefaulted(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "standard", Ref: "v4.233.0"}}))
+	assert.False(t, standardRefDefaulted(&ir.ToolConfig{Registry: &ir.ToolRegistry{
+		Type: "github_content", RepoOwner: "example", RepoName: "aqua-registry", Ref: "abc", Path: "registry.yaml",
+	}}))
+}
+
+func TestEffectiveToolConfigWithRef(t *testing.T) {
+	t.Parallel()
+
+	base := &ir.ToolConfig{Packages: []ir.ToolPackage{{Package: "jqlang/jq", Version: "jq-1.7.1"}}}
+
+	defaulted := effectiveToolConfigWithRef(base, "1111111111111111111111111111111111111111")
+	require.NotNil(t, defaulted.Registry)
+	assert.Equal(t, "1111111111111111111111111111111111111111", defaulted.Registry.Ref)
+
+	unset := effectiveToolConfigWithRef(base, "")
+	require.NotNil(t, unset.Registry)
+	assert.Equal(t, ir.DefaultAquaStandardRegistryRef, unset.Registry.Ref)
+
+	pinnedCfg := &ir.ToolConfig{
+		Registry: &ir.ToolRegistry{Type: "standard", Ref: "v4.233.0"},
+		Packages: base.Packages,
+	}
+	pinned := effectiveToolConfigWithRef(pinnedCfg, "1111111111111111111111111111111111111111")
+	require.NotNil(t, pinned.Registry)
+	assert.Equal(t, "v4.233.0", pinned.Registry.Ref)
 }
 
 func TestAquaParamEnforcesChecksums(t *testing.T) {
@@ -134,9 +168,9 @@ func TestAquaParamEnforcesChecksums(t *testing.T) {
 func TestRenderConfigDefaultsPackageRegistry(t *testing.T) {
 	t.Parallel()
 
-	data, err := RenderConfigForPlatform(&core.ToolConfig{
+	data, err := RenderConfigForPlatform(&ir.ToolConfig{
 		Provider: "aqua",
-		Registry: &core.ToolRegistry{
+		Registry: &ir.ToolRegistry{
 			Name:      "custom",
 			Type:      "github_content",
 			RepoOwner: "example",
@@ -144,7 +178,7 @@ func TestRenderConfigDefaultsPackageRegistry(t *testing.T) {
 			Ref:       "v1.0.0",
 			Path:      "registry.yaml",
 		},
-		Packages: []core.ToolPackage{{
+		Packages: []ir.ToolPackage{{
 			Name:     "tool",
 			Package:  "example/tool",
 			Version:  "v1.0.0",

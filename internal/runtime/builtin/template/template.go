@@ -12,11 +12,14 @@ import (
 	"path/filepath"
 	"text/template"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/templatefuncs"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/templatefuncs"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/go-viper/mapstructure/v2"
 )
 
@@ -37,7 +40,7 @@ type templateConfig struct {
 	Output string         `mapstructure:"output"`
 }
 
-func newTemplate(ctx context.Context, step core.Step) (executor.Executor, error) {
+func newTemplate(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	var cfg templateConfig
 	if step.ExecutorConfig.Config != nil {
 		if err := decodeConfig(step.ExecutorConfig.Config, &cfg); err != nil {
@@ -46,7 +49,7 @@ func newTemplate(ctx context.Context, step core.Step) (executor.Executor, error)
 	}
 
 	if step.Script == "" {
-		return nil, core.NewValidationError("script", nil, fmt.Errorf("script field is required"))
+		return nil, ir.NewValidationError("script", nil, fmt.Errorf("script field is required"))
 	}
 
 	outputFile := cfg.Output
@@ -124,9 +127,20 @@ func decodeConfig(dat map[string]any, cfg *templateConfig) error {
 	return md.Decode(dat)
 }
 
-func validateTemplate(step core.Step) error {
-	if step.Script == "" {
-		return core.NewValidationError("script", nil, fmt.Errorf("script field is required"))
+func validateTemplate(step ir.Step) error {
+	refValue, hasRef := step.ExecutorConfig.Config["template_ref"]
+	if step.Script != "" && hasRef {
+		return ir.NewValidationError("with.template_ref", refValue, fmt.Errorf("template step cannot use both script and with.template_ref"))
+	}
+	if step.Script != "" {
+		return nil
+	}
+	if !hasRef {
+		return ir.NewValidationError("script", nil, fmt.Errorf("script field is required"))
+	}
+	ref, ok := refValue.(string)
+	if !ok || !cmnvalue.IsExactRef(ref) {
+		return ir.NewValidationError("with.template_ref", refValue, fmt.Errorf("must be one complete scoped value reference such as ${env.NAME}"))
 	}
 	return nil
 }
@@ -143,7 +157,7 @@ func buildFuncMap() template.FuncMap {
 }
 
 func init() {
-	executor.RegisterExecutor("template", newTemplate, validateTemplate, core.ExecutorCapabilities{
+	executor.RegisterExecutor("template", newTemplate, validateTemplate, registry.ExecutorCapabilities{
 		Script: true,
 	})
 }

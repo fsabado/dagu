@@ -10,9 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	cmdpkg "github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	cmdpkg "github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,17 +36,17 @@ steps:
   - name: assert_variables_defined
     run: echo "${TARGET_TABLE}"
 `)
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "calculate_zscores",
 		Location:   filepath.Join(root, "calculate_zscores.yaml"),
 		WorkingDir: workDir,
 		Dotenv:     []string{".env.${COL}"},
 		YamlData:   yamlData,
-		ParamDefs: []core.ParamDef{
-			{Name: "COL", Type: core.ParamDefTypeString, Required: true},
+		ParamDefs: []ir.ParamDef{
+			{Name: "COL", Type: ir.ParamDefTypeString, Required: true},
 		},
 	}
-	status := &exec.DAGRunStatus{ParamsList: []string{"COL=foo"}}
+	status := &ir.DAGRunStatus{ParamsList: []string{"COL=foo"}}
 
 	restored, err := cmdpkg.RestoreDAGFromStatusForTest(context.Background(), dag, status)
 	require.NoError(t, err)

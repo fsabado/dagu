@@ -9,11 +9,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/spf13/cobra"
 )
 
@@ -135,10 +135,10 @@ func runExec(ctx *Context, args []string) error {
 		return err
 	}
 
-	dagRunRef := exec.NewDAGRunRef(dag.Name, runID)
+	dagRunRef := ir.NewDAGRunRef(dag.Name, runID)
 
-	attempt, err := ctx.DAGRunStore.FindAttempt(ctx, dagRunRef)
-	if err != nil && !errors.Is(err, exec.ErrDAGRunIDNotFound) {
+	attempt, err := ctx.Persistence.DAGRunRepository.FindAttempt(ctx, dagRunRef)
+	if err != nil && !errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 		return fmt.Errorf("failed to check for existing dag-run: %w", err)
 	}
 	if attempt != nil {
@@ -151,7 +151,11 @@ func runExec(ctx *Context, args []string) error {
 	)
 	logger.Debug(ctx, "Command details", tag.Command(strings.Join(args, " ")))
 
-	return tryExecuteDAG(ctx, dag, runID, dagRunRef, "local", "", core.TriggerTypeManual, "", "")
+	return tryExecuteDAG(ctx, dag, runID, runOptions{
+		root:        dagRunRef,
+		workerID:    "local",
+		triggerType: ir.TriggerTypeManual,
+	})
 }
 
 // resolveRunID returns a validated run ID from the flag or generates a new one.

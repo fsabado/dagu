@@ -14,27 +14,30 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/mailer"
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	notificationmodel "github.com/dagucloud/dagu/internal/notification"
-	"github.com/dagucloud/dagu/internal/service/chatbridge"
-	"github.com/dagucloud/dagu/internal/service/eventstore"
+	"github.com/dagucloud/dagu/v2/internal/cmn/mailer"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/eventstore"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	notificationmodel "github.com/dagucloud/dagu/v2/internal/notification"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/service/chatbridge"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 type Service struct {
 	store                   notificationmodel.Store
-	dagStore                exec.DAGStore
+	dagRepository           *persis.DAGRepository
 	http                    *http.Client
 	logger                  *slog.Logger
 	retry                   DeliveryRetryConfig
@@ -112,10 +115,10 @@ func (s *Service) SetPublicURLResolver(resolver func() string) {
 	}
 }
 
-func New(store notificationmodel.Store, dagStore exec.DAGStore, opts ...Option) *Service {
+func New(store notificationmodel.Store, dagRepository *persis.DAGRepository, opts ...Option) *Service {
 	svc := &Service{
 		store:                   store,
-		dagStore:                dagStore,
+		dagRepository:           dagRepository,
 		http:                    &http.Client{Timeout: 30 * time.Second},
 		logger:                  slog.Default(),
 		reusableChannelsEnabled: func() bool { return true },
@@ -463,15 +466,19 @@ func (s *Service) NotificationDestinations() []string {
 }
 
 func (s *Service) NotificationDestinationsForEvent(event chatbridge.NotificationEvent) []string {
-	if event.Status == nil || event.Status.Name == "" {
+	routeKey := event.DAGRouteKey()
+	if event.Status == nil || routeKey == "" {
+		return nil
+	}
+	if _, state := eventWorkspace(event); state == workspace.WorkspaceLabelInvalid {
 		return nil
 	}
 	ctx := context.Background()
-	setting, err := s.GetByDAGName(ctx, event.Status.Name)
+	setting, err := s.GetByDAGName(ctx, routeKey)
 	if err != nil {
 		if !errors.Is(err, notificationmodel.ErrSettingsNotFound) {
 			s.logger.Warn("Failed to load notification settings",
-				slog.String("dag", event.Status.Name),
+				slog.String("dag", routeKey),
 				slog.String("error", err.Error()),
 			)
 			return nil
@@ -595,7 +602,8 @@ func (s *Service) FlushNotificationBatch(ctx context.Context, destination string
 	if target.Type != notificationmodel.ProviderEmail &&
 		target.Type != notificationmodel.ProviderWebhook &&
 		target.Type != notificationmodel.ProviderSlack &&
-		target.Type != notificationmodel.ProviderTelegram {
+		target.Type != notificationmodel.ProviderTelegram &&
+		target.Type != notificationmodel.ProviderTeams {
 		s.logger.Warn("Unsupported notification target provider",
 			slog.String("destination", destination),
 			slog.String("provider", string(target.Type)),
@@ -823,8 +831,11 @@ func (s *Service) deliverTestTargets(ctx context.Context, targets []resolvedTarg
 
 func (s *Service) testEvent(ctx context.Context, dagName string, eventType eventstore.EventType) chatbridge.NotificationEvent {
 	status := testStatus(dagName, eventType)
-	if s.dagStore != nil {
-		if dag, err := s.dagStore.GetDetails(ctx, dagName); err == nil && dag != nil {
+	if s.dagRepository != nil {
+		if dag, err := s.dagRepository.GetDetails(ctx, dagName, persis.DAGLoadOptions{}); err == nil && dag != nil {
+			if dag.Name != "" {
+				status.Name = dag.Name
+			}
 			status.Labels = dag.Labels.Strings()
 		}
 	}
@@ -832,6 +843,7 @@ func (s *Service) testEvent(ctx context.Context, dagName string, eventType event
 		Key:        "notification-test:" + dagName,
 		Type:       eventType,
 		Status:     status,
+		DAGFile:    dagName,
 		ObservedAt: time.Now().UTC(),
 	}
 }
@@ -847,6 +859,7 @@ func (s *Service) isSupportedEvent(eventType eventstore.EventType) bool {
 	switch eventType {
 	case eventstore.TypeDAGRunWaiting,
 		eventstore.TypeDAGRunSucceeded,
+		eventstore.TypeDAGRunPartiallySucceeded,
 		eventstore.TypeDAGRunFailed,
 		eventstore.TypeDAGRunAborted,
 		eventstore.TypeDAGRunRejected:
@@ -860,30 +873,33 @@ func (s *Service) isSupportedEvent(eventType eventstore.EventType) bool {
 	return false
 }
 
-func testStatus(dagName string, eventType eventstore.EventType) *exec.DAGRunStatus {
+func testStatus(dagName string, eventType eventstore.EventType) *ir.DAGRunStatus {
 	now := time.Now().UTC()
-	status := core.Failed
+	status := ir.Failed
 	message := "This is a test notification from Dagu."
 	switch eventType {
 	case eventstore.TypeDAGRunWaiting:
-		status = core.Waiting
+		status = ir.Waiting
 		message = "This is a test waiting notification from Dagu."
 	case eventstore.TypeDAGRunSucceeded:
-		status = core.Succeeded
+		status = ir.Succeeded
 		message = ""
+	case eventstore.TypeDAGRunPartiallySucceeded:
+		status = ir.PartiallySucceeded
+		message = "This is a test partially succeeded notification from Dagu."
 	case eventstore.TypeDAGRunFailed:
 	case eventstore.TypeDAGRunAborted:
-		status = core.Aborted
+		status = ir.Aborted
 		message = "This is a test aborted notification from Dagu."
 	case eventstore.TypeDAGRunRejected:
-		status = core.Rejected
+		status = ir.Rejected
 		message = "This is a test rejected notification from Dagu."
 	case eventstore.TypeDAGRunQueued,
 		eventstore.TypeDAGRunRunning,
 		eventstore.TypeDAGRunUpdated,
 		eventstore.TypeLLMUsageRecorded:
 	}
-	return &exec.DAGRunStatus{
+	return &ir.DAGRunStatus{
 		Name:       dagName,
 		DAGRunID:   "notification-test",
 		AttemptID:  "notification-test",
@@ -899,11 +915,13 @@ func (s *Service) deliverTarget(ctx context.Context, target notificationmodel.Ta
 	case notificationmodel.ProviderEmail:
 		return s.sendEmail(ctx, target, events)
 	case notificationmodel.ProviderWebhook:
-		return s.withRetry(ctx, func() error { return s.sendWebhook(ctx, target, events) })
+		return s.sendWebhook(ctx, target, events)
 	case notificationmodel.ProviderSlack:
 		return s.withRetry(ctx, func() error { return s.sendSlack(ctx, target, events) })
 	case notificationmodel.ProviderTelegram:
 		return s.withRetry(ctx, func() error { return s.sendTelegram(ctx, target, events) })
+	case notificationmodel.ProviderTeams:
+		return s.withRetry(ctx, func() error { return s.sendTeams(ctx, target, events) })
 	default:
 		return notificationmodel.ErrUnsupportedTarget
 	}
@@ -1108,7 +1126,10 @@ func (s *Service) routeSetDestinationsForEvent(
 }
 
 func (s *Service) effectiveRouteSetForEvent(ctx context.Context, event chatbridge.NotificationEvent) *notificationmodel.RouteSet {
-	workspaceName := eventWorkspaceName(event)
+	workspaceName, state := eventWorkspace(event)
+	if state == workspace.WorkspaceLabelInvalid {
+		return nil
+	}
 	if workspaceName != "" {
 		workspaceRouteSet, err := s.loadRouteSet(ctx, notificationmodel.RouteScopeWorkspace, workspaceName)
 		if err == nil {
@@ -1138,7 +1159,7 @@ func (s *Service) effectiveRouteSetForEvent(ctx context.Context, event chatbridg
 func matchingEvents(setting *notificationmodel.Settings, target notificationmodel.Target, events []chatbridge.NotificationEvent) []chatbridge.NotificationEvent {
 	result := make([]chatbridge.NotificationEvent, 0, len(events))
 	for _, event := range events {
-		if event.Status == nil || event.Status.Name != setting.DAGName {
+		if event.Status == nil || event.DAGRouteKey() != setting.DAGName {
 			continue
 		}
 		if !notificationmodel.IsTargetEventEnabled(setting, target, event.Type) {
@@ -1152,7 +1173,7 @@ func matchingEvents(setting *notificationmodel.Settings, target notificationmode
 func matchingSubscriptionEvents(setting *notificationmodel.Settings, subscription notificationmodel.Subscription, events []chatbridge.NotificationEvent) []chatbridge.NotificationEvent {
 	result := make([]chatbridge.NotificationEvent, 0, len(events))
 	for _, event := range events {
-		if event.Status == nil || event.Status.Name != setting.DAGName {
+		if event.Status == nil || event.DAGRouteKey() != setting.DAGName {
 			continue
 		}
 		if !notificationmodel.IsSubscriptionEventEnabled(setting, subscription, event.Type) {
@@ -1166,17 +1187,18 @@ func matchingSubscriptionEvents(setting *notificationmodel.Settings, subscriptio
 func (s *Service) matchingRouteEvents(ctx context.Context, routeSet *notificationmodel.RouteSet, route notificationmodel.Route, events []chatbridge.NotificationEvent) []chatbridge.NotificationEvent {
 	result := make([]chatbridge.NotificationEvent, 0, len(events))
 	for _, event := range events {
-		if event.Status == nil || event.Status.Name == "" {
+		routeKey := event.DAGRouteKey()
+		if event.Status == nil || routeKey == "" {
 			continue
 		}
 		if !notificationmodel.IsRouteEventEnabled(routeSet, route, event.Type) {
 			continue
 		}
-		if _, err := s.GetByDAGName(ctx, event.Status.Name); err == nil {
+		if _, err := s.GetByDAGName(ctx, routeKey); err == nil {
 			continue
 		} else if !errors.Is(err, notificationmodel.ErrSettingsNotFound) {
 			s.logger.Warn("Failed to load notification settings",
-				slog.String("dag", event.Status.Name),
+				slog.String("dag", routeKey),
 				slog.String("error", err.Error()),
 			)
 			continue
@@ -1190,12 +1212,16 @@ func (s *Service) matchingRouteEvents(ctx context.Context, routeSet *notificatio
 	return result
 }
 
-func eventWorkspaceName(event chatbridge.NotificationEvent) string {
+func eventWorkspace(event chatbridge.NotificationEvent) (string, workspace.WorkspaceLabelState) {
 	if event.Status == nil {
-		return ""
+		return "", workspace.WorkspaceLabelMissing
 	}
-	workspaceName, state := exec.WorkspaceLabelFromLabels(core.NewLabels(event.Status.Labels))
-	if state == exec.WorkspaceLabelValid {
+	return workspace.WorkspaceLabelFromLabels(ir.NewLabels(event.Status.Labels))
+}
+
+func eventWorkspaceName(event chatbridge.NotificationEvent) string {
+	workspaceName, state := eventWorkspace(event)
+	if state == workspace.WorkspaceLabelValid {
 		return workspaceName
 	}
 	return ""
@@ -1227,12 +1253,17 @@ func (s *Service) sendEmail(ctx context.Context, target notificationmodel.Target
 	if target.Email.AttachLogs {
 		attachments = logAttachments(events)
 	}
-	err = mailer.New(mailer.Config{
-		Host:     workspaceSettings.SMTP.Host,
-		Port:     workspaceSettings.SMTP.Port,
-		Username: workspaceSettings.SMTP.Username,
-		Password: workspaceSettings.SMTP.Password,
-	}).SendWithRecipients(
+	mailerConfig, err := mailer.BuildConfig(
+		workspaceSettings.SMTP.Host,
+		workspaceSettings.SMTP.Port,
+		workspaceSettings.SMTP.Username,
+		workspaceSettings.SMTP.Password,
+		workspaceSettings.SMTP.OAuth,
+	)
+	if err != nil {
+		return fmt.Errorf("invalid SMTP configuration: %w", err)
+	}
+	err = mailer.New(mailerConfig).SendWithRecipients(
 		ctx,
 		from,
 		target.Email.To,
@@ -1288,24 +1319,65 @@ func (s *Service) sendWebhook(ctx context.Context, target notificationmodel.Targ
 		return err
 	}
 	publicURL := s.publicURL()
+	if target.Webhook.BodyTemplate != "" {
+		return s.sendWebhookBodyTemplate(ctx, target, events, publicURL)
+	}
 	payload := webhookPayloadForEvents(events, publicURL)
 	payload["message"] = messageForEvents(target.Webhook.MessageTemplate, events, publicURL)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.Webhook.URL, bytes.NewReader(body))
-	if err != nil {
-		return err
+	return s.postWebhookBody(ctx, target, body)
+}
+
+// sendWebhookBodyTemplate posts one custom-rendered request per event, so that
+// every request carries a payload the receiving service can parse on its own.
+// Each request is retried on its own, so a transient failure part-way through
+// does not re-deliver the events that already succeeded.
+func (s *Service) sendWebhookBodyTemplate(
+	ctx context.Context,
+	target notificationmodel.Target,
+	events []chatbridge.NotificationEvent,
+	publicURL string,
+) error {
+	bodies := make([][]byte, 0, len(events))
+	for _, event := range events {
+		if event.Status == nil {
+			continue
+		}
+		single := []chatbridge.NotificationEvent{event}
+		message := messageForEvents(target.Webhook.MessageTemplate, single, publicURL)
+		body := []byte(renderWebhookBodyTemplate(target.Webhook.BodyTemplate, event, message, publicURL))
+		if !json.Valid(body) {
+			return errors.New("webhook body template did not render valid JSON")
+		}
+		bodies = append(bodies, body)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	for key, value := range target.Webhook.Headers {
-		req.Header.Set(key, value)
+	for _, body := range bodies {
+		if err := s.postWebhookBody(ctx, target, body); err != nil {
+			return err
+		}
 	}
-	if target.Webhook.HMACSecret != "" {
-		req.Header.Set("X-Dagu-Signature", "sha256="+signWebhookBody(body, target.Webhook.HMACSecret))
-	}
-	return s.doWebhookRequest(req)
+	return nil
+}
+
+// postWebhookBody delivers a single request body, retrying transient failures.
+func (s *Service) postWebhookBody(ctx context.Context, target notificationmodel.Target, body []byte) error {
+	return s.withRetry(ctx, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.Webhook.URL, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		for key, value := range target.Webhook.Headers {
+			req.Header.Set(key, value)
+		}
+		if target.Webhook.HMACSecret != "" {
+			req.Header.Set("X-Dagu-Signature", "sha256="+signWebhookBody(body, target.Webhook.HMACSecret))
+		}
+		return s.doWebhookRequest(req)
+	})
 }
 
 func (s *Service) sendSlack(ctx context.Context, target notificationmodel.Target, events []chatbridge.NotificationEvent) error {
@@ -1329,14 +1401,49 @@ func (s *Service) sendSlack(ctx context.Context, target notificationmodel.Target
 	return s.doWebhookRequest(req)
 }
 
+func (s *Service) sendTeams(ctx context.Context, target notificationmodel.Target, events []chatbridge.NotificationEvent) error {
+	if target.Teams == nil || target.Teams.WebhookURL == "" {
+		return errors.New("teams webhook url is not configured")
+	}
+	if err := validateOutboundURL(ctx, target.Teams.WebhookURL, false, false); err != nil {
+		return err
+	}
+	body, err := json.Marshal(teamsPayloadForEvents(target.Teams.MessageTemplate, events, s.publicURL()))
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.Teams.WebhookURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return s.deliverRequest(req, teamsThrottleError)
+}
+
+// teamsThrottleError reports rate limiting for Microsoft Teams incoming
+// webhooks, which report it in the body of a 200 response instead of with
+// HTTP 429.
+func teamsThrottleError(body string) error {
+	if strings.Contains(body, "Microsoft Teams endpoint returned HTTP error 429") {
+		return temporaryDeliveryError{err: errors.New("teams webhook is rate limited")}
+	}
+	return nil
+}
+
 func (s *Service) sendTelegram(ctx context.Context, target notificationmodel.Target, events []chatbridge.NotificationEvent) error {
 	if target.Telegram == nil || target.Telegram.BotToken == "" || target.Telegram.ChatID == "" {
 		return errors.New("telegram bot token or chat id is not configured")
 	}
-	body, err := json.Marshal(map[string]string{
+	payload := map[string]any{
 		"chat_id": target.Telegram.ChatID,
 		"text":    messageForEvents(target.Telegram.MessageTemplate, events, s.publicURL()),
-	})
+	}
+	if target.Telegram.TopicID != "" {
+		if topicID, err := strconv.Atoi(target.Telegram.TopicID); err == nil {
+			payload["message_thread_id"] = topicID
+		}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -1350,6 +1457,12 @@ func (s *Service) sendTelegram(ctx context.Context, target notificationmodel.Tar
 }
 
 func (s *Service) doWebhookRequest(req *http.Request) error {
+	return s.deliverRequest(req, nil)
+}
+
+// deliverRequest sends req and maps the response to a delivery error. checkBody,
+// when set, inspects the body of an otherwise successful response.
+func (s *Service) deliverRequest(req *http.Request, checkBody func(body string) error) error {
 	resp, err := s.http.Do(req)
 	if err != nil {
 		return temporaryDeliveryError{err: err}
@@ -1364,6 +1477,9 @@ func (s *Service) doWebhookRequest(req *http.Request) error {
 			return temporaryDeliveryError{err: err}
 		}
 		return err
+	}
+	if checkBody != nil {
+		return checkBody(readLimitedBody(resp.Body))
 	}
 	return nil
 }
@@ -1423,15 +1539,19 @@ func (s *Service) withRetry(ctx context.Context, send func() error) error {
 }
 
 func limitedResponseBody(body io.Reader) string {
-	if body == nil {
-		return ""
-	}
-	data, _ := io.ReadAll(io.LimitReader(body, 512))
-	text := strings.TrimSpace(string(data))
+	text := readLimitedBody(body)
 	if text == "" {
 		return ""
 	}
 	return ": " + text
+}
+
+func readLimitedBody(body io.Reader) string {
+	if body == nil {
+		return ""
+	}
+	data, _ := io.ReadAll(io.LimitReader(body, 512))
+	return strings.TrimSpace(string(data))
 }
 
 func validateOutboundURL(ctx context.Context, rawURL string, allowInsecureHTTP, allowPrivateNetwork bool) error {
@@ -1578,14 +1698,43 @@ func messageForEvents(template string, events []chatbridge.NotificationEvent, pu
 var notificationTemplateTokenRE = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}`)
 
 func renderNotificationTemplate(template string, event chatbridge.NotificationEvent, publicURL string) string {
+	return renderTemplateTokens(template, notificationTemplateValues(event, publicURL), nil)
+}
+
+// renderWebhookBodyTemplate renders a user-supplied JSON request body. Token
+// values are escaped as JSON string content, so a value carrying quotes or
+// newlines cannot break out of the surrounding string literal.
+func renderWebhookBodyTemplate(
+	template string,
+	event chatbridge.NotificationEvent,
+	message string,
+	publicURL string,
+) string {
 	values := notificationTemplateValues(event, publicURL)
+	values["message"] = message
+	return renderTemplateTokens(template, values, escapeJSONStringContent)
+}
+
+func renderTemplateTokens(template string, values map[string]string, escape func(string) string) string {
 	return notificationTemplateTokenRE.ReplaceAllStringFunc(template, func(token string) string {
 		matches := notificationTemplateTokenRE.FindStringSubmatch(token)
 		if len(matches) != 2 {
 			return ""
 		}
-		return values[matches[1]]
+		value := values[matches[1]]
+		if escape != nil {
+			return escape(value)
+		}
+		return value
 	})
+}
+
+func escapeJSONStringContent(value string) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(encoded[1 : len(encoded)-1])
 }
 
 func notificationTemplateValues(event chatbridge.NotificationEvent, publicURL string) map[string]string {
@@ -1608,6 +1757,7 @@ func notificationTemplateValues(event chatbridge.NotificationEvent, publicURL st
 	values["status"] = status.Status.String()
 	values["run.error"] = status.Error
 	values["error"] = status.Error
+	maps.Copy(values, notificationStepStatusValues(status))
 	values["run.startedAt"] = notificationTemplateTime(status.StartedAt)
 	values["run.finishedAt"] = notificationTemplateTime(status.FinishedAt)
 	values["run.attemptId"] = status.AttemptID
@@ -1631,6 +1781,55 @@ func notificationTemplateValues(event chatbridge.NotificationEvent, publicURL st
 	return values
 }
 
+func notificationStepStatusValues(status *ir.DAGRunStatus) map[string]string {
+	labels := map[ir.NodeStatus][]string{
+		ir.NodeFailed:             nil,
+		ir.NodePartiallySucceeded: nil,
+		ir.NodeAborted:            nil,
+		ir.NodeSucceeded:          nil,
+	}
+	for _, node := range status.Nodes {
+		if node == nil {
+			continue
+		}
+		if len(node.StatusDetails) == 0 {
+			if _, ok := labels[node.Status]; ok {
+				labels[node.Status] = append(labels[node.Status], node.Step.Name)
+			}
+			continue
+		}
+		detailMatchesNodeStatus := false
+		for _, detail := range node.StatusDetails {
+			if _, ok := labels[detail.Status]; !ok {
+				continue
+			}
+			labels[detail.Status] = append(labels[detail.Status], notificationStatusDetailLabel(node.Step.Name, detail.Label))
+			detailMatchesNodeStatus = detailMatchesNodeStatus || detail.Status == node.Status
+		}
+		if _, ok := labels[node.Status]; ok && !detailMatchesNodeStatus {
+			labels[node.Status] = append(labels[node.Status], node.Step.Name)
+		}
+	}
+
+	return map[string]string{
+		"run.failed_steps":              strings.Join(labels[ir.NodeFailed], ", "),
+		"run.partially_succeeded_steps": strings.Join(labels[ir.NodePartiallySucceeded], ", "),
+		"run.aborted_steps":             strings.Join(labels[ir.NodeAborted], ", "),
+		"run.succeeded_steps":           strings.Join(labels[ir.NodeSucceeded], ", "),
+	}
+}
+
+func notificationStatusDetailLabel(stepName, detail string) string {
+	switch {
+	case stepName == "":
+		return detail
+	case detail == "":
+		return stepName
+	default:
+		return fmt.Sprintf("%s[%s]", stepName, detail)
+	}
+}
+
 func notificationTemplateTime(value string) string {
 	if value == "" {
 		return ""
@@ -1642,14 +1841,14 @@ func notificationTemplateTime(value string) string {
 	return parsed.Format(time.RFC3339)
 }
 
-func notificationRunPath(status *exec.DAGRunStatus) string {
+func notificationRunPath(status *ir.DAGRunStatus) string {
 	if status == nil || status.Name == "" || status.DAGRunID == "" {
 		return ""
 	}
 
 	root := status.Root
 	if root.Zero() {
-		root = exec.NewDAGRunRef(status.Name, status.DAGRunID)
+		root = ir.NewDAGRunRef(status.Name, status.DAGRunID)
 	}
 	if root.Name == "" || root.ID == "" {
 		return ""
@@ -1678,7 +1877,7 @@ func notificationRunURL(publicURL, runPath string) string {
 	return strings.TrimRight(publicURL, "/") + "/" + strings.TrimLeft(runPath, "/")
 }
 
-func notificationRunLink(status *exec.DAGRunStatus, publicURL string) string {
+func notificationRunLink(status *ir.DAGRunStatus, publicURL string) string {
 	if runURL := notificationRunURL(publicURL, notificationRunPath(status)); runURL != "" {
 		return "Run: " + runURL
 	}
@@ -1698,6 +1897,19 @@ func normalizeNotificationPublicURL(rawURL string) string {
 	parsed.Fragment = ""
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	return parsed.String()
+}
+
+// teamsPayloadForEvents builds a Message Card accepted by Teams Workflows and
+// legacy connectors. The summary provides concise notification preview text.
+func teamsPayloadForEvents(template string, events []chatbridge.NotificationEvent, publicURL string) map[string]any {
+	title := titleForEvents(events)
+	return map[string]any{
+		"@type":    "MessageCard",
+		"@context": "http://schema.org/extensions",
+		"summary":  title,
+		"title":    title,
+		"text":     messageForEvents(template, events, publicURL),
+	}
 }
 
 func webhookPayloadForEvents(events []chatbridge.NotificationEvent, publicURL string) map[string]any {

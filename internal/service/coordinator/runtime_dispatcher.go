@@ -6,28 +6,20 @@ package coordinator
 import (
 	"fmt"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 )
 
 // NewRuntimeDispatcher creates a coordinator-backed dispatcher for runtime DAG execution.
-func NewRuntimeDispatcher(registry exec.ServiceRegistry, peerConfig config.Peer) (exec.Dispatcher, error) {
+func NewRuntimeDispatcher(registry serviceregistry.ServiceRegistry, peerConfig config.Peer) (dispatch.Dispatcher, error) {
 	if registry == nil {
 		return nil, nil
 	}
 
-	cfg := DefaultConfig()
-	cfg.MaxRetries = 50
-	cfg.CAFile = peerConfig.ClientCaFile
-	cfg.CertFile = peerConfig.CertFile
-	cfg.KeyFile = peerConfig.KeyFile
-	cfg.SkipTLSVerify = peerConfig.SkipTLSVerify
-	cfg.Insecure = peerConfig.Insecure
-	if peerConfig.MaxRetries > 0 {
-		cfg.MaxRetries = peerConfig.MaxRetries
-	}
-	if peerConfig.RetryInterval > 0 {
-		cfg.RetryInterval = peerConfig.RetryInterval
+	cfg := ConfigFromPeer(peerConfig)
+	if peerConfig.MaxRetries <= 0 {
+		cfg.MaxRetries = 50
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate runtime dispatcher config: %w", err)

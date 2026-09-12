@@ -6,6 +6,21 @@
   "not": {
     "required": ["hist_retention_days", "hist_retention_runs"]
   },
+  "allOf": [
+    {
+      "if": {
+        "not": {
+          "properties": { "type": { "const": "agent" } },
+          "required": ["type"]
+        }
+      },
+      "then": {
+        "properties": {
+          "llm": { "$ref": "#/definitions/standardLLMConfig" }
+        }
+      }
+    }
+  ],
   "properties": {
     "name": {
       "type": "string",
@@ -20,6 +35,7 @@
       "description": "An organizational label used to group related DAGs together. Useful for categorizing DAGs in the UI, e.g., 'DailyJobs', 'Analytics'."
     },
     "dotenv": {
+      "examples": [".env"],
       "oneOf": [
         {
           "type": "string",
@@ -36,6 +52,7 @@
       "description": "Specifies .env files to load environment variables from. By default, '.env' is loaded. When files are specified, '.env' is automatically prepended to the list. All files are loaded sequentially with later files overriding earlier values. Set to empty array [] to disable all .env loading. Files are loaded relative to the DAG's working_dir."
     },
     "working_dir": {
+      "examples": ["/var/data/etl"],
       "type": "string",
       "description": "Working directory for the DAG. All relative paths (including dotenv files) are resolved relative to this directory. Defaults to the directory containing the DAG file."
     },
@@ -55,52 +72,16 @@
       }
     },
     "schedule": {
+      "examples": ["@daily", "0 * * * *", "*/15 8-18 * * MON-FRI"],
       "oneOf": [
         {
           "type": "string",
-          "description": "Single cron expression for starting the DAG (e.g., '5 4 * * *' runs daily at 04:05)"
+          "description": "Single cron expression or schedule alias for starting the DAG (e.g., '@daily' runs at midnight)"
         },
         {
           "type": "array",
           "items": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string",
-                    "enum": ["cron"]
-                  },
-                  "expression": {
-                    "type": "string",
-                    "description": "Cron expression for a recurring schedule entry"
-                  }
-                },
-                "required": ["expression"],
-                "additionalProperties": false,
-                "description": "Typed cron schedule entry"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string",
-                    "enum": ["at"]
-                  },
-                  "at": {
-                    "type": "string",
-                    "format": "date-time",
-                    "description": "RFC 3339 timestamp with explicit offset and minute precision for a one-off schedule entry"
-                  }
-                },
-                "required": ["at"],
-                "additionalProperties": false,
-                "description": "Typed one-off schedule entry"
-              }
-            ]
+            "$ref": "#/definitions/scheduleStartArrayItem"
           },
           "description": "Multiple schedule entries for starting the DAG at different times"
         },
@@ -113,74 +94,12 @@
                   "type": "string",
                   "description": "Single cron expression for starting the DAG"
                 },
-                {
-                  "type": "object",
-                  "properties": {
-                    "kind": {
-                      "type": "string",
-                      "enum": ["cron"]
-                    },
-                    "expression": {
-                      "type": "string"
-                    }
-                  },
-                  "required": ["expression"],
-                  "additionalProperties": false,
-                  "description": "Single typed cron schedule entry for starting the DAG"
-                },
-                {
-                  "type": "object",
-                  "properties": {
-                    "kind": {
-                      "type": "string",
-                      "enum": ["at"]
-                    },
-                    "at": {
-                      "type": "string",
-                      "format": "date-time"
-                    }
-                  },
-                  "required": ["at"],
-                  "additionalProperties": false,
-                  "description": "Single typed one-off schedule entry for starting the DAG"
-                },
+                { "$ref": "#/definitions/scheduleCronEntry" },
+                { "$ref": "#/definitions/scheduleAtEntry" },
                 {
                   "type": "array",
                   "items": {
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "kind": {
-                            "type": "string",
-                            "enum": ["cron"]
-                          },
-                          "expression": {
-                            "type": "string"
-                          }
-                        },
-                        "required": ["expression"],
-                        "additionalProperties": false
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "kind": {
-                            "type": "string",
-                            "enum": ["at"]
-                          },
-                          "at": {
-                            "type": "string",
-                            "format": "date-time"
-                          }
-                        },
-                        "required": ["at"],
-                        "additionalProperties": false
-                      }
-                    ]
+                    "$ref": "#/definitions/scheduleStartArrayItem"
                   },
                   "description": "Multiple schedule entries for starting the DAG"
                 }
@@ -192,43 +111,11 @@
                   "type": "string",
                   "description": "Single cron expression for stopping the DAG"
                 },
-                {
-                  "type": "object",
-                  "properties": {
-                    "kind": {
-                      "type": "string",
-                      "enum": ["cron"]
-                    },
-                    "expression": {
-                      "type": "string"
-                    }
-                  },
-                  "required": ["expression"],
-                  "additionalProperties": false,
-                  "description": "Single typed cron schedule entry for stopping the DAG"
-                },
+                { "$ref": "#/definitions/scheduleCronEntry" },
                 {
                   "type": "array",
                   "items": {
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "kind": {
-                            "type": "string",
-                            "enum": ["cron"]
-                          },
-                          "expression": {
-                            "type": "string"
-                          }
-                        },
-                        "required": ["expression"],
-                        "additionalProperties": false
-                      }
-                    ]
+                    "$ref": "#/definitions/scheduleCronOnlyArrayItem"
                   },
                   "description": "Multiple cron expressions for stopping the DAG"
                 }
@@ -240,43 +127,11 @@
                   "type": "string",
                   "description": "Single cron expression for restarting the DAG"
                 },
-                {
-                  "type": "object",
-                  "properties": {
-                    "kind": {
-                      "type": "string",
-                      "enum": ["cron"]
-                    },
-                    "expression": {
-                      "type": "string"
-                    }
-                  },
-                  "required": ["expression"],
-                  "additionalProperties": false,
-                  "description": "Single typed cron schedule entry for restarting the DAG"
-                },
+                { "$ref": "#/definitions/scheduleCronEntry" },
                 {
                   "type": "array",
                   "items": {
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "kind": {
-                            "type": "string",
-                            "enum": ["cron"]
-                          },
-                          "expression": {
-                            "type": "string"
-                          }
-                        },
-                        "required": ["expression"],
-                        "additionalProperties": false
-                      }
-                    ]
+                    "$ref": "#/definitions/scheduleCronOnlyArrayItem"
                   },
                   "description": "Multiple cron expressions for restarting the DAG"
                 }
@@ -284,10 +139,10 @@
             }
           },
           "additionalProperties": false,
-          "description": "Advanced scheduling with separate start, stop, and restart schedules"
+          "description": "Advanced scheduling with separate start, stop, and restart schedules."
         }
       ],
-      "description": "Schedule configuration for the DAG. Start schedules support cron expressions and one-off RFC 3339 timestamps with explicit offsets. Stop and restart remain cron-only."
+      "description": "Schedule configuration for the DAG. Start schedules support cron expressions and schedule aliases, profile-scoped cron object entries, and one-off RFC 3339 timestamps with explicit offsets. Stop and restart remain cron-only but may still use profile-scoped cron objects."
     },
     "skip_if_successful": {
       "type": "boolean",
@@ -394,11 +249,34 @@
     },
     "type": {
       "type": "string",
-      "enum": ["graph", "chain", "agent"],
+      "enum": ["graph", "chain", "agent", "build"],
       "default": "graph",
-      "description": "Execution type for steps. 'graph' (default) uses dependency-based execution where steps run based on their 'depends' field. 'chain' executes steps sequentially in the order they are defined, with each step automatically depending on the previous one. 'agent' is reserved for future agent-based execution."
+      "description": "Execution type for steps. 'graph' (default) uses dependency-based execution, 'chain' executes steps sequentially, 'agent' lets the configured LLM choose steps, and 'build' adds file-derived dependencies and materialization reuse."
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Goals an agent DAG must satisfy before it concludes successfully. Requires type: agent.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "description"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Unique task identifier."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "description": "States when the task is considered complete. The agent decides against this text."
+          }
+        }
+      }
     },
     "env": {
+      "examples": [{ "LOG_LEVEL": "debug" }],
       "oneOf": [
         {
           "type": "array",
@@ -555,10 +433,6 @@
             }
           ],
           "description": "Default preconditions for all steps (additive with step-level preconditions)"
-        },
-        "agent": {
-          "$ref": "#/definitions/agentStepConfig",
-          "description": "Default agent configuration for all agent-type steps. Each field is applied only when the step does not set its own value."
         }
       },
       "description": "Default values for step configuration fields. Steps inherit these defaults and can override them individually. Most fields use full replacement when overridden; env and preconditions are additive."
@@ -592,27 +466,32 @@
       "description": "Controls how stdout and stderr are logged. 'separate' writes stdout to .out and stderr to .err files. 'merged' writes both to a single .log file with interleaved output."
     },
     "handler_on": {
+      "examples": [{ "failure": { "run": "./notify.sh" } }],
       "type": "object",
       "properties": {
         "init": {
-          "$ref": "#/definitions/step",
+          "$ref": "#/definitions/handlerStep",
           "description": "Step to execute before any workflow steps run (after preconditions pass). If this fails, the DAG fails and no steps execute."
         },
         "failure": {
-          "$ref": "#/definitions/step"
+          "$ref": "#/definitions/handlerStep"
         },
         "success": {
-          "$ref": "#/definitions/step"
+          "$ref": "#/definitions/handlerStep"
         },
         "abort": {
-          "$ref": "#/definitions/step",
+          "$ref": "#/definitions/handlerStep",
           "description": "Step to execute when the DAG is aborted."
         },
         "exit": {
-          "$ref": "#/definitions/step"
+          "$ref": "#/definitions/handlerStep"
+        },
+        "wait": {
+          "$ref": "#/definitions/handlerStep",
+          "description": "Step to execute when the DAG enters the waiting status because a step needs human input."
         }
       },
-      "description": "Lifecycle event hooks that define commands to execute at various points in the DAG lifecycle: init (before steps), success, failure, abort, and exit (always runs last)."
+      "description": "Lifecycle event hooks that define commands to execute at various points in the DAG lifecycle: init (before steps), success, failure, abort, wait (a step is waiting on a person), and exit (always runs last)."
     },
     "step_types": {
       "$ref": "#/definitions/legacyExecutionDefinitions",
@@ -677,6 +556,7 @@
       "description": "Email configuration for informational notifications."
     },
     "timeout_sec": {
+      "examples": [3600],
       "type": "integer",
       "description": "Maximum number of seconds allowed for the entire DAG to finish. If exceeded, the DAG is considered timed out."
     },
@@ -698,6 +578,7 @@
       "description": "Number of DAG runs to retain in execution history. Mutually exclusive with hist_retention_days."
     },
     "max_active_runs": {
+      "examples": [1],
       "type": "integer",
       "default": 1,
       "description": "DEPRECATED: This field is ignored for local (DAG-based) queues. For concurrency control, define a global queue in config and use the 'queue' field.",
@@ -721,6 +602,7 @@
       "description": "Maximum size in bytes for the output of each step. If a step's output exceeds this limit, it will fail with an error. Defaults to 1MB (1048576 bytes). This limit also applies to pattern matching in preconditions and continue_on conditions."
     },
     "preconditions": {
+      "examples": ["test -f /tmp/input.csv"],
       "oneOf": [
         {
           "type": "string"
@@ -732,9 +614,10 @@
           }
         }
       ],
-      "description": "Conditions that must be satisfied before the DAG can run. Can use shell expansions or command substitutions to validate external states."
+      "description": "Conditions that must be satisfied before the DAG can run. Use condition for command checks or literal/value-resolved comparisons, and eval with expected for dynamic command substitutions."
     },
     "params": {
+      "examples": ["ENVIRONMENT=dev REGION=local"],
       "oneOf": [
         {
           "type": "string",
@@ -913,7 +796,7 @@
           "description": "Set to \"local\" to force this DAG to run locally even when the server default execution mode is distributed."
         }
       ],
-      "description": "Worker selection for this DAG. Use a map of label key-value pairs to target specific workers, or the string \"local\" to force local execution. This setting applies to the entire DAG; individual steps can override this with their own worker_selector."
+      "description": "Worker selection for this DAG. Use a map of label key-value pairs to target specific workers, or the string \"local\" to force local execution. Map keys and values support variable substitution (e.g. ${VAR}) resolved from the DAG environment (including base-config env) and params; the string form \"local\" is literal. This setting applies to the entire DAG; individual steps can override this with their own worker_selector."
     },
     "shell": {
       "oneOf": [
@@ -952,6 +835,70 @@
     }
   },
   "definitions": {
+    "scheduleStartArrayItem": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        { "$ref": "#/definitions/scheduleCronEntry" },
+        { "$ref": "#/definitions/scheduleAtEntry" }
+      ]
+    },
+    "scheduleCronOnlyArrayItem": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        { "$ref": "#/definitions/scheduleCronEntry" }
+      ]
+    },
+    "scheduleCronEntry": {
+      "type": "object",
+      "required": ["expression"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["cron"]
+        },
+        "expression": {
+          "type": "string",
+          "description": "Cron expression for a recurring schedule entry"
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "description": "Runtime profile name that activates this schedule entry"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Cron schedule entry, optionally scoped to a runtime profile."
+    },
+    "scheduleAtEntry": {
+      "type": "object",
+      "required": ["at"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["at"]
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 timestamp with explicit offset and minute precision for a one-off schedule entry"
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "description": "Runtime profile name that activates this schedule entry"
+        }
+      },
+      "additionalProperties": false,
+      "description": "One-off schedule entry, optionally scoped to a runtime profile."
+    },
     "resources": {
       "type": "object",
       "additionalProperties": false,
@@ -991,6 +938,7 @@
       "description": "CPU and memory limits requested for a DAG run."
     },
     "stepRetryPolicy": {
+      "examples": [{ "limit": 2, "interval_sec": 30 }],
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -1605,6 +1553,30 @@
         }
       ]
     },
+    "handlerStep": {
+      "allOf": [
+        { "$ref": "#/definitions/step" },
+        {
+          "not": {
+            "properties": { "action": { "const": "human.task" } },
+            "required": ["action"]
+          }
+        }
+      ],
+      "description": "Executable lifecycle handler step. Processless human tasks are workflow steps and cannot run as handlers."
+    },
+    "foreachBodyStep": {
+      "allOf": [
+        { "$ref": "#/definitions/step" },
+        {
+          "not": {
+            "properties": { "action": { "const": "human.task" } },
+            "required": ["action"]
+          }
+        }
+      ],
+      "description": "Executable foreach body step. Human tasks require a persistent, uniquely addressable workflow step."
+    },
     "step": {
       "type": "object",
       "additionalProperties": false,
@@ -1626,6 +1598,7 @@
           "description": "Working directory for the step. Inherits from DAG's working_dir if not specified. Overrides DAG-level working_dir for this step."
         },
         "run": {
+          "examples": ["echo hello", "python scripts/etl.py"],
           "oneOf": [
             {
               "type": "string",
@@ -1757,6 +1730,7 @@
           "description": "Override DAG-level log output mode. 'separate' writes stdout to .out and stderr to .err files. 'merged' writes both to a single .log file."
         },
         "output": {
+          "examples": ["RESULT"],
           "oneOf": [
             {
               "type": "string",
@@ -1783,9 +1757,34 @@
           "items": {
             "$ref": "#/definitions/stepDeclaredOutput"
           },
-          "description": "Declared file-based step outputs published through DAGU_OUTPUT_FILE for ${steps.<id>.outputs.<name>} references."
+          "description": "Declared step outputs. Value outputs are published through DAGU_OUTPUT_FILE; path outputs publish a verified materialized file."
+        },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/stepDeclaredInput"
+          },
+          "description": "Named regular-file inputs for build execution."
+        },
+        "dependencies": {
+          "examples": ["scripts/backup.sh", ["scripts/**", "config/app.yaml"]],
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "Files, directories, or glob patterns relative to the DAG working directory to snapshot for local or distributed execution."
         },
         "depends": {
+          "examples": ["build", ["build", "test"]],
           "oneOf": [
             {
               "type": "string",
@@ -1865,6 +1864,7 @@
           "$ref": "#/definitions/stepRetryPolicy"
         },
         "repeat_policy": {
+          "examples": [{ "repeat": true, "interval_sec": 60, "limit": 10 }],
           "type": "object",
           "properties": {
             "repeat": {
@@ -1939,7 +1939,7 @@
               }
             }
           ],
-          "description": "Conditions that must be met before this step can run. Supports command exit codes, environment variables, and regex matching."
+          "description": "Conditions that must be met before this step can run. Use condition for command checks or literal/value-resolved comparisons, and eval with expected for dynamic command substitutions."
         },
         "signal_on_stop": {
           "type": "string",
@@ -2110,7 +2110,7 @@
               "type": "array",
               "minItems": 1,
               "items": {
-                "$ref": "#/definitions/step"
+                "$ref": "#/definitions/foreachBodyStep"
               },
               "description": "Inline body steps executed once per item"
             },
@@ -2146,7 +2146,7 @@
               "description": "Set to \"local\" to force this step to run locally even when the server default execution mode is distributed."
             }
           ],
-          "description": "Worker selection for this step. Use a map of label key-value pairs to target specific workers, or the string \"local\" to force local execution."
+          "description": "Worker selection for this step. Use a map of label key-value pairs to target specific workers, or the string \"local\" to force local execution. Map keys and values support variable substitution (e.g. ${VAR}) resolved from the runtime environment; parallel sub-DAG children can reference the item via ${ITEM}. The string form \"local\" is literal."
         },
         "env": {
           "oneOf": [
@@ -2196,14 +2196,9 @@
           "description": "Legacy alias for 'with'. Use 'with' for new DAGs."
         },
         "llm": {
-          "$ref": "#/definitions/llmConfig",
+          "$ref": "#/definitions/standardLLMConfig",
           "deprecated": true,
           "description": "Deprecated LLM configuration for type-based chat steps. Use action: chat.completion with with."
-        },
-        "agent": {
-          "$ref": "#/definitions/agentStepConfig",
-          "deprecated": true,
-          "description": "Deprecated agent configuration for type-based agent steps. Use action: agent.run with with."
         },
         "approval": {
           "type": "object",
@@ -2240,7 +2235,7 @@
             "$ref": "#/definitions/llmMessage"
           },
           "deprecated": true,
-          "description": "Deprecated top-level messages for chat and agent steps. Use action with with.prompt or with.messages."
+          "description": "Deprecated top-level messages for chat steps. Use action with with.prompt or with.messages."
         },
         "tools": {
           "type": "array",
@@ -2272,7 +2267,7 @@
       "allOf": [
         {
           "if": {
-            "required": ["outputs"]
+            "anyOf": [{ "required": ["outputs"] }, { "required": ["inputs"] }]
           },
           "then": {
             "required": ["id"]
@@ -2366,6 +2361,43 @@
             "required": ["with"],
             "properties": {
               "with": { "$ref": "#/definitions/httpRequestActionConfig" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "action": { "const": "human.task" } },
+            "required": ["action"]
+          },
+          "then": {
+            "required": ["id", "with"],
+            "not": {
+              "anyOf": [
+                { "required": ["approval"] },
+                { "required": ["container"] },
+                { "required": ["foreach"] },
+                { "required": ["log_output"] },
+                { "required": ["mail_on_error"] },
+                { "required": ["output"] },
+                { "required": ["output_schema"] },
+                { "required": ["outputs"] },
+                { "required": ["parallel"] },
+                { "required": ["repeat_policy"] },
+                { "required": ["retry_policy"] },
+                { "required": ["signal_on_stop"] },
+                { "required": ["stderr"] },
+                { "required": ["stdout"] },
+                { "required": ["timeout_sec"] },
+                { "required": ["worker_selector"] }
+              ]
+            },
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              },
+              "with": { "$ref": "#/definitions/humanTaskActionConfig" }
             }
           }
         },
@@ -2547,6 +2579,29 @@
         },
         {
           "if": {
+            "properties": { "action": { "const": "git.worktree.add" } },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/definitions/gitWorktreeAddActionConfig" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "action": { "const": "git.worktree.remove" } },
+            "required": ["action"]
+          },
+          "then": {
+            "required": ["with"],
+            "properties": {
+              "with": { "$ref": "#/definitions/gitWorktreeRemoveActionConfig" }
+            }
+          }
+        },
+        {
+          "if": {
             "properties": { "action": { "enum": ["wait.duration", "wait.until", "wait.file", "wait.http"] } },
             "required": ["action"]
           },
@@ -2685,18 +2740,6 @@
             "required": ["with"],
             "properties": {
               "with": { "$ref": "#/definitions/chatCompletionActionConfig" }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": { "action": { "const": "agent.run" } },
-            "required": ["action"]
-          },
-          "then": {
-            "required": ["with"],
-            "properties": {
-              "with": { "$ref": "#/definitions/agentRunActionConfig" }
             }
           }
         },
@@ -2977,17 +3020,21 @@
     },
     "condition": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "condition": {
           "type": "string",
-          "description": "Command or expression to evaluate. Can include shell commands, environment variables, or command substitutions with backticks."
+          "minLength": 1,
+          "description": "Value to compare when expected is set, or command text to execute when expected is omitted. Dagu-owned references are resolved, but backticks and $() are literal in value-match mode."
         },
-        "command": {
+        "eval": {
           "type": "string",
-          "description": "Deprecated alias for condition. Still accepted for backward compatibility."
+          "minLength": 1,
+          "description": "Dynamic expression evaluated before comparing with expected. Use for command substitutions in value-match preconditions."
         },
         "expected": {
           "type": "string",
+          "minLength": 1,
           "description": "Expected value or pattern to match against the condition result. Supports regex patterns with 're:' prefix (e.g., 're:0[1-9]' for matching numbers 01-09)."
         },
         "negate": {
@@ -2995,7 +3042,17 @@
           "description": "If true, inverts the condition result. The DAG/step will run when the condition does NOT match the expected value."
         }
       },
-      "description": "Defines a condition that must be met before execution. Used in preconditions at both DAG and step levels."
+      "oneOf": [
+        {
+          "required": ["condition"],
+          "not": { "required": ["eval"] }
+        },
+        {
+          "required": ["eval", "expected"],
+          "not": { "required": ["condition"] }
+        }
+      ],
+      "description": "Defines a condition that must be met before execution. Used in preconditions at both DAG and step levels. Object entries must set exactly one of condition or eval; eval is valid only with expected."
     },
     "mailConfig": {
       "type": "object",
@@ -3080,6 +3137,7 @@
       "description": "OpenTelemetry configuration for distributed tracing. Enables detailed execution traces for DAGs and steps, providing visibility into workflow performance and debugging."
     },
     "container": {
+      "examples": [{ "image": "python:3.13" }],
       "oneOf": [
         {
           "type": "string",
@@ -3139,12 +3197,12 @@
             },
             {
               "type": "string",
-              "enum": ["always", "never", "missing"],
-              "description": "String policy: 'always' pulls the image every time, 'never' uses only local images, 'missing' pulls only if not present locally"
+              "enum": ["always", "never", "missing", "fallback"],
+              "description": "String policy: 'always' pulls the image every time, 'never' uses only local images, 'missing' pulls only if not present locally, 'fallback' attempts a pull and falls back to a local image if the pull fails"
             }
           ],
           "default": "missing",
-          "description": "Image pull policy. Accepts boolean (true='always', false='never') or string ('always', 'never', 'missing'). Default is 'missing'. Not applicable in exec mode."
+          "description": "Image pull policy. Accepts boolean (true='always', false='never') or string ('always', 'never', 'missing', 'fallback'). Default is 'missing'. Not applicable in exec mode."
         },
         "env": {
           "oneOf": [
@@ -3500,6 +3558,20 @@
     "httpExecutorConfig": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "$comment": "body cannot be combined with the multipart fields; the executor rejects that combination at runtime.",
+          "if": {
+            "anyOf": [
+              { "required": ["form"] },
+              { "required": ["files"] }
+            ]
+          },
+          "then": {
+            "not": { "required": ["body"] }
+          }
+        }
+      ],
       "properties": {
         "method": {
           "type": "string",
@@ -3528,6 +3600,16 @@
           "type": "string",
           "description": "Request body content. Can be JSON, XML, or plain text depending on Content-Type header."
         },
+        "form": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Multipart form fields mapping server field names to values. Cannot be combined with body."
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Files to upload as multipart form data, mapping server field names to local paths. Relative paths resolve from the step working directory. Cannot be combined with body."
+        },
         "silent": {
           "type": "boolean",
           "description": "When true, suppresses response headers and status in output on success."
@@ -3548,6 +3630,11 @@
         "skip_tls_verify": {
           "type": "boolean",
           "description": "Skip TLS certificate verification. WARNING: Only use for testing with self-signed certificates."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to write the response body to (file output mode)."
         }
       },
       "description": "Configuration options for HTTP executor requests."
@@ -3748,12 +3835,12 @@
             },
             {
               "type": "string",
-              "enum": ["always", "never", "missing"],
-              "description": "Pull policy string"
+              "enum": ["always", "never", "missing", "fallback"],
+              "description": "Pull policy string: 'always', 'never', 'missing', or 'fallback'"
             }
           ],
           "default": "missing",
-          "description": "Image pull policy. 'always' pulls every time, 'never' uses only local, 'missing' pulls if not present."
+          "description": "Image pull policy. 'always' pulls every time, 'never' uses only local, 'missing' pulls if not present, 'fallback' attempts a pull and falls back to a local image if the pull fails."
         },
         "auto_remove": {
           "oneOf": [{ "type": "boolean" }, { "type": "string" }],
@@ -4644,57 +4731,18 @@
       "properties": {
         "provider": {
           "type": "string",
-          "description": "Harness provider name. Use builtin for Dagu's in-process agent, a built-in CLI provider such as claude, codex, copilot, opencode, or pi, or a custom top-level harnesses entry. Supports ${VAR} interpolation."
+          "description": "Harness provider name. Use a built-in CLI provider (aider, amp, claude, cline, codex, copilot, cursor, deepseek, droid, gemini, goose, kiro, opencode, pi, or qwen) or a custom top-level harnesses entry. Supports ${VAR} interpolation."
         },
         "model": {
           "type": "string",
-          "description": "For provider: builtin, model ID from Agent Settings. For CLI providers, passed through as a CLI flag."
-        },
-        "tools": {
-          "$ref": "#/definitions/agentToolsConfig",
-          "description": "For provider: builtin, tool selection and bash policy."
-        },
-        "memory": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "For provider: builtin, whether to load global and per-DAG memory into agent context."
-            }
-          },
-          "description": "For provider: builtin, memory configuration."
-        },
-        "max_iterations": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "For provider: builtin, maximum tool-call rounds before stopping."
-        },
-        "safe_mode": {
-          "type": "boolean",
-          "description": "For provider: builtin, safe mode setting."
-        },
-        "skills": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "For provider: builtin, skill IDs the agent is allowed to use."
-        },
-        "soul": {
-          "type": "string",
-          "description": "For provider: builtin, soul ID for the agent identity."
-        },
-        "web_search": {
-          "$ref": "#/definitions/webSearchConfig",
-          "description": "For provider: builtin, provider-native web search configuration."
+          "description": "Provider model passed through as a CLI flag."
         }
       },
       "additionalProperties": {
         "$ref": "#/definitions/harnessConfigValue"
       },
       "required": ["provider"],
-      "description": "Primary or fallback harness provider configuration. For CLI providers, reserved keys are provider and fallback and all other keys are passed through to the CLI as flags. For provider: builtin, the listed builtin agent fields are validated against a fixed allowlist."
+      "description": "Primary or fallback harness provider configuration. Reserved keys are provider and fallback; all other keys are passed through to the CLI as flags."
     },
     "harnessExecutorConfig": {
       "type": "object",
@@ -4706,7 +4754,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "description": "Harness provider name. Use builtin for Dagu's in-process agent, a built-in CLI provider such as claude, codex, copilot, opencode, or pi, or a custom top-level harnesses entry. Supports ${VAR} interpolation."
+          "description": "Harness provider name. Use a built-in CLI provider (aider, amp, claude, cline, codex, copilot, cursor, deepseek, droid, gemini, goose, kiro, opencode, pi, or qwen) or a custom top-level harnesses entry. Supports ${VAR} interpolation."
         },
         "fallback": {
           "type": "array",
@@ -4717,52 +4765,13 @@
         },
         "model": {
           "type": "string",
-          "description": "For provider: builtin, model ID from Agent Settings. For CLI providers, passed through as a CLI flag."
-        },
-        "tools": {
-          "$ref": "#/definitions/agentToolsConfig",
-          "description": "For provider: builtin, tool selection and bash policy."
-        },
-        "memory": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "For provider: builtin, whether to load global and per-DAG memory into agent context."
-            }
-          },
-          "description": "For provider: builtin, memory configuration."
-        },
-        "max_iterations": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "For provider: builtin, maximum tool-call rounds before stopping."
-        },
-        "safe_mode": {
-          "type": "boolean",
-          "description": "For provider: builtin, safe mode setting."
-        },
-        "skills": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "For provider: builtin, skill IDs the agent is allowed to use."
-        },
-        "soul": {
-          "type": "string",
-          "description": "For provider: builtin, soul ID for the agent identity."
-        },
-        "web_search": {
-          "$ref": "#/definitions/webSearchConfig",
-          "description": "For provider: builtin, provider-native web search configuration."
+          "description": "Provider model passed through as a CLI flag."
         }
       },
       "additionalProperties": {
         "$ref": "#/definitions/harnessConfigValue"
       },
-      "description": "Harness step configuration. For CLI providers, unknown keys are passed through to the CLI as flags. For provider: builtin, builtin agent fields are validated against a fixed allowlist. When no DAG-level harness defaults exist, specify provider."
+      "description": "Harness step configuration. Unknown keys are passed through to the CLI as flags. When no DAG-level harness defaults exist, specify provider."
     },
     "harnessDefaultsConfig": {
       "allOf": [
@@ -5920,17 +5929,32 @@
     },
     "llmProvider": {
       "type": "string",
-      "enum": [
-        "openai",
-        "anthropic",
-        "gemini",
-        "google",
-        "openrouter",
-        "local",
-        "ollama",
-        "vllm",
-        "llama"
-      ]
+      "anyOf": [
+        {
+          "enum": [
+            "openai",
+            "openai-codex",
+            "anthropic",
+            "gemini",
+            "google",
+            "openrouter",
+            "local",
+            "ollama",
+            "vllm",
+            "llama",
+            "zai",
+            "zhipu",
+            "zhipuai",
+            "glm",
+            "opencode"
+          ]
+        },
+        {
+          "pattern": "\\$\\{[^}]+\\}",
+          "description": "Value reference resolved at runtime, e.g. ${params.PROVIDER} or ${env.LLM_PROVIDER}."
+        }
+      ],
+      "description": "LLM provider name. Supports value references such as ${params.PROVIDER} resolved when the step runs."
     },
     "llmConfig": {
       "type": "object",
@@ -6000,12 +6024,45 @@
           "$ref": "#/definitions/thinkingConfig",
           "description": "Extended thinking/reasoning configuration. Enables deeper reasoning for complex tasks."
         },
+        "max_context_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 200000,
+          "description": "Agent prompt-token threshold that activates deterministic aging of older observations. Only valid in an agent DAG's root llm configuration. Set to zero to disable proactive aging."
+        },
+        "observation_max_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 524288,
+          "description": "Maximum UTF-8 byte size of one agent-facing tool observation. Only valid in an agent DAG's root llm configuration. Set to zero to disable the limit. The full step output remains stored on the step."
+        },
+        "observation_keep_recent": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 20,
+          "description": "Number of recent agent tool observations kept in full after observation aging starts. Only valid in an agent DAG's root llm configuration. Set to zero to disable observation aging."
+        },
         "web_search": {
           "$ref": "#/definitions/webSearchConfig",
           "description": "Provider-native web search configuration. Supported by Anthropic, Gemini, and OpenRouter."
         }
       },
       "description": "LLM configuration. Supports OpenAI, Anthropic, Google Gemini, OpenRouter, and local models (Ollama/vLLM)."
+    },
+    "standardLLMConfig": {
+      "allOf": [
+        { "$ref": "#/definitions/llmConfig" },
+        {
+          "not": {
+            "anyOf": [
+              { "required": ["max_context_tokens"] },
+              { "required": ["observation_max_bytes"] },
+              { "required": ["observation_keep_recent"] }
+            ]
+          }
+        }
+      ],
+      "description": "LLM configuration without agent-only context management settings."
     },
     "webSearchConfig": {
       "type": "object",
@@ -6089,124 +6146,6 @@
       },
       "description": "A single message in an LLM session."
     },
-    "agentStepConfig": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "model": {
-          "type": "string",
-          "description": "Override the global default model for this step. Must match a model ID configured in Agent Settings."
-        },
-        "tools": {
-          "$ref": "#/definitions/agentToolsConfig"
-        },
-        "memory": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Whether to load global and per-DAG memory into agent context."
-            }
-          },
-          "description": "Memory configuration for the agent step."
-        },
-        "prompt": {
-          "type": "string",
-          "description": "Additional instructions appended to the built-in system prompt."
-        },
-        "max_iterations": {
-          "type": "integer",
-          "minimum": 1,
-          "default": 50,
-          "description": "Maximum number of tool call rounds before stopping. Default: 50."
-        },
-        "safe_mode": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable command approval via human review for bash commands. Default: true."
-        },
-        "skills": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "List of skill IDs the agent is allowed to use. If omitted, falls back to globally enabled skills."
-        },
-        "soul": {
-          "type": "string",
-          "description": "Soul ID for this step's agent identity. When omitted, inherits from defaults.agent.soul or uses the built-in default."
-        },
-        "web_search": {
-          "$ref": "#/definitions/webSearchConfig",
-          "description": "Provider-native web search configuration for this agent step. Overrides the global agent web search setting."
-        }
-      },
-      "description": "Configuration for agent-type steps. Controls model selection, available tools, safety policies, and iteration limits."
-    },
-    "agentToolsConfig": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "enum": ["bash", "read", "patch", "think", "read_schema", "output", "use_skill", "search_skills"]
-          },
-          "description": "List of tools to enable. When omitted, all tools are available."
-        },
-        "bash_policy": {
-          "$ref": "#/definitions/agentBashPolicy"
-        }
-      },
-      "description": "Configuration for which tools are available to the agent."
-    },
-    "agentBashPolicy": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "default_behavior": {
-          "type": "string",
-          "enum": ["allow", "deny"],
-          "description": "Default action when no rule matches."
-        },
-        "deny_behavior": {
-          "type": "string",
-          "enum": ["block", "ask_user"],
-          "description": "What happens when a command is denied: 'block' rejects it, 'ask_user' asks for approval."
-        },
-        "rules": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/agentBashRule"
-          },
-          "description": "Ordered list of pattern-matching rules evaluated top-to-bottom."
-        }
-      },
-      "description": "Security policy for bash commands executed by the agent."
-    },
-    "agentBashRule": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["pattern", "action"],
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "Human-readable name for this rule."
-        },
-        "pattern": {
-          "type": "string",
-          "description": "Regex pattern to match against commands."
-        },
-        "action": {
-          "type": "string",
-          "enum": ["allow", "deny"],
-          "description": "Action to take when the pattern matches."
-        }
-      },
-      "description": "A single bash command policy rule."
-    },
     "builtinExecutorType": {
       "type": "string",
       "enum": [
@@ -6236,7 +6175,6 @@
         "redis",
         "harness",
         "router",
-        "agent",
         "action",
         "outputs",
         "sftp",
@@ -6262,7 +6200,6 @@
         {
           "type": "string",
           "enum": [
-            "agent.run",
             "archive.create",
             "archive.extract",
             "archive.list",
@@ -6286,8 +6223,11 @@
             "file.stat",
             "file.write",
             "git.checkout",
+            "git.worktree.add",
+            "git.worktree.remove",
             "harness.run",
             "http.request",
+            "human.task",
             "jq.filter",
             "k8s.run",
             "kubernetes.run",
@@ -6365,7 +6305,6 @@
     },
     "legacyStepExecutionFieldPresence": {
       "anyOf": [
-        { "required": ["agent"] },
         { "required": ["call"] },
         { "required": ["command"] },
         { "required": ["config"] },
@@ -6578,6 +6517,142 @@
       ],
       "description": "Configuration for action: harness.run."
     },
+    "humanTaskActionConfig": {
+      "type": "object",
+      "required": ["prompt"],
+      "additionalProperties": false,
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Instructions shown to the operator completing the task."
+        },
+        "form": {
+          "$ref": "#/definitions/humanTaskFormSchema",
+          "description": "Optional inline JSON Schema for typed completion input. Omit for acknowledgement-only tasks."
+        }
+      },
+      "description": "Configuration for a processless human task in a root DAG. Root DAGs containing human tasks may run locally or on distributed workers; human tasks are not supported in sub-DAGs."
+    },
+    "humanTaskFormSchema": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "object"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "properties": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/humanTaskFormPropertySchema"
+          },
+          "default": {}
+        },
+        "required": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+          }
+        },
+        "additionalProperties": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "description": "Flat object JSON Schema rendered as the human task completion form."
+    },
+    "humanTaskFormPropertySchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["type"] },
+        { "required": ["enum"] },
+        { "required": ["oneOf"] }
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "integer", "number", "boolean"]
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "default": {
+          "type": ["string", "number", "boolean"]
+        },
+        "enum": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": ["string", "number", "boolean"]
+          }
+        },
+        "oneOf": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/humanTaskFormOneOfOptionSchema"
+          }
+        },
+        "minimum": {
+          "type": "number"
+        },
+        "maximum": {
+          "type": "number"
+        },
+        "minLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pattern": {
+          "type": "string"
+        }
+      },
+      "description": "Renderable scalar JSON Schema property for a human task form."
+    },
+    "humanTaskFormOneOfOptionSchema": {
+      "type": "object",
+      "required": ["const"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "integer", "number", "boolean"]
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "const": {
+          "type": ["string", "number", "boolean"]
+        }
+      },
+      "description": "Labeled scalar choice for a human task form property."
+    },
     "jqFilterActionConfig": {
       "type": "object",
       "required": ["filter"],
@@ -6759,45 +6834,29 @@
       },
       "description": "Configuration for action: chat.completion."
     },
-    "agentRunActionConfig": {
-      "type": "object",
-      "anyOf": [
-        { "required": ["task"] },
-        { "required": ["prompt"] },
-        { "required": ["messages"] }
-      ],
-      "additionalProperties": true,
-      "properties": {
-        "task": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Agent task prompt."
-        },
-        "prompt": {
-          "type": "string",
-          "minLength": 1,
-          "description": "User prompt converted to a single agent message."
-        },
-        "messages": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/definitions/llmMessage"
-          },
-          "description": "Explicit agent messages."
-        }
-      },
-      "description": "Configuration for action: agent.run."
-    },
     "templateRenderActionConfig": {
       "type": "object",
-      "required": ["template"],
       "additionalProperties": true,
+      "oneOf": [
+        {
+          "required": ["template"],
+          "not": { "required": ["template_ref"] }
+        },
+        {
+          "required": ["template_ref"],
+          "not": { "required": ["template"] }
+        }
+      ],
       "properties": {
         "template": {
           "type": "string",
           "minLength": 1,
           "description": "Template text rendered by the template executor."
+        },
+        "template_ref": {
+          "type": "string",
+          "pattern": "^\\$\\{(?:consts\\.[A-Za-z][A-Za-z0-9_]*|params\\.[A-Za-z][A-Za-z0-9_]*|env\\.[A-Za-z_][A-Za-z0-9_]*|steps\\.[A-Za-z][A-Za-z0-9_]*\\.outputs\\.[A-Za-z_][A-Za-z0-9_]*|foreach\\.[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)?|context\\.(?:dag\\.name|run\\.(?:id|status|scheduled_at|root_name|root_id)|attempt\\.(?:id|started_at)|step\\.(?:id|name)|trigger\\.(?:type|actor)|paths\\.(?:log_file|work_dir|artifacts_dir|step_stdout_file|step_stderr_file|step_output_file)|profile\\.(?:name|resolved_at)|pushback\\.(?:iteration|previous_stdout_file)))\\}$",
+          "description": "One complete scoped Dagu value reference resolved once to template text at runtime."
         }
       },
       "description": "Configuration for action: template.render."
@@ -6936,6 +6995,93 @@
         }
       },
       "description": "Configuration for action: git.checkout."
+    },
+    "gitWorktreeAddActionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Local branch checked out in the linked worktree. Dagu generates one when omitted."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Linked-worktree path. Relative paths resolve from the detected repository root."
+        },
+        "create_branch": {
+          "type": "boolean",
+          "description": "Permit creation of an explicitly named branch."
+        },
+        "base": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Local base revision used only when the selected branch is created."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["branch", "base"] },
+          "then": {
+            "required": ["create_branch"],
+            "properties": { "create_branch": { "const": true } }
+          }
+        }
+      ],
+      "description": "Configuration for action: git.worktree.add."
+    },
+    "gitWorktreeRemoveActionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["branch"] },
+        { "required": ["path"] }
+      ],
+      "properties": {
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Local branch whose linked worktree is removed."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Linked-worktree path. Relative paths resolve from the detected repository root."
+        },
+        "force": {
+          "type": "boolean",
+          "description": "Remove a dirty linked worktree."
+        },
+        "delete_branch": {
+          "type": "boolean",
+          "description": "Delete the selected local branch after removing its worktree."
+        },
+        "force_delete_branch": {
+          "type": "boolean",
+          "description": "Permit deletion when the selected branch is not merged into repository HEAD."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["delete_branch"],
+            "properties": { "delete_branch": { "const": true } }
+          },
+          "then": { "required": ["branch"] }
+        },
+        {
+          "if": {
+            "required": ["force_delete_branch"],
+            "properties": { "force_delete_branch": { "const": true } }
+          },
+          "then": {
+            "required": ["delete_branch"],
+            "properties": { "delete_branch": { "const": true } }
+          }
+        }
+      ],
+      "description": "Configuration for action: git.worktree.remove."
     },
     "waitActionConfig": {
       "type": "object",
@@ -7144,6 +7290,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["name"],
+      "oneOf": [
+        { "required": ["type"] },
+        { "required": ["path"] },
+        { "not": { "anyOf": [{ "required": ["type"] }, { "required": ["path"] }] } }
+      ],
       "properties": {
         "name": {
           "type": "string",
@@ -7155,9 +7306,32 @@
           "enum": ["string", "json"],
           "default": "string",
           "description": "Output value type. JSON outputs must contain valid JSON text."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Final regular-file path for a build materialization."
         }
       },
-      "description": "One top-level step output declaration for DAGU_OUTPUT_FILE publication."
+      "description": "One value or path-backed step output declaration."
+    },
+    "stepDeclaredInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$",
+          "description": "Input name scoped to the declaring step."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Regular-file path used as a build input."
+        }
+      },
+      "description": "One named regular-file input declaration."
     },
     "outputsActionConfig": {
       "type": "object",

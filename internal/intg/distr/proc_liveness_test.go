@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,14 +26,14 @@ worker_selector:
 steps:
   - name: sleep
     run: sleep 2
-`, withProcConfig(distrTestProcHeartbeatInterval, distrTestProcHeartbeatInterval, distrTestProcStaleThreshold))
+`, withProcConfig(distrTestProcHeartbeatInterval, distrTestProcStaleThreshold))
 	defer f.cleanup()
 
 	f.startScheduler(30 * time.Second)
 	require.NoError(t, f.start())
 
-	status := f.waitForStatus(core.Succeeded, distrTestProcSuccessTimeout)
-	require.Equal(t, core.Succeeded, status.Status)
+	status := f.waitForStatus(ir.Succeeded, distrTestProcSuccessTimeout)
+	require.Equal(t, ir.Succeeded, status.Status)
 }
 
 func TestExecution_ProcHeartbeat_QueuedDispatch(t *testing.T) {
@@ -45,13 +45,13 @@ worker_selector:
 steps:
   - name: sleep
     run: sleep 2
-`, withProcConfig(distrTestProcHeartbeatInterval, distrTestProcHeartbeatInterval, distrTestProcStaleThreshold))
+`, withProcConfig(distrTestProcHeartbeatInterval, distrTestProcStaleThreshold))
 	defer f.cleanup()
 
 	require.NoError(t, f.enqueue())
 	f.waitForQueued()
 	f.startScheduler(30 * time.Second)
 
-	status := f.waitForStatus(core.Succeeded, distrTestProcSuccessTimeout)
-	require.Equal(t, core.Succeeded, status.Status)
+	status := f.waitForStatus(ir.Succeeded, distrTestProcSuccessTimeout)
+	require.Equal(t, ir.Succeeded, status.Status)
 }

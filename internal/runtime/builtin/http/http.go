@@ -11,11 +11,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/go-resty/resty/v2"
 	"github.com/go-viper/mapstructure/v2"
 )
@@ -39,9 +43,12 @@ type httpConfig struct {
 	Headers       map[string]string `json:"headers" mapstructure:"headers"`
 	Query         map[string]string `json:"query" mapstructure:"query"`
 	Body          string            `json:"body" mapstructure:"body"`
+	Form          map[string]string `json:"form" mapstructure:"form"`
+	Files         map[string]string `json:"files" mapstructure:"files"`
 	Silent        bool              `json:"silent" mapstructure:"silent"`
 	Debug         bool              `json:"debug" mapstructure:"debug"`
 	Format        string            `json:"format" mapstructure:"format"`
+	Output        string            `json:"output" mapstructure:"output"`
 	JSON          bool              `json:"json" mapstructure:"json"`
 	SkipTLSVerify bool              `json:"skip_tls_verify" mapstructure:"skip_tls_verify"`
 }
@@ -49,10 +56,11 @@ type httpConfig struct {
 type httpJSONResult struct {
 	StatusCode int                 `json:"status_code"`
 	Headers    map[string][]string `json:"headers"`
-	Body       any                 `json:"body"`
+	Body       any                 `json:"body,omitempty"`
+	Output     string              `json:"output,omitempty"`
 }
 
-func newHTTP(ctx context.Context, step core.Step) (executor.Executor, error) {
+func newHTTP(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	var reqCfg httpConfig
 	if len(step.Script) > 0 {
 		if err := decodeHTTPConfigFromString(ctx, step.Script, &reqCfg); err != nil {
@@ -99,6 +107,13 @@ func newHTTP(ctx context.Context, step core.Step) (executor.Executor, error) {
 	if method == "" {
 		return nil, fmt.Errorf("http executor: method is required (set via command or with.method)")
 	}
+	if reqCfg.Body != "" && (len(reqCfg.Form) > 0 || len(reqCfg.Files) > 0) {
+		return nil, fmt.Errorf("http executor: body cannot be combined with form or files")
+	}
+	if err := prepareHTTPOutputConfig(ctx, &reqCfg); err != nil {
+		return nil, err
+	}
+	prepareHTTPFilePaths(ctx, &reqCfg)
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -121,7 +136,18 @@ func newHTTP(ctx context.Context, step core.Step) (executor.Executor, error) {
 	if len(reqCfg.Query) > 0 {
 		req = req.SetQueryParams(reqCfg.Query)
 	}
-	req = req.SetBody([]byte(reqCfg.Body))
+	if len(reqCfg.Form) > 0 {
+		req = req.SetMultipartFormData(reqCfg.Form)
+	}
+	if len(reqCfg.Files) > 0 {
+		req = req.SetFiles(reqCfg.Files)
+	}
+	if len(reqCfg.Form) == 0 && len(reqCfg.Files) == 0 {
+		req = req.SetBody([]byte(reqCfg.Body))
+	}
+	if reqCfg.Output != "" {
+		req = req.SetDoNotParseResponse(true)
+	}
 
 	return &http{
 		stdout:    os.Stdout,
@@ -149,20 +175,30 @@ func (e *http) Kill(_ os.Signal) error {
 
 var errHTTPStatusCode = errors.New("http status code not 2xx")
 
-func (e *http) writeJSONResult(rsp *resty.Response) error {
+func (e *http) writeJSONResult(rsp *resty.Response, body []byte) error {
 	var (
 		httpJSONResultData  = &httpJSONResult{}
 		err                 error
 		httpJSONResultBytes []byte
 	)
+	if body == nil {
+		body = rsp.Body()
+	}
 
 	if !rsp.IsSuccess() || !e.cfg.Silent {
 		httpJSONResultData.Headers = rsp.Header()
 		httpJSONResultData.StatusCode = rsp.StatusCode()
 	}
 
-	if err = json.Unmarshal(rsp.Body(), &httpJSONResultData.Body); err != nil {
-		return err
+	if e.cfg.Output != "" && rsp.IsSuccess() {
+		httpJSONResultData.Output = e.cfg.Output
+	} else {
+		if err = json.Unmarshal(body, &httpJSONResultData.Body); err != nil {
+			if e.cfg.Output == "" || rsp.IsSuccess() {
+				return err
+			}
+			httpJSONResultData.Body = string(body)
+		}
 	}
 
 	if httpJSONResultBytes, err = json.MarshalIndent(httpJSONResultData, "", " "); err != nil {
@@ -176,7 +212,7 @@ func (e *http) writeJSONResult(rsp *resty.Response) error {
 	return nil
 }
 
-func (e *http) writeTextResult(rsp *resty.Response) error {
+func (e *http) writeTextPrefix(rsp *resty.Response) error {
 	if !rsp.IsSuccess() || !e.cfg.Silent {
 		if _, err := e.stdout.Write([]byte(rsp.Status() + "\n")); err != nil {
 			return err
@@ -186,6 +222,13 @@ func (e *http) writeTextResult(rsp *resty.Response) error {
 		}
 	}
 
+	return nil
+}
+
+func (e *http) writeTextResult(rsp *resty.Response) error {
+	if err := e.writeTextPrefix(rsp); err != nil {
+		return err
+	}
 	if _, err := e.stdout.Write(rsp.Body()); err != nil {
 		return err
 	}
@@ -193,8 +236,62 @@ func (e *http) writeTextResult(rsp *resty.Response) error {
 	return nil
 }
 
+func (e *http) writeTextResultFromReader(rsp *resty.Response, body io.Reader) error {
+	if err := e.writeTextPrefix(rsp); err != nil {
+		return err
+	}
+	_, err := io.Copy(e.stdout, body)
+	return err
+}
+
+func (e *http) writeFileResult(rsp *resty.Response, body io.Reader) error {
+	if !e.cfg.Silent && !e.isJSONFormat() {
+		if err := e.writeTextPrefix(rsp); err != nil {
+			return err
+		}
+	}
+
+	return writeResponseBodyFile(e.cfg.Output, body)
+}
+
+func writeResponseBodyFile(output string, body io.Reader) error {
+	if err := os.MkdirAll(filepath.Dir(output), 0o750); err != nil {
+		return err
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(output), filepath.Base(output)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := func() { _ = fileutil.Remove(tmpPath) }
+
+	if _, err = io.Copy(tmpFile, body); err != nil {
+		_ = tmpFile.Close()
+		cleanup()
+		return err
+	}
+	if err = tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		cleanup()
+		return err
+	}
+	if err = tmpFile.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err = fileutil.ReplaceFile(tmpPath, output); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
+}
+
 func (e *http) isJSONFormat() bool {
 	return e.cfg.Format == "json" || e.cfg.JSON
+}
+
+func (e *http) hasFileOutput() bool {
+	return e.cfg.Output != ""
 }
 
 func (e *http) Run(_ context.Context) error {
@@ -205,8 +302,18 @@ func (e *http) Run(_ context.Context) error {
 
 	resCode := rsp.StatusCode()
 
+	if e.hasFileOutput() {
+		if err = e.writeFileOutputResult(rsp); err != nil {
+			return err
+		}
+		if !rsp.IsSuccess() {
+			return fmt.Errorf("%w: %d", errHTTPStatusCode, resCode)
+		}
+		return nil
+	}
+
 	if e.isJSONFormat() {
-		if err = e.writeJSONResult(rsp); err != nil {
+		if err = e.writeJSONResult(rsp, rsp.Body()); err != nil {
 			return err
 		}
 	} else {
@@ -219,6 +326,57 @@ func (e *http) Run(_ context.Context) error {
 		return fmt.Errorf("%w: %d", errHTTPStatusCode, resCode)
 	}
 	return nil
+}
+
+func (e *http) writeFileOutputResult(rsp *resty.Response) error {
+	body := rsp.RawBody()
+	if body == nil {
+		return errors.New("http executor: response body is unavailable")
+	}
+	defer func() { _ = body.Close() }()
+
+	if rsp.IsSuccess() {
+		if err := e.writeFileResult(rsp, body); err != nil {
+			return err
+		}
+		if e.isJSONFormat() {
+			return e.writeJSONResult(rsp, nil)
+		}
+		return nil
+	}
+
+	if e.isJSONFormat() {
+		data, err := io.ReadAll(body)
+		if err != nil {
+			return err
+		}
+		return e.writeJSONResult(rsp, data)
+	}
+
+	return e.writeTextResultFromReader(rsp, body)
+}
+
+func prepareHTTPOutputConfig(ctx context.Context, cfg *httpConfig) error {
+	output := strings.TrimSpace(cfg.Output)
+	if output == "" {
+		cfg.Output = ""
+		return nil
+	}
+	if !filepath.IsAbs(output) {
+		env := runtime.GetEnv(ctx)
+		output = filepath.Join(env.WorkingDir, output)
+	}
+	cfg.Output = filepath.Clean(output)
+	return nil
+}
+
+func prepareHTTPFilePaths(ctx context.Context, cfg *httpConfig) {
+	for field, path := range cfg.Files {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(runtime.GetEnv(ctx).WorkingDir, path)
+		}
+		cfg.Files[field] = filepath.Clean(path)
+	}
 }
 
 func decodeHTTPConfig(dat map[string]any, cfg *httpConfig) error {
@@ -249,5 +407,5 @@ func splitMethodURL(cmdWithArgs string) (string, string) {
 }
 
 func init() {
-	executor.RegisterExecutor("http", newHTTP, nil, core.ExecutorCapabilities{Command: true, Script: true})
+	executor.RegisterExecutor("http", newHTTP, nil, registry.ExecutorCapabilities{Command: true, Script: true})
 }

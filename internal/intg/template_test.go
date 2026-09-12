@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,9 +38,94 @@ func TestTemplateExecutor(t *testing.T) {
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": test.Contains("hello, world!"),
+		})
+	})
+
+	t.Run("EnvironmentTemplateReference", func(t *testing.T) {
+		t.Parallel()
+
+		th := test.Setup(t)
+		dag := th.DAG(t, `env:
+  - TEMPLATE: "Hello, {{ .name }}!"
+
+steps:
+  - id: render
+    action: template.render
+    with:
+      template_ref: ${env.TEMPLATE}
+      data:
+        name: Alice
+    output: RESULT
+`)
+		agent := dag.Agent()
+		agent.RunSuccess(t)
+
+		dag.AssertLatestStatus(t, ir.Succeeded)
+		dag.AssertOutputs(t, map[string]any{
+			"RESULT": "Hello, Alice!",
+		})
+	})
+
+	t.Run("StepOutputTemplateReference", func(t *testing.T) {
+		t.Parallel()
+
+		th := test.Setup(t)
+		dag := th.DAG(t, `steps:
+  - id: produce
+    run: |
+      printf 'template=%s\n' 'Hello, {{ .name }}!' >> "$DAGU_OUTPUT_FILE"
+    outputs:
+      - name: template
+
+  - id: render
+    depends:
+      - produce
+    action: template.render
+    with:
+      template_ref: ${steps.produce.outputs.template}
+      data:
+        name: Bob
+    output: RESULT
+`)
+		agent := dag.Agent()
+		agent.RunSuccess(t)
+
+		dag.AssertLatestStatus(t, ir.Succeeded)
+		dag.AssertOutputs(t, map[string]any{
+			"RESULT": "Hello, Bob!",
+		})
+	})
+
+	t.Run("TemplateReferenceUsesSinglePassResolution", func(t *testing.T) {
+		t.Parallel()
+
+		th := test.Setup(t)
+		dag := th.DAG(t, `params:
+  - name: template
+    type: string
+    default: 'Hello, {{ .name }}! ${env.NESTED}'
+
+env:
+  - NESTED: must-not-expand
+
+steps:
+  - id: render
+    action: template.render
+    with:
+      template_ref: ${params.template}
+      data:
+        name: Alice
+    output: RESULT
+`)
+		agent := dag.Agent()
+		agent.RunSuccess(t)
+
+		dag.AssertLatestStatus(t, ir.Succeeded)
+		dag.AssertOutputs(t, map[string]any{
+			"RESULT": "Hello, Alice! ${env.NESTED}",
 		})
 	})
 
@@ -66,7 +151,7 @@ func TestTemplateExecutor(t *testing.T) {
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		content, err := os.ReadFile(outFile)
 		require.NoError(t, err)
@@ -101,7 +186,7 @@ steps:
 		})
 
 		status, _ := readAttemptStatusAndOutputs(t, th, "template-artifact-auto-enable", runID)
-		require.Equal(t, core.Succeeded, status.Status)
+		require.Equal(t, ir.Succeeded, status.Status)
 		require.NotEmpty(t, status.ArchiveDir)
 
 		content, err := os.ReadFile(filepath.Join(status.ArchiveDir, "greeting.txt"))
@@ -129,7 +214,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		content, err := os.ReadFile(filepath.Join(tmpDir, "subdir", "output.txt"))
 		require.NoError(t, err)
@@ -160,7 +245,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": "Hello, Alice!",
 		})
@@ -185,7 +270,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": []test.Contains{
 				test.Contains("${BAR}"),
@@ -218,7 +303,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": []test.Contains{
 				test.Contains("```yaml"),
@@ -244,7 +329,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunCheckErr(t, "execution error")
 
-		dag.AssertLatestStatus(t, core.Failed)
+		dag.AssertLatestStatus(t, ir.Failed)
 	})
 
 	t.Run("ComplexTemplate", func(t *testing.T) {
@@ -270,7 +355,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": []test.Contains{
 				test.Contains("# Domain Report"),
@@ -299,7 +384,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": test.Contains("No items found."),
 		})
@@ -350,7 +435,7 @@ steps:
 		})
 
 		status, outputs := readAttemptStatusAndOutputs(t, th, "template-optional-param", runID)
-		require.Equal(t, core.Succeeded, status.Status)
+		require.Equal(t, ir.Succeeded, status.Status)
 		require.Contains(t, outputs.Outputs, "result")
 		assert.Contains(t, outputs.Outputs["result"], "Hello, tom!")
 		assert.Contains(t, outputs.Outputs["result"], "You are 21 years old.")
@@ -375,7 +460,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": "Anonymous (Admin)",
 		})
@@ -397,7 +482,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": "my-service",
 		})
@@ -422,7 +507,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": []test.Contains{
 				test.Contains("name=MyApp"),
@@ -450,7 +535,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": "api.example.com,app.example.com",
 		})
@@ -480,7 +565,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": []test.Contains{
 				test.Contains("app=my-service"),
@@ -503,7 +588,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunCheckErr(t, "error")
 
-		dag.AssertLatestStatus(t, core.Failed)
+		dag.AssertLatestStatus(t, ir.Failed)
 	})
 
 	t.Run("SlimSprigMissingKeyBoundary", func(t *testing.T) {
@@ -522,7 +607,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunCheckErr(t, "execution error")
 
-		dag.AssertLatestStatus(t, core.Failed)
+		dag.AssertLatestStatus(t, ir.Failed)
 	})
 
 	t.Run("SlimSprigOverlapBehavior", func(t *testing.T) {
@@ -543,7 +628,7 @@ steps:
 		agent := dag.Agent()
 		agent.RunSuccess(t)
 
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"RESULT": []test.Contains{
 				test.Contains("items=a;b;c"),

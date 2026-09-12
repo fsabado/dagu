@@ -1,5 +1,6 @@
-import { components } from '@/api/v1/schema';
+import { components, UserAuthProvider } from '@/api/v1/schema';
 import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -30,12 +31,57 @@ import {
   UserCheck,
   UserPlus,
 } from 'lucide-react';
-import { useCallback, useContext, useEffect, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ResetPasswordModal } from './ResetPasswordModal';
 import { UserFormModal } from './UserFormModal';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { useI18n } from '@/i18n/I18nProvider';
+import { I18nTemplate } from '@/i18n/I18nTemplate';
 
 type User = components['schemas']['User'];
+type UsersListResponse = components['schemas']['UsersListResponse'];
+
+function AuthProviderBadge({
+  user,
+  managedRoleProviders,
+  managedWorkspaceAccessProviders,
+}: {
+  user: User;
+  managedRoleProviders: UserAuthProvider[];
+  managedWorkspaceAccessProviders: UserAuthProvider[];
+}) {
+  const { ts } = useI18n();
+  const provider = user.authProvider ?? UserAuthProvider.builtin;
+  if (provider === UserAuthProvider.builtin) {
+    return 'Local';
+  }
+  const providerLabel = provider === UserAuthProvider.oidc ? 'SSO' : 'Proxy';
+  const roleManaged = managedRoleProviders.includes(provider);
+  const workspaceAccessManaged =
+    managedWorkspaceAccessProviders.includes(provider);
+  if (!roleManaged && !workspaceAccessManaged) {
+    return providerLabel;
+  }
+  if (roleManaged && workspaceAccessManaged) {
+    return (
+      <Badge variant="info">
+        {ts('Managed by {provider}', { provider: providerLabel })}
+      </Badge>
+    );
+  }
+  const scope = ts(roleManaged ? 'Role' : 'Workspace access');
+  return (
+    <Badge variant="info">
+      {ts('{scope} managed by {provider}', { scope, provider: providerLabel })}
+    </Badge>
+  );
+}
+
+function canUsePassword(user: User): boolean {
+  return !user.authProvider || user.authProvider === UserAuthProvider.builtin;
+}
 
 /**
  * Render the Users management page with a table of accounts and controls for creating, editing, resetting passwords, and deleting users.
@@ -45,14 +91,21 @@ type User = components['schemas']['User'];
  * @returns The Users page component as a JSX.Element
  */
 export default function UsersPage() {
+  const { ts } = useI18n();
   const config = useConfig();
   const { user: currentUser } = useAuth();
   const isAdmin = useIsAdmin();
   const hasRbac = useHasFeature('rbac');
   const appBarContext = useContext(AppBarContext);
   const [users, setUsers] = useState<User[]>([]);
+  const [managedRoleProviders, setManagedRoleProviders] = useState<
+    UserAuthProvider[]
+  >([]);
+  const [managedWorkspaceAccessProviders, setManagedWorkspaceAccessProviders] =
+    useState<UserAuthProvider[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const fetchSequence = useRef(0);
 
   // Modal states
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -66,6 +119,16 @@ export default function UsersPage() {
   }, [appBarContext]);
 
   const fetchUsers = useCallback(async () => {
+    const sequence = ++fetchSequence.current;
+    setIsLoading(true);
+    setError(null);
+    setUsers([]);
+    setManagedRoleProviders([]);
+    setManagedWorkspaceAccessProviders([]);
+    setShowCreateModal(false);
+    setEditingUser(null);
+    setResetPasswordUser(null);
+    setDeletingUser(null);
     try {
       const token = localStorage.getItem(TOKEN_KEY);
       const remoteNode = encodeURIComponent(
@@ -84,12 +147,28 @@ export default function UsersPage() {
         throw new Error('Failed to fetch users');
       }
 
-      const data = await response.json();
+      const data = (await response.json()) as UsersListResponse;
+      if (sequence !== fetchSequence.current) {
+        return;
+      }
       setUsers(data.users || []);
+      const roleProviders =
+        data.managedRoleProviders ??
+        (data.oidcWorkspaceAccessSyncEnabled ? [UserAuthProvider.oidc] : []);
+      setManagedRoleProviders(roleProviders);
+      setManagedWorkspaceAccessProviders(
+        data.managedWorkspaceAccessProviders ?? roleProviders
+      );
+      setError(null);
     } catch (err) {
+      if (sequence !== fetchSequence.current) {
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Failed to load users');
     } finally {
-      setIsLoading(false);
+      if (sequence === fetchSequence.current) {
+        setIsLoading(false);
+      }
     }
   }, [config.apiURL, appBarContext.selectedRemoteNode]);
 
@@ -162,9 +241,11 @@ export default function UsersPage() {
     <div className="flex flex-col gap-4 max-w-7xl">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-semibold">Users</h1>
+          <h1 className="text-lg font-semibold">
+            <I18nText text={'Users'} />
+          </h1>
           <p className="text-sm text-muted-foreground">
-            Manage user accounts and their roles
+            <I18nText text={'Manage user accounts and their roles'} />
           </p>
         </div>
         {hasRbac && (
@@ -174,7 +255,7 @@ export default function UsersPage() {
             className="h-8"
           >
             <UserPlus className="h-4 w-4 mr-1.5" />
-            Add User
+            <I18nText text={'Add User'} />
           </Button>
         )}
       </div>
@@ -189,14 +270,19 @@ export default function UsersPage() {
         <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground bg-muted/50 rounded-md">
           <Info className="h-4 w-4 shrink-0" />
           <span>
-            User management features (create, edit, delete) require a{' '}
-            <Link
-              to="/license"
-              className="text-primary underline underline-offset-2"
-            >
-              license or trial
-            </Link>
-            . Password reset is available for all admins.
+            <I18nTemplate
+              text="User management features (create, edit, delete) require a {licenseLink}. Password reset is available for all admins."
+              values={{
+                licenseLink: (
+                  <Link
+                    to="/license"
+                    className="text-primary underline underline-offset-2"
+                  >
+                    <I18nText text="license or trial" />
+                  </Link>
+                ),
+              }}
+            />
           </span>
         </div>
       )}
@@ -205,12 +291,24 @@ export default function UsersPage() {
         <Table className="text-xs">
           <TableHeader>
             <TableRow>
-              <TableHead className="w-[200px]">Username</TableHead>
-              <TableHead className="w-[100px]">Role</TableHead>
-              <TableHead className="w-[80px]">Auth</TableHead>
-              <TableHead className="w-[80px]">Status</TableHead>
-              <TableHead className="w-[150px]">Created</TableHead>
-              <TableHead className="w-[150px]">Updated</TableHead>
+              <TableHead className="w-[200px]">
+                <I18nText text={'Username'} />
+              </TableHead>
+              <TableHead className="w-[100px]">
+                <I18nText text={'Role'} />
+              </TableHead>
+              <TableHead className="w-[80px]">
+                <I18nText text={'Auth'} />
+              </TableHead>
+              <TableHead className="w-[80px]">
+                <I18nText text={'Status'} />
+              </TableHead>
+              <TableHead className="w-[150px]">
+                <I18nText text={'Created'} />
+              </TableHead>
+              <TableHead className="w-[150px]">
+                <I18nText text={'Updated'} />
+              </TableHead>
               <TableHead className="w-[80px]"></TableHead>
             </TableRow>
           </TableHeader>
@@ -221,7 +319,7 @@ export default function UsersPage() {
                   colSpan={7}
                   className="text-center text-muted-foreground py-8"
                 >
-                  Loading users...
+                  <I18nText text={'Loading users...'} />
                 </TableCell>
               </TableRow>
             ) : users.length === 0 ? (
@@ -230,7 +328,7 @@ export default function UsersPage() {
                   colSpan={7}
                   className="text-center text-muted-foreground py-8"
                 >
-                  No users found
+                  <I18nText text={'No users found'} />
                 </TableCell>
               </TableRow>
             ) : (
@@ -244,7 +342,7 @@ export default function UsersPage() {
                       {user.username}
                       {user.id === currentUser?.id && (
                         <span className="text-xs text-muted-foreground">
-                          (you)
+                          <I18nText text={'(you)'} />
                         </span>
                       )}
                     </div>
@@ -255,15 +353,23 @@ export default function UsersPage() {
                     </span>
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
-                    {user.authProvider === 'oidc' ? 'SSO' : 'Local'}
+                    <AuthProviderBadge
+                      user={user}
+                      managedRoleProviders={managedRoleProviders}
+                      managedWorkspaceAccessProviders={
+                        managedWorkspaceAccessProviders
+                      }
+                    />
                   </TableCell>
                   <TableCell className="text-sm">
                     {user.isDisabled ? (
                       <span className="text-red-600 dark:text-red-400">
-                        Disabled
+                        <I18nText text={'Disabled'} />
                       </span>
                     ) : (
-                      <span className="text-muted-foreground">Active</span>
+                      <span className="text-muted-foreground">
+                        <I18nText text={'Active'} />
+                      </span>
                     )}
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
@@ -275,7 +381,11 @@ export default function UsersPage() {
                   <TableCell>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label={`Actions for ${user.username}`}
+                        >
                           <MoreHorizontal className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>
@@ -285,15 +395,15 @@ export default function UsersPage() {
                             onClick={() => setEditingUser(user)}
                           >
                             <Pencil className="h-4 w-4 mr-2" />
-                            Edit
+                            <I18nText text={'Edit'} />
                           </DropdownMenuItem>
                         )}
-                        {isAdmin && (
+                        {isAdmin && canUsePassword(user) && (
                           <DropdownMenuItem
                             onClick={() => setResetPasswordUser(user)}
                           >
                             <Key className="h-4 w-4 mr-2" />
-                            Reset Password
+                            <I18nText text={'Reset Password'} />
                           </DropdownMenuItem>
                         )}
                         {hasRbac && isAdmin && user.id !== currentUser?.id && (
@@ -303,12 +413,12 @@ export default function UsersPage() {
                             {user.isDisabled ? (
                               <>
                                 <UserCheck className="h-4 w-4 mr-2" />
-                                Enable
+                                <I18nText text={'Enable'} />
                               </>
                             ) : (
                               <>
                                 <Ban className="h-4 w-4 mr-2" />
-                                Disable
+                                <I18nText text={'Disable'} />
                               </>
                             )}
                           </DropdownMenuItem>
@@ -320,7 +430,7 @@ export default function UsersPage() {
                             disabled={user.id === currentUser?.id}
                           >
                             <Trash2 className="h-4 w-4 mr-2" />
-                            Delete
+                            <I18nText text={'Delete'} />
                           </DropdownMenuItem>
                         )}
                       </DropdownMenuContent>
@@ -347,6 +457,8 @@ export default function UsersPage() {
       <UserFormModal
         open={!!editingUser}
         user={editingUser || undefined}
+        managedRoleProviders={managedRoleProviders}
+        managedWorkspaceAccessProviders={managedWorkspaceAccessProviders}
         onClose={() => setEditingUser(null)}
         onSuccess={() => {
           setEditingUser(null);
@@ -362,18 +474,22 @@ export default function UsersPage() {
       />
 
       {/* Delete Confirmation */}
-      <ConfirmModal
-        title="Delete User"
-        buttonText="Delete"
-        visible={!!deletingUser}
-        dismissModal={() => setDeletingUser(null)}
-        onSubmit={handleDeleteUser}
-      >
-        <p>
-          Are you sure you want to delete user &quot;{deletingUser?.username}
-          &quot;? This action cannot be undone.
-        </p>
-      </ConfirmModal>
+      <I18nProps>
+        <ConfirmModal
+          title="Delete User"
+          buttonText="Delete"
+          visible={!!deletingUser}
+          dismissModal={() => setDeletingUser(null)}
+          onSubmit={handleDeleteUser}
+        >
+          <p>
+            {ts(
+              'Are you sure you want to delete user "{username}"? This action cannot be undone.',
+              { username: deletingUser?.username ?? '' }
+            )}
+          </p>
+        </ConfirmModal>
+      </I18nProps>
     </div>
   );
 }

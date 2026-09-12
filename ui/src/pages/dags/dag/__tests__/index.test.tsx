@@ -1,20 +1,23 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppBarContext } from '@/contexts/AppBarContext';
-import { PageContextProvider } from '@/contexts/PageContext';
 import { useQuery } from '@/hooks/api';
 import { WorkspaceKind } from '@/lib/workspace';
 import DAGDetails from '..';
 
 vi.mock('@/features/dags/components/dag-details', () => ({
   DAGHeader: () => null,
-  DAGDetailsContent: vi.fn(({ fillHeight }) => (
-    <div data-fill-height={String(fillHeight)} data-testid="dag-details-content" />
+  DAGDetailsContent: vi.fn(({ activeTab, fillHeight }) => (
+    <div
+      data-active-tab={activeTab}
+      data-fill-height={String(fillHeight)}
+      data-testid="dag-details-content"
+    />
   )),
 }));
 
@@ -53,7 +56,6 @@ const dagData = {
     name: 'release-notes',
     artifacts: { enabled: true },
   },
-  filePath: '/tmp/release-notes.yaml',
   latestDAGRun: {
     name: 'release-notes',
     dagRunId: 'run-1',
@@ -62,15 +64,22 @@ const dagData = {
   localDags: [],
 };
 
-function renderPage() {
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <span data-testid="location">{location.pathname + location.search}</span>
+  );
+}
+
+function renderPage(initialEntry = '/dags/release-notes') {
   render(
-    <MemoryRouter initialEntries={['/dags/release-notes']}>
+    <MemoryRouter initialEntries={[initialEntry]}>
       <AppBarContext.Provider value={appBarValue}>
-        <PageContextProvider>
-          <Routes>
-            <Route path="/dags/:fileName" element={<DAGDetails />} />
-          </Routes>
-        </PageContextProvider>
+        <LocationProbe />
+        <Routes>
+          <Route path="/dags/:fileName" element={<DAGDetails />} />
+          <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
+        </Routes>
       </AppBarContext.Provider>
     </MemoryRouter>
   );
@@ -101,5 +110,19 @@ describe('DAGDetails page', () => {
     expect(content).toHaveAttribute('data-fill-height', 'true');
     expect(content.parentElement).toHaveClass('min-h-0');
     expect(content.parentElement).toHaveClass('flex-1');
+  });
+
+  it('redirects the legacy docs tab to the Wiki tab', async () => {
+    renderPage('/dags/release-notes/docs?remoteNode=edge');
+
+    expect(screen.getByTestId('dag-details-content')).toHaveAttribute(
+      'data-active-tab',
+      'wiki'
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('location')).toHaveTextContent(
+        '/dags/release-notes/wiki?remoteNode=edge'
+      );
+    });
   });
 });

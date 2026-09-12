@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/auth"
-	"github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
 )
 
 func newWebhookStore(t *testing.T) *store.WebhookStore {
@@ -113,12 +113,14 @@ func TestWebhookUpdate(t *testing.T) {
 
 	wh.Enabled = false
 	wh.TokenPrefix = "tok2"
+	wh.AllowedProfiles = []string{"prod", "staging"}
 	require.NoError(t, s.Update(ctx, wh))
 
 	got, err := s.GetByID(ctx, wh.ID)
 	require.NoError(t, err)
 	assert.False(t, got.Enabled)
 	assert.Equal(t, "tok2", got.TokenPrefix)
+	assert.Equal(t, []string{"prod", "staging"}, got.AllowedProfiles)
 }
 
 func TestWebhookUpdate_NotFound(t *testing.T) {

@@ -11,10 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -56,17 +55,17 @@ steps:
 
 	// Verify the initial run completed successfully
 	ctx := context.Background()
-	ref := exec.NewDAGRunRef("test_retry", dagRunID)
-	attempt, err := th.DAGRunStore.FindAttempt(ctx, ref)
+	ref := ir.NewDAGRunRef("test_retry", dagRunID)
+	attempt, err := th.DAGRunRepository.FindAttempt(ctx, ref)
 	require.NoError(t, err)
 
 	firstRunStatus, err := attempt.ReadStatus(ctx)
 	require.NoError(t, err)
-	require.Equal(t, firstRunStatus.Status, core.Succeeded)
+	require.Equal(t, firstRunStatus.Status, ir.Succeeded)
 
 	// Manually update the second node status to failed
 	// This simulates a scenario where the user wants to retry from a specific point
-	firstRunStatus.Nodes[1].Status = core.NodeFailed
+	firstRunStatus.Nodes[1].Status = ir.NodeFailed
 
 	err = th.DAGRunMgr.UpdateStatus(ctx, ref, *firstRunStatus)
 	require.NoError(t, err)
@@ -74,7 +73,7 @@ steps:
 	// Read back the status to verify it was persisted correctly
 	readStatus, err := attempt.ReadStatus(ctx)
 	require.NoError(t, err)
-	require.Equal(t, core.NodeFailed.String(), readStatus.Nodes[1].Status.String(), "step2 should be marked as failed in persisted status")
+	require.Equal(t, ir.NodeFailed.String(), readStatus.Nodes[1].Status.String(), "step2 should be marked as failed in persisted status")
 
 	// Now retry the DAG using the retry command
 	retryArgs := []string{"retry", "--run-id", dagRunID, "test_retry"}
@@ -88,7 +87,7 @@ steps:
 	// Actual: The retry fails or doesn't properly execute the failed nodes
 
 	// Get the status after retry
-	retryAttempt, err := th.DAGRunStore.FindAttempt(ctx, ref)
+	retryAttempt, err := th.DAGRunRepository.FindAttempt(ctx, ref)
 	require.NoError(t, err)
 	retryStatus, err := retryAttempt.ReadStatus(ctx)
 	require.NoError(t, err)
@@ -101,11 +100,11 @@ steps:
 	}
 
 	// The expected behavior is that the retry succeeds
-	require.Equal(t, core.Succeeded.String(), retryStatus.Status.String(), "retry should succeed")
+	require.Equal(t, ir.Succeeded.String(), retryStatus.Status.String(), "retry should succeed")
 
 	// Verify that step2 and step3 were re-executed
-	require.Equal(t, core.NodeSucceeded.String(), retryStatus.Nodes[1].Status.String(), "step2 should have succeeded after retry")
-	require.Equal(t, core.NodeSucceeded.String(), retryStatus.Nodes[2].Status.String(), "step3 should have succeeded after retry")
+	require.Equal(t, ir.NodeSucceeded.String(), retryStatus.Nodes[1].Status.String(), "step2 should have succeeded after retry")
+	require.Equal(t, ir.NodeSucceeded.String(), retryStatus.Nodes[2].Status.String(), "step3 should have succeeded after retry")
 }
 
 func TestStepRetryReusesOriginalWorkingDir(t *testing.T) {
@@ -147,8 +146,8 @@ if (-not (Test-Path marker)) {
 	})
 	require.Error(t, err)
 
-	ref := exec.NewDAGRunRef("retry_working_dir", dagRunID)
-	failedAttempt, err := th.DAGRunStore.FindAttempt(th.Context, ref)
+	ref := ir.NewDAGRunRef("retry_working_dir", dagRunID)
+	failedAttempt, err := th.DAGRunRepository.FindAttempt(th.Context, ref)
 	require.NoError(t, err)
 	failedStatus, err := failedAttempt.ReadStatus(th.Context)
 	require.NoError(t, err)
@@ -160,11 +159,11 @@ if (-not (Test-Path marker)) {
 		Args: []string{"retry", "--run-id", dagRunID, "--step", "target", "retry_working_dir"},
 	})
 
-	retryAttempt, err := th.DAGRunStore.FindAttempt(th.Context, ref)
+	retryAttempt, err := th.DAGRunRepository.FindAttempt(th.Context, ref)
 	require.NoError(t, err)
 	retryStatus, err := retryAttempt.ReadStatus(th.Context)
 	require.NoError(t, err)
-	require.Equal(t, core.Succeeded, retryStatus.Status)
+	require.Equal(t, ir.Succeeded, retryStatus.Status)
 
 	observed, err := os.ReadFile(filepath.Join(stepDir, "observed.txt"))
 	require.NoError(t, err)
@@ -178,4 +177,74 @@ if (-not (Test-Path marker)) {
 	}
 	require.GreaterOrEqual(t, observedWorkingDirCount, 2, "step should run from the original step working directory before and during retry")
 	require.Contains(t, observedOutput, "retry ok")
+}
+
+func TestStepRetryWithDownstreamResetsOnlyReachableDescendants(t *testing.T) {
+	th := test.SetupCommand(t)
+	workDir := t.TempDir()
+
+	appendLine := func(letter string) string {
+		return test.ForOS(
+			fmt.Sprintf("echo %s >> seen-%s.txt", letter, letter),
+			fmt.Sprintf("Add-Content -Path seen-%s.txt -Value %s", letter, letter),
+		)
+	}
+	th.CreateDAGFile(t, "retry_downstream.yaml", fmt.Sprintf(`type: graph
+working_dir: %q
+steps:
+  - name: A
+    run: |
+      %s
+  - name: B
+    run: |
+      %s
+    depends:
+      - A
+  - name: C
+    run: |
+      %s
+    depends:
+      - B
+  - name: D
+    run: |
+      %s
+    depends:
+      - A
+`, workDir, appendLine("A"), appendLine("B"), appendLine("C"), appendLine("D")))
+
+	dagRunID := uuid.Must(uuid.NewV7()).String()
+	th.RunCommand(t, cmd.Start(), test.CmdTest{
+		Args: []string{"start", "--run-id", dagRunID, "retry_downstream"},
+	})
+
+	require.Equal(t, map[string]int{"A": 1, "B": 1, "C": 1, "D": 1}, readStepExecutionCounts(t, workDir, "A", "B", "C", "D"))
+
+	th.RunCommand(t, cmd.Retry(), test.CmdTest{
+		Args: []string{"retry", "--run-id", dagRunID, "--step", "B", "--downstream", "retry_downstream"},
+	})
+
+	require.Equal(t, map[string]int{"A": 1, "B": 2, "C": 2, "D": 1}, readStepExecutionCounts(t, workDir, "A", "B", "C", "D"))
+
+	ref := ir.NewDAGRunRef("retry_downstream", dagRunID)
+	attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ref)
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(th.Context)
+	require.NoError(t, err)
+	require.Equal(t, ir.Succeeded, status.Status)
+	require.Equal(t, ir.NodeSucceeded, status.Nodes[0].Status)
+	require.Equal(t, ir.NodeSucceeded, status.Nodes[1].Status)
+	require.Equal(t, ir.NodeSucceeded, status.Nodes[2].Status)
+	require.Equal(t, ir.NodeSucceeded, status.Nodes[3].Status)
+}
+
+func readStepExecutionCounts(t *testing.T, workDir string, steps ...string) map[string]int {
+	t.Helper()
+
+	counts := map[string]int{}
+	for _, step := range steps {
+		output, err := os.ReadFile(filepath.Join(workDir, "seen-"+step+".txt"))
+		require.NoError(t, err)
+		counts[step] = len(strings.Fields(string(output)))
+	}
+	return counts
 }

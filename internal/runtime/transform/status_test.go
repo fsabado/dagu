@@ -8,11 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/transform"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,29 +19,29 @@ import (
 
 func TestStatusSerialization(t *testing.T) {
 	startedAt, finishedAt := time.Now(), time.Now().Add(time.Second*1)
-	dag := &core.DAG{
-		HandlerOn: core.HandlerOn{},
-		Steps: []core.Step{
+	dag := &ir.DAG{
+		HandlerOn: ir.HandlerOn{},
+		Steps: []ir.Step{
 			{
 				Name: "1", Description: "",
-				Dir: "dir", Commands: []core.CommandEntry{{Command: "echo", Args: []string{"1"}}},
-				Depends: []string{}, ContinueOn: core.ContinueOn{},
-				RetryPolicy: core.RetryPolicy{}, MailOnError: false,
-				RepeatPolicy: core.RepeatPolicy{}, Preconditions: []*core.Condition{},
+				Dir: "dir", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"1"}}},
+				Depends: []string{}, ContinueOn: ir.ContinueOn{},
+				RetryPolicy: ir.RetryPolicy{}, MailOnError: false,
+				RepeatPolicy: ir.RepeatPolicy{}, Preconditions: []*ir.Condition{},
 			},
 		},
-		MailOn:    &core.MailOn{},
-		ErrorMail: &core.MailConfig{},
-		InfoMail:  &core.MailConfig{},
-		SMTP:      &core.SMTPConfig{},
+		MailOn:    &ir.MailOn{},
+		ErrorMail: &ir.MailConfig{},
+		InfoMail:  &ir.MailConfig{},
+		SMTP:      &ir.SMTPConfig{},
 	}
 	dagRunID := uuid.Must(uuid.NewV7()).String()
-	statusToPersist := transform.NewStatusBuilder(dag).Create(dagRunID, core.Succeeded, 0, startedAt, transform.WithFinishedAt(finishedAt))
+	statusToPersist := ir.NewStatusBuilder(dag).Create(dagRunID, ir.Succeeded, 0, startedAt, ir.WithFinishedAt(finishedAt))
 
 	rawJSON, err := json.Marshal(statusToPersist)
 	require.NoError(t, err)
 
-	statusObject, err := exec.StatusFromJSON(string(rawJSON))
+	statusObject, err := ir.StatusFromJSON(string(rawJSON))
 	require.NoError(t, err)
 
 	require.Equal(t, statusToPersist.Name, statusObject.Name)
@@ -51,27 +50,27 @@ func TestStatusSerialization(t *testing.T) {
 }
 
 func TestStatusBuilder(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "test-dag",
-		HandlerOn: core.HandlerOn{
-			Exit:    &core.Step{Name: "exit-handler"},
-			Success: &core.Step{Name: "success-handler"},
-			Failure: &core.Step{Name: "failure-handler"},
-			Abort:   &core.Step{Name: "abort-handler"},
+		HandlerOn: ir.HandlerOn{
+			Exit:    &ir.Step{Name: "exit-handler"},
+			Success: &ir.Step{Name: "success-handler"},
+			Failure: &ir.Step{Name: "failure-handler"},
+			Abort:   &ir.Step{Name: "abort-handler"},
 		},
-		Steps: []core.Step{
-			{Name: "step1", Commands: []core.CommandEntry{{Command: "echo", Args: []string{"hello"}}}},
-			{Name: "step2", Commands: []core.CommandEntry{{Command: "echo", Args: []string{"world"}}}},
+		Steps: []ir.Step{
+			{Name: "step1", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"hello"}}}},
+			{Name: "step2", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"world"}}}},
 		},
 		Params: []string{"param1", "param2"},
-		Preconditions: []*core.Condition{
+		Preconditions: []*ir.Condition{
 			{Condition: "test -f file.txt", Expected: "true"},
 		},
 	}
 
-	builder := transform.NewStatusBuilder(dag)
+	builder := ir.NewStatusBuilder(dag)
 	dagRunID := "test-run-123"
-	s := core.Running
+	s := ir.Running
 	pid := 12345
 	startedAt := time.Now()
 
@@ -81,7 +80,7 @@ func TestStatusBuilder(t *testing.T) {
 	assert.Equal(t, dag.Name, result.Name)
 	assert.Equal(t, dagRunID, result.DAGRunID)
 	assert.Equal(t, s, result.Status)
-	assert.Equal(t, exec.PID(pid), result.PID)
+	assert.Equal(t, ir.PID(pid), result.PID)
 	assert.NotEmpty(t, result.StartedAt)
 	assert.Equal(t, 2, len(result.Nodes))
 	assert.NotNil(t, result.OnExit)
@@ -90,20 +89,20 @@ func TestStatusBuilder(t *testing.T) {
 	assert.NotNil(t, result.OnAbort)
 	assert.Equal(t, "param1 param2", result.Params)
 	assert.Equal(t, dag.Params, result.ParamsList)
-	assert.Equal(t, dag.Preconditions, result.Preconditions)
+	assert.Equal(t, expectedConditionResults(dag.Preconditions), result.Preconditions)
 }
 
 func TestStatusBuilderWithOptions(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "test-dag",
-		Steps: []core.Step{
+		Steps: []ir.Step{
 			{Name: "step1"},
 		},
 	}
 
-	builder := transform.NewStatusBuilder(dag)
+	builder := ir.NewStatusBuilder(dag)
 	dagRunID := "test-run-456"
-	s := core.Succeeded
+	s := ir.Succeeded
 	pid := 54321
 	startedAt := time.Now()
 	finishedAt := startedAt.Add(5 * time.Minute)
@@ -111,22 +110,22 @@ func TestStatusBuilderWithOptions(t *testing.T) {
 	// Create nodes for options
 	nodes := []runtime.NodeData{
 		{
-			Step: core.Step{Name: "step1"},
+			Step: ir.Step{Name: "step1"},
 			State: runtime.NodeState{
-				Status:     core.NodeSucceeded,
+				Status:     ir.NodeSucceeded,
 				StartedAt:  startedAt,
 				FinishedAt: finishedAt,
 			},
 		},
 	}
 
-	exitNode := runtime.NewNode(core.Step{Name: "exit-step"}, runtime.NodeState{})
-	successNode := runtime.NewNode(core.Step{Name: "success-step"}, runtime.NodeState{})
-	failureNode := runtime.NewNode(core.Step{Name: "failure-step"}, runtime.NodeState{})
-	abortNode := runtime.NewNode(core.Step{Name: "abort-step"}, runtime.NodeState{})
+	exitNode := runtime.NewNode(ir.Step{Name: "exit-step"}, runtime.NodeState{})
+	successNode := runtime.NewNode(ir.Step{Name: "success-step"}, runtime.NodeState{})
+	failureNode := runtime.NewNode(ir.Step{Name: "failure-step"}, runtime.NodeState{})
+	abortNode := runtime.NewNode(ir.Step{Name: "abort-step"}, runtime.NodeState{})
 
-	rootRef := exec.NewDAGRunRef("root-dag", "root-run-123")
-	parentRef := exec.NewDAGRunRef("parent-dag", "parent-run-456")
+	rootRef := ir.NewDAGRunRef("root-dag", "root-run-123")
+	parentRef := ir.NewDAGRunRef("parent-dag", "parent-run-456")
 
 	// Test with all options
 	result := builder.Create(
@@ -134,21 +133,21 @@ func TestStatusBuilderWithOptions(t *testing.T) {
 		s,
 		pid,
 		startedAt,
-		transform.WithFinishedAt(finishedAt),
+		ir.WithFinishedAt(finishedAt),
 		transform.WithNodes(nodes),
 		transform.WithOnExitNode(exitNode),
 		transform.WithOnSuccessNode(successNode),
 		transform.WithOnFailureNode(failureNode),
 		transform.WithOnAbortNode(abortNode),
-		transform.WithLogFilePath("/tmp/log.txt"),
-		transform.WithWorkingDir("/tmp/work"),
-		transform.WithPreconditions([]*core.Condition{{Condition: "test", Expected: "true"}}),
-		transform.WithHierarchyRefs(rootRef, parentRef),
-		transform.WithAttemptID("attempt-789"),
-		transform.WithQueuedAt("2024-01-01 12:00:00"),
-		transform.WithCreatedAt(1234567890),
-		transform.WithWorkerID("worker-abc"),
-		transform.WithPIDStartedAt(9876543210),
+		ir.WithLogFilePath("/tmp/log.txt"),
+		ir.WithWorkingDir("/tmp/work"),
+		ir.WithPreconditions([]*ir.Condition{{Condition: "test", Expected: "true"}}),
+		ir.WithHierarchyRefs(rootRef, parentRef),
+		ir.WithAttemptID("attempt-789"),
+		ir.WithQueuedAt("2024-01-01 12:00:00"),
+		ir.WithCreatedAt(1234567890),
+		ir.WithWorkerID("worker-abc"),
+		ir.WithPIDStartedAt(9876543210),
 	)
 
 	assert.Equal(t, stringutil.FormatTime(finishedAt), result.FinishedAt)
@@ -169,70 +168,140 @@ func TestStatusBuilderWithOptions(t *testing.T) {
 	assert.Equal(t, int64(9876543210), result.PIDStartedAt)
 }
 
+func TestStatusBuilderWithConditions(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{Name: "queued-dag"}
+	checkedAt := time.Date(2026, 5, 19, 1, 2, 3, 0, time.UTC)
+	runnable := ir.NewDAGRunCondition(
+		"Runnable",
+		"False",
+		"MaxConcurrencyReached",
+		"The DAG-run cannot start because the queue active-run concurrency limit has been reached.",
+		checkedAt,
+	)
+	concurrencyReadyOlder := ir.NewDAGRunCondition(
+		"ConcurrencyReady",
+		"False",
+		"MaxConcurrencyReached",
+		"The queue active-run concurrency limit has been reached.",
+		checkedAt.Add(-time.Minute),
+	)
+	concurrencyReadyNewer := ir.NewDAGRunCondition(
+		"ConcurrencyReady",
+		"True",
+		"ConcurrencyAvailable",
+		"The queue active-run concurrency limit has capacity.",
+		checkedAt.Add(time.Minute),
+	)
+
+	result := ir.NewStatusBuilder(dag).Create(
+		"queued-run",
+		ir.Queued,
+		0,
+		time.Time{},
+		ir.WithConditions([]ir.DAGRunCondition{
+			concurrencyReadyOlder,
+			runnable,
+			concurrencyReadyNewer,
+		}),
+	)
+
+	assert.Equal(t, []ir.DAGRunCondition{
+		runnable,
+		concurrencyReadyNewer,
+	}, result.Conditions)
+}
+
+func TestStatusBuilderWithConditionsClearsConditionsForNonQueuedStatus(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{Name: "running-dag"}
+	checkedAt := time.Date(2026, 5, 19, 1, 2, 3, 0, time.UTC)
+
+	result := ir.NewStatusBuilder(dag).Create(
+		"running-run",
+		ir.Running,
+		0,
+		time.Time{},
+		ir.WithConditions([]ir.DAGRunCondition{
+			ir.NewDAGRunCondition(
+				"Runnable",
+				"False",
+				"MaxConcurrencyReached",
+				"The DAG-run cannot start because the queue active-run concurrency limit has been reached.",
+				checkedAt,
+			),
+		}),
+	)
+
+	assert.Empty(t, result.Conditions)
+}
+
 func TestStatusBuilderPopulatesPendingStepRetriesFromNodes(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "retrying-dag",
-		Steps: []core.Step{
+		Steps: []ir.Step{
 			{Name: "step1"},
 		},
 	}
 
-	builder := transform.NewStatusBuilder(dag)
+	builder := ir.NewStatusBuilder(dag)
 	result := builder.Create(
 		"retry-run",
-		core.Queued,
+		ir.Queued,
 		123,
 		time.Now(),
 		transform.WithNodes([]runtime.NodeData{
 			{
-				Step: core.Step{
+				Step: ir.Step{
 					Name: "step1",
-					RetryPolicy: core.RetryPolicy{
+					RetryPolicy: ir.RetryPolicy{
 						Interval: 2 * time.Second,
 					},
 				},
 				State: runtime.NodeState{
-					Status:     core.NodeRetrying,
+					Status:     ir.NodeRetrying,
 					RetryCount: 1,
 				},
 			},
 		}),
 	)
 
-	assert.Equal(t, []exec.PendingStepRetry{
+	assert.Equal(t, []ir.PendingStepRetry{
 		{StepName: "step1", Interval: 2 * time.Second},
 	}, result.PendingStepRetries)
 }
 
 func TestStatusBuilderPendingStepRetriesOptionOverridesAutoDerivation(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "retrying-dag",
-		Steps: []core.Step{
+		Steps: []ir.Step{
 			{Name: "step1"},
 		},
 	}
 
-	builder := transform.NewStatusBuilder(dag)
+	builder := ir.NewStatusBuilder(dag)
 	result := builder.Create(
 		"retry-run",
-		core.Queued,
+		ir.Queued,
 		123,
 		time.Now(),
 		transform.WithNodes([]runtime.NodeData{
 			{
-				Step: core.Step{
+				Step: ir.Step{
 					Name: "step1",
-					RetryPolicy: core.RetryPolicy{
+					RetryPolicy: ir.RetryPolicy{
 						Interval: 2 * time.Second,
 					},
 				},
 				State: runtime.NodeState{
-					Status:     core.NodeRetrying,
+					Status:     ir.NodeRetrying,
 					RetryCount: 1,
 				},
 			},
 		}),
-		transform.WithPendingStepRetries([]exec.PendingStepRetry{}),
+		ir.WithPendingStepRetries([]ir.PendingStepRetry{}),
 	)
 
 	assert.NotNil(t, result.PendingStepRetries)
@@ -240,64 +309,64 @@ func TestStatusBuilderPendingStepRetriesOptionOverridesAutoDerivation(t *testing
 }
 
 func TestStatusBuilderPopulatesPendingStepRetriesFromHandlerNodes(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "retrying-dag",
-		HandlerOn: core.HandlerOn{
-			Failure: &core.Step{Name: "onFailure"},
+		HandlerOn: ir.HandlerOn{
+			Failure: &ir.Step{Name: "onFailure"},
 		},
 	}
 
 	failureHandler := runtime.NewNode(
-		core.Step{
+		ir.Step{
 			Name: "onFailure",
-			RetryPolicy: core.RetryPolicy{
+			RetryPolicy: ir.RetryPolicy{
 				Interval: 3 * time.Second,
 			},
 		},
 		runtime.NodeState{
-			Status:     core.NodeRetrying,
+			Status:     ir.NodeRetrying,
 			RetryCount: 1,
 		},
 	)
 
-	builder := transform.NewStatusBuilder(dag)
+	builder := ir.NewStatusBuilder(dag)
 	result := builder.Create(
 		"retry-run",
-		core.Queued,
+		ir.Queued,
 		123,
 		time.Now(),
 		transform.WithOnFailureNode(failureHandler),
 	)
 
-	assert.Equal(t, []exec.PendingStepRetry{
+	assert.Equal(t, []ir.PendingStepRetry{
 		{StepName: "onFailure", Interval: 3 * time.Second},
 	}, result.PendingStepRetries)
 }
 
 func TestInitialStatus(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "initial-test",
-		HandlerOn: core.HandlerOn{
-			Exit:    &core.Step{Name: "exit"},
-			Success: &core.Step{Name: "success"},
-			Failure: &core.Step{Name: "failure"},
-			Abort:   &core.Step{Name: "abort"},
+		HandlerOn: ir.HandlerOn{
+			Exit:    &ir.Step{Name: "exit"},
+			Success: &ir.Step{Name: "success"},
+			Failure: &ir.Step{Name: "failure"},
+			Abort:   &ir.Step{Name: "abort"},
 		},
-		Steps: []core.Step{
+		Steps: []ir.Step{
 			{Name: "step1"},
 			{Name: "step2"},
 		},
 		Params: []string{"arg1", "arg2"},
-		Preconditions: []*core.Condition{
+		Preconditions: []*ir.Condition{
 			{Condition: "test condition"},
 		},
 	}
 
-	st := exec.InitialStatus(dag)
+	st := ir.InitialStatus(dag)
 
 	assert.Equal(t, dag.Name, st.Name)
-	assert.Equal(t, core.NotStarted, st.Status)
-	assert.Equal(t, exec.PID(0), st.PID)
+	assert.Equal(t, ir.NotStarted, st.Status)
+	assert.Equal(t, ir.PID(0), st.PID)
 	assert.Equal(t, 2, len(st.Nodes))
 	assert.NotNil(t, st.OnExit)
 	assert.NotNil(t, st.OnSuccess)
@@ -305,7 +374,7 @@ func TestInitialStatus(t *testing.T) {
 	assert.NotNil(t, st.OnAbort)
 	assert.Equal(t, "arg1 arg2", st.Params)
 	assert.Equal(t, dag.Params, st.ParamsList)
-	assert.Equal(t, dag.Preconditions, st.Preconditions)
+	assert.Equal(t, expectedConditionResults(dag.Preconditions), st.Preconditions)
 	assert.NotZero(t, st.CreatedAt)
 	assert.Equal(t, "", st.StartedAt)
 	assert.Equal(t, "", st.FinishedAt)
@@ -313,16 +382,16 @@ func TestInitialStatus(t *testing.T) {
 
 func TestStatusFromJSONError(t *testing.T) {
 	// Test with invalid JSON
-	_, err := exec.StatusFromJSON("invalid json")
+	_, err := ir.StatusFromJSON("invalid json")
 	assert.Error(t, err)
 
 	// Test with empty string
-	_, err = exec.StatusFromJSON("")
+	_, err = ir.StatusFromJSON("")
 	assert.Error(t, err)
 }
 
 func TestDAGRunStatus_DAGRun(t *testing.T) {
-	dagRunStatus := &exec.DAGRunStatus{
+	dagRunStatus := &ir.DAGRunStatus{
 		Name:     "test-dag",
 		DAGRunID: "run-123",
 	}
@@ -333,16 +402,16 @@ func TestDAGRunStatus_DAGRun(t *testing.T) {
 }
 
 func TestDAGRunStatus_Errors(t *testing.T) {
-	dagRunStatus := &exec.DAGRunStatus{
-		Nodes: []*exec.Node{
-			{Step: core.Step{Name: "step1"}, Error: "error1"},
-			{Step: core.Step{Name: "step2"}, Error: ""},
-			{Step: core.Step{Name: "step3"}, Error: "error3"},
+	dagRunStatus := &ir.DAGRunStatus{
+		Nodes: []*ir.Node{
+			{Step: ir.Step{Name: "step1"}, Error: "error1"},
+			{Step: ir.Step{Name: "step2"}, Error: ""},
+			{Step: ir.Step{Name: "step3"}, Error: "error3"},
 		},
-		OnExit:    &exec.Node{Step: core.Step{Name: "exit"}, Error: "exit error"},
-		OnSuccess: &exec.Node{Step: core.Step{Name: "success"}, Error: ""},
-		OnFailure: &exec.Node{Step: core.Step{Name: "failure"}, Error: "failure error"},
-		OnAbort:   &exec.Node{Step: core.Step{Name: "cancel"}, Error: "cancel error"},
+		OnExit:    &ir.Node{Step: ir.Step{Name: "exit"}, Error: "exit error"},
+		OnSuccess: &ir.Node{Step: ir.Step{Name: "success"}, Error: ""},
+		OnFailure: &ir.Node{Step: ir.Step{Name: "failure"}, Error: "failure error"},
+		OnAbort:   &ir.Node{Step: ir.Step{Name: "cancel"}, Error: "cancel error"},
 	}
 
 	errors := dagRunStatus.Errors()
@@ -355,15 +424,15 @@ func TestDAGRunStatus_Errors(t *testing.T) {
 }
 
 func TestDAGRunStatus_NodeByName(t *testing.T) {
-	dagRunStatus := &exec.DAGRunStatus{
-		Nodes: []*exec.Node{
-			{Step: core.Step{Name: "step1"}},
-			{Step: core.Step{Name: "step2"}},
+	dagRunStatus := &ir.DAGRunStatus{
+		Nodes: []*ir.Node{
+			{Step: ir.Step{Name: "step1"}},
+			{Step: ir.Step{Name: "step2"}},
 		},
-		OnExit:    &exec.Node{Step: core.Step{Name: "exit"}},
-		OnSuccess: &exec.Node{Step: core.Step{Name: "success"}},
-		OnFailure: &exec.Node{Step: core.Step{Name: "failure"}},
-		OnAbort:   &exec.Node{Step: core.Step{Name: "cancel"}},
+		OnExit:    &ir.Node{Step: ir.Step{Name: "exit"}},
+		OnSuccess: &ir.Node{Step: ir.Step{Name: "success"}},
+		OnFailure: &ir.Node{Step: ir.Step{Name: "failure"}},
+		OnAbort:   &ir.Node{Step: ir.Step{Name: "cancel"}},
 	}
 
 	// Test finding regular nodes
@@ -389,22 +458,22 @@ func TestDAGRunStatus_NodeByName(t *testing.T) {
 func TestPID_String(t *testing.T) {
 	tests := []struct {
 		name     string
-		pid      exec.PID
+		pid      ir.PID
 		expected string
 	}{
 		{
 			name:     "PositivePID",
-			pid:      exec.PID(12345),
+			pid:      ir.PID(12345),
 			expected: "12345",
 		},
 		{
 			name:     "ZeroPID",
-			pid:      exec.PID(0),
+			pid:      ir.PID(0),
 			expected: "",
 		},
 		{
 			name:     "NegativePID",
-			pid:      exec.PID(-1),
+			pid:      ir.PID(-1),
 			expected: "",
 		},
 	}
@@ -417,37 +486,47 @@ func TestPID_String(t *testing.T) {
 }
 
 func TestNewNodesFromSteps(t *testing.T) {
-	steps := []core.Step{
+	steps := []ir.Step{
 		{
 			Name:        "step1",
-			Commands:    []core.CommandEntry{{Command: "echo", Args: []string{"hello"}}},
+			Commands:    []ir.CommandEntry{{Command: "echo", Args: []string{"hello"}}},
 			Description: "First step",
 		},
 		{
 			Name:        "step2",
-			Commands:    []core.CommandEntry{{Command: "echo", Args: []string{"world"}}},
+			Commands:    []ir.CommandEntry{{Command: "echo", Args: []string{"world"}}},
 			Description: "Second step",
 		},
 	}
 
-	nodes := exec.NewNodesFromSteps(steps)
+	nodes := ir.NewNodesFromSteps(steps)
 
 	assert.Equal(t, 2, len(nodes))
 	assert.Equal(t, "step1", nodes[0].Step.Name)
 	assert.Equal(t, "step2", nodes[1].Step.Name)
-	assert.Equal(t, core.NodeNotStarted, nodes[0].Status)
-	assert.Equal(t, core.NodeNotStarted, nodes[1].Status)
+	assert.Equal(t, ir.NodeNotStarted, nodes[0].Status)
+	assert.Equal(t, ir.NodeNotStarted, nodes[1].Status)
 }
 
 func TestWithCreatedAtDefaultTime(t *testing.T) {
-	dag := &core.DAG{Name: "test"}
-	dagRunStatus := exec.InitialStatus(dag)
+	dag := &ir.DAG{Name: "test"}
+	dagRunStatus := ir.InitialStatus(dag)
 
 	// Test WithCreatedAt with 0 - should use current time
 	beforeTime := time.Now().UnixMilli()
-	transform.WithCreatedAt(0)(&dagRunStatus)
+	ir.WithCreatedAt(0)(&dagRunStatus)
 	afterTime := time.Now().UnixMilli()
 
 	assert.GreaterOrEqual(t, dagRunStatus.CreatedAt, beforeTime)
 	assert.LessOrEqual(t, dagRunStatus.CreatedAt, afterTime)
+}
+
+func expectedConditionResults(conditions []*ir.Condition) []ir.ConditionResult {
+	results := make([]ir.ConditionResult, len(conditions))
+	for i, condition := range conditions {
+		if condition != nil {
+			results[i].Condition = *condition
+		}
+	}
+	return results
 }

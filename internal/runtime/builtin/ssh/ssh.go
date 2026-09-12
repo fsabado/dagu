@@ -5,20 +5,20 @@ package ssh
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"slices"
 	"strings"
-	"sync"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -40,19 +40,16 @@ func getSSHClientFromContext(ctx context.Context) *Client {
 }
 
 type sshExecutor struct {
-	mu        sync.Mutex
-	step      core.Step
+	executorLifecycle
+	step      ir.Step
 	client    *Client
 	stdout    io.Writer
 	stderr    io.Writer
-	conn      *ssh.Client  // SSH connection (must be closed after session)
-	session   *ssh.Session // SSH session
-	closed    bool         // Whether session/conn have been closed
 	shell     string
 	shellArgs []string
 }
 
-func NewSSHExecutor(ctx context.Context, step core.Step) (executor.Executor, error) {
+func NewSSHExecutor(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	client, err := resolveSSHClient(ctx, step)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up ssh step: %w", err)
@@ -82,22 +79,7 @@ func (e *sshExecutor) SetStderr(out io.Writer) {
 }
 
 func (e *sshExecutor) Kill(_ os.Signal) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.closed {
-		return nil
-	}
-	e.closed = true
-
-	var sessionErr, connErr error
-	if e.session != nil {
-		sessionErr = e.session.Close()
-	}
-	if e.conn != nil {
-		connErr = e.conn.Close()
-	}
-	return errors.Join(sessionErr, connErr)
+	return e.shutdown(true)
 }
 
 func (e *sshExecutor) Run(ctx context.Context) error {
@@ -105,39 +87,43 @@ func (e *sshExecutor) Run(ctx context.Context) error {
 		return nil
 	}
 
-	conn, session, err := e.client.NewSession()
+	runCtx, ok := e.begin(ctx)
+	if !ok {
+		return context.Canceled
+	}
+
+	defer func() {
+		if closeErr := e.shutdown(false); closeErr != nil {
+			logger.Warn(ctx, "SSH cleanup error", tag.Error(closeErr))
+		}
+	}()
+
+	conn, session, err := e.client.NewSession(runCtx)
 	if err != nil {
 		return fmt.Errorf("failed to create SSH session: %w", err)
 	}
 
-	e.mu.Lock()
-	e.conn = conn
-	e.session = session
-	e.mu.Unlock()
-
-	defer func() {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-
-		if e.closed {
-			return
+	if !e.registerTransport(conn) {
+		_ = session.Close()
+		_ = conn.Close()
+		if ctxErr := runCtx.Err(); ctxErr != nil {
+			return ctxErr
 		}
-
-		// Close session first, then the underlying connection
-		if closeErr := session.Close(); closeErr != nil {
-			logger.Warn(ctx, "SSH session close error", tag.Error(closeErr))
+		return context.Canceled
+	}
+	if !e.registerResource(session) {
+		_ = session.Close()
+		if ctxErr := runCtx.Err(); ctxErr != nil {
+			return ctxErr
 		}
-		if closeErr := conn.Close(); closeErr != nil {
-			logger.Warn(ctx, "SSH connection close error", tag.Error(closeErr))
-		}
-		e.closed = true
-	}()
+		return context.Canceled
+	}
 
 	session.Stdout = e.stdout
 	session.Stderr = e.stderr
 	session.Stdin = strings.NewReader(e.buildScript())
 
-	return e.runWithCancellation(ctx, session, e.buildShellCommand())
+	return e.runWithCancellation(runCtx, session, e.buildShellCommand())
 }
 
 // runWithCancellation executes the session command with context cancellation support.
@@ -149,13 +135,17 @@ func (e *sshExecutor) runWithCancellation(ctx context.Context, session *ssh.Sess
 
 	select {
 	case err := <-done:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err == nil {
 			return nil
 		}
 		return fmt.Errorf("ssh execution failed: %w", err)
 	case <-ctx.Done():
-		// Close session to unblock the goroutine, then wait for it to finish
-		_ = session.Close()
+		// Closing the transport unblocks Session.Wait even when the server keeps
+		// the channel open until the remote process exits.
+		_ = e.shutdown(true)
 		<-done
 		return ctx.Err()
 	}
@@ -209,7 +199,7 @@ func (e *sshExecutor) buildScript() string {
 // For SSH, we prefer CmdWithArgs (the original command string) so that
 // variable references like $HOME are passed through to the remote shell
 // without being single-quoted.
-func (e *sshExecutor) buildCommandString(cmd core.CommandEntry) string {
+func (e *sshExecutor) buildCommandString(cmd ir.CommandEntry) string {
 	if cmd.CmdWithArgs != "" {
 		return cmd.CmdWithArgs
 	}
@@ -225,7 +215,7 @@ func (e *sshExecutor) buildCommandString(cmd core.CommandEntry) string {
 // 2. Shell specified in the step's Shell field.
 // 3. /bin/sh as POSIX-compliant fallback.
 // Note: DAG-level shell (dag.Shell) is NOT used as it's configured for local execution.
-func resolveShell(step core.Step, client *Client) (string, []string) {
+func resolveShell(step ir.Step, client *Client) (string, []string) {
 	if client != nil && client.Shell != "" {
 		return client.Shell, slices.Clone(client.ShellArgs)
 	}
@@ -237,18 +227,18 @@ func resolveShell(step core.Step, client *Client) (string, []string) {
 }
 
 func init() {
-	caps := core.ExecutorCapabilities{
+	caps := registry.ExecutorCapabilities{
 		Command:          true,
 		MultipleCommands: true,
 		Script:           true,
 		Shell:            true,
-		CommandContext: func(ctx context.Context, step core.Step) cmnvalue.CommandContext {
+		CommandContext: func(ctx context.Context, step ir.Step) cmnvalue.CommandContext {
 			return cmnvalue.CommandContext{
 				Target:          cmnvalue.CommandTargetSSH,
 				ShellConfigured: hasShellConfigured(ctx, step),
 			}
 		},
-		ScriptContext: func(ctx context.Context, step core.Step) cmnvalue.CommandContext {
+		ScriptContext: func(ctx context.Context, step ir.Step) cmnvalue.CommandContext {
 			return cmnvalue.CommandContext{
 				Target:          cmnvalue.CommandTargetSSH,
 				ShellConfigured: hasShellConfigured(ctx, step),
@@ -258,7 +248,7 @@ func init() {
 	executor.RegisterExecutor("ssh", NewSSHExecutor, nil, caps)
 }
 
-func hasShellConfigured(ctx context.Context, step core.Step) bool {
+func hasShellConfigured(ctx context.Context, step ir.Step) bool {
 	if len(step.ExecutorConfig.Config) > 0 {
 		return cmdutil.IsShellValueSet(step.ExecutorConfig.Config["shell"])
 	}

@@ -1,0 +1,6 @@
+steps:
+  - action: python-script
+    with:
+      script: "return input['value']"
+      input:
+        value: 42

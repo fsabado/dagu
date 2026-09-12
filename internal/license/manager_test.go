@@ -12,11 +12,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -146,116 +146,42 @@ func TestNewManager_FieldsSetCorrectly(t *testing.T) {
 	})
 }
 
-func TestManager_ActivationData(t *testing.T) {
+func TestManager_FailureReflectsCurrentClaims(t *testing.T) {
 	t.Parallel()
 
-	t.Run("returns persisted activation data from store", func(t *testing.T) {
-		t.Parallel()
+	tests := []struct {
+		name   string
+		claims func() *LicenseClaims
+		want   string
+	}{
+		{
+			name:   "valid license",
+			claims: validClaims,
+			want:   "",
+		},
+		{
+			name:   "expired license in grace period",
+			claims: expiredInGraceClaims,
+			want:   "",
+		},
+		{
+			name:   "expired license past grace period",
+			claims: expiredPastGraceClaims,
+			want:   licenseExpiredFailure,
+		},
+	}
 
-		pub, _ := testKeyPair(t)
-		store := &mockActivationStore{data: &ActivationData{
-			Token:           "tok",
-			HeartbeatSecret: "secret",
-			ServerID:        "srv-1",
-		}}
-		m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, store, slog.Default())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		data, err := m.ActivationData()
-		require.NoError(t, err)
-		require.NotNil(t, data)
-		assert.Equal(t, "srv-1", data.ServerID)
-	})
+			pub, _ := testKeyPair(t)
+			m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, nil, slog.Default())
+			m.state.Update(tc.claims(), "token")
 
-	t.Run("nil store returns nil activation data", func(t *testing.T) {
-		t.Parallel()
-
-		pub, _ := testKeyPair(t)
-		m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, nil, slog.Default())
-
-		data, err := m.ActivationData()
-		require.NoError(t, err)
-		assert.Nil(t, data)
-	})
-}
-
-func TestManager_CloudMachineCredentials(t *testing.T) {
-	t.Parallel()
-
-	t.Run("returns license id from claims id rather than tenant subject", func(t *testing.T) {
-		t.Parallel()
-
-		pub, _ := testKeyPair(t)
-		store := &mockActivationStore{data: &ActivationData{
-			ServerID:        "srv-1",
-			HeartbeatSecret: "hb-secret-1",
-		}}
-		m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, store, slog.Default())
-		m.source = SourceActivationFile
-		m.state.Update(&LicenseClaims{
-			RegisteredClaims: jwt.RegisteredClaims{
-				Subject: "tenant-1",
-				ID:      "lic-1",
-			},
-		}, "token")
-
-		creds, err := m.CloudMachineCredentials()
-		require.NoError(t, err)
-		require.NotNil(t, creds)
-		assert.Equal(t, "lic-1", creds.LicenseID)
-		assert.Equal(t, "srv-1", creds.ServerID)
-		assert.Equal(t, "hb-secret-1", creds.HeartbeatSecret)
-	})
-
-	t.Run("returns nil when no machine activation data exists", func(t *testing.T) {
-		t.Parallel()
-
-		pub, _ := testKeyPair(t)
-		m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, &mockActivationStore{}, slog.Default())
-		m.source = SourceActivationFile
-		m.state.Update(&LicenseClaims{
-			RegisteredClaims: jwt.RegisteredClaims{
-				Subject: "tenant-1",
-				ID:      "lic-1",
-			},
-		}, "token")
-
-		creds, err := m.CloudMachineCredentials()
-		require.NoError(t, err)
-		assert.Nil(t, creds)
-	})
-
-	t.Run("returns nil when source does not support heartbeat credentials", func(t *testing.T) {
-		t.Parallel()
-
-		pub, _ := testKeyPair(t)
-		store := &mockActivationStore{data: &ActivationData{
-			ServerID:        "srv-1",
-			HeartbeatSecret: "hb-secret-1",
-		}}
-		m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, store, slog.Default())
-		m.source = SourceEnvInline
-		m.state.Update(&LicenseClaims{
-			RegisteredClaims: jwt.RegisteredClaims{
-				ID: "lic-1",
-			},
-		}, "token")
-
-		creds, err := m.CloudMachineCredentials()
-		require.NoError(t, err)
-		assert.Nil(t, creds)
-	})
-
-	t.Run("zero-value manager returns nil without panicking", func(t *testing.T) {
-		t.Parallel()
-
-		m := &Manager{}
-
-		require.NotPanics(t, func() {
-			creds, err := m.CloudMachineCredentials()
-			require.NoError(t, err)
-			assert.Nil(t, creds)
+			assert.Equal(t, tc.want, m.Failure())
 		})
-	})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +205,7 @@ func TestManager_Start_CommunityMode(t *testing.T) {
 		checker := m.Checker()
 		assert.True(t, checker.IsCommunity())
 		assert.Equal(t, "", checker.Plan())
+		assert.Empty(t, m.Failure())
 	})
 }
 
@@ -309,6 +236,7 @@ func TestManager_Start_EnvInlineJWT(t *testing.T) {
 		assert.True(t, checker.IsFeatureEnabled(FeatureAudit))
 		assert.True(t, checker.IsFeatureEnabled(FeatureRBAC))
 		assert.True(t, checker.IsFeatureEnabled(FeatureSSO))
+		assert.Empty(t, m.Failure())
 	})
 
 	t.Run("garbage token gracefully degrades to community mode", func(t *testing.T) {
@@ -324,6 +252,7 @@ func TestManager_Start_EnvInlineJWT(t *testing.T) {
 		require.NoError(t, err, "invalid token must not cause Start to return an error")
 
 		assert.True(t, m.Checker().IsCommunity(), "bad token should fall back to community mode")
+		assert.Equal(t, licenseVerificationFailure, m.Failure())
 	})
 
 	t.Run("expired-in-grace token uses lenient verify and updates state", func(t *testing.T) {
@@ -344,6 +273,25 @@ func TestManager_Start_EnvInlineJWT(t *testing.T) {
 		assert.False(t, checker.IsCommunity())
 		assert.Equal(t, "pro", checker.Plan())
 		assert.True(t, checker.IsGracePeriod(), "expired-in-grace token should put state in grace period")
+		assert.Empty(t, m.Failure())
+	})
+
+	t.Run("expired token outside grace reports a license failure", func(t *testing.T) {
+		pub, priv := testKeyPair(t)
+		token := signToken(t, priv, expiredPastGraceClaims())
+
+		t.Setenv("DAGU_LICENSE", token)
+		t.Setenv("DAGU_LICENSE_KEY", "")
+		t.Setenv("DAGU_LICENSE_FILE", "")
+
+		m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, nil, slog.Default())
+
+		err := m.Start(context.Background())
+		require.NoError(t, err)
+
+		assert.False(t, m.Checker().IsCommunity())
+		assert.False(t, m.Checker().IsGracePeriod())
+		assert.Equal(t, licenseExpiredFailure, m.Failure())
 	})
 }
 
@@ -403,6 +351,7 @@ func TestManager_Start_EnvLicenseKey(t *testing.T) {
 		require.NoError(t, err, "activation failure must not propagate as an error from Start")
 
 		assert.True(t, m.Checker().IsCommunity())
+		assert.Equal(t, licenseActivationFailure, m.Failure())
 	})
 }
 
@@ -470,6 +419,7 @@ func TestManager_Start_OfflineFallback(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.True(t, m.Checker().IsCommunity(), "no cached data should fall back to community mode")
+		assert.Equal(t, licenseActivationFailure, m.Failure())
 	})
 
 	t.Run("offline with key mismatch falls back to community mode", func(t *testing.T) {
@@ -500,6 +450,7 @@ func TestManager_Start_OfflineFallback(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.True(t, m.Checker().IsCommunity(), "mismatched key should fall back to community mode")
+		assert.Equal(t, licenseActivationFailure, m.Failure())
 	})
 
 	t.Run("offline with store load error falls back to community mode", func(t *testing.T) {
@@ -524,6 +475,7 @@ func TestManager_Start_OfflineFallback(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.True(t, m.Checker().IsCommunity(), "store load error should fall back to community mode")
+		assert.Equal(t, licenseActivationFailure, m.Failure())
 	})
 }
 
@@ -624,6 +576,21 @@ func TestManager_Start_DiscoveryError(t *testing.T) {
 		require.NoError(t, err, "discovery error must not be returned; manager degrades gracefully")
 
 		assert.True(t, m.Checker().IsCommunity())
+		assert.Equal(t, licenseDiscoveryFailure, m.Failure())
+	})
+
+	t.Run("explicit missing license file reports a discovery failure", func(t *testing.T) {
+		pub, _ := testKeyPair(t)
+
+		t.Setenv("DAGU_LICENSE", "")
+		t.Setenv("DAGU_LICENSE_KEY", "")
+		t.Setenv("DAGU_LICENSE_FILE", filepath.Join(t.TempDir(), "missing.jwt"))
+
+		m := NewManager(ManagerConfig{LicenseDir: t.TempDir()}, pub, nil, slog.Default())
+
+		require.NoError(t, m.Start(context.Background()))
+		assert.True(t, m.Checker().IsCommunity())
+		assert.Equal(t, licenseDiscoveryFailure, m.Failure())
 	})
 }
 
@@ -737,15 +704,117 @@ func TestManager_ActivateWithKey(t *testing.T) {
 			activateHandler: activateHandlerFn(token, "hb-secret"),
 		})
 
+		store := &mockActivationStore{}
 		m := NewManager(ManagerConfig{
 			LicenseDir: t.TempDir(),
 			CloudURL:   srv.URL,
-		}, pub, nil, slog.Default())
+		}, pub, store, slog.Default())
 
 		result, err := m.ActivateWithKey(context.Background(), "my-key")
 		require.Error(t, err)
 		assert.Nil(t, result)
 		assert.Contains(t, err.Error(), "activated token verification failed")
+		assert.Equal(t, 0, store.saveCalls)
+	})
+
+	t.Run("replacement waits for the previous heartbeat before installing new state", func(t *testing.T) {
+		t.Parallel()
+
+		pub, priv := testKeyPair(t)
+		oldClaims := validClaims()
+		oldClaims.ID = "old-license"
+		oldToken := signToken(t, priv, oldClaims)
+		newClaims := validClaims()
+		newClaims.ID = "new-license"
+		newToken := signToken(t, priv, newClaims)
+
+		oldHeartbeatStarted := make(chan struct{})
+		oldHeartbeatRelease := make(chan struct{})
+		newHeartbeatStarted := make(chan struct{}, 1)
+		var releaseOldHeartbeat sync.Once
+		t.Cleanup(func() {
+			releaseOldHeartbeat.Do(func() { close(oldHeartbeatRelease) })
+		})
+
+		srv := newMockCloudServer(t, mockCloudServerConfig{
+			activateHandler: activateHandlerFn(newToken, "new-secret"),
+			heartbeatHandler: func(w http.ResponseWriter, r *http.Request) {
+				var request HeartbeatRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if request.HeartbeatSecret == "old-secret" {
+					close(oldHeartbeatStarted)
+					<-oldHeartbeatRelease
+					_ = json.NewEncoder(w).Encode(HeartbeatResponse{Token: oldToken})
+					return
+				}
+
+				select {
+				case newHeartbeatStarted <- struct{}{}:
+				default:
+				}
+				_ = json.NewEncoder(w).Encode(HeartbeatResponse{Token: newToken})
+			},
+		})
+
+		store := &mockActivationStore{}
+		m := NewManager(ManagerConfig{
+			LicenseDir: t.TempDir(),
+			CloudURL:   srv.URL,
+		}, pub, store, slog.Default())
+		m.state.Update(oldClaims, oldToken)
+		m.setSource(SourceActivationFile)
+		m.startHeartbeat(&ActivationData{
+			Token:           oldToken,
+			HeartbeatSecret: "old-secret",
+			LicenseKey:      "old-key",
+			ServerID:        "server-001",
+		})
+
+		select {
+		case <-oldHeartbeatStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("previous heartbeat did not start")
+		}
+
+		type activationOutcome struct {
+			result *ActivationResult
+			err    error
+		}
+		outcome := make(chan activationOutcome, 1)
+		go func() {
+			result, err := m.ActivateWithKey(context.Background(), "new-key")
+			outcome <- activationOutcome{result: result, err: err}
+		}()
+
+		var activated activationOutcome
+		select {
+		case activated = <-outcome:
+		case <-time.After(5 * time.Second):
+			t.Fatal("replacement activation did not complete")
+		}
+		require.NoError(t, activated.err)
+		require.NotNil(t, activated.result)
+		releaseOldHeartbeat.Do(func() { close(oldHeartbeatRelease) })
+
+		select {
+		case <-newHeartbeatStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("replacement heartbeat did not start")
+		}
+
+		claims := m.Checker().Claims()
+		require.NotNil(t, claims)
+		assert.Equal(t, "new-license", claims.ID)
+		assert.Empty(t, m.Failure())
+		stored, err := store.Load()
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "new-secret", stored.HeartbeatSecret)
+
+		stopWithTimeout(t, m, 5*time.Second)
 	})
 
 	t.Run("nil ExpiresAt in claims yields zero Expiry", func(t *testing.T) {
@@ -857,6 +926,7 @@ func TestManager_doHeartbeat(t *testing.T) {
 		m.doHeartbeat(context.Background(), makeAD("server-001"))
 
 		assert.True(t, m.Checker().IsCommunity(), "in-memory state must be cleared after 410 Gone")
+		assert.Equal(t, licenseRevokedFailure, m.Failure())
 		assert.Equal(t, 0, store.removeCalls, "stored activation must NOT be removed by heartbeat failure")
 	})
 
@@ -881,6 +951,7 @@ func TestManager_doHeartbeat(t *testing.T) {
 		m.doHeartbeat(context.Background(), makeAD("server-001"))
 
 		assert.True(t, m.Checker().IsCommunity(), "in-memory state must be cleared after 401")
+		assert.Equal(t, licenseUnauthorizedFailure, m.Failure())
 		assert.Equal(t, 0, store.removeCalls, "stored activation must NOT be removed by heartbeat failure")
 	})
 
@@ -930,6 +1001,31 @@ func TestManager_doHeartbeat(t *testing.T) {
 		assert.False(t, m.Checker().IsCommunity())
 		assert.Equal(t, "pro", m.Checker().Plan())
 		assert.True(t, m.Checker().IsGracePeriod())
+		assert.Empty(t, m.Failure())
+	})
+
+	t.Run("400 Bad Request reports expiry after grace ends", func(t *testing.T) {
+		t.Parallel()
+
+		pub, priv := testKeyPair(t)
+		claims := expiredPastGraceClaims()
+		token := signToken(t, priv, claims)
+
+		srv := newMockCloudServer(t, mockCloudServerConfig{
+			heartbeatHandler: errorHandlerFn(http.StatusBadRequest, "license has expired"),
+		})
+
+		m := NewManager(ManagerConfig{
+			LicenseDir: t.TempDir(),
+			CloudURL:   srv.URL,
+		}, pub, nil, slog.Default())
+		m.state.Update(claims, token)
+
+		m.doHeartbeat(context.Background(), makeAD("server-001"))
+
+		assert.False(t, m.Checker().IsCommunity())
+		assert.False(t, m.Checker().IsGracePeriod())
+		assert.Equal(t, licenseExpiredFailure, m.Failure())
 	})
 
 	t.Run("invalid refreshed token leaves state unchanged", func(t *testing.T) {

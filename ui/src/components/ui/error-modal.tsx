@@ -9,11 +9,14 @@ import {
 import { AlertTriangle, X } from 'lucide-react';
 import { createContext, useContext, useState } from 'react';
 import type { FC, ReactNode } from 'react';
+import { I18nText } from '@/i18n/I18nText';
 
 interface ErrorModalProps {
   title?: string;
   message: string;
   hint?: string;
+  /** Machine-generated diagnostics (e.g. validation errors); rendered monospace with line breaks preserved. */
+  details?: string[];
   isOpen: boolean;
   onClose: () => void;
 }
@@ -22,12 +25,16 @@ export const ErrorModal: FC<ErrorModalProps> = ({
   title = 'Error',
   message,
   hint,
+  details,
   isOpen,
   onClose,
 }) => {
+  const hasDetails = details != null && details.length > 0;
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-[450px]">
+      <DialogContent
+        className={hasDetails ? 'sm:max-w-[640px]' : 'sm:max-w-[450px]'}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-error">
             <AlertTriangle className="h-5 w-5" />
@@ -42,12 +49,17 @@ export const ErrorModal: FC<ErrorModalProps> = ({
               {hint}
             </p>
           )}
+          {hasDetails && (
+            <pre className="text-xs font-mono whitespace-pre-wrap break-words bg-muted px-3 py-2 rounded-md max-h-60 overflow-y-auto">
+              {details.join('\n')}
+            </pre>
+          )}
         </div>
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>
             <X className="h-4 w-4 mr-1" />
-            Close
+            <I18nText text={"Close"} />
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -59,10 +71,16 @@ interface ErrorState {
   title?: string;
   message: string;
   hint?: string;
+  details?: string[];
 }
 
 interface ErrorModalContextType {
-  showError: (message: string, hint?: string, title?: string) => void;
+  showError: (
+    message: string,
+    hint?: string,
+    title?: string,
+    details?: string[]
+  ) => void;
 }
 
 export const ErrorModalContext = createContext<ErrorModalContextType>({
@@ -78,8 +96,13 @@ export const ErrorModalProvider: FC<ErrorModalProviderProps> = ({
 }) => {
   const [error, setError] = useState<ErrorState | null>(null);
 
-  const showError = (message: string, hint?: string, title?: string) => {
-    setError({ message, hint, title });
+  const showError = (
+    message: string,
+    hint?: string,
+    title?: string,
+    details?: string[]
+  ) => {
+    setError({ message, hint, title, details });
   };
 
   const handleClose = () => {
@@ -94,6 +117,7 @@ export const ErrorModalProvider: FC<ErrorModalProviderProps> = ({
           title={error.title}
           message={error.message}
           hint={error.hint}
+          details={error.details}
           isOpen={true}
           onClose={handleClose}
         />

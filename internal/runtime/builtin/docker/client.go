@@ -6,10 +6,14 @@ package docker
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"regexp"
 	"slices"
@@ -21,12 +25,12 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/cmn/signal"
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/signal"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
@@ -65,22 +69,39 @@ const (
 	keepAliveSleepCmd   = "while true; do sleep 86400; done"
 	keepAliveTargetPath = "/__dagu_runner/keepalive"
 
+	// Marks a cancelable exec so the daemon can signal it from inside the container.
+	execCancelTokenEnv = "DAGU_EXEC_TOKEN"
+
 	// Log scanning buffer sizes
 	logScanInitialBuf = 64 * 1024
 	logScanMaxBuf     = 1024 * 1024
 )
 
+var containerCgroupIDPattern = regexp.MustCompile(
+	`(^|/)((docker|libpod|cri-containerd)-[0-9a-f]{12,64}\.scope|(docker|containerd|libpod)/[0-9a-f]{12,64})($|/)`,
+)
+
+type cancelHelperMode uint8
+
+const (
+	cancelHelperNone cancelHelperMode = iota
+	cancelHelperBound
+	cancelHelperCopied
+)
+
 type Client struct {
 	cfg *Config
 
-	platform    specs.Platform // resolved platform
-	containerID string         // ID of the running container (if any)
-	started     atomic.Bool
+	platform       specs.Platform // resolved platform
+	containerID    string         // ID of the running container (if any)
+	started        atomic.Bool
+	cleanupPending atomic.Bool
 
 	mu  sync.Mutex
 	cli *client.Client
 
 	keepAliveTmp string
+	cancelHelper cancelHelperMode
 
 	// authManager handles registry authentication
 	authManager *RegistryAuthManager
@@ -97,8 +118,6 @@ type ExecOptions struct {
 	Env []string
 	// Direct executes cmd as argv without applying the configured shell wrapper.
 	Direct bool
-	// PIDFile records the container-local process ID for targeted cancellation.
-	PIDFile string
 	// TerminateOnCancel attempts to terminate only the exec process when ctx is canceled.
 	TerminateOnCancel bool
 }
@@ -324,12 +343,16 @@ func (c *Client) Close(ctx context.Context) {
 		return
 	}
 
-	// If we have a running container and autoRemove is set, remove it
-	if c.cfg.AutoRemove && c.started.Load() && c.containerID != "" {
-		if removeContainerForCleanup(ctx, c.cli, c.containerID, client.ContainerRemoveOptions{Force: true}) {
+	// Remove a container this client started under auto-remove, and any container
+	// an earlier cleanup attempt failed to remove.
+	shouldRemove := (c.cfg.AutoRemove && c.started.Load()) || c.cleanupPending.Load()
+	if shouldRemove && c.containerID != "" {
+		if removeContainerForCleanup(ctx, c.cli, c.containerID, client.ContainerRemoveOptions{Force: true}, defaultCancelStopWait) {
 			c.clearContainerStateLocked(c.containerID)
 		}
 	}
+
+	c.removeKeepAliveTmp(ctx)
 
 	_ = c.cli.Close()
 	c.cli = nil
@@ -381,15 +404,7 @@ func (c *Client) CreateContainerKeepAlive(ctx context.Context) error {
 	switch mode {
 	case "keepalive":
 		if len(c.cfg.Container.Cmd) == 0 {
-			// Detect if we're running in docker-in-docker environment
-			isDockerInDocker := c.isDockerInDocker()
-
-			if isDockerInDocker {
-				logger.Info(ctx, "Detected docker-in-docker environment, using sleep for keepalive")
-				cmd = []string{"sh", "-c", keepAliveSleepCmd}
-			} else {
-				cmd = c.setupKeepaliveCommand(ctx)
-			}
+			cmd = []string{keepAliveTargetPath}
 		}
 	case "entrypoint":
 		// Respect image ENTRYPOINT/CMD: do not set cmd; run as-is
@@ -402,6 +417,14 @@ func (c *Client) CreateContainerKeepAlive(ctx context.Context) error {
 	default:
 		return fmt.Errorf("invalid startup mode: %s", mode)
 	}
+	helpMode, installHelper, err := c.prepareCancelHelper()
+	if err != nil {
+		logger.Warn(ctx, "Docker exec cancellation helper unavailable; using container tools", tag.Error(err))
+		helpMode = cancelHelperNone
+		installHelper = nil
+		cmd = c.keepAliveFallbackCmd(mode, cmd)
+	}
+	c.cancelHelper = helpMode
 
 	// Set init true to prevent zombie subprocess issues
 	c.cfg.Host.Init = new(true)
@@ -411,8 +434,21 @@ func (c *Client) CreateContainerKeepAlive(ctx context.Context) error {
 	c.cancel = cancel
 	c.cancelMu.Unlock()
 
-	ctID, err := c.startNewContainer(ctx, c.cfg.ContainerName, c.cli, cmd, true)
+	ctID, err := c.startNewContainer(ctx, c.cfg.ContainerName, c.cli, cmd, true, installHelper)
+	if err != nil && helpMode != cancelHelperNone {
+		// Installing the helper can fail for reasons the run itself does not depend
+		// on: a read-only rootfs rejects the copy, and a bind source resolved on this
+		// host is absent from a daemon that turned out to be remote. Cancellation
+		// then falls back to in-container tooling instead of failing the run.
+		logger.Warn(ctx, "Docker exec cancellation helper install failed; using container tools", tag.Error(err))
+		c.discardCancelHelper(ctx, ctID)
+		helpMode = cancelHelperNone
+		c.cancelHelper = helpMode
+		cmd = c.keepAliveFallbackCmd(mode, cmd)
+		ctID, err = c.startNewContainer(ctx, c.cfg.ContainerName, c.cli, cmd, true, nil)
+	}
 	if err != nil {
+		c.cancelHelper = cancelHelperNone
 		return fmt.Errorf("failed to start a new container: %w", err)
 	}
 	c.containerID = ctID
@@ -461,21 +497,84 @@ func (c *Client) CreateContainerKeepAlive(ctx context.Context) error {
 	return nil
 }
 
-// setupKeepaliveCommand configures the keepalive command for non-docker-in-docker environments
-func (c *Client) setupKeepaliveCommand(ctx context.Context) []string {
-	// Standard environment, use the keepalive binary
-	hostPath, err := GetKeepaliveFile(c.platform)
-	if err != nil {
-		// Fallback to sleep if keepalive binary fails
-		logger.Warn(ctx, "Failed to get keepalive binary; using sleep fallback", tag.Error(err))
-		return []string{"sh", "-c", keepAliveSleepCmd}
+func (c *Client) prepareCancelHelper() (cancelHelperMode, func(context.Context, string) error, error) {
+	if c.shouldCopyCancelHelper() {
+		if _, _, err := getKeepaliveBinary(c.platform); err != nil {
+			return cancelHelperNone, nil, err
+		}
+		return cancelHelperCopied, func(ctx context.Context, containerID string) error {
+			return copyKeepaliveToContainer(ctx, c.cli, containerID, c.platform)
+		}, nil
 	}
 
+	hostPath, err := GetKeepaliveFile(c.platform)
+	if err != nil {
+		return cancelHelperNone, nil, err
+	}
 	c.keepAliveTmp = hostPath
-	// Setup the volume bind for the keepalive binary
-	bind := hostPath + ":" + keepAliveTargetPath + ":ro"
-	c.cfg.Host.Binds = append(c.cfg.Host.Binds, bind)
-	return []string{keepAliveTargetPath}
+	c.cfg.Host.Binds = append(c.cfg.Host.Binds, hostPath+":"+keepAliveTargetPath+":ro")
+	return cancelHelperBound, nil, nil
+}
+
+// keepAliveFallbackCmd returns the startup command for a container that will run
+// without the cancellation helper. Keepalive mode has to supply its own idle
+// process once the helper binary is out of the picture; other modes are unaffected.
+func (c *Client) keepAliveFallbackCmd(mode string, cmd []string) []string {
+	if mode == "keepalive" && len(c.cfg.Container.Cmd) == 0 {
+		return []string{"sh", "-c", keepAliveSleepCmd}
+	}
+	return cmd
+}
+
+// discardCancelHelper undoes prepareCancelHelper and removes any container left
+// behind by the failed attempt, so the run can be retried under the same name.
+func (c *Client) discardCancelHelper(ctx context.Context, containerID string) {
+	if containerID != "" {
+		if removeContainerForCleanup(
+			ctx, c.cli, containerID,
+			client.ContainerRemoveOptions{Force: true},
+			defaultCancelStopWait,
+		) {
+			c.clearContainerState(containerID)
+		}
+	}
+	if c.keepAliveTmp == "" {
+		return
+	}
+	bind := c.keepAliveTmp + ":" + keepAliveTargetPath + ":ro"
+	c.cfg.Host.Binds = slices.DeleteFunc(c.cfg.Host.Binds, func(b string) bool { return b == bind })
+	c.removeKeepAliveTmp(ctx)
+}
+
+// removeKeepAliveTmp deletes the host-side copy of the keepalive binary, if any.
+func (c *Client) removeKeepAliveTmp(ctx context.Context) {
+	if c.keepAliveTmp == "" {
+		return
+	}
+	if err := fileutil.Remove(c.keepAliveTmp); err != nil && !os.IsNotExist(err) {
+		logger.Error(ctx, "Docker executor: remove keep alive file", tag.Error(err))
+	}
+	c.keepAliveTmp = ""
+}
+
+func (c *Client) shouldCopyCancelHelper() bool {
+	return daemonNeedsHelperCopy(c.cli.DaemonHost(), c.isDockerInDocker())
+}
+
+func daemonNeedsHelperCopy(daemonHost string, containerized bool) bool {
+	if containerized {
+		return true
+	}
+	host, err := url.Parse(daemonHost)
+	if err != nil {
+		return true
+	}
+	switch host.Scheme {
+	case "", "unix", "npipe":
+		return false
+	default:
+		return true
+	}
 }
 
 // StopContainerKeepAlive stops the container running keep alive command
@@ -491,68 +590,14 @@ func (c *Client) StopContainerKeepAlive(ctx context.Context) {
 	c.cancel = nil
 
 	if c.containerID != "" {
-		// Stop the container
-		if _, err := c.cli.ContainerStop(ctx, c.containerID, client.ContainerStopOptions{}); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultCancelStopWait)
+		defer cancel()
+		if err := stopContainer(cleanupCtx, c.cli, c.containerID, c.cfg.StopSignal, c.cfg.StopGrace); err != nil {
 			logger.Error(ctx, "Docker executor: stop container", tag.Error(err))
 		}
-
-		// Forcefully stop after timeout
-		defaultStopTimeout := 5 * time.Second
-		var containerStopped atomic.Bool
-		forceKillTimer := time.AfterFunc(defaultStopTimeout, func() {
-			if containerStopped.Load() {
-				return
-			}
-			if _, err := c.cli.ContainerKill(context.Background(), c.containerID, client.ContainerKillOptions{Signal: "SIGKILL"}); err != nil {
-				if errdefs.IsNotFound(err) {
-					return
-				}
-				logger.Error(ctx, "Docker executor: force stop container", tag.Error(err))
-			}
-		})
-
-		// Wait for container to be fully stopped
-		maxWait := 30 * time.Second
-		waitTimer := time.NewTimer(maxWait)
-		defer waitTimer.Stop()
-
-	WAIT_LOOP:
-		for {
-			info, err := inspectContainer(context.Background(), c.cli, c.containerID)
-			if err != nil {
-				if errdefs.IsNotFound(err) {
-					containerStopped.Store(true)
-					break
-				}
-				logger.Error(ctx, "Docker executor: inspect container",
-					tag.Error(err),
-				)
-			} else if info.State != nil && !info.State.Running {
-				containerStopped.Store(true)
-				break
-			}
-
-			select {
-			case <-waitTimer.C:
-				logger.Warn(ctx, "Docker executor: timeout waiting for container to stop")
-				break WAIT_LOOP
-			default:
-				time.Sleep(defaultPollInterval)
-			}
-		}
-
-		if containerStopped.Load() {
-			_ = forceKillTimer.Stop()
-		}
 	}
 
-	if c.keepAliveTmp != "" {
-		// Remove the temporary keep alive file if it exists
-		if err := fileutil.Remove(c.keepAliveTmp); err != nil && !os.IsNotExist(err) {
-			logger.Error(ctx, "Docker executor: remove keep alive file", tag.Error(err))
-		}
-	}
-	c.keepAliveTmp = ""
+	c.removeKeepAliveTmp(ctx)
 }
 
 // Run executes the command in the container and returns exit code
@@ -574,7 +619,7 @@ func (c *Client) Run(ctx context.Context, cmd []string, stdout, stderr io.Writer
 		}
 		// Container exists and is running; exec in it
 		if err == nil && info.State != nil && info.State.Running {
-			return c.execInContainer(ctx, c.cli, cmd, stdout, stderr, ExecOptions{})
+			return c.execInContainer(ctx, c.cli, cmd, stdout, stderr, nativeExecOptions())
 		}
 		// If shouldStart is false, return error
 		if !c.cfg.ShouldStart {
@@ -597,7 +642,7 @@ func (c *Client) Run(ctx context.Context, cmd []string, stdout, stderr io.Writer
 		slog.String("containerName", c.cfg.ContainerName),
 		slog.Any("cmd", cmd),
 	)
-	ctID, err := c.startNewContainer(ctx, c.cfg.ContainerName, c.cli, cmd, false)
+	ctID, err := c.startNewContainer(ctx, c.cfg.ContainerName, c.cli, cmd, false, nil)
 	if err != nil {
 		logger.Error(ctx, "Docker: Run failed to start new container", tag.Error(err))
 		return errorExitCode, fmt.Errorf("failed to start a new container: %w", err)
@@ -609,7 +654,7 @@ func (c *Client) Run(ctx context.Context, cmd []string, stdout, stderr io.Writer
 			return
 		}
 
-		if removeContainerForCleanup(ctx, c.cli, ctID, client.ContainerRemoveOptions{Force: true}) {
+		if removeContainerForCleanup(ctx, c.cli, ctID, client.ContainerRemoveOptions{Force: true}, defaultCancelStopWait) {
 			c.clearContainerState(ctID)
 		}
 	}()
@@ -621,23 +666,32 @@ func (c *Client) Run(ctx context.Context, cmd []string, stdout, stderr io.Writer
 		slog.Bool("hasError", err != nil),
 	)
 
-	// Wait for container to be stopped before returning
+	// Wait for container to be stopped before returning. Honor ctx so a
+	// timeout_sec cancel stops the container instead of polling forever.
 	logger.Debug(ctx, "Docker: Run waiting for container to stop")
-	for {
-		info, err := inspectContainer(context.Background(), c.cli, ctID)
-		if err != nil {
-			if errdefs.IsNotFound(err) {
-				break
+	if waitErr := waitUntilContainerStopped(ctx,
+		func(inspectCtx context.Context) (bool, bool, error) {
+			info, inspectErr := inspectContainer(inspectCtx, c.cli, ctID)
+			if inspectErr != nil {
+				if errdefs.IsNotFound(inspectErr) {
+					return false, true, nil
+				}
+				return false, false, fmt.Errorf("failed to inspect container %s: %w", ctID, inspectErr)
 			}
-			return exitCode, fmt.Errorf("failed to inspect container %s: %w", ctID, err)
-		}
-		if info.State != nil && !info.State.Running {
-			logger.Debug(ctx, "Docker: Run container stopped", slog.String("status", string(info.State.Status)))
-			break
-		}
-		logger.Debug(ctx, "Docker: Run container still running, waiting...")
-
-		time.Sleep(defaultPollInterval)
+			running := info.State != nil && info.State.Running
+			if !running && info.State != nil {
+				logger.Debug(ctx, "Docker: Run container stopped", slog.String("status", string(info.State.Status)))
+			}
+			return running, false, nil
+		},
+		func(cleanupCtx context.Context) error {
+			logger.Debug(ctx, "Docker: Run stopping container after context cancel", slog.String("containerID", ctID))
+			return stopContainer(cleanupCtx, c.cli, ctID, c.cfg.StopSignal, c.cfg.StopGrace)
+		},
+		defaultPollInterval,
+		defaultCancelStopWait,
+	); waitErr != nil {
+		return exitCode, errors.Join(err, waitErr)
 	}
 
 	logger.Debug(ctx, "Docker: Run completed", slog.Int("exitCode", exitCode))
@@ -688,19 +742,8 @@ func (c *Client) Stop(sig os.Signal) error {
 		return nil
 	}
 
-	// Only stop containers that were started by this client
+	// Only stop containers owned by this client.
 	if !c.started.Load() {
-		return nil
-	}
-
-	info, err := inspectContainer(context.Background(), c.cli, c.containerID)
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to inspect container %s: %w", c.containerID, err)
-	}
-	if info.State != nil && !info.State.Running {
 		return nil
 	}
 
@@ -708,18 +751,19 @@ func (c *Client) Stop(sig os.Signal) error {
 	if sysSig, ok := sig.(syscall.Signal); ok {
 		sigName = signal.GetSignalName(sysSig)
 	}
-
-	if _, err := c.cli.ContainerStop(context.Background(), c.containerID, client.ContainerStopOptions{Signal: sigName}); err != nil {
-		if errdefs.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-
-	return nil
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultCancelStopWait)
+	defer cancel()
+	return stopContainer(cleanupCtx, c.cli, c.containerID, sigName, c.cfg.StopGrace)
 }
 
-func (c *Client) startNewContainer(ctx context.Context, name string, cli *client.Client, cmd []string, clearEntrypoint bool) (string, error) {
+func (c *Client) startNewContainer(
+	ctx context.Context,
+	name string,
+	cli *client.Client,
+	cmd []string,
+	clearEntrypoint bool,
+	beforeStart func(context.Context, string) error,
+) (string, error) {
 	logger.Debug(ctx, "Docker: startNewContainer started",
 		slog.String("name", name),
 		slog.Any("cmd", cmd),
@@ -759,16 +803,38 @@ func (c *Client) startNewContainer(ctx context.Context, name string, cli *client
 
 		logger.Debug(ctx, "Docker: startNewContainer calling ImagePull")
 		reader, err := cli.ImagePull(ctx, c.cfg.Image, pullOpts)
+
+		// Check for API-level error
 		if err != nil {
 			logger.Error(ctx, "Docker: startNewContainer ImagePull failed", tag.Error(err))
-			return "", err
+		} else {
+			// Check for stream-level error (registry errors reported in JSON)
+			logger.Debug(ctx, "Docker: startNewContainer ImagePull returned, checking stream for errors")
+			err = checkImagePullStream(reader)
+			_ = reader.Close()
+			if err != nil {
+				logger.Error(ctx, "Docker: startNewContainer image pull stream error", tag.Error(err))
+			}
 		}
-		logger.Debug(ctx, "Docker: startNewContainer ImagePull returned, draining reader")
-		// Output pull-image log to stderr instead of stdout
-		_, _ = io.Copy(io.Discard, reader)
-		_ = reader.Close()
-		logger.Debug(ctx, "Docker: startNewContainer image pull completed")
-		logger.Infof(ctx, "Successfully pulled the image %q", c.cfg.Image)
+
+		// Handle pull failure with unified fallback logic
+		if err != nil {
+			if c.cfg.Pull == ir.PullPolicyFallback {
+				hasLocal, checkErr := c.hasLocalImage(ctx, cli, &c.platform)
+				if checkErr != nil {
+					return "", fmt.Errorf("image pull failed and local image check failed: %w (original pull error: %v)", checkErr, err)
+				}
+				if !hasLocal {
+					return "", fmt.Errorf("image pull failed and no local image available: %w", err)
+				}
+				logger.Warnf(ctx, "Pull failed for %q, falling back to local image: %v", c.cfg.Image, err)
+			} else {
+				return "", err
+			}
+		} else {
+			logger.Debug(ctx, "Docker: startNewContainer image pull completed")
+			logger.Infof(ctx, "Successfully pulled the image %q", c.cfg.Image)
+		}
 	}
 
 	ctCfg := *c.cfg.Container // Copy to avoid mutating original
@@ -813,6 +879,12 @@ func (c *Client) startNewContainer(ctx context.Context, name string, cli *client
 	}
 
 	c.containerID = resp.ID
+	c.started.Store(true)
+	if beforeStart != nil {
+		if err := beforeStart(ctx, resp.ID); err != nil {
+			return "", c.cleanupFailedHelperInstall(ctx, cli, resp.ID, err)
+		}
+	}
 
 	logger.Debug(ctx, "Docker: startNewContainer calling ContainerStart", slog.String("containerID", resp.ID))
 	_, err = cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{})
@@ -820,10 +892,25 @@ func (c *Client) startNewContainer(ctx context.Context, name string, cli *client
 		logger.Error(ctx, "Docker: startNewContainer ContainerStart failed", tag.Error(err))
 	} else {
 		logger.Debug(ctx, "Docker: startNewContainer ContainerStart succeeded")
-		c.started.Store(true)
 	}
 
 	return resp.ID, err
+}
+
+func (c *Client) cleanupFailedHelperInstall(
+	ctx context.Context,
+	cli *client.Client,
+	containerID string,
+	installErr error,
+) error {
+	removeErr := removeContainerForCleanupError(cli, containerID, client.ContainerRemoveOptions{Force: true}, defaultCancelStopWait)
+	if removeErr != nil {
+		c.cleanupPending.Store(true)
+		logger.Error(ctx, "Docker executor: remove container after helper install failure", tag.Error(removeErr))
+		return errors.Join(installErr, fmt.Errorf("remove container after helper install failure: %w", removeErr))
+	}
+	c.clearContainerState(containerID)
+	return installErr
 }
 
 // ensureCommandFlag adds the appropriate command flag (-c, -Command, /c)
@@ -910,6 +997,11 @@ func (c *Client) execInContainer(ctx context.Context, cli *client.Client, cmd []
 		configuredEnv = append(configuredEnv, c.cfg.Container.Env...)
 	}
 	execEnv := mergeEnvByKey(containerEnv, configuredEnv, cfgExec.Env, opts.Env)
+	execCancelToken := ""
+	if opts.TerminateOnCancel {
+		execCancelToken = newExecCancelToken()
+		execEnv = append(execEnv, execCancelTokenEnv+"="+execCancelToken)
+	}
 
 	// Create exec configuration
 	execOpts := client.ExecCreateOptions{
@@ -928,6 +1020,10 @@ func (c *Client) execInContainer(ctx context.Context, cli *client.Client, cmd []
 	if opts.WorkingDir != "" {
 		execOpts.WorkingDir = opts.WorkingDir
 	}
+	signalOpts := execSignalOptions{user: cfgExec.User}
+	if c.started.Load() {
+		signalOpts.helper = c.cancelHelper
+	}
 
 	// Create exec instance
 	execCreateResp, err := cli.ExecCreate(ctx, containerID, execOpts)
@@ -938,12 +1034,16 @@ func (c *Client) execInContainer(ctx context.Context, cli *client.Client, cmd []
 	// Start exec instance
 	resp, err := cli.ExecAttach(ctx, execCreateResp.ID, client.ExecAttachOptions{TTY: cfgExec.TTY})
 	if err != nil {
+		if ctx.Err() != nil && opts.TerminateOnCancel {
+			return 1, canceledExecError(ctx, cli, execCreateResp.ID, execCancelToken, signalOpts)
+		}
 		return 1, fmt.Errorf("failed to start exec: %w", err)
 	}
 
 	// Copy output
 	var wg sync.WaitGroup
 	wg.Add(1)
+	copyDone := make(chan struct{})
 	defer func() {
 		resp.Close()
 		wg.Wait()
@@ -951,6 +1051,7 @@ func (c *Client) execInContainer(ctx context.Context, cli *client.Client, cmd []
 
 	go func() {
 		defer wg.Done()
+		defer close(copyDone)
 		var copyErr error
 		if cfgExec.TTY {
 			_, copyErr = io.Copy(stdout, resp.Reader)
@@ -962,7 +1063,19 @@ func (c *Client) execInContainer(ctx context.Context, cli *client.Client, cmd []
 		}
 	}()
 
-	time.Sleep(defaultPollInterval) // Give some time for the exec to start
+	// The daemon closes the attached stream once the exec's process exits, and it
+	// marks the exec running only after that stream is established. Inspecting
+	// before the stream ends can therefore observe a not-yet-running exec and
+	// read its zero-valued exit code as success.
+	select {
+	case <-copyDone:
+	case <-ctx.Done():
+		resp.Close()
+		if opts.TerminateOnCancel {
+			return 1, canceledExecError(ctx, cli, execCreateResp.ID, execCancelToken, signalOpts)
+		}
+		return 1, ctx.Err()
+	}
 
 	// Wait for exec to complete
 	for {
@@ -970,9 +1083,8 @@ func (c *Client) execInContainer(ctx context.Context, cli *client.Client, cmd []
 		if err != nil {
 			if ctx.Err() != nil {
 				if opts.TerminateOnCancel {
-					if err := terminateExecProcess(cli, execCreateResp.ID, opts.PIDFile); err != nil {
-						logger.Warn(ctx, "Docker executor: terminate exec process after cancellation", tag.Error(err))
-					}
+					resp.Close()
+					return 1, canceledExecError(ctx, cli, execCreateResp.ID, execCancelToken, signalOpts)
 				}
 				resp.Close()
 				return 1, ctx.Err()
@@ -987,18 +1099,13 @@ func (c *Client) execInContainer(ctx context.Context, cli *client.Client, cmd []
 			return inspectResp.ExitCode, nil
 		}
 
-		select {
-		case <-ctx.Done():
+		if err := waitForContainerPoll(ctx, defaultPollInterval); err != nil {
 			if opts.TerminateOnCancel {
-				if err := terminateExecProcess(cli, execCreateResp.ID, opts.PIDFile); err != nil {
-					logger.Warn(ctx, "Docker executor: terminate exec process after cancellation", tag.Error(err))
-				}
+				resp.Close()
+				return 1, canceledExecError(ctx, cli, execCreateResp.ID, execCancelToken, signalOpts)
 			}
 			resp.Close()
 			return 1, ctx.Err()
-
-		default:
-			time.Sleep(defaultPollInterval)
 		}
 	}
 }
@@ -1024,137 +1131,183 @@ func mergeEnvByKey(layers ...[]string) []string {
 }
 
 func execCommand(shell, cmd []string, opts ExecOptions) []string {
-	var execCmd []string
 	if opts.Direct {
-		execCmd = append([]string(nil), cmd...)
-	} else {
-		execCmd = wrapCommandWithShell(shell, cmd)
+		return append([]string(nil), cmd...)
 	}
-	if opts.PIDFile != "" {
-		return wrapCommandWithPIDFile(execCmd, opts.PIDFile)
-	}
-	return execCmd
+	return wrapCommandWithShell(shell, cmd)
 }
 
-func wrapCommandWithPIDFile(cmd []string, pidFile string) []string {
-	if len(cmd) == 0 {
-		return cmd
-	}
-	script := `pidfile="$1"
-shift
-dir="${pidfile%/*}"
-if [ "$dir" != "$pidfile" ]; then
-  mkdir -p "$dir" || exit 125
-fi
-"$@" &
-child=$!
-if ! printf '%s\n' "$child" > "$pidfile"; then
-  kill "$child" 2>/dev/null || true
-  wait "$child" 2>/dev/null || true
-  exit 125
-fi
-wait "$child"
-status=$?
-rm -f "$pidfile" 2>/dev/null || true
-exit "$status"`
-	wrapped := []string{"sh", "-c", script, "dagu-exec-wrapper", pidFile}
-	return append(wrapped, cmd...)
+func newExecCancelToken() string {
+	var b [8]byte
+	rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
-func terminateExecProcess(cli *client.Client, execID string, pidFile string) error {
-	inspectCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+type execSignalOptions struct {
+	helper cancelHelperMode
+	user   string
+}
+
+func canceledExecError(
+	ctx context.Context,
+	cli *client.Client,
+	execID string,
+	token string,
+	signalOpts execSignalOptions,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultCancelStopWait)
 	defer cancel()
+	cleanupErr := terminateExecProcess(cleanupCtx, cli, execID, token, signalOpts)
+	return errors.Join(ctx.Err(), cleanupErr)
+}
 
-	inspectResp, err := cli.ExecInspect(inspectCtx, execID, client.ExecInspectOptions{})
+func terminateExecProcess(
+	ctx context.Context,
+	cli *client.Client,
+	execID string,
+	token string,
+	signalOpts execSignalOptions,
+) error {
+	inspectResp, err := cli.ExecInspect(ctx, execID, client.ExecInspectOptions{})
 	if err != nil {
 		return fmt.Errorf("inspect exec %s: %w", execID, err)
 	}
-	if !inspectResp.Running {
-		return nil
-	}
 
-	if pidFile == "" {
-		return fmt.Errorf("exec %s has no PID file for targeted cancellation", execID)
+	if token == "" {
+		if !inspectResp.Running {
+			return nil
+		}
+		return fmt.Errorf("exec %s has no cancel token for daemon-side cancellation", execID)
 	}
-
-	if err := signalContainerPIDFileProcess(cli, inspectResp.ContainerID, pidFile, "TERM"); err != nil {
-		return err
+	stopped := !inspectResp.Running
+	var cleanupErr error
+	if !stopped {
+		if err := signalContainerTokenProcess(ctx, cli, inspectResp.ContainerID, token, "TERM", signalOpts); err != nil {
+			cleanupErr = err
+		} else {
+			stopped, err = execStoppedWithin(ctx, cli, execID, 2*time.Second)
+			if err != nil {
+				cleanupErr = err
+			}
+		}
 	}
-	if execStoppedWithin(cli, execID, 2*time.Second) {
-		return nil
+	if err := signalContainerTokenProcess(ctx, cli, inspectResp.ContainerID, token, "KILL", signalOpts); err != nil {
+		return errors.Join(cleanupErr, err)
 	}
-	if err := signalContainerPIDFileProcess(cli, inspectResp.ContainerID, pidFile, "KILL"); err != nil {
-		return err
+	if stopped {
+		return cleanupErr
 	}
-	if execStoppedWithin(cli, execID, 2*time.Second) {
-		return nil
+	stopped, err = execStoppedWithin(ctx, cli, execID, 0)
+	if err != nil {
+		return errors.Join(cleanupErr, fmt.Errorf("wait for exec %s after KILL: %w", execID, err))
 	}
-	return fmt.Errorf("exec %s is still running after KILL", execID)
+	if stopped {
+		return cleanupErr
+	}
+	return errors.Join(cleanupErr, fmt.Errorf("exec %s is still running after KILL", execID))
 }
 
-func signalContainerPIDFileProcess(cli *client.Client, containerID string, pidFile string, signalName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+func signalContainerTokenProcess(
+	ctx context.Context,
+	cli *client.Client,
+	containerID string,
+	token string,
+	signalName string,
+	signalOpts execSignalOptions,
+) error {
+	if signalOpts.helper != cancelHelperNone {
+		execOpts := helperSignalExecOptions(signalOpts.user, signalName, token)
+		return runContainerSignalExec(ctx, cli, containerID, signalName, "cancel token", execOpts)
+	}
 
 	script := `sig="$1"
-pidfile="$2"
-pid="$(cat "$pidfile" 2>/dev/null || true)"
-[ -n "$pid" ] || exit 0
+token="$2"
 kill_tree() {
   for child in $(ps -eo pid,ppid 2>/dev/null | awk -v parent="$1" 'NR > 1 && $2 == parent { print $1 }'); do
     kill_tree "$child"
   done
   kill "-$sig" "$1" 2>/dev/null || true
 }
-kill "-$sig" -- "-$pid" 2>/dev/null || true
-kill_tree "$pid"
-rm -f "$pidfile" 2>/dev/null || true`
-	resp, err := cli.ExecCreate(ctx, containerID, client.ExecCreateOptions{
-		User: "0",
-		Cmd:  []string{"sh", "-c", script, "dagu-kill-exec", signalName, pidFile},
+for environ in /proc/[0-9]*/environ; do
+  pid="${environ#/proc/}"
+  pid="${pid%/environ}"
+  if tr '\0' '\n' < "$environ" 2>/dev/null | grep -Fxq "` + execCancelTokenEnv + `=$token"; then
+    kill "-$sig" -- "-$pid" 2>/dev/null || true
+    kill_tree "$pid"
+  fi
+done`
+	return runContainerSignalExec(ctx, cli, containerID, signalName, "cancel token", client.ExecCreateOptions{
+		User: signalOpts.user,
+		Cmd:  []string{"sh", "-c", script, "dagu-kill-exec", signalName, token},
 	})
-	if err != nil {
-		return fmt.Errorf("create %s signal exec for pid file %q: %w", signalName, pidFile, err)
-	}
-	if _, err := cli.ExecStart(ctx, resp.ID, client.ExecStartOptions{Detach: true}); err != nil {
-		return fmt.Errorf("start %s signal exec for pid file %q: %w", signalName, pidFile, err)
-	}
+}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		inspectResp, err := cli.ExecInspect(ctx, resp.ID, client.ExecInspectOptions{})
-		if err != nil {
-			return fmt.Errorf("inspect %s signal exec for pid file %q: %w", signalName, pidFile, err)
-		}
-		if !inspectResp.Running {
-			if inspectResp.ExitCode != 0 {
-				return fmt.Errorf("%s signal exec for pid file %q exited with code %d", signalName, pidFile, inspectResp.ExitCode)
-			}
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s signal exec for pid file %q did not finish", signalName, pidFile)
-		}
-		time.Sleep(defaultPollInterval)
+func helperSignalExecOptions(user string, signalName string, token string) client.ExecCreateOptions {
+	return client.ExecCreateOptions{
+		User: user,
+		Cmd:  []string{keepAliveTargetPath, "signal-token", signalName, token},
 	}
 }
 
-func execStoppedWithin(cli *client.Client, execID string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+func runContainerSignalExec(
+	ctx context.Context,
+	cli *client.Client,
+	containerID string,
+	signalName string,
+	target string,
+	execOpts client.ExecCreateOptions,
+) error {
+	resp, err := cli.ExecCreate(ctx, containerID, execOpts)
+	if err != nil {
+		return fmt.Errorf("create %s signal exec for %s: %w", signalName, target, err)
+	}
+	if _, err := cli.ExecStart(ctx, resp.ID, client.ExecStartOptions{Detach: true}); err != nil {
+		return fmt.Errorf("start %s signal exec for %s: %w", signalName, target, err)
+	}
+
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), defaultPollInterval)
-		inspectResp, err := cli.ExecInspect(ctx, execID, client.ExecInspectOptions{})
-		cancel()
+		inspectResp, err := cli.ExecInspect(ctx, resp.ID, client.ExecInspectOptions{})
 		if err != nil {
-			return false
+			return fmt.Errorf("inspect %s signal exec for %s: %w", signalName, target, err)
 		}
 		if !inspectResp.Running {
-			return true
+			if inspectResp.ExitCode != 0 {
+				return fmt.Errorf("%s signal exec for %s exited with code %d", signalName, target, inspectResp.ExitCode)
+			}
+			return nil
 		}
-		if time.Now().After(deadline) {
-			return false
+		if err := waitForContainerPoll(ctx, defaultPollInterval); err != nil {
+			return fmt.Errorf("wait for %s signal exec for %s: %w", signalName, target, err)
 		}
-		time.Sleep(defaultPollInterval)
+	}
+}
+
+func execStoppedWithin(ctx context.Context, cli *client.Client, execID string, timeout time.Duration) (bool, error) {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	for {
+		inspectResp, err := cli.ExecInspect(ctx, execID, client.ExecInspectOptions{})
+		if err != nil {
+			return false, fmt.Errorf("inspect exec %s while waiting for stop: %w", execID, err)
+		}
+		if !inspectResp.Running {
+			return true, nil
+		}
+		poll := defaultPollInterval
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false, nil
+			}
+			if remaining < poll {
+				poll = remaining
+			}
+		}
+		if err := waitForContainerPoll(ctx, poll); err != nil {
+			return false, err
+		}
 	}
 }
 
@@ -1169,17 +1322,41 @@ func removeStoppedContainer(ctx context.Context, cli *client.Client, containerID
 }
 
 // removeContainerForCleanup reports whether the container no longer needs removal.
-func removeContainerForCleanup(ctx context.Context, cli *client.Client, containerID string, opts client.ContainerRemoveOptions) bool {
-	// Cleanup should still run after the caller's context has been canceled.
-	cleanupCtx := context.Background()
-	if _, err := cli.ContainerRemove(cleanupCtx, containerID, opts); err != nil {
-		if errdefs.IsNotFound(err) {
-			return true
-		}
+func removeContainerForCleanup(
+	ctx context.Context,
+	cli *client.Client,
+	containerID string,
+	opts client.ContainerRemoveOptions,
+	timeout time.Duration,
+) bool {
+	err := removeContainerForCleanupError(cli, containerID, opts, timeout)
+	if err != nil {
 		logger.Error(ctx, "Docker executor: remove container", tag.Error(err))
 		return false
 	}
 	return true
+}
+
+// removeContainerForCleanupError removes a container on its own timeout so
+// cleanup completes after the caller's context has been canceled.
+func removeContainerForCleanupError(
+	cli *client.Client,
+	containerID string,
+	opts client.ContainerRemoveOptions,
+	timeout time.Duration,
+) error {
+	if timeout <= 0 {
+		timeout = defaultCancelStopWait
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := cli.ContainerRemove(cleanupCtx, containerID, opts); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // clearContainerState forgets ownership of a container after cleanup.
@@ -1196,6 +1373,7 @@ func (c *Client) clearContainerStateLocked(containerID string) {
 	}
 	c.containerID = ""
 	c.started.Store(false)
+	c.cleanupPending.Store(false)
 }
 
 func (c *Client) attachAndWait(ctx context.Context, cli *client.Client, containerID string, stdout, stderr io.Writer) (int, error) {
@@ -1214,17 +1392,26 @@ func (c *Client) attachAndWait(ctx context.Context, cli *client.Client, containe
 		return 1, err
 	}
 	logger.Debug(ctx, "Docker: attachAndWait ContainerLogs succeeded")
-	defer func() {
-		logger.Debug(ctx, "Docker: attachAndWait closing log reader")
-		_ = out.Close()
-	}()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	defer wg.Wait() // Ensure log copying completes before returning
+	copyDone := make(chan struct{})
+	defer func() {
+		// A followed log stream does not end while the container still runs, so
+		// draining it is only bounded by ctx. Close the reader once either the
+		// copy finishes or ctx ends, then join the copy goroutine.
+		select {
+		case <-copyDone:
+		case <-ctx.Done():
+		}
+		logger.Debug(ctx, "Docker: attachAndWait closing log reader")
+		_ = out.Close()
+		wg.Wait()
+	}()
 
 	go func() {
 		defer wg.Done()
+		defer close(copyDone)
 		logger.Debug(ctx, "Docker: attachAndWait stdcopy goroutine started")
 		if _, err := stdcopy.StdCopy(stdout, stderr, out); err != nil {
 			logger.Error(ctx, "Docker executor: stdcopy", tag.Error(err))
@@ -1285,18 +1472,46 @@ func (c *Client) isInContainerByCgroup() bool {
 	if err != nil {
 		return false
 	}
+	return cgroupIndicatesContainer(string(data))
+}
 
-	content := string(data)
-	// Look for container runtime indicators in cgroup
-	containerIndicators := []string{"docker", "containerd", "kubepods", "lxc"}
-	for _, indicator := range containerIndicators {
-		if strings.Contains(content, indicator) {
+// cgroupIndicatesContainer reports whether a /proc/1/cgroup body describes a
+// containerized init. Host init systems also run under named slices, so only
+// runtime-specific paths count; a missed runtime is recovered from at container
+// start rather than guessed at here.
+func cgroupIndicatesContainer(content string) bool {
+	for line := range strings.SplitSeq(content, "\n") {
+		_, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		_, cgroupPath, ok := strings.Cut(rest, ":")
+		if !ok {
+			continue
+		}
+		if containerCgroupIDPattern.MatchString(cgroupPath) {
 			return true
 		}
+		for segment := range strings.SplitSeq(strings.Trim(cgroupPath, "/"), "/") {
+			if isContainerCgroupSegment(segment) {
+				return true
+			}
+		}
 	}
+	return false
+}
 
-	// Additional check for non-root cgroup (indicates containerization)
-	return content != "0::/" && content != ""
+// isContainerCgroupSegment reports whether one cgroup path segment names a
+// container runtime's own hierarchy rather than a host slice.
+func isContainerCgroupSegment(segment string) bool {
+	switch segment {
+	case "kubepods", "kubepods.slice", "lxc", "ecs", "docker", "actions_job":
+		return true
+	}
+	return strings.HasPrefix(segment, "kubepods-") ||
+		strings.HasPrefix(segment, "lxc.payload") ||
+		strings.HasPrefix(segment, "machine-") ||
+		strings.HasPrefix(segment, "nspawn-")
 }
 
 func getPlatform(ctx context.Context, cli *client.Client, cfg *Config) (specs.Platform, error) {
@@ -1320,16 +1535,50 @@ func getPlatform(ctx context.Context, cli *client.Client, cfg *Config) (specs.Pl
 	return platform, nil
 }
 
-func (c *Client) shouldPullImage(ctx context.Context, cli *client.Client, platform *specs.Platform) (bool, error) {
-	if c.cfg.Pull == core.PullPolicyAlways {
-		return true, nil
-	}
-	if c.cfg.Pull == core.PullPolicyNever {
-		return false, nil
+// checkImagePullStream decodes the Docker image pull JSON stream and checks for errors.
+// Docker's ImagePull can return a successful io.ReadCloser even when the registry reports
+// errors in the JSON stream itself (e.g., authentication failures, not found, etc.).
+func checkImagePullStream(reader io.Reader) error {
+	decoder := json.NewDecoder(reader)
+	type pullMessage struct {
+		Status string `json:"status,omitempty"`
+		Error  string `json:"error,omitempty"`
 	}
 
-	// Loop through all locally available images that have the same reference with
-	// the input image to check if we have the correct platform.
+	for {
+		var msg pullMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to decode stream message: %w", err)
+		}
+
+		if msg.Error != "" {
+			return fmt.Errorf("image pull error: %s", msg.Error)
+		}
+	}
+
+	return nil
+}
+
+func (c *Client) shouldPullImage(ctx context.Context, cli *client.Client, platform *specs.Platform) (bool, error) {
+	if c.cfg.Pull == ir.PullPolicyAlways {
+		return true, nil
+	}
+	if c.cfg.Pull == ir.PullPolicyNever {
+		return false, nil
+	}
+	if c.cfg.Pull == ir.PullPolicyFallback {
+		// Always attempt pull; fallback to local is handled by the caller.
+		return true, nil
+	}
+
+	return c.needsPull(ctx, cli, platform)
+}
+
+// hasLocalImage checks whether a local image matching the given platform exists.
+func (c *Client) hasLocalImage(ctx context.Context, cli *client.Client, platform *specs.Platform) (bool, error) {
 	filters := make(client.Filters).Add("reference", c.cfg.Image)
 
 	images, err := cli.ImageList(ctx, client.ImageListOptions{Filters: filters})
@@ -1342,13 +1591,30 @@ func (c *Client) shouldPullImage(ctx context.Context, cli *client.Client, platfo
 		if err != nil {
 			return false, fmt.Errorf("failed to inspect image %s: %w", summary.ID, err)
 		}
-		if (platform.OS == inspect.Os) && (platform.Architecture == inspect.Architecture) && (platform.Variant == inspect.Variant) {
-			// We have the correct image locally, no need to pull
-			return false, nil
+
+		localPlatform := specs.Platform{
+			OS:           inspect.Os,
+			Architecture: inspect.Architecture,
+			Variant:      inspect.Variant,
+		}
+
+		if platforms.OnlyStrict(*platform).Match(localPlatform) {
+			return true, nil
 		}
 	}
 
-	// We don't have the correct image
+	return false, nil
+}
+
+// needsPull checks if the image needs to be pulled for PullPolicyMissing.
+func (c *Client) needsPull(ctx context.Context, cli *client.Client, platform *specs.Platform) (bool, error) {
+	hasLocal, err := c.hasLocalImage(ctx, cli, platform)
+	if err != nil {
+		return false, err
+	}
+	if hasLocal {
+		return false, nil
+	}
 	return true, nil
 }
 

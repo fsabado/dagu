@@ -6,9 +6,8 @@ package convert_test
 import (
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/proto/convert"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,14 +15,14 @@ func TestDAGRunStatusProtoRoundTripPreservesStepOutputsValue(t *testing.T) {
 	t.Parallel()
 
 	stepOutputsValue := `{"image_tag":"v1.2.3","metadata":"{\"image\":\"api\"}"}`
-	original := &exec.DAGRunStatus{
+	original := &ir.DAGRunStatus{
 		Name:     "build",
 		DAGRunID: "run-1",
-		Status:   core.Running,
-		Nodes: []*exec.Node{
+		Status:   ir.Running,
+		Nodes: []*ir.Node{
 			{
-				Step:             core.Step{Name: "publish", ID: "publish"},
-				Status:           core.NodeSucceeded,
+				Step:             ir.Step{Name: "publish", ID: "publish"},
+				Status:           ir.NodeSucceeded,
 				StepOutputsValue: &stepOutputsValue,
 			},
 		},

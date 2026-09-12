@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/spec"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	filedag "github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 )
 
 const (
@@ -28,25 +30,31 @@ const (
 // dagFileSource resolves watched DAG files into stable metadata snapshots.
 type dagFileSource struct {
 	dir  string
-	load func(context.Context, string) (*core.DAG, error)
+	load func(context.Context, string) (*ir.DAG, error)
 }
 
 // dagFileSnapshot represents the scheduler-visible state of one DAG file.
 type dagFileSnapshot struct {
-	dag    *core.DAG
+	dag    *ir.DAG
 	exists bool
 }
 
 // newDAGFileSource creates the production DAG file source for a watched directory.
-func newDAGFileSource(dir string) *dagFileSource {
+func newDAGFileSource(dir string, dagRepository *persis.DAGRepository) *dagFileSource {
+	load := loadDAGMetadata
+	if dagRepository != nil {
+		load = func(ctx context.Context, filePath string) (*ir.DAG, error) {
+			return dagRepository.GetMetadata(ctx, filePath)
+		}
+	}
 	return &dagFileSource{
 		dir:  dir,
-		load: loadDAGMetadata,
+		load: load,
 	}
 }
 
 // loadDAGMetadata loads only scheduler metadata from a DAG spec file.
-func loadDAGMetadata(ctx context.Context, filePath string) (*core.DAG, error) {
+func loadDAGMetadata(ctx context.Context, filePath string) (*ir.DAG, error) {
 	return spec.Load(
 		ctx,
 		filePath,
@@ -67,7 +75,7 @@ func (s *dagFileSource) snapshot(ctx context.Context, fileName string) (dagFileS
 			return dagFileSnapshot{dag: dag, exists: true}, nil
 		}
 
-		if !errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, filedag.ErrExternalSymlinkDisabled) || !errors.Is(err, os.ErrNotExist) {
 			return dagFileSnapshot{}, err
 		}
 		if attempt >= dagFileSnapshotRetries {

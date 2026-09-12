@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,6 +26,65 @@ func TestResolverConstLoadResolvesConstsAndPreservesRuntimeBindings(t *testing.T
 	got, err = resolver.String(ctx, "${params.environment}", value.ConstLoadField("consts.bad"))
 	require.NoError(t, err)
 	assert.Equal(t, "${params.environment}", got)
+}
+
+func TestResolveRefSinglePass(t *testing.T) {
+	t.Parallel()
+
+	templateText := "  Hello, {{ .name }}! ${env.NESTED} `command`\n"
+	resolver := value.NewResolver(
+		value.StaticScope{},
+		value.RuntimeScope{
+			Env: testEnvScope(map[string]string{
+				"TEMPLATE": templateText,
+				"NESTED":   "must-not-expand",
+			}),
+		},
+	)
+
+	got, err := resolver.ResolveRef(
+		context.Background(),
+		"${env.TEMPLATE}",
+		value.TemplateConfigField("with.template_ref"),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, templateText, got)
+}
+
+func TestResolveRefValidation(t *testing.T) {
+	t.Parallel()
+
+	resolver := value.NewResolver(
+		value.StaticScope{Consts: value.Values{"object": map[string]any{"template": "value"}}},
+		value.RuntimeScope{
+			Consts: value.Values{"object": map[string]any{"template": "value"}},
+			Env:    testEnvScope(map[string]string{"EMPTY": " \n"}),
+		},
+	)
+
+	tests := []struct {
+		name  string
+		token string
+		err   string
+	}{
+		{name: "invalid token", token: "env.TEMPLATE", err: "must be one complete scoped value reference"},
+		{name: "missing value", token: "${env.MISSING}", err: "unknown env.MISSING binding"},
+		{name: "non-string value", token: "${consts.object}", err: "must resolve to a string"},
+		{name: "empty value", token: "${env.EMPTY}", err: "resolved to an empty string"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := resolver.ResolveRef(
+				context.Background(),
+				tt.token,
+				value.TemplateConfigField("with.template_ref"),
+			)
+			require.ErrorContains(t, err, tt.err)
+		})
+	}
 }
 
 func TestResolverUnresolvedStrictReferencesPreserve(t *testing.T) {
@@ -368,6 +427,27 @@ func TestResolverPowerShellCommandFieldPreservesEnvMemberAccess(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, "if ([int]($env:DEV_PCENT) -ge [int]($env:DEV_ALERT)) { exit 0 } else { exit 1 }", got)
+}
+
+func TestResolverConditionCommandResolvesBuildInput(t *testing.T) {
+	ctx := context.Background()
+	resolver := value.NewResolver(value.StaticScope{}, value.RuntimeScope{
+		Inputs: value.Values{"source": "/tmp/source.txt"},
+	})
+	command := value.CommandContext{
+		Target:          value.CommandTargetLocal,
+		Shell:           []string{"sh"},
+		ShellConfigured: true,
+	}
+
+	got, err := resolver.String(
+		ctx,
+		`test -f "${inputs.source}"`,
+		value.ConditionCommandField("preconditions[0].condition", command),
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, `test -f "/tmp/source.txt"`, got)
 }
 
 func TestResolverHostConfigObjectUsesScopedEnvWithoutOSFallback(t *testing.T) {

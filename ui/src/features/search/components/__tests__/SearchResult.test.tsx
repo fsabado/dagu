@@ -151,4 +151,52 @@ describe('SearchResult', () => {
     const link = screen.getByRole('link', { name: /build/i });
     expect(link.getAttribute('href')).toBe('/dags/build/spec?workspace=team-a');
   });
+
+  it('loads more Wiki page matches with the page workspace query', async () => {
+    render(
+      <MemoryRouter>
+        <SearchResult
+          type="wiki"
+          query="needle"
+          results={[
+            {
+              id: 'team-a/runbooks/deploy',
+              title: 'deploy',
+              description: '',
+              workspace: 'team-a',
+              matches: [
+                {
+                  line: 'needle',
+                  lineNumber: 3,
+                  startLine: 3,
+                },
+              ],
+              hasMoreMatches: true,
+              nextMatchesCursor: 'cursor-1',
+            },
+          ]}
+        />
+      </MemoryRouter>
+    );
+
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Show more matches' })
+    );
+
+    await waitFor(() => {
+      expect(getMock).toHaveBeenCalledTimes(1);
+    });
+
+    expect(getMock).toHaveBeenCalledWith('/search/wiki/matches', {
+      params: {
+        query: {
+          remoteNode: 'local',
+          path: 'runbooks/deploy',
+          q: 'needle',
+          cursor: 'cursor-1',
+          workspace: 'team-a',
+        },
+      },
+    });
+  });
 });

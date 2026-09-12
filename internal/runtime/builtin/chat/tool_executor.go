@@ -13,20 +13,19 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	exec1 "github.com/dagucloud/dagu/internal/core/exec"
-	llmpkg "github.com/dagucloud/dagu/internal/llm"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	llmpkg "github.com/dagucloud/dagu/v2/internal/llm"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
 // ToolCallResult bundles a tool result with sub-DAG run info for tracking.
 // This enables UI drill-down into tool executions.
 type ToolCallResult struct {
-	Result core.ToolResult
-	SubRun exec1.SubDAGRun
+	Result ir.ToolResult
+	SubRun ir.SubDAGRun
 }
 
 // ToolExecutor handles the execution of tool calls by running DAGs.
@@ -66,7 +65,7 @@ func (e *ToolExecutor) ExecuteToolCalls(ctx context.Context, toolCalls []llmpkg.
 }
 
 // executeToolCall executes a single tool call and returns the result with sub-DAG run info.
-func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) (core.ToolResult, exec1.SubDAGRun) {
+func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) (ir.ToolResult, ir.SubDAGRun) {
 	toolName := tc.Function.Name
 
 	ctx = logger.WithValues(ctx,
@@ -79,11 +78,11 @@ func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) 
 	dag, ok := e.registry.GetDAGByToolName(toolName)
 	if !ok {
 		logger.Error(ctx, "Tool not found in registry")
-		return core.ToolResult{
+		return ir.ToolResult{
 			ToolCallID: tc.ID,
 			Name:       toolName,
 			Error:      fmt.Sprintf("tool %q not found", toolName),
-		}, exec1.SubDAGRun{}
+		}, ir.SubDAGRun{}
 	}
 
 	// Parse the arguments from JSON string
@@ -91,11 +90,11 @@ func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) 
 	if tc.Function.Arguments != "" {
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 			logger.Error(ctx, "Failed to parse tool arguments", tag.Error(err))
-			return core.ToolResult{
+			return ir.ToolResult{
 				ToolCallID: tc.ID,
 				Name:       toolName,
 				Error:      fmt.Sprintf("failed to parse arguments: %v", err),
-			}, exec1.SubDAGRun{}
+			}, ir.SubDAGRun{}
 		}
 	}
 
@@ -114,11 +113,11 @@ func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) 
 	subDAGExec, err := executor.NewSubDAGExecutor(ctx, e.registry.dagNames[toolName])
 	if err != nil {
 		logger.Error(ctx, "Failed to create SubDAGExecutor", tag.Error(err))
-		return core.ToolResult{
+		return ir.ToolResult{
 			ToolCallID: tc.ID,
 			Name:       toolName,
 			Error:      fmt.Sprintf("failed to create executor: %v", err),
-		}, exec1.SubDAGRun{}
+		}, ir.SubDAGRun{}
 	}
 	defer func() {
 		if cleanErr := subDAGExec.Cleanup(ctx); cleanErr != nil {
@@ -144,15 +143,15 @@ func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) 
 	}
 
 	logger.Info(ctx, "Starting tool DAG execution",
-		tag.RunID(runID),
-		tag.DAG(dag.Name),
+		tag.SubRunID(runID),
+		tag.SubDAG(dag.Name),
 		slog.String("params", params),
 	)
 
 	result, err := subDAGExec.Execute(ctx, runParams, e.parentWorkDir)
 
 	// Build SubDAGRun info for UI drill-down tracking
-	subRun := exec1.SubDAGRun{
+	subRun := ir.SubDAGRun{
 		DAGRunID: runID,
 		Params:   params,
 		DAGName:  dag.Name, // Use DAG name for UI display
@@ -160,7 +159,7 @@ func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) 
 
 	if err != nil {
 		logger.Error(ctx, "Tool DAG execution failed", tag.Error(err))
-		return core.ToolResult{
+		return ir.ToolResult{
 			ToolCallID: tc.ID,
 			Name:       toolName,
 			Error:      fmt.Sprintf("execution failed: %v", err),
@@ -171,11 +170,11 @@ func (e *ToolExecutor) executeToolCall(ctx context.Context, tc llmpkg.ToolCall) 
 	content := formatToolResult(result)
 
 	logger.Info(ctx, "Tool execution completed successfully",
-		tag.RunID(runID),
+		tag.SubRunID(runID),
 		slog.Int("output_length", len(content)),
 	)
 
-	return core.ToolResult{
+	return ir.ToolResult{
 		ToolCallID: tc.ID,
 		Name:       toolName,
 		Content:    content,
@@ -256,7 +255,7 @@ func formatArgValue(value any) string {
 }
 
 // formatToolResult converts a DAG execution result to a tool result content string.
-func formatToolResult(result *exec1.RunStatus) string {
+func formatToolResult(result *ir.RunStatus) string {
 	if result == nil {
 		return "Tool execution completed but no result returned"
 	}

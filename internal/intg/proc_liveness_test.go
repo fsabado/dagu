@@ -10,13 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
-	"github.com/dagucloud/dagu/internal/test"
-	"github.com/dagucloud/dagu/internal/test/intgharness"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/test/intgharness"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
@@ -32,7 +31,6 @@ func TestProcHeartbeat_StartCommand(t *testing.T) {
 
 	th := test.SetupCommand(t, test.WithConfigMutator(func(cfg *config.Config) {
 		cfg.Proc.HeartbeatInterval = testProcHeartbeatInterval
-		cfg.Proc.HeartbeatSyncInterval = testProcHeartbeatInterval
 		cfg.Proc.StaleThreshold = testProcStaleThreshold
 	}))
 	h := intgharness.New(t, th.Helper)
@@ -52,7 +50,7 @@ steps:
 		dag.Location,
 	})
 
-	ref := exec.NewDAGRunRef(dag.Name, dagRunID)
+	ref := ir.NewDAGRunRef(dag.Name, dagRunID)
 	run := h.Run(ref, dag.ProcGroup())
 	run.RequireRunning(5 * time.Second)
 	run.RequireHeartbeatAdvance(3 * time.Second)
@@ -60,7 +58,7 @@ steps:
 	require.NoError(t, <-errCh)
 
 	status := run.ReadStatus()
-	require.Equal(t, core.Succeeded, status.Status)
+	require.Equal(t, ir.Succeeded, status.Status)
 }
 
 func TestProcHeartbeat_RetryCommand(t *testing.T) {
@@ -68,7 +66,6 @@ func TestProcHeartbeat_RetryCommand(t *testing.T) {
 
 	th := test.SetupCommand(t, test.WithConfigMutator(func(cfg *config.Config) {
 		cfg.Proc.HeartbeatInterval = testProcHeartbeatInterval
-		cfg.Proc.HeartbeatSyncInterval = testProcHeartbeatInterval
 		cfg.Proc.StaleThreshold = testProcStaleThreshold
 	}))
 	h := intgharness.New(t, th.Helper)
@@ -90,7 +87,7 @@ steps:
 		dag.Location,
 	})
 
-	ref := exec.NewDAGRunRef(dag.Name, dagRunID)
+	ref := ir.NewDAGRunRef(dag.Name, dagRunID)
 	run := h.Run(ref, dag.ProcGroup())
 	run.RequireRunning(5 * time.Second)
 	run.RequireHeartbeatAdvance(3 * time.Second)
@@ -98,7 +95,7 @@ steps:
 	require.NoError(t, <-errCh)
 
 	status := run.ReadStatus()
-	require.Equal(t, core.Succeeded, status.Status)
+	require.Equal(t, ir.Succeeded, status.Status)
 }
 
 func runCommandAsync(ctx context.Context, command *cobra.Command, args []string) chan error {
@@ -113,23 +110,23 @@ func runCommandAsync(ctx context.Context, command *cobra.Command, args []string)
 	return errCh
 }
 
-func createFailedRun(t *testing.T, th test.Command, dag *core.DAG, dagRunID string) {
+func createFailedRun(t *testing.T, th test.Command, dag *ir.DAG, dagRunID string) {
 	t.Helper()
 
-	attempt, err := th.DAGRunStore.CreateAttempt(th.Context, dag, time.Now(), dagRunID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dag, time.Now(), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
 	logFile := filepath.Join(th.Config.Paths.LogDir, dag.Name, dagRunID+".log")
 	require.NoError(t, os.MkdirAll(filepath.Dir(logFile), 0o750))
 
-	status := transform.NewStatusBuilder(dag).Create(
+	status := ir.NewStatusBuilder(dag).Create(
 		dagRunID,
-		core.Failed,
+		ir.Failed,
 		0,
 		time.Now(),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithHierarchyRefs(exec.NewDAGRunRef(dag.Name, dagRunID), exec.DAGRunRef{}),
-		transform.WithLogFilePath(logFile),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithHierarchyRefs(ir.NewDAGRunRef(dag.Name, dagRunID), ir.DAGRunRef{}),
+		ir.WithLogFilePath(logFile),
 	)
 
 	require.NoError(t, attempt.Open(th.Context))

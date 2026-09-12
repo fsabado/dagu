@@ -8,15 +8,17 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
 )
 
 // Resolver resolves workflow values for semantic fields.
 type Resolver struct {
-	static  StaticScope
-	runtime RuntimeScope
-	notices ValueReferenceNoticeSink
+	static                     StaticScope
+	runtime                    RuntimeScope
+	notices                    ValueReferenceNoticeSink
+	disableCommandSubstitution bool
 }
 
 // ResolverOption configures a Resolver.
@@ -38,9 +40,44 @@ func WithValueReferenceNotices(sink ValueReferenceNoticeSink) ResolverOption {
 	}
 }
 
+// WithoutCommandSubstitution prevents resolver policies from executing command substitutions.
+func WithoutCommandSubstitution() ResolverOption {
+	return func(r *Resolver) {
+		r.disableCommandSubstitution = true
+	}
+}
+
 // String resolves raw according to field.
 func (r Resolver) String(ctx context.Context, raw string, field Field) (string, error) {
 	return r.resolveString(ctx, raw, field)
+}
+
+// ResolveRef resolves an exact scoped reference to a non-empty string.
+func (r Resolver) ResolveRef(ctx context.Context, token string, field Field) (string, error) {
+	ref, ok := parseExactRef(token)
+	if !ok {
+		return "", fieldError(field, fmt.Errorf("must be one complete scoped value reference"))
+	}
+
+	value, err := bindingValue(ctx, ref.Expr, r.bindingScope(), true)
+	if err != nil {
+		return "", fieldError(field, fmt.Errorf("failed to resolve %s: %w", token, err))
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fieldError(field, fmt.Errorf("%s must resolve to a string, got %T", token, value))
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", fieldError(field, fmt.Errorf("%s resolved to an empty string", token))
+	}
+	return text, nil
+}
+
+func fieldError(field Field, err error) error {
+	if field.path == "" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", field.path, err)
 }
 
 // Int resolves raw according to field and converts the result to an integer.
@@ -102,8 +139,12 @@ func (r Resolver) resolveString(ctx context.Context, raw string, field Field) (s
 }
 
 func (r Resolver) bindingScope() RuntimeScope {
-	if r.runtime.Consts != nil || r.runtime.Params != nil || r.runtime.Env != nil || len(r.runtime.Steps) > 0 || r.runtime.Foreach != nil || len(r.runtime.BuiltinContext.values) > 0 {
-		return r.runtime
+	if r.runtime.Consts != nil || r.runtime.Params != nil || r.runtime.ParamsJSON != "" || r.runtime.Env != nil || len(r.runtime.Steps) > 0 || r.runtime.Foreach != nil || r.runtime.Inputs != nil || r.runtime.Outputs != nil || len(r.runtime.BuiltinContext.values) > 0 {
+		scope := r.runtime
+		if scope.Consts == nil {
+			scope.Consts = r.static.Consts
+		}
+		return scope
 	}
 	return RuntimeScope{Consts: r.static.Consts}
 }
@@ -134,6 +175,9 @@ func (r Resolver) optionsFor(policy resolverPolicy) []option {
 		opts = append(opts, withStepMap(r.runtime.Steps))
 	}
 	opts = append(opts, policy.options...)
+	if r.disableCommandSubstitution {
+		opts = append(opts, withoutSubstitute(), withoutShellCommandSubstitution())
+	}
 	return opts
 }
 
@@ -178,8 +222,10 @@ func policyForField(field Field) resolverPolicy {
 		return resolverPolicy{strict: true, options: []option{withoutSubstitute()}}
 	case fieldWorkflowObject:
 		return workflowValuePolicy()
-	case fieldConditionValue:
+	case fieldConditionValue, fieldConditionRuntimeValue:
 		return resolverPolicy{strict: true, options: []option{withoutSubstitute()}}
+	case fieldConditionEval:
+		return resolverPolicy{strict: true, envVariables: envVariablesUser, options: []option{withOSExpansion(), withShellCommandSubstitution()}}
 	case fieldDAGEnv:
 		return resolverPolicy{strict: true, envVariables: envVariablesUser, options: []option{withOSExpansion(), withoutSubstitute()}}
 	case fieldRuntimeDAGEnv:

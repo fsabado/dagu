@@ -7,7 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/service/eventstore"
+	"github.com/dagucloud/dagu/v2/internal/cmn/mailer/oauthconfig"
+	"github.com/dagucloud/dagu/v2/internal/eventstore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -282,6 +283,27 @@ func TestNormalizeWorkspaceSettingsValidatesSMTP(t *testing.T) {
 		SMTP: &SMTPConfig{Host: "smtp.example.com", Port: "587", From: "invalid"},
 	}, "tester")
 	assert.ErrorIs(t, err, ErrInvalidSettings)
+
+	oauthSettings, err := NormalizeWorkspaceSettings(&WorkspaceSettings{
+		SMTP: &SMTPConfig{
+			Username: " sender@example.com ",
+			OAuth: &oauthconfig.Config{
+				Provider: oauthconfig.ProviderMicrosoft, TenantID: " tenant ",
+				ClientID: " client ", ClientSecret: "secret",
+			},
+			From: "sender@example.com",
+		},
+	}, "tester")
+	require.NoError(t, err)
+	require.NotNil(t, oauthSettings.SMTP)
+	assert.Equal(t, "smtp.office365.com", oauthSettings.SMTP.Host)
+	assert.Equal(t, "587", oauthSettings.SMTP.Port)
+	assert.Equal(t, "sender@example.com", oauthSettings.SMTP.Username)
+	public := oauthSettings.ToPublic()
+	require.NotNil(t, public.SMTP)
+	require.NotNil(t, public.SMTP.OAuth)
+	assert.True(t, public.SMTP.OAuth.ClientSecretConfigured)
+	assert.Empty(t, public.SMTP.OAuth.RefreshTokenConfigured)
 }
 
 func TestNormalizeRouteSetValidatesScopeAndRoutes(t *testing.T) {
@@ -332,10 +354,16 @@ func TestIsRouteEventEnabledDefaultsToOperationalEvents(t *testing.T) {
 	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunFailed))
 	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunWaiting))
 	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunSucceeded))
+	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunPartiallySucceeded))
 
 	route.Events = []eventstore.EventType{eventstore.TypeDAGRunSucceeded}
 	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunFailed))
 	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunSucceeded))
+	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunPartiallySucceeded))
+
+	route.Events = []eventstore.EventType{eventstore.TypeDAGRunPartiallySucceeded}
+	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunSucceeded))
+	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunPartiallySucceeded))
 }
 
 func TestPreserveWorkspaceSecrets(t *testing.T) {
@@ -356,6 +384,43 @@ func TestPreserveWorkspaceSecrets(t *testing.T) {
 	next.SMTP.Password = ""
 	PreserveWorkspaceSecrets(next, existing)
 	assert.Empty(t, next.SMTP.Password)
+
+	existing.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth: &oauthconfig.Config{
+			Provider: oauthconfig.ProviderGoogleRefresh, ClientID: "client",
+			ClientSecret: "old-client-secret", RefreshToken: "old-refresh-token",
+		},
+	}
+	next.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth: &oauthconfig.Config{
+			Provider: oauthconfig.ProviderGoogleRefresh, ClientID: "client",
+		},
+	}
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Equal(t, "old-client-secret", next.SMTP.OAuth.ClientSecret)
+	assert.Equal(t, "old-refresh-token", next.SMTP.OAuth.RefreshToken)
+
+	next.SMTP.Username = "other@example.com"
+	next.SMTP.OAuth.ClientSecret = ""
+	next.SMTP.OAuth.RefreshToken = ""
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Empty(t, next.SMTP.OAuth.ClientSecret)
+	assert.Empty(t, next.SMTP.OAuth.RefreshToken)
+
+	existing.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth: &oauthconfig.Config{
+			Provider: oauthconfig.ProviderGoogleServiceAccount, ServiceAccountJSON: "service-account-json",
+		},
+	}
+	next.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth:    &oauthconfig.Config{Provider: oauthconfig.ProviderGoogleServiceAccount},
+	}
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Equal(t, "service-account-json", next.SMTP.OAuth.ServiceAccountJSON)
 }
 
 func TestPreserveChannelSecrets(t *testing.T) {
@@ -419,4 +484,38 @@ func TestNormalizeRejectsPrivateWebhookTargetUnlessExplicitlyAllowed(t *testing.
 		}},
 	}, "tester")
 	require.NoError(t, err)
+}
+
+func TestNormalizeRejectsInvalidTelegramTopicID(t *testing.T) {
+	t.Parallel()
+
+	for _, topicID := range []string{"not-a-number", "0", "-1"} {
+		_, err := Normalize(&Settings{
+			DAGName: "daily-report",
+			Enabled: true,
+			Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+			Targets: []Target{{
+				Type:    ProviderTelegram,
+				Enabled: true,
+				Telegram: &TelegramTarget{
+					BotToken: "12345:secret",
+					ChatID:   "67890",
+					TopicID:  topicID,
+				},
+			}},
+		}, "tester")
+		assert.ErrorIs(t, err, ErrInvalidSettings, "topicID=%q", topicID)
+
+		_, err = NormalizeChannel(&Channel{
+			Name:    "Ops Telegram",
+			Type:    ProviderTelegram,
+			Enabled: true,
+			Telegram: &TelegramTarget{
+				BotToken: "12345:secret",
+				ChatID:   "67890",
+				TopicID:  topicID,
+			},
+		}, "tester")
+		assert.ErrorIs(t, err, ErrInvalidSettings, "topicID=%q", topicID)
+	}
 }

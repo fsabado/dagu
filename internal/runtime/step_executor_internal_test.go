@@ -9,10 +9,12 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	runtimeexec "github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,24 +26,56 @@ func (e *emptySideChannelExecutor) Kill(os.Signal) error { return nil }
 func (e *emptySideChannelExecutor) Run(context.Context) error {
 	return nil
 }
-func (e *emptySideChannelExecutor) GetToolDefinitions() []exec.ToolDefinition {
+func (e *emptySideChannelExecutor) GetToolDefinitions() []ir.ToolDefinition {
 	return nil
 }
 func (e *emptySideChannelExecutor) GetOutputs() map[string]any {
 	return nil
 }
 
+type declaredSideChannelExecutor struct {
+	emptySideChannelExecutor
+}
+
+func (e *declaredSideChannelExecutor) GetOutputs() map[string]any {
+	return map[string]any{"path": "/tmp/worktree", "created": true}
+}
+
+func (e *declaredSideChannelExecutor) PublishesDeclaredOutputs() bool {
+	return true
+}
+
+type emptyDeclaredSideChannelExecutor struct {
+	emptySideChannelExecutor
+}
+
+func (e *emptyDeclaredSideChannelExecutor) PublishesDeclaredOutputs() bool {
+	return true
+}
+
+type invalidDeclaredSideChannelExecutor struct {
+	emptySideChannelExecutor
+}
+
+func (e *invalidDeclaredSideChannelExecutor) GetOutputs() map[string]any {
+	return map[string]any{"invalid": make(chan int)}
+}
+
+func (e *invalidDeclaredSideChannelExecutor) PublishesDeclaredOutputs() bool {
+	return true
+}
+
 func TestStepExecutorReturnsWrappedSetupError(t *testing.T) {
 	executorType := "test-step-executor-setup-error"
 	setupErr := errors.New("setup failed")
-	runtimeexec.RegisterExecutor(executorType, func(context.Context, core.Step) (runtimeexec.Executor, error) {
+	runtimeexec.RegisterExecutor(executorType, func(context.Context, ir.Step) (runtimeexec.Executor, error) {
 		return nil, setupErr
-	}, nil, core.ExecutorCapabilities{})
+	}, nil, registry.ExecutorCapabilities{})
 	t.Cleanup(func() { runtimeexec.UnregisterExecutor(executorType) })
 
-	node := NewNode(core.Step{
+	node := NewNode(ir.Step{
 		Name: "setup-error-step",
-		ExecutorConfig: core.ExecutorConfig{
+		ExecutorConfig: ir.ExecutorConfig{
 			Type: executorType,
 		},
 	}, NodeState{})
@@ -56,18 +90,18 @@ func TestStepExecutorReturnsWrappedSetupError(t *testing.T) {
 
 func TestStepExecutorClearsEmptyToolDefinitionsAndOutputs(t *testing.T) {
 	executorType := "test-step-executor-empty-side-channels"
-	runtimeexec.RegisterExecutor(executorType, func(context.Context, core.Step) (runtimeexec.Executor, error) {
+	runtimeexec.RegisterExecutor(executorType, func(context.Context, ir.Step) (runtimeexec.Executor, error) {
 		return &emptySideChannelExecutor{}, nil
-	}, nil, core.ExecutorCapabilities{})
+	}, nil, registry.ExecutorCapabilities{})
 	t.Cleanup(func() { runtimeexec.UnregisterExecutor(executorType) })
 
-	node := NewNode(core.Step{
+	node := NewNode(ir.Step{
 		Name: "empty-side-channel-step",
-		ExecutorConfig: core.ExecutorConfig{
+		ExecutorConfig: ir.ExecutorConfig{
 			Type: executorType,
 		},
 	}, NodeState{})
-	node.SetToolDefinitions([]exec.ToolDefinition{{Name: "stale-tool"}})
+	node.SetToolDefinitions([]ir.ToolDefinition{{Name: "stale-tool"}})
 	node.setOutputsValue(`{"stale":true}`)
 
 	require.NoError(t, NewStepExecutor().Execute(newTestStepExecutorContext(), node))
@@ -76,6 +110,95 @@ func TestStepExecutorClearsEmptyToolDefinitionsAndOutputs(t *testing.T) {
 	require.Nil(t, node.State().OutputsValue)
 }
 
+func TestStepExecutorPublishesExecutorDeclaredOutputs(t *testing.T) {
+	executorType := "test-step-executor-declared-outputs"
+	runtimeexec.RegisterExecutor(executorType, func(context.Context, ir.Step) (runtimeexec.Executor, error) {
+		return &declaredSideChannelExecutor{}, nil
+	}, nil, registry.ExecutorCapabilities{})
+	t.Cleanup(func() { runtimeexec.UnregisterExecutor(executorType) })
+
+	node := NewNode(ir.Step{
+		ID:   "worktree",
+		Name: "worktree",
+		ExecutorConfig: ir.ExecutorConfig{
+			Type: executorType,
+		},
+	}, NodeState{})
+
+	require.NoError(t, NewStepExecutor().Execute(newTestStepExecutorContext(), node))
+	state := node.State()
+	require.NotNil(t, state.OutputsValue)
+	require.NotNil(t, state.StepOutputsValue)
+	require.JSONEq(t, `{"created":true,"path":"/tmp/worktree"}`, *state.StepOutputsValue)
+	info := node.StepInfo()
+	require.NotNil(t, info.DeclaredOutputs)
+}
+
+func TestStepExecutorRecordsDeclaredOutputSerializationError(t *testing.T) {
+	executorType := "test-step-executor-invalid-declared-outputs"
+	runtimeexec.RegisterExecutor(executorType, func(context.Context, ir.Step) (runtimeexec.Executor, error) {
+		return &invalidDeclaredSideChannelExecutor{}, nil
+	}, nil, registry.ExecutorCapabilities{})
+	t.Cleanup(func() { runtimeexec.UnregisterExecutor(executorType) })
+
+	node := NewNode(ir.Step{
+		ID:   "worktree",
+		Name: "worktree",
+		ExecutorConfig: ir.ExecutorConfig{
+			Type: executorType,
+		},
+	}, NodeState{})
+
+	err := NewStepExecutor().Execute(newTestStepExecutorContext(), node)
+	require.ErrorContains(t, err, "failed to serialize outputs")
+	require.Same(t, err, node.Error())
+}
+
+func TestStepExecutorRecordsTimeoutBeforeCommandStarts(t *testing.T) {
+	executorType := "test-step-executor-pre-run-timeout"
+	runtimeexec.RegisterExecutor(executorType, func(ctx context.Context, _ ir.Step) (runtimeexec.Executor, error) {
+		<-ctx.Done()
+		return &emptySideChannelExecutor{}, nil
+	}, nil, registry.ExecutorCapabilities{})
+	t.Cleanup(func() { runtimeexec.UnregisterExecutor(executorType) })
+
+	node := NewNode(ir.Step{
+		Name: "pre-run-timeout-step",
+		ExecutorConfig: ir.ExecutorConfig{
+			Type: executorType,
+		},
+		Timeout: 10 * time.Millisecond,
+	}, NodeState{})
+
+	err := NewStepExecutor().Execute(newTestStepExecutorContext(), node)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "step timed out")
+	require.Equal(t, ir.NodeFailed, node.Status())
+	require.Equal(t, 124, node.GetExitCode())
+}
+
 func newTestStepExecutorContext() context.Context {
-	return NewContext(context.Background(), &core.DAG{}, "run-1", "dag.log")
+	return NewContext(context.Background(), &ir.DAG{}, "run-1", "dag.log")
+}
+
+// An executor that declares outputs but publishes none must leave the step
+// output channels empty rather than storing a null payload.
+func TestStepExecutorSkipsEmptyExecutorDeclaredOutputs(t *testing.T) {
+	executorType := "test-step-executor-empty-declared-outputs"
+	runtimeexec.RegisterExecutor(executorType, func(context.Context, ir.Step) (runtimeexec.Executor, error) {
+		return &emptyDeclaredSideChannelExecutor{}, nil
+	}, nil, registry.ExecutorCapabilities{})
+	t.Cleanup(func() { runtimeexec.UnregisterExecutor(executorType) })
+
+	node := NewNode(ir.Step{
+		Name: "empty-declared-outputs-step",
+		ExecutorConfig: ir.ExecutorConfig{
+			Type: executorType,
+		},
+	}, NodeState{})
+
+	require.NoError(t, NewStepExecutor().Execute(newTestStepExecutorContext(), node))
+
+	require.Nil(t, node.State().StepOutputsValue)
+	require.Nil(t, node.State().OutputsValue)
 }

@@ -5,16 +5,14 @@ package dagrun
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,16 +20,16 @@ import (
 
 // TestWriter verifies writer persistence to new and existing status files.
 func TestWriter(t *testing.T) {
-	th := setupTestStore(t)
+	th := setupTestRepository(t)
 
 	t.Run("WriteStatusToNewFile", func(t *testing.T) {
 		dag := th.DAG("test_write_status")
 		dagRunID := uuid.Must(uuid.NewV7()).String()
-		dagRunStatus := transform.NewStatusBuilder(dag.DAG).Create(dagRunID, core.Running, 1, time.Now())
+		dagRunStatus := ir.NewStatusBuilder(dag.DAG).Create(dagRunID, ir.Running, 1, time.Now())
 		writer := dag.Writer(t, dagRunID, time.Now())
 		writer.Write(t, dagRunStatus)
 
-		writer.AssertContent(t, "test_write_status", dagRunID, core.Running)
+		writer.AssertContent(t, "test_write_status", dagRunID, ir.Running)
 	})
 
 	t.Run("WriteStatusToExistingFile", func(t *testing.T) {
@@ -41,12 +39,12 @@ func TestWriter(t *testing.T) {
 
 		writer := dag.Writer(t, dagRunID, startedAt)
 
-		dagRunStatus := transform.NewStatusBuilder(dag.DAG).Create(dagRunID, core.Aborted, 1, time.Now())
+		dagRunStatus := ir.NewStatusBuilder(dag.DAG).Create(dagRunID, ir.Aborted, 1, time.Now())
 
 		// Write initial status
 		writer.Write(t, dagRunStatus)
 		writer.Close(t)
-		writer.AssertContent(t, "test_append_to_existing", dagRunID, core.Aborted)
+		writer.AssertContent(t, "test_append_to_existing", dagRunID, ir.Aborted)
 
 		// Append to existing file
 		dataRoot := NewDataRoot(th.TmpDir, dag.Name)
@@ -63,18 +61,18 @@ func TestWriter(t *testing.T) {
 		}()
 
 		// Append new status
-		dagRunStatus.Status = core.Succeeded
+		dagRunStatus.Status = ir.Succeeded
 		err = latestRun.Write(th.Context, dagRunStatus)
 		require.NoError(t, err)
 
 		// Verify appended data
-		writer.AssertContent(t, "test_append_to_existing", dagRunID, core.Succeeded)
+		writer.AssertContent(t, "test_append_to_existing", dagRunID, ir.Succeeded)
 	})
 }
 
 // TestWriterErrorHandling verifies writer lifecycle and error paths.
 func TestWriterErrorHandling(t *testing.T) {
-	th := setupTestStore(t)
+	th := setupTestRepository(t)
 
 	t.Run("OpenNonExistentDirectory", func(t *testing.T) {
 		blocker := filepath.Join(t.TempDir(), "blocked")
@@ -92,7 +90,7 @@ func TestWriterErrorHandling(t *testing.T) {
 
 		dag := th.DAG("test_write_to_closed_writer")
 		dagRunID := uuid.Must(uuid.NewV7()).String()
-		dagRunStatus := transform.NewStatusBuilder(dag.DAG).Create(dagRunID, core.Running, 1, time.Now())
+		dagRunStatus := ir.NewStatusBuilder(dag.DAG).Create(dagRunID, ir.Running, 1, time.Now())
 		assert.Error(t, writer.write(dagRunStatus))
 	})
 
@@ -119,7 +117,7 @@ func TestWriterErrorHandling(t *testing.T) {
 
 		dag := th.DAG("test_newline_delimited_json")
 		dagRunID := uuid.Must(uuid.NewV7()).String()
-		dagRunStatus := transform.NewStatusBuilder(dag.DAG).Create(dagRunID, core.Running, 1, time.Now())
+		dagRunStatus := ir.NewStatusBuilder(dag.DAG).Create(dagRunID, ir.Running, 1, time.Now())
 
 		require.NoError(t, writer.write(dagRunStatus))
 		require.NoError(t, writer.close())
@@ -133,27 +131,4 @@ func TestWriterErrorHandling(t *testing.T) {
 
 		assert.Equal(t, byte('\n'), data[len(data)-1])
 	})
-}
-
-// TestWriterRename verifies status files follow DAG rename operations.
-func TestWriterRename(t *testing.T) {
-	th := setupTestStore(t)
-
-	// Create a status file with old path
-	dag := th.DAG("test_rename_old")
-	writer := dag.Writer(t, "dag-run-id-1", time.Now())
-	dagRunID := uuid.Must(uuid.NewV7()).String()
-	dagRunStatus := transform.NewStatusBuilder(dag.DAG).Create(dagRunID, core.Running, 1, time.Now())
-	writer.Write(t, dagRunStatus)
-	writer.Close(t)
-	require.FileExists(t, writer.FilePath)
-
-	// Rename and verify the file
-	newDAG := th.DAG("test_rename_new")
-	err := th.Store.RenameDAGRuns(context.Background(), dag.Location, newDAG.Location)
-	require.NoError(t, err)
-	newWriter := newDAG.Writer(t, "dag-run-id-2", time.Now())
-
-	require.NoFileExists(t, writer.FilePath)
-	require.FileExists(t, newWriter.FilePath)
 }

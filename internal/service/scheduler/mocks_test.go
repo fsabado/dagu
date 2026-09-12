@@ -6,15 +6,14 @@ package scheduler_test
 import (
 	"context"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
 )
 
 var _ scheduler.EntryReader = (*mockJobManager)(nil)
 
 type mockJobManager struct {
-	LoadedDAGs []*core.DAG
+	LoadedDAGs []*ir.DAG
 }
 
 func newMockJobManager() *mockJobManager {
@@ -31,10 +30,14 @@ func (er *mockJobManager) Start(_ context.Context) {
 func (er *mockJobManager) Stop() {
 }
 
-func (er *mockJobManager) DAGs() []*core.DAG {
-	return er.LoadedDAGs
+func (er *mockJobManager) Entries() []scheduler.DAGEntry {
+	entries := make([]scheduler.DAGEntry, 0, len(er.LoadedDAGs))
+	for _, dag := range er.LoadedDAGs {
+		entries = append(entries, scheduler.DAGEntry{DefinitionID: dag.SuspendFlagName(), DAG: dag})
+	}
+	return entries
 }
 
-func (*mockJobManager) DAGStore() exec.DAGStore {
+func (*mockJobManager) Events() <-chan scheduler.DAGChangeEvent {
 	return nil
 }

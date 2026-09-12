@@ -10,8 +10,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/persis"
-	"github.com/dagucloud/dagu/internal/profile"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/profile"
 )
 
 var _ profile.Store = (*ProfileStore)(nil)
@@ -161,6 +161,15 @@ func (s *ProfileStore) Delete(ctx context.Context, name string) error {
 func validateStoredProfile(p *profile.Profile) error {
 	if err := validateProfileStorageName(p.Name); err != nil {
 		return err
+	}
+	defaultProfile := p.DefaultProfile
+	if defaultProfile != "" {
+		if !profile.IsWorkspaceInheritedStorageName(p.Name) {
+			return errors.New("profile store: default profile is only allowed on workspace inherited profiles")
+		}
+		if err := profile.ValidateName(defaultProfile); err != nil {
+			return err
+		}
 	}
 	if profile.IsInheritedStorageName(p.Name) {
 		if !p.Protected {

@@ -12,16 +12,16 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 )
 
 func artifactOutputFilePath(ctx context.Context, raw string) (string, error) {
 	artifactDir := ""
 	if scope := GetEnv(ctx).Scope; scope != nil {
-		artifactDir, _ = scope.Get(exec.EnvKeyDAGRunArtifactsDir)
+		artifactDir, _ = scope.Get(runenv.EnvKeyDAGRunArtifactsDir)
 	}
 	if strings.TrimSpace(artifactDir) == "" {
-		return "", fmt.Errorf("%s is not set; enable artifacts for this DAG", exec.EnvKeyDAGRunArtifactsDir)
+		return "", fmt.Errorf("%s is not set; enable artifacts for this DAG", runenv.EnvKeyDAGRunArtifactsDir)
 	}
 
 	rel, err := cleanArtifactOutputPath(raw)

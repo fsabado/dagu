@@ -6,12 +6,12 @@ import { UpdateBanner } from '@/components/UpdateBanner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { cn } from '@/lib/utils';
 import { getResponsiveTitleClass } from '@/lib/text-utils';
-import { Menu, Terminal, X } from 'lucide-react';
-import { AgentChatPanel, useAgentChatContext } from '@/features/agent';
+import { Menu, X } from 'lucide-react';
 import * as React from 'react';
 import { useLocation } from 'react-router-dom';
 import { ContentNavigation } from './ContentNavigation';
 import { mainListItems as MainListItems } from '../menu';
+import { useI18n } from '@/i18n/I18nProvider';
 
 /**
  * Choose a readable foreground color (black or white) that contrasts with the given background color.
@@ -72,73 +72,11 @@ function getSidebarOverlayColor(foreground: string, alpha: number): string {
 // Constants
 const NAV_SIDEBAR_EXPANDED_WIDTH = 240;
 const NAV_SIDEBAR_COLLAPSED_WIDTH = 56;
-const AGENT_SIDEBAR_DEFAULT_WIDTH = 420;
-const AGENT_SIDEBAR_MIN_WIDTH = 320;
-const AGENT_SIDEBAR_MAX_WIDTH = 720;
-const AGENT_SIDEBAR_MIN_CONTENT_WIDTH = 360;
-const AGENT_SIDEBAR_WIDTH_STORAGE_KEY = 'agentSidebarWidth';
-const SIDEBAR_MODE_STORAGE_KEY = 'sidebarMode';
-
-type SidebarMode = 'navigation' | 'agent';
 
 type LayoutProps = {
   navbarColor?: string;
   children?: React.ReactElement | React.ReactElement[];
 };
-
-function getAgentSidebarMaxWidth(): number {
-  if (typeof window === 'undefined') {
-    return AGENT_SIDEBAR_MAX_WIDTH;
-  }
-
-  return Math.max(
-    AGENT_SIDEBAR_MIN_WIDTH,
-    Math.min(
-      AGENT_SIDEBAR_MAX_WIDTH,
-      window.innerWidth - AGENT_SIDEBAR_MIN_CONTENT_WIDTH
-    )
-  );
-}
-
-function clampAgentSidebarWidth(width: number): number {
-  return Math.min(
-    getAgentSidebarMaxWidth(),
-    Math.max(AGENT_SIDEBAR_MIN_WIDTH, Math.round(width))
-  );
-}
-
-function getInitialAgentSidebarWidth(): number {
-  try {
-    const saved = localStorage.getItem(AGENT_SIDEBAR_WIDTH_STORAGE_KEY);
-    if (saved) {
-      const parsed = Number(saved);
-      if (Number.isFinite(parsed)) {
-        return clampAgentSidebarWidth(parsed);
-      }
-    }
-  } catch {
-    // Ignore unavailable storage and fall back to the default width.
-  }
-
-  return clampAgentSidebarWidth(AGENT_SIDEBAR_DEFAULT_WIDTH);
-}
-
-function isSidebarMode(value: string | null): value is SidebarMode {
-  return value === 'navigation' || value === 'agent';
-}
-
-function getInitialSidebarMode(): SidebarMode {
-  try {
-    const saved = localStorage.getItem(SIDEBAR_MODE_STORAGE_KEY);
-    if (isSidebarMode(saved)) {
-      return saved;
-    }
-  } catch {
-    // Ignore unavailable storage and fall back to navigation.
-  }
-
-  return 'navigation';
-}
 
 /**
  * Render the application's main layout with a responsive sidebar and scrollable content area.
@@ -152,8 +90,8 @@ function getInitialSidebarMode(): SidebarMode {
  */
 function Content({ navbarColor, children }: LayoutProps) {
   const config = useConfig();
-  const { toggleChat } = useAgentChatContext();
   const location = useLocation();
+  const { t } = useI18n();
 
   const hasCustomColor: boolean = Boolean(
     navbarColor && navbarColor.trim() !== ''
@@ -184,143 +122,73 @@ function Content({ navbarColor, children }: LayoutProps) {
     const saved = localStorage.getItem('sidebarExpanded');
     return saved ? saved === 'true' : true;
   });
-  const [sidebarMode, setSidebarMode] =
-    React.useState<SidebarMode>(getInitialSidebarMode);
-  const [agentSidebarWidth, setAgentSidebarWidth] = React.useState(
-    getInitialAgentSidebarWidth
-  );
-  const [isResizingAgentSidebar, setIsResizingAgentSidebar] =
-    React.useState(false);
   // Mobile sidebar state (hidden by default)
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = React.useState(false);
-  const isAgentSidebarOpen = sidebarMode === 'agent' && config.agentEnabled;
+  const openMenuButtonRef = React.useRef<HTMLButtonElement>(null);
+  const closeMenuButtonRef = React.useRef<HTMLButtonElement>(null);
+  const mobileSidebarRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    if (!isMobileSidebarOpen) {
+      return;
+    }
+
+    closeMenuButtonRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsMobileSidebarOpen(false);
+        requestAnimationFrame(() => openMenuButtonRef.current?.focus());
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+
+      const focusableElements = Array.from(
+        mobileSidebarRef.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+        ) ?? []
+      ).filter((element) => !element.closest('[inert]'));
+      const first = focusableElements[0];
+      const last = focusableElements[focusableElements.length - 1];
+      if (!first || !last) {
+        event.preventDefault();
+        return;
+      }
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [isMobileSidebarOpen]);
+
+  const closeMobileSidebar = () => {
+    setIsMobileSidebarOpen(false);
+    requestAnimationFrame(() => openMenuButtonRef.current?.focus());
+  };
 
   // Save sidebar state to localStorage when it changes
   React.useEffect(() => {
     localStorage.setItem('sidebarExpanded', isSidebarExpanded.toString());
   }, [isSidebarExpanded]);
 
-  React.useEffect(() => {
-    try {
-      localStorage.setItem(SIDEBAR_MODE_STORAGE_KEY, sidebarMode);
-    } catch {
-      // Ignore unavailable storage.
-    }
-  }, [sidebarMode]);
-
-  React.useEffect(() => {
-    try {
-      localStorage.setItem(
-        AGENT_SIDEBAR_WIDTH_STORAGE_KEY,
-        agentSidebarWidth.toString()
-      );
-    } catch {
-      // Ignore unavailable storage.
-    }
-  }, [agentSidebarWidth]);
-
-  React.useEffect(() => {
-    if (!config.agentEnabled && sidebarMode === 'agent') {
-      setSidebarMode('navigation');
-    }
-  }, [config.agentEnabled, sidebarMode]);
-
-  React.useEffect(() => {
-    if (!isResizingAgentSidebar) {
-      return undefined;
-    }
-
-    const handlePointerMove = (event: PointerEvent) => {
-      setAgentSidebarWidth(clampAgentSidebarWidth(event.clientX));
-    };
-    const handlePointerUp = () => setIsResizingAgentSidebar(false);
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-
-    document.addEventListener('pointermove', handlePointerMove);
-    document.addEventListener('pointerup', handlePointerUp);
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    return () => {
-      document.removeEventListener('pointermove', handlePointerMove);
-      document.removeEventListener('pointerup', handlePointerUp);
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-    };
-  }, [isResizingAgentSidebar]);
-
-  React.useEffect(() => {
-    const handleResize = () => {
-      setAgentSidebarWidth((width) => clampAgentSidebarWidth(width));
-    };
-
-    window.addEventListener('resize', handleResize);
-    return () => {
-      window.removeEventListener('resize', handleResize);
-    };
-  }, []);
-
-  const isDesignWorkspace =
-    location.pathname === '/design' || location.pathname.startsWith('/design/');
-
-  if (isDesignWorkspace) {
-    return (
-      <div className="h-screen w-full overflow-hidden bg-background">
-        {children}
-      </div>
-    );
-  }
-
   // Toggle sidebar function
   const toggleSidebar = () => {
     setIsSidebarExpanded(!isSidebarExpanded);
   };
 
-  const openAgentSidebar = () => {
-    if (config.agentEnabled) {
-      setSidebarMode('agent');
-    }
-  };
-
-  const closeAgentSidebar = () => {
-    setSidebarMode('navigation');
-  };
-
-  const startAgentSidebarResize = (
-    event: React.PointerEvent<HTMLDivElement>
-  ) => {
-    if (event.button !== 0) {
-      return;
-    }
-    event.preventDefault();
-    setIsResizingAgentSidebar(true);
-  };
-
-  const handleAgentSidebarResizeKeyDown = (
-    event: React.KeyboardEvent<HTMLDivElement>
-  ) => {
-    const step = event.shiftKey ? 40 : 16;
-    if (event.key === 'ArrowLeft') {
-      event.preventDefault();
-      setAgentSidebarWidth((width) => clampAgentSidebarWidth(width - step));
-    } else if (event.key === 'ArrowRight') {
-      event.preventDefault();
-      setAgentSidebarWidth((width) => clampAgentSidebarWidth(width + step));
-    }
-  };
-
-  const desktopSidebarWidth = isAgentSidebarOpen
-    ? agentSidebarWidth
-    : isSidebarExpanded
-      ? NAV_SIDEBAR_EXPANDED_WIDTH
-      : NAV_SIDEBAR_COLLAPSED_WIDTH;
+  const desktopSidebarWidth = isSidebarExpanded
+    ? NAV_SIDEBAR_EXPANDED_WIDTH
+    : NAV_SIDEBAR_COLLAPSED_WIDTH;
   const desktopSidebarStyle = {
-    ...(isAgentSidebarOpen ? {} : sidebarStyle),
+    ...sidebarStyle,
     width: desktopSidebarWidth,
-    transition: isResizingAgentSidebar
-      ? 'none'
-      : 'width 280ms cubic-bezier(0.4, 0, 0.2, 1)',
+    transition: 'width 280ms cubic-bezier(0.4, 0, 0.2, 1)',
   } as React.CSSProperties;
 
   return (
@@ -330,60 +198,28 @@ function Content({ navbarColor, children }: LayoutProps) {
         data-testid="app-sidebar"
         className={cn(
           'hidden md:block h-full shrink-0 border-r border-border z-20',
-          isAgentSidebarOpen
-            ? 'bg-card text-foreground'
-            : [
-                !hasCustomColor && 'bg-sidebar text-sidebar-foreground',
-                hasCustomColor && 'custom-sidebar-color',
-              ]
+          !hasCustomColor && 'bg-sidebar text-sidebar-foreground',
+          hasCustomColor && 'custom-sidebar-color'
         )}
         style={desktopSidebarStyle}
       >
         <div className="flex flex-col h-full">
-          {isAgentSidebarOpen ? (
-            <AgentChatPanel
-              active
-              className="h-full"
-              defaultSidebarOpen={false}
-              onClose={closeAgentSidebar}
-              placeholder="Ask me to create a DAG, run a command..."
+          <nav className="flex-1 overflow-y-auto min-h-0 px-2 py-3">
+            <MainListItems
+              isOpen={isSidebarExpanded}
+              onToggle={toggleSidebar}
+              customColor={hasCustomColor}
             />
-          ) : (
-            <nav className="flex-1 overflow-y-auto min-h-0 px-2 py-3">
-              <MainListItems
-                isOpen={isSidebarExpanded}
-                onAgentModeToggle={openAgentSidebar}
-                onToggle={toggleSidebar}
-                customColor={hasCustomColor}
-              />
-            </nav>
-          )}
+          </nav>
         </div>
       </aside>
 
-      {isAgentSidebarOpen && (
-        <div
-          role="separator"
-          aria-label="Resize agent panel"
-          aria-orientation="vertical"
-          aria-valuemin={AGENT_SIDEBAR_MIN_WIDTH}
-          aria-valuemax={getAgentSidebarMaxWidth()}
-          aria-valuenow={agentSidebarWidth}
-          tabIndex={0}
-          className={cn(
-            'hidden md:flex h-full w-1 shrink-0 cursor-col-resize items-center justify-center z-20',
-            'bg-border/30 transition-colors hover:bg-primary/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
-            isResizingAgentSidebar && 'bg-primary/60'
-          )}
-          onPointerDown={startAgentSidebarResize}
-          onKeyDown={handleAgentSidebarResizeKeyDown}
-        >
-          <div className="h-8 w-px rounded-full bg-muted-foreground/40" />
-        </div>
-      )}
-
       {/* Main Content Area - Developer-tool */}
-      <div className="flex flex-col flex-1 h-full overflow-hidden relative bg-background">
+      <div
+        className="flex flex-col flex-1 h-full overflow-hidden relative bg-background"
+        aria-hidden={isMobileSidebarOpen || undefined}
+        inert={isMobileSidebarOpen ? true : undefined}
+      >
         {/* Mobile Header Bar - Minimal Design */}
         <header
           className={cn(
@@ -394,9 +230,10 @@ function Content({ navbarColor, children }: LayoutProps) {
           style={sidebarStyle}
         >
           <button
+            ref={openMenuButtonRef}
             className="p-2 rounded-md hover:bg-muted transition-colors"
             onClick={() => setIsMobileSidebarOpen(true)}
-            aria-label="Open menu"
+            aria-label={t('navigation.openMenu')}
           >
             <Menu className="h-5 w-5" />
           </button>
@@ -408,17 +245,7 @@ function Content({ navbarColor, children }: LayoutProps) {
           >
             {config.title || 'Dagu'}
           </span>
-          {config.agentEnabled ? (
-            <button
-              onClick={toggleChat}
-              className="p-2 rounded-md hover:bg-muted transition-colors"
-              aria-label="Agent Console"
-            >
-              <Terminal className="h-5 w-5" />
-            </button>
-          ) : (
-            <div className="w-8" />
-          )}
+          <div className="w-8" />
         </header>
 
         {/* Scrollable Content - More Compact Padding */}
@@ -436,9 +263,13 @@ function Content({ navbarColor, children }: LayoutProps) {
       {isMobileSidebarOpen && (
         <div
           className="fixed inset-0 bg-background/60 z-50 md:hidden flex backdrop-blur-sm"
-          onClick={() => setIsMobileSidebarOpen(false)}
+          onClick={closeMobileSidebar}
         >
           <div
+            ref={mobileSidebarRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mobile-navigation-title"
             className={cn(
               'h-full w-64 overflow-hidden shadow-lg border-r border-border',
               !hasCustomColor && 'bg-sidebar text-sidebar-foreground',
@@ -449,6 +280,7 @@ function Content({ navbarColor, children }: LayoutProps) {
           >
             <div className="flex justify-between items-center p-4 border-b border-sidebar-border">
               <span
+                id="mobile-navigation-title"
                 className={cn(
                   'font-semibold whitespace-normal leading-tight',
                   getResponsiveTitleClass(
@@ -460,7 +292,10 @@ function Content({ navbarColor, children }: LayoutProps) {
                 {config.title || 'Dagu'}
               </span>
               <button
-                onClick={() => setIsMobileSidebarOpen(false)}
+                ref={closeMenuButtonRef}
+                type="button"
+                aria-label={t('navigation.closeMenu')}
+                onClick={closeMobileSidebar}
                 className="p-1.5 hover:bg-sidebar-hover rounded-md transition-colors"
               >
                 <X className="h-5 w-5" />
@@ -470,7 +305,7 @@ function Content({ navbarColor, children }: LayoutProps) {
               <nav className="flex-1 overflow-y-auto min-h-0 px-2">
                 <MainListItems
                   isOpen={true}
-                  onNavItemClick={() => setIsMobileSidebarOpen(false)}
+                  onNavItemClick={closeMobileSidebar}
                   customColor={hasCustomColor}
                 />
               </nav>

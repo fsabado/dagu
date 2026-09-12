@@ -115,7 +115,7 @@ export interface paths {
         put?: never;
         /**
          * Change current user's password
-         * @description Allows the authenticated user to change their own password
+         * @description Allows a locally authenticated builtin user to change their own password. Externally authenticated users do not have Dagu passwords.
          */
         post: operations["changePassword"];
         delete?: never;
@@ -187,7 +187,7 @@ export interface paths {
         put?: never;
         /**
          * Reset user's password
-         * @description Resets a user's password to a new value. Requires admin role.
+         * @description Resets a locally authenticated builtin user's password to a new value. Requires admin role. Externally authenticated users do not have Dagu passwords.
          */
         post: operations["resetUserPassword"];
         delete?: never;
@@ -277,7 +277,7 @@ export interface paths {
         };
         /**
          * List all available DAGs
-         * @description Retrieves DAG definitions with optional filtering by name and labels
+         * @description Retrieves DAG definitions with optional filtering by name, labels, and active status (scheduled and not suspended).
          */
         get: operations["listDAGs"];
         put?: never;
@@ -371,7 +371,10 @@ export interface paths {
         put?: never;
         /**
          * Execute DAG synchronously and wait for completion
-         * @description Creates a DAG-run from the DAG definition, starts its execution, waits for it to complete (or timeout), and returns the full execution details including node statuses.
+         * @deprecated
+         * @description **Deprecated:** Use `POST /dags/{fileName}/start`, then monitor the DAG run through the DAG-run status API or SSE.
+         *
+         *     Creates a DAG-run from the DAG definition, starts its execution, waits for it to complete (or timeout), and returns the full execution details including node statuses.
          *
          *     **Important behaviors:**
          *     - If the timeout is exceeded, the DAG run continues executing in the background. The 408 response includes the `dagRunId` so clients can monitor or cancel the run.
@@ -569,7 +572,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/search/docs": {
+    "/search/wiki": {
         parameters: {
             query?: never;
             header?: never;
@@ -577,10 +580,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Search documents
-         * @description Returns cursor-based, lightweight document search results for the global search page.
+         * Search Wiki pages
+         * @description Returns cursor-based Wiki page search results in stable path order. Use nextCursor only with the same query, workspace, and prefix.
          */
-        get: operations["searchDocFeed"];
+        get: operations["searchWikiPageFeed"];
         put?: never;
         post?: never;
         delete?: never;
@@ -609,7 +612,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/search/docs/matches": {
+    "/search/wiki/matches": {
         parameters: {
             query?: never;
             header?: never;
@@ -617,10 +620,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Search document match snippets
-         * @description Returns cursor-based snippets for one matching document.
+         * Search Wiki page match snippets
+         * @description Returns cursor-based snippets for one matching Wiki page.
          */
-        get: operations["searchDocMatches"];
+        get: operations["searchWikiPageMatches"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1017,9 +1020,49 @@ export interface paths {
         put?: never;
         /**
          * Retry DAG-run execution
-         * @description Creates a new DAG-run based on a previous execution
+         * @description Retries the existing DAG-run by reusing its DAG-run ID rather than creating a new DAG-run. Resets only the selected step or reachable descendants.
          */
         post: operations["retryDAGRun"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/human-tasks/{stepId}/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Complete a waiting human task
+         * @description Validates typed input against the stored human-task form, completes the step atomically, and queues the same DAG-run when no manual steps remain waiting.
+         */
+        post: operations["completeHumanTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/human-tasks/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Queue a completed human-task checkpoint for resume
+         * @description Queues a retry for a completed human-task checkpoint without requiring the previously submitted form values.
+         */
+        post: operations["resumeHumanTaskDAGRun"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1121,7 +1164,7 @@ export interface paths {
         head?: never;
         /**
          * Manually update a step's execution status
-         * @description Changes the status of a specific step within a DAG-run
+         * @description Changes the status of a specific step after the DAG-run is no longer active
          */
         patch: operations["updateDAGRunStepStatus"];
         trace?: never;
@@ -1180,6 +1223,40 @@ export interface paths {
          * @description Pushes back a step that is in Waiting status, providing input parameters that will be injected as environment variables when the step re-executes. The step must have an approval configuration.
          */
         post: operations["pushBackDAGRunStep"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/agent-interactions/{interactionId}/respond": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Respond to a managed-agent interaction */
+        post: operations["respondDAGRunStepAgentInteraction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/agent-session/restart": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restart a managed-agent session cleanly */
+        post: operations["restartDAGRunStepAgentSession"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1401,7 +1478,7 @@ export interface paths {
         head?: never;
         /**
          * Manually update a step's execution status in a sub DAG-run
-         * @description Changes the status of a specific step within a sub DAG-run
+         * @description Changes the status of a specific step after the sub DAG-run and its embedded root run are no longer active
          */
         patch: operations["updateSubDAGRunStepStatus"];
         trace?: never;
@@ -1460,6 +1537,40 @@ export interface paths {
          * @description Pushes back a step that is in Waiting status within a sub DAG-run, providing input parameters that will be injected as environment variables when the step re-executes. The step must have an approval configuration.
          */
         post: operations["pushBackSubDAGRunStep"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/agent-interactions/{interactionId}/respond": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Respond to a managed-agent interaction in a sub DAG-run */
+        post: operations["respondSubDAGRunStepAgentInteraction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/agent-session/restart": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restart a managed-agent session cleanly in a sub DAG-run */
+        post: operations["restartSubDAGRunStepAgentSession"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2022,6 +2133,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dags/{fileName}/webhook/profile-selection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Configure webhook profile selection
+         * @description Replaces the runtime profiles that callers may select through the
+         *     `X-Dagu-Profile` header. An empty list disables caller selection.
+         *     Admin only.
+         *
+         */
+        put: operations["configureDAGWebhookProfileSelection"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dags/{fileName}/webhook/toggle": {
         parameters: {
             query?: never;
@@ -2289,7 +2423,7 @@ export interface paths {
         };
         /**
          * Get Git sync status
-         * @description Returns the overall Git sync status including status of all DAGs
+         * @description Returns the overall Git sync status including all supported sync items
          */
         get: operations["getSyncStatus"];
         put?: never;
@@ -2330,8 +2464,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Publish selected DAGs
-         * @description Commits and pushes the specified item IDs. If itemIds is omitted, publishes all modified or untracked items.
+         * Publish selected sync items
+         * @description Commits and pushes the specified sync item IDs. If itemIds is omitted, publishes all modified or untracked items.
          */
         post: operations["syncPublishAll"];
         delete?: never;
@@ -2455,7 +2589,7 @@ export interface paths {
         put?: never;
         /**
          * Forget a sync item
-         * @description Removes the state entry for a missing, untracked, or conflict sync item. Synced and modified items are rejected.
+         * @description Removes the state entry for a missing, untracked, or conflicting sync item. Synced and modified items are rejected.
          */
         post: operations["forgetSyncItem"];
         delete?: never;
@@ -2475,7 +2609,7 @@ export interface paths {
         put?: never;
         /**
          * Delete a sync item
-         * @description Removes an item from remote repository (git rm + commit + push), local disk, and sync state
+         * @description Removes a sync item from the remote repository (git rm + commit + push), local disk, and sync state
          */
         post: operations["deleteSyncItem"];
         delete?: never;
@@ -2495,7 +2629,7 @@ export interface paths {
         put?: never;
         /**
          * Move a sync item
-         * @description Atomically renames an item across local filesystem, remote repository, and sync state
+         * @description Renames a tracked sync item
          */
         post: operations["moveSyncItem"];
         delete?: never;
@@ -2515,7 +2649,7 @@ export interface paths {
         put?: never;
         /**
          * Delete all missing sync items
-         * @description Removes all missing items from remote repository, local disk, and sync state
+         * @description Removes all missing sync items from the remote repository, local disk, and sync state
          */
         post: operations["syncDeleteMissing"];
         delete?: never;
@@ -2535,7 +2669,7 @@ export interface paths {
         put?: never;
         /**
          * Delete selected sync items
-         * @description Removes the specified items from remote repository, local disk, and sync state in a single commit.
+         * @description Removes the specified sync items from the remote repository, local disk, and sync state in a single commit.
          */
         post: operations["syncDeleteBatch"];
         delete?: never;
@@ -2612,7 +2746,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/settings/agent": {
+    "/license/status": {
         parameters: {
             query?: never;
             header?: never;
@@ -2620,400 +2754,12 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get agent configuration
-         * @description Returns the current AI agent configuration. Requires admin role.
+         * Get license status
+         * @description Returns the current public license status without exposing license credentials.
          */
-        get: operations["getAgentConfig"];
+        get: operations["getLicenseStatus"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        /**
-         * Update agent configuration
-         * @description Updates the AI agent configuration. Requires admin role.
-         */
-        patch: operations["updateAgentConfig"];
-        trace?: never;
-    };
-    "/settings/agent/models": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List agent models
-         * @description Returns all configured AI agent models. Requires admin role.
-         */
-        get: operations["listAgentModels"];
-        put?: never;
-        /**
-         * Create agent model
-         * @description Creates a new AI agent model configuration. Requires admin role.
-         */
-        post: operations["createAgentModel"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/auth/providers": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List agent auth providers
-         * @description Returns subscription-backed agent auth provider status for the selected node. Requires admin role.
-         */
-        get: operations["listAgentAuthProviders"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/auth/providers/{providerId}/login": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Start agent auth provider login
-         * @description Starts a manual OAuth login flow for the selected provider. Requires admin role.
-         */
-        post: operations["startAgentAuthProviderLogin"];
-        /**
-         * Disconnect agent auth provider login
-         * @description Removes the stored OAuth credential for the selected provider. Requires admin role.
-         */
-        delete: operations["disconnectAgentAuthProviderLogin"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/auth/providers/{providerId}/login/complete": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Complete agent auth provider login
-         * @description Completes a manual OAuth login flow using the pasted redirect URL or authorization code. Requires admin role.
-         */
-        post: operations["completeAgentAuthProviderLogin"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/models/{modelId}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        /**
-         * Delete agent model
-         * @description Deletes an AI agent model configuration. Requires admin role.
-         */
-        delete: operations["deleteAgentModel"];
-        options?: never;
-        head?: never;
-        /**
-         * Update agent model
-         * @description Updates an existing AI agent model configuration. Requires admin role.
-         */
-        patch: operations["updateAgentModel"];
-        trace?: never;
-    };
-    "/settings/agent/default-model": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        /**
-         * Set default agent model
-         * @description Sets the default model for the AI agent. Requires admin role.
-         */
-        put: operations["setDefaultAgentModel"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/memory": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get agent memory
-         * @description Returns global memory content and list of DAGs with memory. Requires admin role.
-         */
-        get: operations["getAgentMemory"];
-        /**
-         * Update global agent memory
-         * @description Updates the global MEMORY.md content. Requires admin role.
-         */
-        put: operations["updateAgentMemory"];
-        post?: never;
-        /**
-         * Clear global agent memory
-         * @description Deletes the global MEMORY.md file. Requires admin role.
-         */
-        delete: operations["deleteAgentMemory"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/memory/dags/{dagName}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get DAG-specific agent memory
-         * @description Returns memory content for a specific DAG. Requires admin role.
-         */
-        get: operations["getAgentDAGMemory"];
-        /**
-         * Update DAG-specific agent memory
-         * @description Updates the memory content for a specific DAG. Requires admin role.
-         */
-        put: operations["updateAgentDAGMemory"];
-        post?: never;
-        /**
-         * Clear DAG-specific agent memory
-         * @description Deletes the memory file for a specific DAG. Requires admin role.
-         */
-        delete: operations["deleteAgentDAGMemory"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/model-presets": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List model presets
-         * @description Returns hardcoded model presets with metadata. Requires admin role.
-         */
-        get: operations["listModelPresets"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/tools": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List agent tools
-         * @description Returns metadata for all registered agent tools.
-         */
-        get: operations["listAgentTools"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/souls": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List agent souls
-         * @description Returns all configured agent souls (personalities). Requires admin role.
-         */
-        get: operations["listAgentSouls"];
-        put?: never;
-        /**
-         * Create agent soul
-         * @description Creates a new agent soul (personality). Requires admin role.
-         */
-        post: operations["createAgentSoul"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/settings/agent/souls/{soulId}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get agent soul
-         * @description Returns a single agent soul by ID. Requires admin role.
-         */
-        get: operations["getAgentSoul"];
-        put?: never;
-        post?: never;
-        /**
-         * Delete agent soul
-         * @description Deletes an agent soul. Requires admin role.
-         */
-        delete: operations["deleteAgentSoul"];
-        options?: never;
-        head?: never;
-        /**
-         * Update agent soul
-         * @description Updates an existing agent soul. Requires admin role.
-         */
-        patch: operations["updateAgentSoul"];
-        trace?: never;
-    };
-    "/agent/sessions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List agent sessions
-         * @description Lists sessions for the current user. `listAgentSessions` uses `AgentSessionPaginationMode=cursor` or an `AgentSessionCursor` value to return cursor pages and `nextCursor`; cursor mode rejects `Page` because mixed cursor/page requests are ambiguous, while `PerPage` still controls page size. Without cursor mode it uses `Page` and `PerPage` offset pagination. `RemoteNode` selects the target node for either pagination mode. Malformed or invalid cursor values return 400.
-         */
-        get: operations["listAgentSessions"];
-        put?: never;
-        /**
-         * Create agent session
-         * @description Creates a new agent session and sends the first message.
-         */
-        post: operations["createAgentSession"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/agent/sessions/{sessionId}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get agent session
-         * @description Returns session details including messages and current state.
-         */
-        get: operations["getAgentSession"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/agent/sessions/{sessionId}/chat": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Send message to agent session
-         * @description Sends a message to an existing agent session.
-         */
-        post: operations["chatAgentSession"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/agent/sessions/{sessionId}/cancel": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Cancel agent session
-         * @description Cancels processing in an active agent session.
-         */
-        post: operations["cancelAgentSession"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/agent/sessions/{sessionId}/respond": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Respond to agent prompt
-         * @description Submits user's response to an agent prompt.
-         */
-        post: operations["respondAgentSession"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3060,7 +2806,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/docs": {
+    "/wiki": {
         parameters: {
             query?: never;
             header?: never;
@@ -3068,23 +2814,26 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List documents
-         * @description Returns documents as a tree structure or flat list. All authenticated users can browse.
+         * List Wiki pages
+         * @description Returns Wiki pages as a tree structure or flat list. All authenticated users can browse.
+         *     In tree mode, page and perPage apply to direct children of the selected workspace or prefix;
+         *     each returned directory includes its descendants. In flat mode, they apply to individual Wiki pages.
+         *
          */
-        get: operations["listDocs"];
+        get: operations["listWikiPages"];
         put?: never;
         /**
-         * Create document
-         * @description Creates a new document. Requires DAG write permission.
+         * Create Wiki page
+         * @description Creates a new Wiki page. Requires DAG write permission.
          */
-        post: operations["createDoc"];
+        post: operations["createWikiPage"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/docs/search": {
+    "/wiki/search": {
         parameters: {
             query?: never;
             header?: never;
@@ -3092,10 +2841,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Search documents
-         * @description Searches document content for the given query.
+         * Search Wiki pages
+         * @description Searches Wiki page content for the given query.
          */
-        get: operations["searchDocs"];
+        get: operations["searchWikiPages"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3104,7 +2853,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/docs/doc": {
+    "/wiki/backlinks": {
         parameters: {
             query?: never;
             header?: never;
@@ -3112,27 +2861,114 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get document
-         * @description Returns a single document by path.
+         * List Wiki page backlinks
+         * @description Returns Wiki pages whose wiki links resolve to the given target.
+         *     The target is a Wiki page path, or a scheme-prefixed wiki-link target
+         *     such as dag:name.
+         *
          */
-        get: operations["getDoc"];
+        get: operations["listWikiPageBacklinks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/wiki/page/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Wiki page revisions
+         * @description Returns stored prior versions of a Wiki page, newest first, without content.
+         */
+        get: operations["listWikiPageRevisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/wiki/page/revision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wiki page revision
+         * @description Returns one stored revision including its content.
+         */
+        get: operations["getWikiPageRevision"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/wiki/page/attachment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download Wiki page attachment
+         * @description Streams a stored Wiki page attachment.
+         */
+        get: operations["downloadWikiPageAttachment"];
+        /**
+         * Upload Wiki page attachment
+         * @description Stores a binary attachment for an existing Wiki page, replacing any attachment with the same name. Requires DAG write permission.
+         */
+        put: operations["uploadWikiPageAttachment"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/wiki/page": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wiki page
+         * @description Returns a single Wiki page by path.
+         */
+        get: operations["getWikiPage"];
         put?: never;
         post?: never;
         /**
-         * Delete document
-         * @description Deletes a document. Requires DAG write permission.
+         * Delete Wiki page
+         * @description Deletes a Wiki page. Requires DAG write permission.
          */
-        delete: operations["deleteDoc"];
+        delete: operations["deleteWikiPage"];
         options?: never;
         head?: never;
         /**
-         * Update document
-         * @description Updates an existing document's content. Requires DAG write permission.
+         * Update Wiki page
+         * @description Updates an existing Wiki page's content. Requires DAG write permission.
          */
-        patch: operations["updateDoc"];
+        patch: operations["updateWikiPage"];
         trace?: never;
     };
-    "/docs/doc/rename": {
+    "/wiki/page/rename": {
         parameters: {
             query?: never;
             header?: never;
@@ -3142,17 +2978,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Rename document or directory
-         * @description Renames/moves a document or directory to a new path. When a directory path is given, all documents under it are moved atomically. Requires DAG write permission.
+         * Rename Wiki page or directory
+         * @description Renames/moves a Wiki page or directory to a new path. When a directory path is given, all Wiki pages under it are moved atomically. Requires DAG write permission.
          */
-        post: operations["renameDoc"];
+        post: operations["renameWikiPage"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/docs/delete-batch": {
+    "/wiki/delete-batch": {
         parameters: {
             query?: never;
             header?: never;
@@ -3162,10 +2998,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Delete multiple documents or directories
-         * @description Deletes multiple documents and/or directories in a single operation. Supports recursive directory deletion. Not-found items are treated as successful deletes for idempotency. Requires DAG write permission.
+         * Delete multiple Wiki pages or directories
+         * @description Deletes multiple Wiki pages and/or directories in a single operation. Supports recursive directory deletion. Not-found items are treated as successful deletes for idempotency. Requires DAG write permission.
          */
-        post: operations["deleteDocBatch"];
+        post: operations["deleteWikiPageBatch"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3509,13 +3345,13 @@ export interface paths {
         };
         /**
          * List saved views
-         * @description Lists all saved Overview view configurations, ordered by creation time.
+         * @description Lists all shared saved view configurations visible to the caller, ordered by creation time.
          */
         get: operations["listViews"];
         put?: never;
         /**
          * Create a view
-         * @description Creates a saved Overview view configuration. Views are global and shared across users.
+         * @description Creates a saved view configuration. Views are shared across users with access to their workspace scope.
          */
         post: operations["createView"];
         delete?: never;
@@ -3901,6 +3737,26 @@ export interface components {
             /** @description The sub-DAG run ID, present only for sub-DAG push-back operations */
             subDAGRunId?: string;
         };
+        /** @description Answer to a pending managed-agent permission or question */
+        AgentInteractionResponseRequest: {
+            /** @enum {string} */
+            decision?: AgentInteractionResponseRequestDecision;
+            answers?: string[][];
+        };
+        AgentInteractionResponse: {
+            dagRunId: string;
+            stepName: string;
+            interactionId: string;
+            resumed: boolean;
+            subDAGRunId?: string;
+        };
+        AgentSessionRestartResponse: {
+            dagRunId: string;
+            stepName: string;
+            generation: number;
+            resumed: boolean;
+            subDAGRunId?: string;
+        };
         /** @description Configuration for a human approval gate on a step */
         ApprovalConfig: {
             /** @description Message displayed to the approver */
@@ -3911,6 +3767,36 @@ export interface components {
             required?: string[];
             /** @description Optional step name to restart from when the approver pushes the step back. Must reference the step itself or an upstream dependency. */
             rewindTo?: string;
+        };
+        /** @description Resolved human-task instructions and optional normalized input form */
+        HumanTaskConfig: {
+            /** @description Instructions displayed to the operator. Run details contain the resolved, secret-masked snapshot. */
+            prompt: string;
+            /** @description Normalized flat JSON Schema for typed completion input */
+            form?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Typed human-task completion input. An empty object acknowledges a task without a form. */
+        HumanTaskInput: {
+            [key: string]: unknown;
+        };
+        /** @description Result of completing or confirming one human task */
+        HumanTaskCompletionResponse: {
+            dagName: components["schemas"]["DAGName"];
+            dagRunId: components["schemas"]["DAGRunId"];
+            stepId: string;
+            alreadyCompleted: boolean;
+            /** @description Whether this request durably queued the DAG-run retry */
+            queued: boolean;
+            remainingWaitingSteps: number;
+        };
+        /** @description Result of queueing a completed human-task retry */
+        HumanTaskResumeResponse: {
+            dagName: components["schemas"]["DAGName"];
+            dagRunId: components["schemas"]["DAGRunId"];
+            /** @description Whether this request durably queued the DAG-run retry */
+            queued: boolean;
         };
         /** @description Generic error response object */
         Error: {
@@ -3987,6 +3873,7 @@ export interface components {
             enabled: boolean;
             authMode: components["schemas"]["WebhookAuthMode"];
             hmac: components["schemas"]["WebhookHMACDetails"];
+            profileSelection: components["schemas"]["WebhookProfileSelectionDetails"];
             /**
              * Format: date-time
              * @description When the webhook was created
@@ -4020,6 +3907,15 @@ export interface components {
             /** @description Whether to enable or disable the webhook */
             enabled: boolean;
         };
+        /** @description Runtime profiles that webhook callers may select */
+        WebhookProfileSelectionDetails: {
+            /** @description Runtime profile names accepted through X-Dagu-Profile. An empty list disables caller selection. */
+            allowedProfiles: components["schemas"]["RuntimeProfileName"][];
+        };
+        /** @description Replacement runtime-profile allowlist for a webhook */
+        WebhookProfileSelectionRequest: {
+            allowedProfiles: components["schemas"]["RuntimeProfileName"][];
+        };
         /** @description Request to configure webhook HMAC auth mode and enforcement.
          *     If enforcementMode is omitted when enabling HMAC, it defaults to strict.
          *     If omitted when configuring an existing webhook, the current enforcement
@@ -4044,7 +3940,7 @@ export interface components {
          */
         NotificationProviderType: NotificationProviderType;
         /**
-         * @description DAG run event that can trigger server-side notifications
+         * @description DAG run event that can trigger server-side notifications. Rules configured for dag.run.succeeded also match dag.run.partially_succeeded; rules configured only for dag.run.partially_succeeded do not match clean successes.
          * @enum {string}
          */
         NotificationEventType: NotificationEventType;
@@ -4067,6 +3963,34 @@ export interface components {
             /** @description Attach DAG and step logs when available */
             attachLogs?: boolean;
         };
+        /**
+         * @description SMTP OAuth token provider
+         * @enum {string}
+         */
+        NotificationSMTPOAuthProvider: NotificationSMTPOAuthProvider;
+        /** @description SMTP OAuth credentials. Secret values are encrypted at rest and omitted from responses. */
+        NotificationSMTPOAuthSettingsInput: {
+            provider: components["schemas"]["NotificationSMTPOAuthProvider"];
+            /** @description Microsoft Entra tenant ID */
+            tenantId?: string;
+            /** @description OAuth client ID */
+            clientId?: string;
+            /** @description OAuth client secret. Omit on updates to preserve the existing value when the OAuth identity is unchanged. */
+            clientSecret?: string;
+            /** @description Google refresh token. Omit on updates to preserve the existing value when the OAuth identity is unchanged. */
+            refreshToken?: string;
+            /** @description Google service-account JSON. Omit on updates to preserve the existing value when the OAuth identity is unchanged. */
+            serviceAccountJson?: string;
+        };
+        /** @description Public SMTP OAuth settings. Secret values are never returned. */
+        NotificationSMTPOAuthSettings: {
+            provider: components["schemas"]["NotificationSMTPOAuthProvider"];
+            tenantId?: string;
+            clientId?: string;
+            clientSecretConfigured: boolean;
+            refreshTokenConfigured: boolean;
+            serviceAccountJsonConfigured: boolean;
+        };
         /** @description Workspace SMTP transport input for notification email delivery. Values are encrypted at rest where applicable. */
         NotificationSMTPSettingsInput: {
             /** @description SMTP server host */
@@ -4079,6 +4003,7 @@ export interface components {
             password?: string;
             /** @description Clear the stored SMTP password. */
             clearPassword?: boolean;
+            oauth?: components["schemas"]["NotificationSMTPOAuthSettingsInput"] | null;
             /** @description Default sender address for notification email channels */
             from?: string;
         };
@@ -4090,6 +4015,7 @@ export interface components {
             port?: string;
             /** @description SMTP username */
             username?: string;
+            oauth?: components["schemas"]["NotificationSMTPOAuthSettings"];
             /** @description Default sender address for notification email channels */
             from?: string;
             /** @description Whether an SMTP password is configured */
@@ -4186,6 +4112,8 @@ export interface components {
             clearHmacSecret?: boolean;
             /** @description Optional rendered message added to the webhook JSON payload as message. */
             messageTemplate?: string;
+            /** @description Optional request body template. When set, it replaces the default Dagu payload and must render to valid JSON. One request is sent per event. Supports the same tokens as messageTemplate plus {{message}}. */
+            bodyTemplate?: string;
             /** @description Allow plain HTTP webhook URLs. Disabled by default. */
             allowInsecureHttp?: boolean;
             /** @description Allow loopback or private network webhook targets. Disabled by default. */
@@ -4205,6 +4133,8 @@ export interface components {
             hmacSecretConfigured: boolean;
             /** @description Optional rendered message added to the webhook JSON payload as message. */
             messageTemplate?: string;
+            /** @description Optional request body template that replaces the default Dagu payload. */
+            bodyTemplate?: string;
             /** @description Whether this target allows plain HTTP webhook URLs */
             allowInsecureHttp?: boolean;
             /** @description Whether this target allows loopback or private network webhook targets */
@@ -4235,6 +4165,8 @@ export interface components {
             botToken?: string;
             /** @description Telegram chat ID */
             chatId?: string;
+            /** @description Optional Telegram topic ID (message thread ID) for forum groups */
+            topicId?: string;
             /** @description Optional Telegram message template. When omitted, Dagu sends the default notification text. */
             messageTemplate?: string;
         };
@@ -4246,7 +4178,28 @@ export interface components {
             botTokenPreview?: string;
             /** @description Telegram chat ID */
             chatId?: string;
+            /** @description Optional Telegram topic ID (message thread ID) for forum groups */
+            topicId?: string;
             /** @description Optional Telegram message template. When omitted, Dagu sends the default notification text. */
+            messageTemplate?: string;
+        };
+        /** @description Microsoft Teams incoming webhook target input. Values are encrypted at rest. */
+        NotificationTeamsTargetInput: {
+            /**
+             * Format: uri
+             * @description Microsoft Teams incoming webhook URL, from a Teams Workflows (Power Automate) trigger or a legacy connector. Must use HTTPS. Omit on updates to preserve the existing URL.
+             */
+            webhookUrl?: string;
+            /** @description Optional Teams message template. When omitted, Dagu sends the default notification text. */
+            messageTemplate?: string;
+        };
+        /** @description Public Microsoft Teams target details */
+        NotificationTeamsTarget: {
+            /** @description Whether a Microsoft Teams incoming webhook URL is configured */
+            webhookUrlConfigured: boolean;
+            /** @description Redacted Microsoft Teams webhook URL preview */
+            webhookUrlPreview?: string;
+            /** @description Optional Teams message template. When omitted, Dagu sends the default notification text. */
             messageTemplate?: string;
         };
         /** @description Notification target input */
@@ -4264,6 +4217,7 @@ export interface components {
             webhook?: components["schemas"]["NotificationWebhookTargetInput"];
             slack?: components["schemas"]["NotificationSlackTargetInput"];
             telegram?: components["schemas"]["NotificationTelegramTargetInput"];
+            teams?: components["schemas"]["NotificationTeamsTargetInput"];
         };
         /** @description Public notification target details. Secrets are never returned. */
         NotificationTarget: {
@@ -4280,6 +4234,7 @@ export interface components {
             webhook?: components["schemas"]["NotificationWebhookTarget"];
             slack?: components["schemas"]["NotificationSlackTarget"];
             telegram?: components["schemas"]["NotificationTelegramTarget"];
+            teams?: components["schemas"]["NotificationTeamsTarget"];
         };
         /** @description Notification channel input */
         NotificationChannelInput: {
@@ -4292,6 +4247,7 @@ export interface components {
             webhook?: components["schemas"]["NotificationWebhookTargetInput"];
             slack?: components["schemas"]["NotificationSlackTargetInput"];
             telegram?: components["schemas"]["NotificationTelegramTargetInput"];
+            teams?: components["schemas"]["NotificationTeamsTargetInput"];
         };
         /** @description Notification channel. Secrets are never returned. */
         NotificationChannel: {
@@ -4306,6 +4262,7 @@ export interface components {
             webhook?: components["schemas"]["NotificationWebhookTarget"];
             slack?: components["schemas"]["NotificationSlackTarget"];
             telegram?: components["schemas"]["NotificationTelegramTarget"];
+            teams?: components["schemas"]["NotificationTeamsTarget"];
             /** Format: date-time */
             createdAt: string;
             /** Format: date-time */
@@ -4648,8 +4605,6 @@ export interface components {
         DAGFile: {
             /** @description File ID of the DAG file */
             fileName: string;
-            /** @description Absolute file path of the DAG file on disk */
-            filePath?: string;
             dag: components["schemas"]["DAG"];
             latestDAGRun: components["schemas"]["DAGRunSummary"];
             /**
@@ -4709,6 +4664,8 @@ export interface components {
              * @description RFC 3339 timestamp with explicit offset for one-off schedules
              */
             at?: string;
+            /** @description Runtime profile name that activates this schedule entry */
+            profile?: components["schemas"]["RuntimeProfileName"];
         };
         /**
          * @description Numeric status code indicating current DAG-run state:
@@ -4719,7 +4676,7 @@ export interface components {
          *     4: "Success"
          *     5: "Queued"
          *     6: "Partial Success"
-         *     7: "Waiting for approval"
+         *     7: "Waiting for manual action"
          *     8: "Rejected"
          *
          * @enum {integer}
@@ -4744,7 +4701,7 @@ export interface components {
          *     4: "Success"
          *     5: "Skipped"
          *     6: "Partial Success"
-         *     7: "Waiting for approval"
+         *     7: "Waiting for manual action"
          *     8: "Rejected"
          *     9: "Retrying"
          *
@@ -4835,6 +4792,13 @@ export interface components {
         /** @description Detailed DAG configuration information */
         DAGDetails: {
             /**
+             * @description Execution type. 'graph' resolves dependencies, 'chain' runs steps in order, 'agent' lets an LLM choose each step, and 'build' adds file-derived dependencies and materialization reuse.
+             * @enum {string}
+             */
+            type?: DAGDetailsType;
+            /** @description Goals an agent DAG must satisfy. Present only for type agent. */
+            tasks?: components["schemas"]["AgentTask"][];
+            /**
              * Format: date-time
              * @description Scheduler-aware next planned run time. Pending overdue one-offs remain visible until consumed.
              */
@@ -4905,6 +4869,11 @@ export interface components {
              * @enum {string}
              */
             reason?: ValueReferenceNoticeReason;
+            /**
+             * @description Whether the reference is a defect in the spec or its availability depends on runtime values or lifecycle scope.
+             * @enum {string}
+             */
+            class?: ValueReferenceNoticeClass;
         };
         /** @description Editor-only metadata used to synthesize per-document schema hints */
         DAGEditorHints: {
@@ -5014,6 +4983,25 @@ export interface components {
             abort?: components["schemas"]["Step"];
             exit?: components["schemas"]["Step"];
         };
+        /** @description Type-keyed current-state runtime condition for a DAG-run. Each condition is the latest observation for its type, not a historical event. */
+        DAGRunCondition: {
+            /** @description Condition type */
+            type: string;
+            /**
+             * @description Observed status of the condition
+             * @enum {string}
+             */
+            status: DAGRunConditionStatus;
+            /** @description Machine-readable reason for the condition status */
+            reason: string;
+            /** @description Human-readable detail for the condition status */
+            message: string;
+            /**
+             * Format: date-time
+             * @description RFC 3339 timestamp when the condition was observed
+             */
+            checkedAt: string;
+        };
         /** @description Current status of a DAG-run */
         DAGRunSummary: {
             dagRunId: components["schemas"]["DAGRunId"];
@@ -5036,6 +5024,8 @@ export interface components {
             finishedAt: string;
             /** @description Whether artifact files are available for this DAG-run */
             artifactsAvailable: boolean;
+            /** @description Whether reuse of prior build materializations was disabled for this DAG-run */
+            noReuse?: boolean;
             /** @description Runtime parameters passed to the DAG-run in JSON format */
             params?: string;
             /** @description Runtime profile selected for this DAG-run. */
@@ -5043,6 +5033,10 @@ export interface components {
             /** @description ID of the worker that executed this DAG-run ('local' for local execution) */
             workerId?: string;
             triggerType?: components["schemas"]["TriggerType"];
+            /** @description Authenticated actor that initiated the DAG-run, when attribution is available */
+            triggerActor?: string;
+            /** @description Type-keyed current-state runtime conditions for the DAG-run. This list reports the latest condition for each type, not a history of queued reasons. */
+            conditions?: components["schemas"]["DAGRunCondition"][];
             /** @description List of labels for categorizing and filtering DAG runs */
             labels?: string[];
             /**
@@ -5063,16 +5057,24 @@ export interface components {
             log: string;
             /** @description Status of individual steps within the DAG-run */
             nodes: components["schemas"]["Node"][];
+            onInit?: components["schemas"]["Node"];
             onExit?: components["schemas"]["Node"];
             onSuccess?: components["schemas"]["Node"];
             onFailure?: components["schemas"]["Node"];
             onAbort?: components["schemas"]["Node"];
+            onWait?: components["schemas"]["Node"];
             /** @description List of preconditions that must be met before the DAG-run can start */
             preconditions?: components["schemas"]["Condition"][];
+            /** @description Goal progress of an agent DAG-run. Absent for other DAG types. */
+            agentTasks?: components["schemas"]["AgentTask"][];
+            /** @description Ordered decision timeline of an agent DAG-run: what the agent ran, in what order, and when each task was satisfied. Absent for other DAG types. */
+            agentEvents?: components["schemas"]["AgentEvent"][];
             /** @description Whether this DAG-run still has a usable source file on disk, so reschedule can load the current spec from that file instead of the stored historical YAML snapshot. */
             specFromFile?: boolean;
             /** @description File name of the source DAG definition, derived from the DAG-run's source file path. Only set when the source file still exists on disk. Can be used to navigate to the DAG definition page. */
             sourceFileName?: components["schemas"]["DAGFileName"];
+            /** @description Whether completed human-task input is durable but the same DAG-run still needs its retry queued */
+            humanTaskResumePending?: boolean;
         };
         /**
          * @description Artifact tree node type
@@ -5154,6 +5156,66 @@ export interface components {
             /** @description JSON-serialized parameters passed to the DAG */
             params?: string;
         };
+        /** @description One entry on an agent DAG-run's decision timeline */
+        AgentEvent: {
+            /** @description Agent turn this event belongs to, starting at 1 */
+            turn: number;
+            /**
+             * @description What the agent did on this turn
+             * @enum {string}
+             */
+            kind: AgentEventKind;
+            /** @description Step or task the event concerns */
+            name?: string;
+            /** @description Resulting step status for an action event, or the new task status for a task_status event */
+            status?: string;
+            /** @description Which run of this step it was, starting at 1 */
+            attempt?: number;
+            /** @description Agent's justification, or why the call was rejected */
+            reason?: string;
+            /** @description RFC3339 timestamp when the step started */
+            startedAt?: string;
+            /** @description RFC3339 timestamp when the step finished */
+            finishedAt?: string;
+            /** @description Child DAG-run this action produced, for linking to its run page. Absent for steps that run no child DAG. */
+            childDagRunId?: string;
+            /** @description Name of the child DAG that ran */
+            childDagName?: string;
+        };
+        /** @description A goal an agent DAG must satisfy before the run concludes */
+        AgentTask: {
+            /** @description Unique task name */
+            name: string;
+            /** @description Completion criteria the agent decides against */
+            description?: string;
+            /**
+             * @description Where the task stands. The run ends once none is open, and fails if any is failed. A skipped task does not fail the run.
+             * @enum {string}
+             */
+            status: AgentTaskStatus;
+            /** @description Justification the agent gave for the current status */
+            reason?: string;
+        };
+        /** @description DAG-run that produced a reused materialization */
+        BuildProducer: {
+            name?: string;
+            id?: string;
+        };
+        /** @description Build execution decision and its explanation */
+        BuildExecution: {
+            /** @enum {string} */
+            decision: BuildExecutionDecision;
+            /** @enum {string} */
+            phase: BuildExecutionPhase;
+            /** @description Stable machine-readable reason for the decision */
+            reason: string;
+            /** @description Human-readable explanation of the decision */
+            detail?: string;
+            fingerprint?: string;
+            materializationKey?: string;
+            producerRun?: components["schemas"]["BuildProducer"];
+            producerAttemptId?: string;
+        };
         /** @description Status of an individual step within a DAG-run */
         Node: {
             step: components["schemas"]["Step"];
@@ -5177,10 +5239,17 @@ export interface components {
             subRunsRepeated?: components["schemas"]["SubDAGRun"][];
             /** @description Error message if the step failed */
             error?: string;
+            build?: components["schemas"]["BuildExecution"];
+            /** @description Name of the subject that completed the human task */
+            humanTaskCompletedBy?: string;
+            /** @description ID of the subject that completed the human task; local CLI IDs use the os:<uid> form */
+            humanTaskCompletedById?: string;
             /** @description RFC3339 timestamp when the step was approved */
             approvedAt?: string;
             /** @description Username of who approved the step */
             approvedBy?: string;
+            /** @description ID of the subject that approved the step */
+            approvedById?: string;
             /** @description Key-value inputs provided during approval */
             approvalInputs?: {
                 [key: string]: string;
@@ -5189,6 +5258,8 @@ export interface components {
             rejectedAt?: string;
             /** @description Username of who rejected the step */
             rejectedBy?: string;
+            /** @description ID of the subject that rejected the step */
+            rejectedById?: string;
             /** @description Optional reason for rejection */
             rejectionReason?: string;
             /** @description Number of times this step has been pushed back for re-execution */
@@ -5199,6 +5270,76 @@ export interface components {
             };
             /** @description Chronological push-back history for this step */
             pushBackHistory?: components["schemas"]["PushBackHistoryEntry"][];
+            agentSession?: components["schemas"]["AgentSession"];
+        };
+        /** @description Durable state for a managed coding-agent session */
+        AgentSession: {
+            provider: string;
+            providerVersion?: string;
+            sessionId?: string;
+            generation?: number;
+            agent?: string;
+            model?: string;
+            variant?: string;
+            state: components["schemas"]["AgentSessionState"];
+            lastError?: string;
+            usage?: components["schemas"]["AgentUsage"];
+            interactions?: components["schemas"]["AgentInteraction"][];
+            events?: components["schemas"]["AgentSessionEvent"][];
+        };
+        /** @enum {string} */
+        AgentSessionState: AgentSessionState;
+        AgentUsage: {
+            /** Format: int64 */
+            inputTokens?: number;
+            /** Format: int64 */
+            outputTokens?: number;
+            /** Format: int64 */
+            reasoningTokens?: number;
+            /** Format: int64 */
+            totalTokens?: number;
+            /** Format: double */
+            cost?: number;
+        };
+        AgentInteraction: {
+            id: string;
+            /** @enum {string} */
+            kind: AgentInteractionKind;
+            /** @enum {string} */
+            status: AgentInteractionStatus;
+            permission?: string;
+            patterns?: string[];
+            allowForSessionPatterns?: string[];
+            questions?: components["schemas"]["AgentQuestion"][];
+            decision?: string;
+            answers?: string[][];
+            createdAt?: string;
+            respondedAt?: string;
+            respondedBy?: string;
+            respondedById?: string;
+        };
+        AgentQuestion: {
+            header: string;
+            question: string;
+            options?: components["schemas"]["AgentQuestionOption"][];
+            multiple?: boolean;
+            custom?: boolean;
+        };
+        AgentQuestionOption: {
+            label: string;
+            description?: string;
+        };
+        AgentSessionEvent: {
+            /** Format: int64 */
+            sequence: number;
+            id: string;
+            type: string;
+            timestamp?: string;
+            role?: string;
+            content?: string;
+            name?: string;
+            status?: string;
+            files?: string[];
         };
         /** @description One push-back event recorded for an approval step */
         PushBackHistoryEntry: {
@@ -5206,6 +5347,8 @@ export interface components {
             iteration: number;
             /** @description Authenticated user who pushed the step back */
             by?: string;
+            /** @description ID of the subject that pushed the step back */
+            byId?: string;
             /**
              * Format: date-time
              * @description RFC3339 timestamp when the push-back was recorded
@@ -5238,7 +5381,7 @@ export interface components {
             /** @description RFC 3339 timestamp when the sub DAG-run finished */
             finishedAt?: string;
         };
-        /** @description One file-based step output declaration published through DAGU_OUTPUT_FILE */
+        /** @description One named value output or build file output */
         StepOutputDeclaration: {
             /** @description Published output name scoped to the declaring step */
             name: string;
@@ -5247,6 +5390,13 @@ export interface components {
              * @enum {string}
              */
             type?: StepOutputDeclarationType;
+            /** @description Regular-file path published atomically by a build step */
+            path?: string;
+        };
+        /** @description One named regular-file input for build execution */
+        StepInputDeclaration: {
+            name: string;
+            path: string;
         };
         /** @description Individual task definition that performs a specific operation in a DAG-run */
         Step: {
@@ -5268,8 +5418,12 @@ export interface components {
             stderr?: string;
             /** @description Variable name to store the step's output */
             output?: string;
-            /** @description Declared file-based step outputs published through DAGU_OUTPUT_FILE for ${steps.<id>.outputs.<name>} references. Steps that declare outputs must also define id. */
+            /** @description Declared named outputs. Value outputs are published through DAGU_OUTPUT_FILE; path outputs publish a verified materialized file. Steps that declare outputs must also define id. */
             outputs?: components["schemas"]["StepOutputDeclaration"][];
+            /** @description Named regular-file inputs used for build fingerprints and inferred dependencies. Steps that declare inputs must also define id. */
+            inputs?: components["schemas"]["StepInputDeclaration"][];
+            /** @description Files, directories, or glob patterns relative to the DAG working directory to snapshot for local or distributed execution */
+            dependencies?: string[];
             /** @description The name of the DAG to execute as a sub DAG-run */
             call?: string;
             /** @description Parameters to pass to the sub DAG-run in JSON format */
@@ -5311,6 +5465,7 @@ export interface components {
                 }[];
             };
             approval?: components["schemas"]["ApprovalConfig"];
+            humanTask?: components["schemas"]["HumanTaskConfig"];
         };
         /** @description Individual search result item for a DAG */
         SearchResultItem: {
@@ -5341,24 +5496,31 @@ export interface components {
             hasMore: boolean;
             nextCursor?: string;
         };
-        /** @description Lightweight cursor-based search result item for a document */
-        DocSearchPageItem: {
+        /** @description Lightweight cursor-based search result item for a Wiki page */
+        WikiPageSearchPageItem: {
             id: string;
             title: string;
-            /** @description Short document description from YAML frontmatter */
+            /** @description Short Wiki page description from YAML frontmatter */
             description: string;
-            /** @description Workspace that owns this document. Omitted for default documents. */
+            /** @description Wiki page tags from YAML frontmatter */
+            tags?: string[];
+            /** @description Workspace that owns this Wiki page. Omitted for default Wiki pages. */
             workspace?: string;
+            /**
+             * Format: date-time
+             * @description Last modification time of the Wiki page file
+             */
+            modifiedAt?: string;
             /** @description Whether additional snippets are available beyond the preview */
             hasMoreMatches: boolean;
-            /** @description Opaque cursor for loading more snippets for this document result */
+            /** @description Opaque cursor for loading more snippets for this Wiki page result */
             nextMatchesCursor?: string;
             /** @description Preview snippets for the result */
             matches: components["schemas"]["SearchMatchItem"][];
         };
-        /** @description Cursor-based document search results */
-        DocSearchFeedResponse: {
-            results: components["schemas"]["DocSearchPageItem"][];
+        /** @description Cursor-based Wiki page search results */
+        WikiPageSearchFeedResponse: {
+            results: components["schemas"]["WikiPageSearchPageItem"][];
             hasMore: boolean;
             nextCursor?: string;
         };
@@ -5376,6 +5538,161 @@ export interface components {
             matches: components["schemas"]["SearchMatchItem"][];
             hasMore: boolean;
             nextCursor?: string;
+        };
+        /** @description Full Wiki page with content */
+        WikiPageResponse: {
+            id: string;
+            title: string;
+            /** @description Short Wiki page description from YAML frontmatter */
+            description: string;
+            /** @description Wiki page tags from YAML frontmatter */
+            tags?: string[];
+            /** @description Workspace that owns this Wiki page. Omitted for default Wiki pages. */
+            workspace?: string;
+            /** @description Full file content including YAML frontmatter */
+            content: string;
+            /**
+             * Format: date-time
+             * @description RFC3339 timestamp when the Wiki page was created
+             */
+            createdAt?: string;
+            /**
+             * Format: date-time
+             * @description RFC3339 timestamp when the Wiki page was last updated
+             */
+            updatedAt?: string;
+        };
+        /** @description Lightweight Wiki page metadata */
+        WikiPageMetadataResponse: {
+            id: string;
+            title: string;
+            /** @description Short Wiki page description from YAML frontmatter */
+            description: string;
+            /** @description Wiki page tags from YAML frontmatter */
+            tags?: string[];
+            /** @description Workspace that owns this Wiki page. Omitted for default Wiki pages. */
+            workspace?: string;
+            /**
+             * Format: date-time
+             * @description Last modification time of the Wiki page file
+             */
+            modifiedAt?: string;
+        };
+        /** @description A file or directory node in the Wiki page tree */
+        WikiPageTreeNodeResponse: {
+            id: string;
+            name: string;
+            title?: string;
+            /** @description Wiki page tags from YAML frontmatter. Only present on file nodes. */
+            tags?: string[];
+            /** @description Workspace that owns this node. Omitted for default nodes. */
+            workspace?: string;
+            /** @enum {string} */
+            type: WikiPageTreeNodeResponseType;
+            children?: components["schemas"]["WikiPageTreeNodeResponse"][];
+            /**
+             * Format: date-time
+             * @description Last modification time. For files: file mtime. For directories: most recent descendant mtime.
+             */
+            modifiedAt?: string;
+        };
+        /** @description Paginated Wiki page list (tree or flat) */
+        WikiPageListResponse: {
+            tree?: components["schemas"]["WikiPageTreeNodeResponse"][];
+            items?: components["schemas"]["WikiPageMetadataResponse"][];
+            pagination: components["schemas"]["Pagination"];
+        };
+        /** @description A search result for a single Wiki page */
+        WikiPageSearchResultItem: {
+            id: string;
+            title: string;
+            /** @description Short Wiki page description from YAML frontmatter */
+            description: string;
+            /** @description Wiki page tags from YAML frontmatter */
+            tags?: string[];
+            /** @description Workspace that owns this Wiki page. Omitted for default Wiki pages. */
+            workspace?: string;
+            /**
+             * Format: date-time
+             * @description Last modification time of the Wiki page file
+             */
+            modifiedAt?: string;
+            /** @description Total number of query matches in the Wiki page */
+            matchCount?: number;
+            matches?: components["schemas"]["SearchMatchItem"][];
+        };
+        /** @description Search results */
+        WikiPageSearchResponse: {
+            results: components["schemas"]["WikiPageSearchResultItem"][];
+        };
+        /** @description Wiki pages linking to a wiki-link target */
+        WikiPageBacklinksResponse: {
+            items: components["schemas"]["WikiPageMetadataResponse"][];
+        };
+        /** @description A stored prior version of a Wiki page */
+        WikiPageRevisionResponse: {
+            /** @description Opaque revision identifier */
+            rev: string;
+            /**
+             * Format: date-time
+             * @description When the revision was stored
+             */
+            savedAt: string;
+            /**
+             * Format: int64
+             * @description Revision content size in bytes
+             */
+            size: number;
+            /** @description Revision content. Present only when fetching a single revision. */
+            content?: string;
+        };
+        /** @description Stored revisions of a Wiki page, newest first */
+        WikiPageRevisionsResponse: {
+            revisions: components["schemas"]["WikiPageRevisionResponse"][];
+        };
+        /** @description A stored Wiki page attachment */
+        WikiPageAttachmentResponse: {
+            /** @description Attachment file name */
+            name: string;
+            /**
+             * Format: int64
+             * @description Attachment size in bytes
+             */
+            size: number;
+        };
+        /** @description Relative Wiki page path without extension, for example runbooks/deploy-guide. Must not start with / or contain .. */
+        WikiPagePath: string;
+        /** @description Request to create a new Wiki page */
+        CreateWikiPageRequest: {
+            id: components["schemas"]["WikiPagePath"];
+            /** @description Full file content including optional YAML frontmatter */
+            content: string;
+        };
+        /** @description Request to update Wiki page content */
+        UpdateWikiPageRequest: {
+            /** @description Full file content including optional YAML frontmatter */
+            content: string;
+        };
+        /** @description Request to rename/move a Wiki page or directory */
+        RenameWikiPageRequest: {
+            newPath: components["schemas"]["WikiPagePath"];
+        };
+        /** @description Request to delete multiple Wiki pages or directories */
+        WikiPageDeleteBatchRequest: {
+            /** @description Wiki page or directory paths to delete (max 100) */
+            paths: components["schemas"]["WikiPagePath"][];
+        };
+        WikiPageDeleteBatchResponse: {
+            /** @description Successfully deleted paths */
+            deleted: string[];
+            /** @description Paths that failed to delete with error details */
+            failed: components["schemas"]["WikiPageDeleteBatchFailedItem"][];
+            /** @description Human-readable summary */
+            message: string;
+        };
+        WikiPageDeleteBatchFailedItem: {
+            path: string;
+            error: string;
         };
         /** @description Log information for the execution */
         Log: {
@@ -5399,9 +5716,11 @@ export interface components {
         };
         /** @description Precondition that must be satisfied before running a step or DAG-run */
         Condition: {
-            /** @description Expression or check to evaluate. When `expected` is omitted, the value runs as a command check using the same variable expansion rules as shell `command` steps. */
-            condition: string;
-            /** @description Expected result of the condition evaluation. When set, Dagu compares the evaluated string output instead of using command exit status. */
+            /** @description Value or command text to evaluate. When `expected` is omitted, this runs as a command check. When `expected` is set, this is value-resolved and compared as data. */
+            condition?: string;
+            /** @description Dynamic value expression to evaluate and compare with `expected`. Valid only when `expected` is set and `condition` is omitted. */
+            eval?: string;
+            /** @description Expected result for a value-match precondition. When set, Dagu compares the actual value from `condition` or `eval` instead of using command exit status. */
             expected?: string;
             /** @description If true, inverts the condition result (run when condition does NOT match) */
             negate?: boolean;
@@ -5508,8 +5827,10 @@ export interface components {
             maxConcurrency?: number;
             /** @description Number of currently running DAG-runs */
             runningCount: number;
-            /** @description Number of queued DAG-runs waiting to execute */
+            /** @description Number of queued DAG-runs waiting to execute. When queuedCountCapped is true this is a lower bound, not an exact total. */
             queuedCount: number;
+            /** @description True when counting stopped at the server-side scan cap, so queuedCount is a lower bound rather than an exact total */
+            queuedCountCapped?: boolean;
             /** @description List of currently running DAG-runs (bounded by maxConcurrency) */
             running: components["schemas"]["DAGRunSummary"][];
         };
@@ -5526,8 +5847,10 @@ export interface components {
             totalQueues: number;
             /** @description Total DAG-runs currently executing */
             totalRunning: number;
-            /** @description Total DAG-runs waiting in queues */
+            /** @description Total DAG-runs waiting in queues. When totalQueuedCapped is true this is a lower bound, not an exact total. */
             totalQueued: number;
+            /** @description True when at least one queue's count reached the server-side scan cap, so totalQueued is a lower bound */
+            totalQueuedCapped?: boolean;
             /** @description Sum of all queue maxConcurrency values */
             totalCapacity: number;
             /**
@@ -5576,6 +5899,11 @@ export interface components {
          * @enum {string}
          */
         UserRole: UserRole;
+        /**
+         * @description Authentication provider for a user account
+         * @enum {string}
+         */
+        UserAuthProvider: UserAuthProvider;
         /** @description Workspace name. The reserved names all, default, and global are not allowed. */
         WorkspaceName: string;
         /** @description Role granted for a specific workspace */
@@ -5615,6 +5943,29 @@ export interface components {
             expiresAt: string;
             user: components["schemas"]["User"];
         };
+        /** @description Public status of the current Dagu license */
+        LicenseStatusResponse: {
+            /** @description Whether the loaded license token has not expired */
+            valid: boolean;
+            /** @description License plan name */
+            plan: string;
+            /** @description License expiration timestamp, or empty for a perpetual or absent license */
+            expiry: string;
+            /** @description Feature claims included in the license */
+            features: string[];
+            /** @description Whether the license is expired but still inside its grace period */
+            gracePeriod: boolean;
+            /** @description Grace-period end timestamp, or empty when the license has no expiration */
+            graceEndsAt: string;
+            /** @description Whether no license claims are loaded */
+            community: boolean;
+            /** @description Public license source category */
+            source: string;
+            /** @description Warning code included in the license token */
+            warningCode: string;
+            /** @description User-facing explanation when a configured license is unusable */
+            error: string;
+        };
         /** @description Request body for changing password */
         ChangePasswordRequest: {
             /** @description Current password for verification */
@@ -5653,11 +6004,7 @@ export interface components {
             username: string;
             role: components["schemas"]["UserRole"];
             workspaceAccess: components["schemas"]["WorkspaceAccess"];
-            /**
-             * @description Authentication provider (builtin or oidc)
-             * @enum {string}
-             */
-            authProvider?: UserAuthProvider;
+            authProvider?: components["schemas"]["UserAuthProvider"];
             /** @description Whether the user account is disabled */
             isDisabled?: boolean;
             /**
@@ -5678,6 +6025,12 @@ export interface components {
         /** @description Response containing list of users */
         UsersListResponse: {
             users: components["schemas"]["User"][];
+            /** @description Whether OIDC workspace access is synchronized by this node */
+            oidcWorkspaceAccessSyncEnabled?: boolean;
+            /** @description Authentication providers that synchronize user roles at login on this node */
+            managedRoleProviders: components["schemas"]["UserAuthProvider"][];
+            /** @description Authentication providers that synchronize workspace access at login on this node */
+            managedWorkspaceAccessProviders: components["schemas"]["UserAuthProvider"][];
         };
         /** @description API key information */
         APIKey: {
@@ -5786,7 +6139,7 @@ export interface components {
             message: string;
         };
         /**
-         * @description Sync status of a DAG
+         * @description Sync status of an item
          * @enum {string}
          */
         SyncStatus: SyncStatus;
@@ -5802,7 +6155,7 @@ export interface components {
         SyncItemKind: SyncItemKind;
         /** @description Sync state for a single item */
         SyncItem: {
-            /** @description Stable item identifier (file path without extension) */
+            /** @description Stable sync item identifier. Supporting file IDs include their extension. */
             itemId: string;
             /** @description Relative file path with extension */
             filePath: string;
@@ -5816,12 +6169,12 @@ export interface components {
             lastSyncedHash?: string;
             /**
              * Format: date-time
-             * @description When the DAG was last synced
+             * @description When the item was last synced
              */
             lastSyncedAt?: string;
             /**
              * Format: date-time
-             * @description When the DAG was last modified locally
+             * @description When the item was last modified locally
              */
             modifiedAt?: string;
             /** @description Current local content hash */
@@ -5845,7 +6198,7 @@ export interface components {
              */
             missingAt?: string;
         };
-        /** @description Counts of DAGs in each sync status */
+        /** @description Counts of items in each sync status */
         SyncStatusCounts: {
             synced: number;
             modified: number;
@@ -5884,37 +6237,58 @@ export interface components {
         };
         /** @description Diff between local and remote versions of a sync item */
         SyncItemDiffResponse: {
-            /** @description The item identifier */
+            /** @description The sync item identifier */
             itemId: string;
             /** @description Relative file path with extension */
             filePath: string;
             status: components["schemas"]["SyncStatus"];
-            /** @description Current local file content */
-            localContent: string;
-            /** @description Content from remote repository */
+            kind?: components["schemas"]["SyncItemKind"];
+            /** @description True for binary items; content fields are omitted and sizes are reported instead */
+            binary?: boolean;
+            /** @description Current local file content. Omitted for binary items. */
+            localContent?: string;
+            /** @description Content from remote repository. Omitted for binary items. */
             remoteContent?: string;
+            /**
+             * Format: int64
+             * @description Local file size in bytes. Only set for binary items.
+             */
+            localSize?: number;
+            /**
+             * Format: int64
+             * @description Remote file size in bytes. Only set for binary items.
+             */
+            remoteSize?: number;
             /** @description Commit hash being compared against */
             remoteCommit?: string;
             /** @description Author of the remote commit */
             remoteAuthor?: string;
             /** @description Commit message of the remote version */
             remoteMessage?: string;
+            /** @description Whether the remote file was deleted */
+            remoteDeleted?: boolean;
+            /** @description Whether the local supporting file is executable */
+            localExecutable?: boolean;
+            /** @description Whether the remote supporting file is executable */
+            remoteExecutable?: boolean;
         };
         /** @description Result of a sync operation */
         SyncResultResponse: {
             success: boolean;
             message?: string;
-            /** @description DAG IDs that were synced */
+            /** @description Sync item IDs that were synced */
             synced?: string[];
-            /** @description DAG IDs that were modified */
+            /** @description Sync item IDs deleted locally after remote deletion */
+            deleted?: string[];
+            /** @description Sync item IDs that were modified */
             modified?: string[];
-            /** @description DAG IDs with conflicts */
+            /** @description Sync item IDs with conflicts */
             conflicts?: string[];
             errors?: components["schemas"]["SyncError"][];
             /** Format: date-time */
             timestamp: string;
         };
-        /** @description Request to publish a DAG */
+        /** @description Request to publish a sync item */
         SyncPublishRequest: {
             /** @description Commit message */
             message?: string;
@@ -5924,16 +6298,16 @@ export interface components {
              */
             force: boolean;
         };
-        /** @description Request to publish selected items */
+        /** @description Request to publish selected sync items */
         SyncPublishAllRequest: {
             /** @description Commit message */
             message?: string;
-            /** @description Item IDs to publish. If omitted, all modified or untracked items are published. */
+            /** @description Sync item IDs to publish. If omitted, all modified or untracked items are published. */
             itemIds?: string[];
         };
-        /** @description Request to delete selected items */
+        /** @description Request to delete selected sync items */
         SyncDeleteBatchRequest: {
-            /** @description Item IDs to delete */
+            /** @description Sync item IDs to delete */
             itemIds: string[];
             /** @description Commit message for the deletion */
             message?: string;
@@ -5996,567 +6370,6 @@ export interface components {
             autoSync?: components["schemas"]["SyncAutoSyncConfig"];
             pushEnabled?: boolean;
             commit?: components["schemas"]["SyncCommitConfig"];
-        };
-        /** @description AI Agent configuration */
-        AgentConfigResponse: {
-            /** @description Whether the AI agent is enabled */
-            enabled?: boolean;
-            /** @description ID of the default model */
-            defaultModelId?: string;
-            toolPolicy?: components["schemas"]["AgentToolPolicy"];
-            /** @description ID of the currently selected soul */
-            selectedSoulId?: string | null;
-            webSearch?: components["schemas"]["AgentWebSearchConfig"];
-            webTools?: components["schemas"]["AgentWebToolsConfig"];
-        };
-        /** @description Request to update AI agent configuration */
-        UpdateAgentConfigRequest: {
-            /** @description Whether the AI agent is enabled */
-            enabled?: boolean;
-            /** @description ID of the default model */
-            defaultModelId?: string;
-            toolPolicy?: components["schemas"]["AgentToolPolicy"];
-            /** @description ID of the soul to select */
-            selectedSoulId?: string | null;
-            webSearch?: components["schemas"]["AgentWebSearchConfig"];
-            webTools?: components["schemas"]["AgentWebToolsConfig"];
-        };
-        /** @description Global tool permission policy for AI agent sessions */
-        AgentToolPolicy: {
-            /** @description Per-tool enable/disable map */
-            tools?: {
-                [key: string]: boolean;
-            };
-            bash?: components["schemas"]["AgentBashPolicy"];
-        };
-        /** @description Granular command policy for the bash tool */
-        AgentBashPolicy: {
-            rules?: components["schemas"]["AgentBashRule"][];
-            /**
-             * @description Behavior when no rule matches a command segment
-             * @enum {string}
-             */
-            defaultBehavior?: AgentBashPolicyDefaultBehavior;
-            /**
-             * @description Behavior when a command segment is denied
-             * @enum {string}
-             */
-            denyBehavior?: AgentBashPolicyDenyBehavior;
-        };
-        AgentBashRule: {
-            name?: string;
-            /** @description Regex pattern matched against each shell command segment */
-            pattern: string;
-            /** @enum {string} */
-            action: AgentBashRuleAction;
-            /** @description Rule enabled state (default: true when omitted) */
-            enabled?: boolean;
-        };
-        /** @description Provider-native web search configuration for agent sessions */
-        AgentWebSearchConfig: {
-            /** @description Whether provider-native web search is enabled */
-            enabled?: boolean;
-            /** @description Maximum number of search invocations per request */
-            maxUses?: number;
-        };
-        /**
-         * @description Backend provider for agent web tools
-         * @enum {string}
-         */
-        AgentWebToolsBackend: AgentWebToolsBackend;
-        /** @description First-class web_search and web_extract tool configuration */
-        AgentWebToolsConfig: {
-            /** @description Whether provider-backed web tools are enabled */
-            enabled?: boolean;
-            backend?: components["schemas"]["AgentWebToolsBackend"];
-            tavily?: components["schemas"]["AgentTavilyWebToolsConfig"];
-            firecrawl?: components["schemas"]["AgentFirecrawlWebToolsConfig"];
-        };
-        /** @description Tavily web tool settings */
-        AgentTavilyWebToolsConfig: {
-            /** @description Tavily API key. Write-only; omitted from responses. */
-            apiKey?: string;
-            /** @description Clear the stored Tavily API key when true */
-            clearApiKey?: boolean;
-            /** @description Whether a Tavily API key is stored */
-            readonly apiKeyConfigured?: boolean;
-            /**
-             * Format: uri
-             * @description Optional Tavily-compatible base URL
-             */
-            baseUrl?: string;
-            /** @description Maximum search results allowed per web_search call */
-            maxResults?: number;
-            /**
-             * @description Tavily search depth
-             * @enum {string}
-             */
-            searchDepth?: AgentTavilyWebToolsConfigSearchDepth;
-        };
-        /** @description Firecrawl web tool settings */
-        AgentFirecrawlWebToolsConfig: {
-            /** @description Firecrawl API key. Write-only; omitted from responses. */
-            apiKey?: string;
-            /** @description Clear the stored Firecrawl API key when true */
-            clearApiKey?: boolean;
-            /** @description Whether a Firecrawl API key is stored */
-            readonly apiKeyConfigured?: boolean;
-            /**
-             * Format: uri
-             * @description Optional Firecrawl-compatible base URL
-             */
-            baseUrl?: string;
-            /** @description Maximum search results allowed per web_search call */
-            maxResults?: number;
-        };
-        /** @description Model configuration */
-        ModelConfigResponse: {
-            id: string;
-            name: string;
-            /** @enum {string} */
-            provider: ModelConfigResponseProvider;
-            model: string;
-            apiKeyConfigured?: boolean;
-            baseUrl?: string;
-            contextWindow?: number;
-            maxOutputTokens?: number;
-            /** Format: double */
-            inputCostPer1M?: number;
-            /** Format: double */
-            outputCostPer1M?: number;
-            supportsThinking?: boolean;
-            /** @enum {string} */
-            thinkingEffort?: ModelConfigResponseThinkingEffort;
-            description?: string;
-        };
-        /** @description Request to create a new model configuration */
-        CreateModelConfigRequest: {
-            /** @description Optional custom ID (auto-generated from name if omitted) */
-            id?: string;
-            name: string;
-            /** @enum {string} */
-            provider: CreateModelConfigRequestProvider;
-            model: string;
-            apiKey?: string;
-            baseUrl?: string;
-            contextWindow?: number;
-            maxOutputTokens?: number;
-            /** Format: double */
-            inputCostPer1M?: number;
-            /** Format: double */
-            outputCostPer1M?: number;
-            supportsThinking?: boolean;
-            /** @enum {string} */
-            thinkingEffort?: CreateModelConfigRequestThinkingEffort;
-            description?: string;
-        };
-        /** @description Request to update a model configuration */
-        UpdateModelConfigRequest: {
-            name?: string;
-            /** @enum {string} */
-            provider?: UpdateModelConfigRequestProvider;
-            model?: string;
-            apiKey?: string;
-            baseUrl?: string;
-            contextWindow?: number;
-            maxOutputTokens?: number;
-            /** Format: double */
-            inputCostPer1M?: number;
-            /** Format: double */
-            outputCostPer1M?: number;
-            supportsThinking?: boolean;
-            /** @enum {string} */
-            thinkingEffort?: UpdateModelConfigRequestThinkingEffort;
-            description?: string;
-        };
-        /** @description Request to set the default model */
-        SetDefaultModelRequest: {
-            /** @description Model ID to set as default */
-            modelId: string;
-        };
-        /** @description Response after setting the default model */
-        SetDefaultModelResponse: {
-            defaultModelId?: string;
-        };
-        /** @description List of model configurations */
-        ListModelsResponse: {
-            models: components["schemas"]["ModelConfigResponse"][];
-            defaultModelId?: string;
-        };
-        /** @description Connection status for one subscription-backed agent auth provider */
-        AgentAuthProviderStatus: {
-            id: string;
-            name: string;
-            connected: boolean;
-            /** Format: date-time */
-            expiresAt?: string;
-            canRefresh?: boolean;
-            accountId?: string;
-        };
-        /** @description List of subscription-backed auth providers */
-        ListAgentAuthProvidersResponse: {
-            providers: components["schemas"]["AgentAuthProviderStatus"][];
-        };
-        /** @description Manual OAuth login flow information */
-        StartAgentAuthProviderLoginResponse: {
-            flowId: string;
-            authUrl: string;
-            instructions?: string;
-        };
-        /** @description Complete a manual OAuth login flow */
-        CompleteAgentAuthProviderLoginRequest: {
-            flowId: string;
-            /** Format: uri */
-            redirectUrl?: string;
-            code?: string;
-        } | unknown | unknown;
-        /** @description Updated provider status after login completion */
-        CompleteAgentAuthProviderLoginResponse: {
-            provider: components["schemas"]["AgentAuthProviderStatus"];
-        };
-        /** @description Soul (agent personality) configuration */
-        SoulResponse: {
-            id: string;
-            name: string;
-            description?: string;
-            /** @description Markdown body content (identity definition) */
-            content?: string;
-        };
-        /** @description List of souls */
-        ListSoulsResponse: {
-            souls: components["schemas"]["SoulResponse"][];
-            pagination: components["schemas"]["Pagination"];
-        };
-        /** @description Request to create a new soul */
-        CreateSoulRequest: {
-            /** @description Optional custom ID (auto-generated from name if omitted) */
-            id?: string;
-            name: string;
-            description?: string;
-            /** @description Markdown body content (identity definition) */
-            content: string;
-        };
-        /** @description Request to update a soul (partial update) */
-        UpdateSoulRequest: {
-            name?: string;
-            description?: string;
-            /** @description Markdown body content (identity definition) */
-            content?: string;
-        };
-        /** @description Full document with content */
-        DocResponse: {
-            id: string;
-            title: string;
-            /** @description Short document description from YAML frontmatter */
-            description: string;
-            /** @description Workspace that owns this document. Omitted for default documents. */
-            workspace?: string;
-            /** @description Full file content including YAML frontmatter */
-            content: string;
-            /** @description Absolute file path of the document on disk */
-            filePath?: string;
-            /**
-             * Format: date-time
-             * @description RFC3339 timestamp when the document was created
-             */
-            createdAt?: string;
-            /**
-             * Format: date-time
-             * @description RFC3339 timestamp when the document was last updated
-             */
-            updatedAt?: string;
-        };
-        /** @description Lightweight document metadata */
-        DocMetadataResponse: {
-            id: string;
-            title: string;
-            /** @description Short document description from YAML frontmatter */
-            description: string;
-            /** @description Workspace that owns this document. Omitted for default documents. */
-            workspace?: string;
-            /**
-             * Format: date-time
-             * @description Last modification time of the document file
-             */
-            modifiedAt?: string;
-        };
-        /** @description A file or directory node in the doc tree */
-        DocTreeNodeResponse: {
-            id: string;
-            name: string;
-            title?: string;
-            /** @description Workspace that owns this node. Omitted for default nodes. */
-            workspace?: string;
-            /** @enum {string} */
-            type: DocTreeNodeResponseType;
-            children?: components["schemas"]["DocTreeNodeResponse"][];
-            /**
-             * Format: date-time
-             * @description Last modification time. For files: file mtime. For directories: most recent descendant mtime.
-             */
-            modifiedAt?: string;
-        };
-        /** @description Paginated document list (tree or flat) */
-        DocListResponse: {
-            tree?: components["schemas"]["DocTreeNodeResponse"][];
-            items?: components["schemas"]["DocMetadataResponse"][];
-            pagination: components["schemas"]["Pagination"];
-        };
-        /** @description A search result for a single document */
-        DocSearchResultItem: {
-            id: string;
-            title: string;
-            /** @description Short document description from YAML frontmatter */
-            description: string;
-            /** @description Workspace that owns this document. Omitted for default documents. */
-            workspace?: string;
-            matches?: components["schemas"]["SearchMatchItem"][];
-        };
-        /** @description Search results */
-        DocSearchResponse: {
-            results: components["schemas"]["DocSearchResultItem"][];
-        };
-        /** @description Relative document path (without extension), e.g. runbooks/deploy-guide. Must not start with / or contain .. */
-        DocPath: string;
-        /** @description Request to create a new document */
-        CreateDocRequest: {
-            id: components["schemas"]["DocPath"];
-            /** @description Full file content including optional YAML frontmatter */
-            content: string;
-        };
-        /** @description Request to update document content */
-        UpdateDocRequest: {
-            /** @description Full file content including optional YAML frontmatter */
-            content: string;
-        };
-        /** @description Request to rename/move a document or directory */
-        RenameDocRequest: {
-            newPath: components["schemas"]["DocPath"];
-        };
-        /** @description Request to delete multiple documents or directories */
-        DocDeleteBatchRequest: {
-            /** @description Document or directory paths to delete (max 100) */
-            paths: components["schemas"]["DocPath"][];
-        };
-        DocDeleteBatchResponse: {
-            /** @description Successfully deleted paths */
-            deleted: string[];
-            /** @description Paths that failed to delete with error details */
-            failed: components["schemas"]["DocDeleteBatchFailedItem"][];
-            /** @description Human-readable summary */
-            message: string;
-        };
-        DocDeleteBatchFailedItem: {
-            path: string;
-            error: string;
-        };
-        /** @description Hardcoded model preset with metadata */
-        ModelPreset: {
-            name: string;
-            /** @enum {string} */
-            provider: ModelPresetProvider;
-            model: string;
-            contextWindow?: number;
-            maxOutputTokens?: number;
-            /** Format: double */
-            inputCostPer1M?: number;
-            /** Format: double */
-            outputCostPer1M?: number;
-            supportsThinking?: boolean;
-            /** @enum {string} */
-            thinkingEffort?: ModelPresetThinkingEffort;
-            description?: string;
-        };
-        /** @description List of model presets */
-        ListModelPresetsResponse: {
-            presets: components["schemas"]["ModelPreset"][];
-        };
-        /** @description Agent memory overview */
-        AgentMemoryResponse: {
-            /** @description Content of global MEMORY.md */
-            globalMemory?: string;
-            /** @description List of DAG names that have memory files */
-            dagMemories?: components["schemas"]["DAGName"][];
-            /** @description Root memory directory path */
-            memoryDir?: string;
-        };
-        /** @description DAG-specific memory content */
-        AgentDAGMemoryResponse: {
-            dagName: components["schemas"]["DAGName"];
-            content: string;
-        };
-        /** @description Request to update memory content */
-        UpdateAgentMemoryRequest: {
-            /** @description New memory content (markdown) */
-            content: string;
-        };
-        /** @description Metadata for a registered agent tool */
-        AgentToolInfo: {
-            name: string;
-            label: string;
-            description: string;
-        };
-        /** @description List of agent tool metadata */
-        ListAgentToolsResponse: {
-            tools: components["schemas"]["AgentToolInfo"][];
-        };
-        /** @description DAG reference for context-aware agent responses */
-        AgentDAGContext: {
-            /** @description DAG file path or name */
-            dagFile: string;
-            /** @description Specific run ID of the DAG */
-            dagRunId?: string;
-        };
-        /** @description Request to send a chat message to the agent */
-        AgentChatRequest: {
-            /** @description User's input text */
-            message: string;
-            /** @description LLM model ID to use */
-            model?: string;
-            /** @description DAG references for context */
-            dagContexts?: components["schemas"]["AgentDAGContext"][];
-            /** @description Enable approval prompts for dangerous commands */
-            safeMode?: boolean;
-            /** @description Soul ID to use for this session (overrides default) */
-            soulId?: string;
-            /** @description Optional client-provided session ID (UUID v4) for idempotent creation. Only used by the create-session endpoint; ignored by the chat endpoint. */
-            sessionId?: string;
-        };
-        /** @description Response after creating a new agent session */
-        CreateAgentSessionResponse: {
-            sessionId: string;
-            status: string;
-        };
-        /** @description Agent chat session metadata */
-        AgentSession: {
-            id: string;
-            userId?: string;
-            dagName?: string;
-            title?: string;
-            /** Format: date-time */
-            createdAt: string;
-            /** Format: date-time */
-            updatedAt: string;
-            parentSessionId?: string;
-            delegateTask?: string;
-        };
-        /** @description Current processing state of an agent session */
-        AgentSessionState: {
-            sessionId: string;
-            working: boolean;
-            /** @description Whether the agent is waiting for user input */
-            hasPendingPrompt?: boolean;
-            model?: string;
-            /**
-             * Format: double
-             * @description Total accumulated cost in USD
-             */
-            totalCost: number;
-        };
-        /** @description Agent session with its current state */
-        AgentSessionWithState: components["schemas"]["AgentSessionState"] & {
-            session: components["schemas"]["AgentSession"];
-        };
-        /** @description Paginated list of agent sessions */
-        ListAgentSessionsResponse: {
-            sessions: components["schemas"]["AgentSessionWithState"][];
-            pagination: components["schemas"]["Pagination"];
-            /** @description Opaque cursor for loading the next page of older sessions */
-            nextCursor?: string;
-        };
-        /** @description Function call details in a tool call */
-        AgentToolCallFunction: {
-            name: string;
-            arguments: string;
-        };
-        /** @description Tool call requested by the LLM */
-        AgentToolCall: {
-            id: string;
-            type: string;
-            function: components["schemas"]["AgentToolCallFunction"];
-        };
-        /** @description Result from a tool execution */
-        AgentToolResult: {
-            toolCallId: string;
-            content: string;
-            isError?: boolean;
-        };
-        /** @description Token usage statistics from LLM */
-        AgentTokenUsage: {
-            promptTokens?: number;
-            completionTokens?: number;
-            totalTokens?: number;
-        };
-        /** @description UI action to be performed */
-        AgentUIAction: {
-            type: string;
-            path?: string;
-        };
-        /** @description Single option in a user prompt */
-        AgentUserPromptOption: {
-            id: string;
-            label: string;
-            description?: string;
-        };
-        /** @description Question from the agent requiring user response */
-        AgentUserPrompt: {
-            promptId: string;
-            question: string;
-            options?: components["schemas"]["AgentUserPromptOption"][];
-            allowFreeText: boolean;
-            freeTextPlaceholder?: string;
-            multiSelect: boolean;
-            /** @enum {string} */
-            promptType?: AgentUserPromptPromptType;
-            command?: string;
-            workingDir?: string;
-        };
-        /** @description A message in an agent session */
-        AgentMessage: {
-            id: string;
-            sessionId: string;
-            /** @enum {string} */
-            type: AgentMessageType;
-            /** Format: int64 */
-            sequenceId: number;
-            content?: string;
-            toolCalls?: components["schemas"]["AgentToolCall"][];
-            toolResults?: components["schemas"]["AgentToolResult"][];
-            usage?: components["schemas"]["AgentTokenUsage"];
-            /** Format: double */
-            cost?: number;
-            /** Format: date-time */
-            createdAt: string;
-            uiAction?: components["schemas"]["AgentUIAction"];
-            userPrompt?: components["schemas"]["AgentUserPrompt"];
-            delegateIds?: string[];
-        };
-        /** @description Session details including messages and current state */
-        AgentSessionDetailResponse: {
-            messages: components["schemas"]["AgentMessage"][];
-            session: components["schemas"]["AgentSession"];
-            sessionState: components["schemas"]["AgentSessionState"];
-            delegates?: components["schemas"]["AgentDelegateSnapshot"][];
-        };
-        /** @description Snapshot of a delegate sub-agent's lifecycle state */
-        AgentDelegateSnapshot: {
-            id: string;
-            task: string;
-            /** @enum {string} */
-            status: AgentDelegateSnapshotStatus;
-            /** Format: double */
-            cost?: number;
-        };
-        /** @description User's response to an agent prompt */
-        AgentUserPromptResponse: {
-            promptId: string;
-            selectedOptionIds?: string[];
-            freeTextResponse?: string;
-            cancelled?: boolean;
-        };
-        /** @description Simple status response */
-        AgentStatusResponse: {
-            status: string;
         };
         CreateRemoteNodeRequest: {
             /** @description Display name for the remote node */
@@ -6645,6 +6458,8 @@ export interface components {
         };
         UpdateInheritedRuntimeProfileRequest: {
             description?: string;
+            /** @description Workspace default runtime profile. Only valid for workspace defaults. Empty string clears the setting; omit to leave it unchanged. */
+            defaultProfile?: components["schemas"]["RuntimeProfileOverride"];
         };
         SetRuntimeProfileVariableRequest: {
             value: string;
@@ -6686,6 +6501,8 @@ export interface components {
             name: components["schemas"]["InheritedRuntimeProfileName"];
             scope: components["schemas"]["InheritedRuntimeProfileScope"];
             workspace?: components["schemas"]["WorkspaceName"];
+            /** @description Workspace default runtime profile used when a run and DAG do not select a profile. */
+            defaultProfile?: components["schemas"]["RuntimeProfileName"];
             description?: string;
             status: components["schemas"]["RuntimeProfileStatus"];
             protected: boolean;
@@ -6750,11 +6567,31 @@ export interface components {
             secrets: components["schemas"]["SecretResponse"][];
             total: number;
         };
+        /**
+         * @description A status column available in a Kanban view.
+         * @enum {string}
+         */
+        ViewColumn: ViewColumn;
+        /**
+         * @description Workflows page workspace selection represented by the view.
+         * @enum {string}
+         */
+        ViewWorkspaceScope: ViewWorkspaceScope;
+        /**
+         * @description Field used to sort workflows.
+         * @enum {string}
+         */
+        ViewSortField: ViewSortField;
+        /**
+         * @description Direction used to sort workflows.
+         * @enum {string}
+         */
+        ViewSortOrder: ViewSortOrder;
         ViewSpec: {
             /** @description Display name for the view. */
             name: string;
             /**
-             * @description Render type. Currently only kanban is supported.
+             * @description Saved view type.
              * @default kanban
              * @enum {string}
              */
@@ -6767,11 +6604,20 @@ export interface components {
             dagName?: string;
             /** @description Required number of days each row (bucket) groups. Rows scroll back in time by this unit. */
             intervalDays: number;
+            /** @description Status columns to display, in left-to-right order. Omitted values use the default order with all columns visible. */
+            columns?: components["schemas"]["ViewColumn"][];
             /**
              * @description Whether the view is pinned to the left sidebar.
              * @default false
              */
             pinned: boolean;
+            workspaceScope?: components["schemas"]["ViewWorkspaceScope"];
+            sortField?: components["schemas"]["ViewSortField"];
+            sortOrder?: components["schemas"]["ViewSortOrder"];
+            /** @description Whether the view only includes scheduled, unsuspended workflows. */
+            activeOnly?: boolean;
+            /** @description Whether this is the default workflow view for its workspace scope. */
+            isDefault?: boolean;
         };
         View: {
             id: string;
@@ -6781,7 +6627,15 @@ export interface components {
             labels?: string[];
             dagName?: string;
             intervalDays: number;
+            /** @description Visible status columns in left-to-right display order. */
+            columns?: components["schemas"]["ViewColumn"][];
             pinned?: boolean;
+            workspaceScope?: components["schemas"]["ViewWorkspaceScope"];
+            sortField?: components["schemas"]["ViewSortField"];
+            sortOrder?: components["schemas"]["ViewSortOrder"];
+            /** @description Whether the view only includes scheduled, unsuspended workflows. */
+            activeOnly?: boolean;
+            isDefault?: boolean;
             /** @description Username of the creator, for display only. */
             createdBy?: string;
             /** Format: date-time */
@@ -6823,12 +6677,12 @@ export interface components {
         APIKeyId: string;
         /** @description number of items per page (default is 30, max is 100) */
         PerPage: number;
-        /** @description Opaque cursor for loading the next page of older agent sessions */
-        AgentSessionCursor: string;
-        /** @description Pagination mode. Use `cursor` for the agent session sidebar infinite-loading flow; omit or use `offset` for compatibility pagination. */
-        AgentSessionPaginationMode: ComponentsParametersAgentSessionPaginationMode;
-        /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+        /** @description Number of Wiki page entries per page (default 50, max 200) */
+        WikiPagesPerPage: number;
+        /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
         Workspace: string;
+        /** @description Optional Wiki page path prefix within the selected workspace */
+        WikiPagePrefix: components["schemas"]["WikiPagePath"];
         /** @description Opaque cursor returned by the previous search response */
         SearchCursor: string;
         /** @description Number of search results to return (default 20, max 50) */
@@ -6841,6 +6695,8 @@ export interface components {
         DAGName: components["schemas"]["DAGName"];
         /** @description name of the step */
         StepName: string;
+        /** @description explicit ID of the human-task step */
+        HumanTaskStepId: string;
         /** @description Relative artifact file path within the DAG-run artifact directory. Must not start with '/' or '\' or contain '..'. */
         ArtifactPath: string & unknown & unknown & unknown;
         /** @description Whether to recursively expand nested artifact directories */
@@ -6893,10 +6749,6 @@ export interface components {
         Limit: number;
         /** @description Whether to return stdout or stderr logs */
         Stream: components["schemas"]["Stream"];
-        /** @description Unique identifier of the agent session */
-        AgentSessionId: string;
-        /** @description The soul ID */
-        SoulId: string;
         /** @description The unique identifier of the remote node */
         RemoteNodeId: string;
     };
@@ -7151,6 +7003,15 @@ export interface operations {
             };
             /** @description Not authenticated or wrong current password */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Password is managed by the authentication provider */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7525,7 +7386,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Forbidden - requires admin role */
+            /** @description Forbidden - requires admin role, or the target user uses an external authentication provider */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7917,12 +7778,14 @@ export interface operations {
                 perPage?: components["parameters"]["PerPage"];
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
                 /** @description Filter DAGs by name */
                 name?: string;
                 /** @description Filter DAGs by labels (comma-separated). Returns DAGs that have ALL specified labels. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                 labels?: string;
+                /** @description Filter to DAGs that have a schedule and are not suspended. */
+                active?: boolean;
                 /**
                  * @deprecated
                  * @description Deprecated alias for `labels`; mutually exclusive with `labels`. Filter DAGs by labels (comma-separated).
@@ -8089,8 +7952,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        /** @description Absolute file path of the DAG file on disk */
-                        filePath?: string;
                         dag?: components["schemas"]["DAGDetails"];
                         /** @description List of local DAGs that are part of this DAG */
                         localDags: components["schemas"]["LocalDag"][];
@@ -8186,6 +8047,11 @@ export interface operations {
                      * @default false
                      */
                     singleton?: boolean;
+                    /**
+                     * @description If true, execute eligible build steps without reusing prior materializations
+                     * @default false
+                     */
+                    noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
                     /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
@@ -8262,6 +8128,11 @@ export interface operations {
                      * @default false
                      */
                     singleton?: boolean;
+                    /**
+                     * @description If true, execute eligible build steps without reusing prior materializations
+                     * @default false
+                     */
+                    noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
                     /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
@@ -8351,6 +8222,11 @@ export interface operations {
                      * @default false
                      */
                     singleton?: boolean;
+                    /**
+                     * @description If true, execute eligible build steps without reusing prior materializations
+                     * @default false
+                     */
+                    noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
                     /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
@@ -8764,7 +8640,7 @@ export interface operations {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
                 /** @description A search query string */
                 q: string;
@@ -8810,15 +8686,19 @@ export interface operations {
             };
         };
     };
-    searchDocFeed: {
+    searchWikiPageFeed: {
         parameters: {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
+                /** @description Optional Wiki page path prefix within the selected workspace */
+                prefix?: components["parameters"]["WikiPagePrefix"];
                 /** @description A search query string */
                 q: string;
+                /** @description Only return Wiki pages carrying every given tag (case-insensitive) */
+                tags?: string[];
                 /** @description Opaque cursor returned by the previous search response */
                 cursor?: components["parameters"]["SearchCursor"];
                 /** @description Number of search results to return (default 20, max 50) */
@@ -8830,13 +8710,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cursor-based document search results */
+            /** @description Cursor-based Wiki page search results */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocSearchFeedResponse"];
+                    "application/json": components["schemas"]["WikiPageSearchFeedResponse"];
                 };
             };
             /** @description Invalid request */
@@ -8868,7 +8748,7 @@ export interface operations {
                 q: string;
                 /** @description Filter DAG matches by labels (comma-separated). Returns matches only when the DAG has ALL specified labels. */
                 labels?: string;
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
                 /** @description Opaque cursor returned by the previous search response */
                 cursor?: components["parameters"]["SearchCursor"];
@@ -8922,15 +8802,15 @@ export interface operations {
             };
         };
     };
-    searchDocMatches: {
+    searchWikiPageMatches: {
         parameters: {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
-                /** @description Document path (may include slashes for nested docs) */
-                path: components["schemas"]["DocPath"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
                 /** @description A search query string */
                 q: string;
                 /** @description Opaque cursor returned by the previous search response */
@@ -8944,7 +8824,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cursor-based document match snippets */
+            /** @description Cursor-based Wiki page match snippets */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -8962,7 +8842,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Document not found */
+            /** @description Wiki page not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8987,7 +8867,7 @@ export interface operations {
             query?: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
             };
             header?: never;
@@ -9021,7 +8901,7 @@ export interface operations {
             query?: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
             };
             header?: never;
@@ -9067,7 +8947,7 @@ export interface operations {
                 cursor?: components["parameters"]["DAGRunListCursor"];
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
                 /** @description Filter DAG-runs by name */
                 name?: string;
@@ -9141,6 +9021,11 @@ export interface operations {
                      * @default false
                      */
                     singleton?: boolean;
+                    /**
+                     * @description If true, execute eligible build steps without reusing prior materializations
+                     * @default false
+                     */
+                    noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
                     /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
@@ -9218,6 +9103,11 @@ export interface operations {
                      * @default false
                      */
                     singleton?: boolean;
+                    /**
+                     * @description If true, execute eligible build steps without reusing prior materializations
+                     * @default false
+                     */
+                    noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
                     /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
@@ -9283,7 +9173,7 @@ export interface operations {
                 cursor?: components["parameters"]["DAGRunListCursor"];
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
             };
             header?: never;
@@ -10078,8 +9968,11 @@ export interface operations {
             content: {
                 "application/json": {
                     dagRunId: components["schemas"]["DAGRunId"] & unknown;
-                    /** @description Optional. If provided, only this step will be retried. */
+                    /** @description Optional. If provided, this step will be retried. Combine with includeDownstream to also reset reachable descendants. */
                     stepName?: string;
+                    /** @description Optional. When true, retry the selected step and every reachable descendant. Requires stepName. Unrelated branches keep their existing status. */
+                    includeDownstream?: boolean;
+                    subDAGRunId?: components["schemas"]["DAGRunId"] & unknown;
                 };
             };
         };
@@ -10090,6 +9983,159 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    completeHumanTask: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run; must not be the special 'latest' alias */
+                dagRunId: components["parameters"]["DAGRunConcreteId"];
+                /** @description explicit ID of the human-task step */
+                stepId: components["parameters"]["HumanTaskStepId"];
+            };
+            cookie?: never;
+        };
+        /** @description Typed form input. The JSON request body is limited to 16 MiB. */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HumanTaskInput"];
+            };
+        };
+        responses: {
+            /** @description Human task completed or an identical prior completion confirmed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HumanTaskCompletionResponse"];
+                };
+            };
+            /** @description Malformed or invalid human-task input */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description DAG-run or human task not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Human task is not actionable or completion conflicts with current state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Human-task input exceeds the 16 MiB request-body limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Completion was stored but the DAG-run retry could not be queued */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    resumeHumanTaskDAGRun: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run; must not be the special 'latest' alias */
+                dagRunId: components["parameters"]["DAGRunConcreteId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The retry was queued or was already queued or running */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HumanTaskResumeResponse"];
+                };
+            };
+            /** @description DAG-run not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The DAG-run still has waiting steps or no recoverable human-task checkpoint */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The retry could not be queued and remains retryable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             /** @description Generic error response */
             default: {
@@ -10521,6 +10567,143 @@ export interface operations {
             };
             /** @description DAG-run or step not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    respondDAGRunStepAgentInteraction: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                interactionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentInteractionResponseRequest"];
+            };
+        };
+        responses: {
+            /** @description Interaction response stored and resume attempted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentInteractionResponse"];
+                };
+            };
+            /** @description Invalid or stale interaction response */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description DAG-run, step, or interaction not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Managed session owner is unavailable or state changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    restartDAGRunStepAgentSession: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Clean session restart queued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentSessionRestartResponse"];
+                };
+            };
+            /** @description Step does not have a restartable managed-agent session */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description DAG-run or step not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Managed session state changed */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -11314,6 +11497,145 @@ export interface operations {
             };
         };
     };
+    respondSubDAGRunStepAgentInteraction: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                subDAGRunId: string;
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                interactionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentInteractionResponseRequest"];
+            };
+        };
+        responses: {
+            /** @description Interaction response stored and resume attempted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentInteractionResponse"];
+                };
+            };
+            /** @description Invalid or stale interaction response */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Sub DAG-run, step, or interaction not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Managed session owner is unavailable or state changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    restartSubDAGRunStepAgentSession: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                subDAGRunId: string;
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Clean session restart queued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentSessionRestartResponse"];
+                };
+            };
+            /** @description Step does not have a restartable managed-agent session */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Sub DAG-run or step not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Managed session state changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listQueues: {
         parameters: {
             query?: {
@@ -11606,8 +11928,15 @@ export interface operations {
             header?: {
                 /** @description Bearer token for webhook authentication (e.g., 'Bearer dagu_wh_...'). Required only when the webhook auth mode includes token authentication. */
                 Authorization?: string;
-                /** @description HMAC webhook signature in the format 'sha256=<hex>'. Required only when the webhook auth mode includes HMAC authentication with strict enforcement. */
+                /** @description HMAC webhook signature in the format `sha256=<hex>`. Required only
+                 *     when the webhook auth mode includes HMAC authentication with strict
+                 *     enforcement. Sign the raw request body when `X-Dagu-Profile` is
+                 *     absent. When it is present, sign
+                 *     `x-dagu-profile:<profile>\n<raw-request-body>`.
+                 *      */
                 "X-Dagu-Signature"?: string;
+                /** @description Runtime profile selected for this DAG run. The profile must be allowed by the webhook profile-selection policy. Omit the header to use the DAG's default profile resolution. */
+                "X-Dagu-Profile"?: components["schemas"]["RuntimeProfileName"];
             };
             path: {
                 /** @description the name of the DAG file */
@@ -13087,6 +13416,63 @@ export interface operations {
             };
         };
     };
+    configureDAGWebhookProfileSelection: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WebhookProfileSelectionRequest"];
+            };
+        };
+        responses: {
+            /** @description Webhook profile selection updated successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDetails"];
+                };
+            };
+            /** @description Invalid or unavailable runtime profile */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No webhook or runtime profile found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     toggleDAGWebhook: {
         parameters: {
             query?: {
@@ -14294,7 +14680,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The sync item identifier (file path without extension) */
+                /** @description The sync item identifier. Supporting file IDs include their extension. */
                 itemId: string;
             };
             cookie?: never;
@@ -14310,7 +14696,7 @@ export interface operations {
                     "application/json": components["schemas"]["SyncItemDiffResponse"];
                 };
             };
-            /** @description Item not found */
+            /** @description Sync item not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14338,7 +14724,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The sync item identifier (file path without extension) */
+                /** @description The sync item identifier. Supporting file IDs include their extension. */
                 itemId: string;
             };
             cookie?: never;
@@ -14349,7 +14735,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Item published successfully */
+            /** @description Sync item published successfully */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14358,7 +14744,7 @@ export interface operations {
                     "application/json": components["schemas"]["SyncResultResponse"];
                 };
             };
-            /** @description Item not found */
+            /** @description Sync item not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14395,7 +14781,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The sync item identifier (file path without extension) */
+                /** @description The sync item identifier. Supporting file IDs include their extension. */
                 itemId: string;
             };
             cookie?: never;
@@ -14411,7 +14797,7 @@ export interface operations {
                     "application/json": components["schemas"]["SuccessResponse"];
                 };
             };
-            /** @description Item not found */
+            /** @description Sync item not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14439,14 +14825,14 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The sync item identifier (file path without extension) */
+                /** @description The sync item identifier. Supporting file IDs include their extension. */
                 itemId: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Item forgotten successfully */
+            /** @description Sync item forgotten successfully */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14455,7 +14841,7 @@ export interface operations {
                     "application/json": components["schemas"]["SuccessResponse"];
                 };
             };
-            /** @description Item cannot be forgotten */
+            /** @description Sync item cannot be forgotten */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -14464,7 +14850,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Item not found */
+            /** @description Sync item not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14492,7 +14878,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The sync item identifier (file path without extension) */
+                /** @description The sync item identifier. Supporting file IDs include their extension. */
                 itemId: string;
             };
             cookie?: never;
@@ -14502,13 +14888,13 @@ export interface operations {
                 "application/json": {
                     /** @description Commit message for the deletion */
                     message?: string;
-                    /** @description Force delete even if item has local modifications */
+                    /** @description Force delete even if the sync item has local modifications */
                     force?: boolean;
                 };
             };
         };
         responses: {
-            /** @description Item deleted successfully */
+            /** @description Sync item deleted successfully */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14517,7 +14903,7 @@ export interface operations {
                     "application/json": components["schemas"]["SuccessResponse"];
                 };
             };
-            /** @description Item cannot be deleted */
+            /** @description Sync item cannot be deleted */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -14526,7 +14912,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Item not found */
+            /** @description Sync item not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14554,7 +14940,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description The current sync item identifier (file path without extension) */
+                /** @description The current sync item identifier. Supporting file IDs include their extension. */
                 itemId: string;
             };
             cookie?: never;
@@ -14562,17 +14948,17 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    /** @description The new item identifier to rename to */
+                    /** @description The new sync item identifier */
                     newItemId: string;
                     /** @description Commit message for the move */
                     message?: string;
-                    /** @description Force move even if item has conflicts */
+                    /** @description Force move even if the sync item has conflicts */
                     force?: boolean;
                 };
             };
         };
         responses: {
-            /** @description Item moved successfully */
+            /** @description Sync item moved successfully */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14581,7 +14967,7 @@ export interface operations {
                     "application/json": components["schemas"]["SuccessResponse"];
                 };
             };
-            /** @description Item cannot be moved */
+            /** @description Sync item cannot be moved */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -14590,7 +14976,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Item not found */
+            /** @description Sync item not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14638,14 +15024,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Missing items deleted successfully */
+            /** @description Missing sync items deleted successfully */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        /** @description List of deleted item IDs */
+                        /** @description List of deleted sync item IDs */
                         deleted: string[];
                         /** @description Summary message */
                         message: string;
@@ -14688,14 +15074,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Items deleted successfully */
+            /** @description Sync items deleted successfully */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        /** @description List of deleted item IDs */
+                        /** @description List of deleted sync item IDs */
                         deleted: string[];
                         /** @description Summary message */
                         message: string;
@@ -14711,7 +15097,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Item not found */
+            /** @description Sync item not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -14750,7 +15136,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        /** @description List of forgotten item IDs */
+                        /** @description List of forgotten sync item IDs */
                         forgotten: string[];
                         /** @description Summary message */
                         message: string;
@@ -15047,7 +15433,7 @@ export interface operations {
             };
         };
     };
-    getAgentConfig: {
+    getLicenseStatus: {
         parameters: {
             query?: {
                 /** @description name of the remote node */
@@ -15059,1781 +15445,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Agent configuration */
+            /** @description Current license status */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AgentConfigResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    updateAgentConfig: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateAgentConfigRequest"];
-            };
-        };
-        responses: {
-            /** @description Updated agent configuration */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentConfigResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    listAgentModels: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description List of models */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListModelsResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    createAgentModel: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateModelConfigRequest"];
-            };
-        };
-        responses: {
-            /** @description Model created */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ModelConfigResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Model already exists */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    listAgentAuthProviders: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description List of auth providers */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListAgentAuthProvidersResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    startAgentAuthProviderLogin: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Auth provider ID */
-                providerId: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Login flow started */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["StartAgentAuthProviderLoginResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    disconnectAgentAuthProviderLogin: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Auth provider ID */
-                providerId: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Provider disconnected */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    completeAgentAuthProviderLogin: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Auth provider ID */
-                providerId: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CompleteAgentAuthProviderLoginRequest"];
-            };
-        };
-        responses: {
-            /** @description Login completed */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CompleteAgentAuthProviderLoginResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    deleteAgentModel: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Model ID */
-                modelId: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Model deleted */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    updateAgentModel: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Model ID */
-                modelId: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateModelConfigRequest"];
-            };
-        };
-        responses: {
-            /** @description Model updated */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ModelConfigResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    setDefaultAgentModel: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SetDefaultModelRequest"];
-            };
-        };
-        responses: {
-            /** @description Default model set */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SetDefaultModelResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    getAgentMemory: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Agent memory overview */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentMemoryResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    updateAgentMemory: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateAgentMemoryRequest"];
-            };
-        };
-        responses: {
-            /** @description Memory updated successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    deleteAgentMemory: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Memory cleared successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    getAgentDAGMemory: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Name of the DAG */
-                dagName: components["schemas"]["DAGName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description DAG memory content */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentDAGMemoryResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    updateAgentDAGMemory: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Name of the DAG */
-                dagName: components["schemas"]["DAGName"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateAgentMemoryRequest"];
-            };
-        };
-        responses: {
-            /** @description DAG memory updated successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    deleteAgentDAGMemory: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Name of the DAG */
-                dagName: components["schemas"]["DAGName"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description DAG memory cleared successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    listModelPresets: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description List of model presets */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListModelPresetsResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    listAgentTools: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description List of tools */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListAgentToolsResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    listAgentSouls: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description page number of items to fetch (default is 1) */
-                page?: components["parameters"]["Page"];
-                /** @description number of items per page (default is 30, max is 100) */
-                perPage?: components["parameters"]["PerPage"];
-                /** @description Search query (matches name, description) */
-                q?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description List of souls */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListSoulsResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    createAgentSoul: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateSoulRequest"];
-            };
-        };
-        responses: {
-            /** @description Soul created */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SoulResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Soul already exists */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    getAgentSoul: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description The soul ID */
-                soulId: components["parameters"]["SoulId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Soul details */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SoulResponse"];
-                };
-            };
-            /** @description Invalid soul ID */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Soul not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    deleteAgentSoul: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description The soul ID */
-                soulId: components["parameters"]["SoulId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Soul deleted */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Invalid soul ID */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Soul not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    updateAgentSoul: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description The soul ID */
-                soulId: components["parameters"]["SoulId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateSoulRequest"];
-            };
-        };
-        responses: {
-            /** @description Soul updated */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SoulResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Requires admin role */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Soul not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    listAgentSessions: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Pagination mode. Use `cursor` for the agent session sidebar infinite-loading flow; omit or use `offset` for compatibility pagination. */
-                paginationMode?: components["parameters"]["AgentSessionPaginationMode"];
-                /** @description Opaque cursor for loading the next page of older agent sessions */
-                cursor?: components["parameters"]["AgentSessionCursor"];
-                /** @description page number of items to fetch (default is 1) */
-                page?: components["parameters"]["Page"];
-                /** @description number of items per page (default is 30, max is 100) */
-                perPage?: components["parameters"]["PerPage"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Paginated list of sessions */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListAgentSessionsResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    createAgentSession: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AgentChatRequest"];
-            };
-        };
-        responses: {
-            /** @description Session created */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CreateAgentSessionResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Agent not configured */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    getAgentSession: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Unique identifier of the agent session */
-                sessionId: components["parameters"]["AgentSessionId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Session details */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentSessionDetailResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Session not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    chatAgentSession: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Unique identifier of the agent session */
-                sessionId: components["parameters"]["AgentSessionId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AgentChatRequest"];
-            };
-        };
-        responses: {
-            /** @description Message accepted */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentStatusResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Session not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Agent not configured */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    cancelAgentSession: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Unique identifier of the agent session */
-                sessionId: components["parameters"]["AgentSessionId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Session cancelled */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentStatusResponse"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Session not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Unexpected error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    respondAgentSession: {
-        parameters: {
-            query?: {
-                /** @description name of the remote node */
-                remoteNode?: components["parameters"]["RemoteNode"];
-            };
-            header?: never;
-            path: {
-                /** @description Unique identifier of the agent session */
-                sessionId: components["parameters"]["AgentSessionId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AgentUserPromptResponse"];
-            };
-        };
-        responses: {
-            /** @description Response accepted */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentStatusResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Not authenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Session not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Prompt expired or already answered */
-            410: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
+                    "application/json": components["schemas"]["LicenseStatusResponse"];
                 };
             };
             /** @description Unexpected error */
@@ -16960,27 +15578,31 @@ export interface operations {
             };
         };
     };
-    listDocs: {
+    listWikiPages: {
         parameters: {
             query?: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
+                /** @description Optional Wiki page path prefix within the selected workspace */
+                prefix?: components["parameters"]["WikiPagePrefix"];
                 /** @description page number of items to fetch (default is 1) */
                 page?: components["parameters"]["Page"];
-                /** @description number of items per page (default is 30, max is 100) */
-                perPage?: components["parameters"]["PerPage"];
+                /** @description Number of Wiki page entries per page (default 50, max 200) */
+                perPage?: components["parameters"]["WikiPagesPerPage"];
                 /** @description If true, returns flat list instead of tree */
                 flat?: boolean;
+                /** @description Only return Wiki pages carrying every given tag (case-insensitive). Effective in flat mode only. */
+                tags?: string[];
                 /** @description Field to sort by:
                  *     - `name`: Alphabetically by display name (case-insensitive)
                  *     - `type`: By node type (dirs vs files), then alphabetically within each group
                  *     - `mtime`: By last modification time
                  *      */
-                sort?: PathsDocsGetParametersQuerySort;
+                sort?: PathsWikiGetParametersQuerySort;
                 /** @description Sort order. For type: asc=folders first. For mtime: desc=newest first. */
-                order?: PathsDocsGetParametersQueryOrder;
+                order?: PathsWikiGetParametersQueryOrder;
             };
             header?: never;
             path?: never;
@@ -16988,13 +15610,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description List of documents */
+            /** @description List of Wiki pages */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocListResponse"];
+                    "application/json": components["schemas"]["WikiPageListResponse"];
                 };
             };
             /** @description Unexpected error */
@@ -17008,12 +15630,12 @@ export interface operations {
             };
         };
     };
-    createDoc: {
+    createWikiPage: {
         parameters: {
             query?: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
             };
             header?: never;
@@ -17022,11 +15644,11 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["CreateDocRequest"];
+                "application/json": components["schemas"]["CreateWikiPageRequest"];
             };
         };
         responses: {
-            /** @description Document created */
+            /** @description Wiki page created */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -17046,7 +15668,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Document already exists */
+            /** @description Wiki page already exists */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17066,12 +15688,12 @@ export interface operations {
             };
         };
     };
-    searchDocs: {
+    searchWikiPages: {
         parameters: {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
                 /** @description Search query */
                 q: string;
@@ -17088,7 +15710,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocSearchResponse"];
+                    "application/json": components["schemas"]["WikiPageSearchResponse"];
                 };
             };
             /** @description Missing query parameter */
@@ -17111,15 +15733,15 @@ export interface operations {
             };
         };
     };
-    getDoc: {
+    listWikiPageBacklinks: {
         parameters: {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
-                /** @description Document path (may include slashes for nested docs) */
-                path: components["schemas"]["DocPath"];
+                /** @description Wiki page path or scheme-prefixed wiki-link target (for example dag:name) */
+                target: string;
             };
             header?: never;
             path?: never;
@@ -17127,16 +15749,52 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Document details */
+            /** @description Wiki pages linking to the target */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocResponse"];
+                    "application/json": components["schemas"]["WikiPageBacklinksResponse"];
                 };
             };
-            /** @description Document not found */
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listWikiPageRevisions: {
+        parameters: {
+            query: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
+                workspace?: components["parameters"]["Workspace"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stored revisions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiPageRevisionsResponse"];
+                };
+            };
+            /** @description Wiki page not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -17156,15 +15814,17 @@ export interface operations {
             };
         };
     };
-    deleteDoc: {
+    getWikiPageRevision: {
         parameters: {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
-                /** @description Document path (may include slashes for nested docs) */
-                path: components["schemas"]["DocPath"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
+                /** @description Revision identifier from the revision list */
+                rev: string;
             };
             header?: never;
             path?: never;
@@ -17172,14 +15832,222 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Document deleted */
+            /** @description Revision with content */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiPageRevisionResponse"];
+                };
+            };
+            /** @description Wiki page or revision not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    downloadWikiPageAttachment: {
+        parameters: {
+            query: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
+                workspace?: components["parameters"]["Workspace"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
+                /** @description Attachment file name (single path segment) */
+                name: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Attachment content */
+            200: {
+                headers: {
+                    /** @description Attachment filename */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Wiki page or attachment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    uploadWikiPageAttachment: {
+        parameters: {
+            query: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
+                workspace?: components["parameters"]["Workspace"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
+                /** @description Attachment file name (single path segment) */
+                name: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Attachment stored */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiPageAttachmentResponse"];
+                };
+            };
+            /** @description Invalid attachment name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Wiki page not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Attachment too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getWikiPage: {
+        parameters: {
+            query: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
+                workspace?: components["parameters"]["Workspace"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Wiki page details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WikiPageResponse"];
+                };
+            };
+            /** @description Wiki page not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    deleteWikiPage: {
+        parameters: {
+            query: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
+                workspace?: components["parameters"]["Workspace"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Wiki page deleted */
             204: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Document not found */
+            /** @description Wiki page not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -17199,15 +16067,15 @@ export interface operations {
             };
         };
     };
-    updateDoc: {
+    updateWikiPage: {
         parameters: {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
-                /** @description Document path (may include slashes for nested docs) */
-                path: components["schemas"]["DocPath"];
+                /** @description Wiki page path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
             };
             header?: never;
             path?: never;
@@ -17215,11 +16083,11 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["UpdateDocRequest"];
+                "application/json": components["schemas"]["UpdateWikiPageRequest"];
             };
         };
         responses: {
-            /** @description Document updated */
+            /** @description Wiki page updated */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -17230,7 +16098,7 @@ export interface operations {
                     };
                 };
             };
-            /** @description Document not found */
+            /** @description Wiki page not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -17250,15 +16118,15 @@ export interface operations {
             };
         };
     };
-    renameDoc: {
+    renameWikiPage: {
         parameters: {
             query: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
-                /** @description Current document or directory path (may include slashes for nested docs) */
-                path: components["schemas"]["DocPath"];
+                /** @description Current Wiki page or directory path (may include slashes for nested pages) */
+                path: components["schemas"]["WikiPagePath"];
             };
             header?: never;
             path?: never;
@@ -17266,11 +16134,11 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["RenameDocRequest"];
+                "application/json": components["schemas"]["RenameWikiPageRequest"];
             };
         };
         responses: {
-            /** @description Document or directory renamed */
+            /** @description Wiki page or directory renamed */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -17281,7 +16149,7 @@ export interface operations {
                     };
                 };
             };
-            /** @description Document or directory not found */
+            /** @description Wiki page or directory not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -17310,12 +16178,12 @@ export interface operations {
             };
         };
     };
-    deleteDocBatch: {
+    deleteWikiPageBatch: {
         parameters: {
             query?: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
-                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default. */
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
             };
             header?: never;
@@ -17324,7 +16192,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["DocDeleteBatchRequest"];
+                "application/json": components["schemas"]["WikiPageDeleteBatchRequest"];
             };
         };
         responses: {
@@ -17334,7 +16202,16 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocDeleteBatchResponse"];
+                    "application/json": components["schemas"]["WikiPageDeleteBatchResponse"];
+                };
+            };
+            /** @description Invalid batch delete request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Unexpected error */
@@ -19722,6 +18599,15 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            /** @description Workspace still contains Wiki pages */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     updateWorkspace: {
@@ -19780,12 +18666,12 @@ export enum PathsDagsGetParametersQueryOrder {
     asc = "asc",
     desc = "desc"
 }
-export enum PathsDocsGetParametersQuerySort {
+export enum PathsWikiGetParametersQuerySort {
     name = "name",
     type = "type",
     mtime = "mtime"
 }
-export enum PathsDocsGetParametersQueryOrder {
+export enum PathsWikiGetParametersQueryOrder {
     asc = "asc",
     desc = "desc"
 }
@@ -19794,6 +18680,11 @@ export enum ChatMessageRole {
     user = "user",
     assistant = "assistant",
     tool = "tool"
+}
+export enum AgentInteractionResponseRequestDecision {
+    once = "once",
+    session = "session",
+    reject = "reject"
 }
 export enum ErrorCode {
     forbidden = "forbidden",
@@ -19810,7 +18701,10 @@ export enum ErrorCode {
     auth_token_invalid = "auth.token_invalid",
     auth_forbidden = "auth.forbidden",
     timeout = "timeout",
-    rate_limited = "rate_limited"
+    rate_limited = "rate_limited",
+    conflict = "conflict",
+    human_task_resume_failed = "human_task_resume_failed",
+    payload_too_large = "payload_too_large"
 }
 export enum WebhookAuthMode {
     token_only = "token_only",
@@ -19829,14 +18723,21 @@ export enum NotificationProviderType {
     email = "email",
     webhook = "webhook",
     slack = "slack",
-    telegram = "telegram"
+    telegram = "telegram",
+    teams = "teams"
 }
 export enum NotificationEventType {
     dag_run_waiting = "dag.run.waiting",
     dag_run_succeeded = "dag.run.succeeded",
+    dag_run_partially_succeeded = "dag.run.partially_succeeded",
     dag_run_failed = "dag.run.failed",
     dag_run_aborted = "dag.run.aborted",
     dag_run_rejected = "dag.run.rejected"
+}
+export enum NotificationSMTPOAuthProvider {
+    microsoft = "microsoft",
+    google_service_account = "google_service_account",
+    google_refresh = "google_refresh"
 }
 export enum NotificationRouteScope {
     global = "global",
@@ -19955,19 +18856,36 @@ export enum WorkerHealthStatus {
     warning = "warning",
     unhealthy = "unhealthy"
 }
+export enum DAGDetailsType {
+    graph = "graph",
+    chain = "chain",
+    agent = "agent",
+    build = "build"
+}
 export enum ValueReferenceNoticeReason {
     unknown_step_id = "unknown_step_id",
     unknown_output_name = "unknown_output_name",
     missing_dependency = "missing_dependency",
     self_reference = "self_reference",
     namespace_unavailable = "namespace_unavailable",
-    unknown_context_field = "unknown_context_field"
+    unknown_context_field = "unknown_context_field",
+    unknown_env_binding = "unknown_env_binding",
+    unknown_const_name = "unknown_const_name"
+}
+export enum ValueReferenceNoticeClass {
+    defect = "defect",
+    runtime_only = "runtime_only"
 }
 export enum ParamDefType {
     string = "string",
     integer = "integer",
     number = "number",
     boolean = "boolean"
+}
+export enum DAGRunConditionStatus {
+    True = "True",
+    False = "False",
+    Unknown = "Unknown"
 }
 export enum ArtifactNodeType {
     directory = "directory",
@@ -19980,9 +18898,59 @@ export enum ArtifactPreviewKind {
     image = "image",
     binary = "binary"
 }
+export enum AgentEventKind {
+    action = "action",
+    task_status = "task_status",
+    ask_user = "ask_user",
+    rejected = "rejected",
+    stalled = "stalled"
+}
+export enum AgentTaskStatus {
+    open = "open",
+    completed = "completed",
+    skipped = "skipped",
+    failed = "failed"
+}
+export enum BuildExecutionDecision {
+    none = "none",
+    always = "always",
+    execute = "execute",
+    reuse = "reuse",
+    deferred = "deferred"
+}
+export enum BuildExecutionPhase {
+    precondition = "precondition",
+    evaluate = "evaluate",
+    execute = "execute",
+    verify = "verify",
+    commit = "commit",
+    complete = "complete"
+}
+export enum AgentSessionState {
+    starting = "starting",
+    running = "running",
+    waiting = "waiting",
+    succeeded = "succeeded",
+    failed = "failed",
+    aborted = "aborted",
+    unavailable = "unavailable"
+}
+export enum AgentInteractionKind {
+    permission = "permission",
+    question = "question"
+}
+export enum AgentInteractionStatus {
+    pending = "pending",
+    answered = "answered",
+    rejected = "rejected"
+}
 export enum StepOutputDeclarationType {
     string = "string",
     json = "json"
+}
+export enum WikiPageTreeNodeResponseType {
+    file = "file",
+    directory = "directory"
 }
 export enum RepeatMode {
     While = "while",
@@ -20001,7 +18969,8 @@ export enum UserRole {
 }
 export enum UserAuthProvider {
     builtin = "builtin",
-    oidc = "oidc"
+    oidc = "oidc",
+    proxy = "proxy"
 }
 export enum APIKeyAllowedSurfaces {
     rest_api = "rest_api",
@@ -20043,120 +19012,13 @@ export enum SyncSummary {
 }
 export enum SyncItemKind {
     dag = "dag",
-    config = "config",
-    memory = "memory",
-    skill = "skill",
-    soul = "soul",
-    doc = "doc"
+    doc = "doc",
+    doc_asset = "doc-asset",
+    file = "file"
 }
 export enum SyncAuthConfigType {
     token = "token",
     ssh = "ssh"
-}
-export enum AgentBashPolicyDefaultBehavior {
-    allow = "allow",
-    deny = "deny"
-}
-export enum AgentBashPolicyDenyBehavior {
-    ask_user = "ask_user",
-    block = "block"
-}
-export enum AgentBashRuleAction {
-    allow = "allow",
-    deny = "deny"
-}
-export enum AgentWebToolsBackend {
-    tavily = "tavily",
-    firecrawl = "firecrawl"
-}
-export enum AgentTavilyWebToolsConfigSearchDepth {
-    basic = "basic",
-    advanced = "advanced",
-    fast = "fast",
-    ultra_fast = "ultra-fast"
-}
-export enum ModelConfigResponseProvider {
-    anthropic = "anthropic",
-    openai = "openai",
-    openai_codex = "openai-codex",
-    gemini = "gemini",
-    openrouter = "openrouter",
-    local = "local",
-    zai = "zai",
-    opencode = "opencode"
-}
-export enum ModelConfigResponseThinkingEffort {
-    low = "low",
-    medium = "medium",
-    high = "high",
-    xhigh = "xhigh"
-}
-export enum CreateModelConfigRequestProvider {
-    anthropic = "anthropic",
-    openai = "openai",
-    openai_codex = "openai-codex",
-    gemini = "gemini",
-    openrouter = "openrouter",
-    local = "local",
-    zai = "zai",
-    opencode = "opencode"
-}
-export enum CreateModelConfigRequestThinkingEffort {
-    low = "low",
-    medium = "medium",
-    high = "high",
-    xhigh = "xhigh"
-}
-export enum UpdateModelConfigRequestProvider {
-    anthropic = "anthropic",
-    openai = "openai",
-    openai_codex = "openai-codex",
-    gemini = "gemini",
-    openrouter = "openrouter",
-    local = "local",
-    zai = "zai",
-    opencode = "opencode"
-}
-export enum UpdateModelConfigRequestThinkingEffort {
-    low = "low",
-    medium = "medium",
-    high = "high",
-    xhigh = "xhigh"
-}
-export enum DocTreeNodeResponseType {
-    file = "file",
-    directory = "directory"
-}
-export enum ModelPresetProvider {
-    anthropic = "anthropic",
-    openai = "openai",
-    openai_codex = "openai-codex",
-    gemini = "gemini",
-    openrouter = "openrouter",
-    local = "local",
-    zai = "zai",
-    opencode = "opencode"
-}
-export enum ModelPresetThinkingEffort {
-    low = "low",
-    medium = "medium",
-    high = "high",
-    xhigh = "xhigh"
-}
-export enum AgentUserPromptPromptType {
-    general = "general",
-    command_approval = "command_approval"
-}
-export enum AgentMessageType {
-    user = "user",
-    assistant = "assistant",
-    error = "error",
-    ui_action = "ui_action",
-    user_prompt = "user_prompt"
-}
-export enum AgentDelegateSnapshotStatus {
-    running = "running",
-    completed = "completed"
 }
 export enum CreateRemoteNodeRequestAuthType {
     none = "none",
@@ -20193,9 +19055,10 @@ export enum SecretProviderType {
     dagu_managed = "dagu-managed",
     vault = "vault",
     kubernetes = "kubernetes",
-    gcp_secret_manager = "gcp-secret-manager",
-    aws_secrets_manager = "aws-secrets-manager",
-    azure_key_vault = "azure-key-vault"
+    gcp = "gcp",
+    aws = "aws",
+    azure = "azure",
+    alibaba = "alibaba"
 }
 export enum SecretStatus {
     active = "active",
@@ -20204,12 +19067,29 @@ export enum SecretStatus {
 export enum CreateSecretRequestProviderType {
     dagu_managed = "dagu-managed"
 }
-export enum ViewSpecType {
-    kanban = "kanban"
+export enum ViewColumn {
+    queued = "queued",
+    running = "running",
+    review = "review",
+    done = "done",
+    failed = "failed"
 }
-export enum ComponentsParametersAgentSessionPaginationMode {
-    offset = "offset",
-    cursor = "cursor"
+export enum ViewWorkspaceScope {
+    all = "all",
+    default = "default",
+    workspace = "workspace"
+}
+export enum ViewSortField {
+    name = "name",
+    nextRun = "nextRun"
+}
+export enum ViewSortOrder {
+    asc = "asc",
+    desc = "desc"
+}
+export enum ViewSpecType {
+    kanban = "kanban",
+    workflow = "workflow"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",

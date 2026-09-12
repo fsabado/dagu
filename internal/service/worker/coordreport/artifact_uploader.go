@@ -5,6 +5,7 @@ package coordreport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,10 +13,12 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
 var _ runtime.ArtifactFinalizer = (*ArtifactUploader)(nil)
@@ -27,8 +30,9 @@ type ArtifactUploader struct {
 	dagRunID  string
 	dagName   string
 	attemptID string
-	rootRef   exec.DAGRunRef
-	owner     exec.HostInfo
+	claimKey  string
+	rootRef   ir.DAGRunRef
+	owner     serviceregistry.HostInfo
 	mu        sync.RWMutex
 }
 
@@ -39,10 +43,10 @@ func NewArtifactUploader(
 	dagRunID string,
 	dagName string,
 	attemptID string,
-	rootRef exec.DAGRunRef,
-	owner ...exec.HostInfo,
+	rootRef ir.DAGRunRef,
+	owner ...serviceregistry.HostInfo,
 ) *ArtifactUploader {
-	var target exec.HostInfo
+	var target serviceregistry.HostInfo
 	if len(owner) > 0 {
 		target = owner[0]
 	}
@@ -64,6 +68,13 @@ func (u *ArtifactUploader) SetAttemptID(attemptID string) {
 	u.attemptID = attemptID
 }
 
+// SetClaimKey binds uploaded artifacts to the task claim that authorizes the run.
+func (u *ArtifactUploader) SetClaimKey(claimKey string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.claimKey = claimKey
+}
+
 // Finalize uploads artifacts for the finalized attempt before the terminal status is written.
 func (u *ArtifactUploader) Finalize(ctx context.Context, attemptID, dir string) error {
 	u.SetAttemptID(attemptID)
@@ -74,6 +85,19 @@ func (u *ArtifactUploader) getAttemptID() string {
 	u.mu.RLock()
 	defer u.mu.RUnlock()
 	return u.attemptID
+}
+
+func (u *ArtifactUploader) attemptKey(attemptID string) string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	if u.claimKey != "" {
+		return u.claimKey
+	}
+	root := u.rootRef
+	if root.Zero() {
+		root = ir.NewDAGRunRef(u.dagName, u.dagRunID)
+	}
+	return ir.GenerateAttemptKey(root.Name, root.ID, u.dagName, u.dagRunID, attemptID)
 }
 
 func (u *ArtifactUploader) openStream(ctx context.Context) (coordinatorv1.CoordinatorService_StreamArtifactsClient, error) {
@@ -90,8 +114,26 @@ func (u *ArtifactUploader) UploadDir(ctx context.Context, dir string) error {
 	}
 
 	attemptID := u.getAttemptID()
+	err := u.uploadDir(ctx, dir, attemptID)
+	if !isRetryableStreamError(err) {
+		return err
+	}
+
+	retryCtx, cancel := context.WithTimeout(ctx, finalDeliveryRetryTimeout)
+	defer cancel()
+	return backoff.Retry(retryCtx, func(ctx context.Context) error {
+		return u.uploadDir(ctx, dir, attemptID)
+	}, finalDeliveryRetryPolicy(), isRetryableStreamError)
+}
+
+func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string) error {
 	seq := uint64(0)
 	var stream coordinatorv1.CoordinatorService_StreamArtifactsClient
+	defer func() {
+		if stream != nil {
+			_ = stream.CloseSend()
+		}
+	}()
 
 	sendChunk := func(chunk *coordinatorv1.ArtifactChunk) error {
 		if stream == nil {
@@ -101,7 +143,13 @@ func (u *ArtifactUploader) UploadDir(ctx context.Context, dir string) error {
 				return err
 			}
 		}
-		return stream.Send(chunk)
+		err := stream.Send(chunk)
+		if errors.Is(err, io.EOF) {
+			if _, terminalErr := stream.CloseAndRecv(); terminalErr != nil {
+				return terminalErr
+			}
+		}
+		return err
 	}
 
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
@@ -141,6 +189,7 @@ func (u *ArtifactUploader) UploadDir(ctx context.Context, dir string) error {
 						RootDagRunId:       u.rootRef.ID,
 						AttemptId:          attemptID,
 						OwnerCoordinatorId: u.owner.ID,
+						AttemptKey:         u.attemptKey(attemptID),
 					}
 					if err := sendChunk(chunk); err != nil {
 						return fmt.Errorf("send artifact chunk: %w", err)
@@ -167,6 +216,7 @@ func (u *ArtifactUploader) UploadDir(ctx context.Context, dir string) error {
 				RootDagRunId:       u.rootRef.ID,
 				AttemptId:          attemptID,
 				OwnerCoordinatorId: u.owner.ID,
+				AttemptKey:         u.attemptKey(attemptID),
 			}); err != nil {
 				return fmt.Errorf("send artifact final marker: %w", err)
 			}

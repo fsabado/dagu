@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/persis"
-	"github.com/dagucloud/dagu/internal/view"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/view"
 )
 
 var _ view.Store = (*ViewStore)(nil)
@@ -27,8 +29,8 @@ type ViewStore struct {
 }
 
 // NewViewStore creates a ViewStore backed by col.
-func NewViewStore(col persis.Collection) (*ViewStore, error) {
-	return &ViewStore{col: col}, nil
+func NewViewStore(col persis.Collection) *ViewStore {
+	return &ViewStore{col: col}
 }
 
 // Create stores a new view. Returns [view.ErrViewExists] if a view with the
@@ -54,12 +56,18 @@ func (s *ViewStore) Create(ctx context.Context, v *view.View) error {
 		return fmt.Errorf("view store: precheck: %w", err)
 	}
 
-	return s.col.Put(ctx, &persis.Record{
+	if err := s.col.Put(ctx, &persis.Record{
 		ID:        v.ID,
 		Data:      data,
 		CreatedAt: v.CreatedAt,
 		UpdatedAt: v.UpdatedAt,
-	})
+	}); err != nil {
+		return err
+	}
+	if err := s.clearOtherDefaultsLocked(ctx, v); err != nil {
+		logger.Warn(ctx, "Failed to clear competing defaults after creating view", tag.Name(v.ID), tag.Error(err))
+	}
+	return nil
 }
 
 // GetByID retrieves a view by ID. Returns [view.ErrViewNotFound] if absent.
@@ -139,6 +147,9 @@ func (s *ViewStore) Update(ctx context.Context, v *view.View, expectedWorkspace 
 		}
 		return err
 	}
+	if err := s.clearOtherDefaultsLocked(ctx, v); err != nil {
+		logger.Warn(ctx, "Failed to clear competing defaults after updating view", tag.Name(v.ID), tag.Error(err))
+	}
 	return nil
 }
 
@@ -180,4 +191,46 @@ func viewFromRecord(rec *persis.Record) (*view.View, error) {
 		return nil, fmt.Errorf("view store: decode record %q: %w", rec.ID, err)
 	}
 	return stored.ToView(), nil
+}
+
+func (s *ViewStore) clearOtherDefaultsLocked(ctx context.Context, selected *view.View) error {
+	if !selected.Default {
+		return nil
+	}
+	records, err := listAll(ctx, s.col, persis.ListQuery{})
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.ID == selected.ID {
+			continue
+		}
+		candidate, err := viewFromRecord(record)
+		if err != nil {
+			logger.Warn(ctx, "Skipped unreadable view while clearing competing defaults", tag.Name(record.ID), tag.Error(err))
+			continue
+		}
+		if !candidate.Default || !sameDefaultScope(candidate, selected) {
+			continue
+		}
+		candidate.Default = false
+		candidate.UpdatedAt = time.Now().UTC()
+		data, err := persis.Encode(candidate.ToStorage())
+		if err != nil {
+			return err
+		}
+		if err := s.col.CompareAndSwap(ctx, candidate.ID, record.Data, data); err != nil {
+			if errors.Is(err, persis.ErrConflict) {
+				return view.ErrViewChanged
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func sameDefaultScope(left, right *view.View) bool {
+	return left.Type == right.Type &&
+		left.WorkspaceScope == right.WorkspaceScope &&
+		left.Workspace == right.Workspace
 }

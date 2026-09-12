@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/service/audit"
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/wiki"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 func workspaceStoreUnavailable() *Error {
@@ -66,6 +69,23 @@ func (a *API) CreateWorkspace(ctx context.Context, request api.CreateWorkspaceRe
 			Code:    api.ErrorCodeBadRequest,
 			Message: "Workspace name must contain only letters, numbers, underscores, and hyphens",
 		}, nil
+	}
+
+	a.workspaceWikiMu.Lock()
+	defer a.workspaceWikiMu.Unlock()
+
+	wikiStore := a.wikiStore
+	if wikiStore != nil {
+		pageExists, directoryExists, err := wikiStore.PathExists(ctx, body.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect workspace Wiki page path: %w", err)
+		}
+		if pageExists || directoryExists {
+			return api.CreateWorkspace409JSONResponse{
+				Code:    api.ErrorCodeAlreadyExists,
+				Message: "Workspace name conflicts with an existing Wiki page path",
+			}, nil
+		}
 	}
 
 	ws := workspace.NewWorkspace(body.Name, valueOf(body.Description))
@@ -122,6 +142,9 @@ func (a *API) UpdateWorkspace(ctx context.Context, request api.UpdateWorkspaceRe
 		return nil, workspaceStoreUnavailable()
 	}
 
+	a.workspaceWikiMu.Lock()
+	defer a.workspaceWikiMu.Unlock()
+
 	existing, err := a.workspaceStore.GetByID(ctx, request.WorkspaceId)
 	if err != nil {
 		if errors.Is(err, workspace.ErrWorkspaceNotFound) {
@@ -139,6 +162,7 @@ func (a *API) UpdateWorkspace(ctx context.Context, request api.UpdateWorkspaceRe
 		}, nil
 	}
 
+	updated := *existing
 	body := request.Body
 	if body.Name != nil {
 		if err := workspace.ValidateName(*body.Name); err != nil {
@@ -148,15 +172,59 @@ func (a *API) UpdateWorkspace(ctx context.Context, request api.UpdateWorkspaceRe
 				HTTPStatus: http.StatusBadRequest,
 			}
 		}
-		existing.Name = *body.Name
+		updated.Name = *body.Name
 	}
 	if body.Description != nil {
-		existing.Description = *body.Description
+		updated.Description = *body.Description
 	}
 
-	existing.UpdatedAt = time.Now().UTC()
+	updated.UpdatedAt = time.Now().UTC()
 
-	if err := a.workspaceStore.Update(ctx, existing); err != nil {
+	wikiStore := a.wikiStore
+	wikiMoved := false
+	if wikiStore != nil && updated.Name != existing.Name {
+		oldPageExists, oldDirectoryExists, err := wikiStore.PathExists(ctx, existing.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect current workspace Wiki page path: %w", err)
+		}
+		newPageExists, newDirectoryExists, err := wikiStore.PathExists(ctx, updated.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect new workspace Wiki page path: %w", err)
+		}
+		if oldPageExists || newPageExists || newDirectoryExists {
+			return api.UpdateWorkspace409JSONResponse{
+				Code:    api.ErrorCodeAlreadyExists,
+				Message: "Workspace rename conflicts with an existing Wiki page path",
+			}, nil
+		}
+		if oldDirectoryExists {
+			if err := wikiStore.Rename(ctx, existing.Name, updated.Name); err != nil {
+				if errors.Is(err, wiki.ErrPageAlreadyExists) || errors.Is(err, wiki.ErrPagePathConflict) {
+					return api.UpdateWorkspace409JSONResponse{
+						Code:    api.ErrorCodeAlreadyExists,
+						Message: "Workspace rename conflicts with an existing Wiki page path",
+					}, nil
+				}
+				return nil, fmt.Errorf("failed to rename workspace Wiki pages: %w", err)
+			}
+			wikiMoved = true
+		}
+	}
+
+	if err := a.workspaceStore.Update(ctx, &updated); err != nil {
+		if wikiMoved {
+			if rollbackErr := wikiStore.Rename(ctx, updated.Name, existing.Name); rollbackErr != nil {
+				logger.Error(ctx, "Failed to restore workspace Wiki pages after update failure",
+					tag.String("current-page-id", updated.Name),
+					tag.String("restore-page-id", existing.Name),
+					tag.Error(rollbackErr),
+				)
+				return nil, errors.Join(
+					fmt.Errorf("failed to update workspace: %w", err),
+					fmt.Errorf("failed to restore workspace Wiki pages: %w", rollbackErr),
+				)
+			}
+		}
 		if errors.Is(err, workspace.ErrWorkspaceAlreadyExists) {
 			return api.UpdateWorkspace409JSONResponse{
 				Code:    api.ErrorCodeAlreadyExists,
@@ -167,11 +235,11 @@ func (a *API) UpdateWorkspace(ctx context.Context, request api.UpdateWorkspaceRe
 	}
 
 	a.logAudit(ctx, audit.CategoryWorkspace, "workspace_update", map[string]string{
-		"id":   existing.ID,
-		"name": existing.Name,
+		"id":   updated.ID,
+		"name": updated.Name,
 	})
 
-	return api.UpdateWorkspace200JSONResponse(toWorkspaceResponse(existing)), nil
+	return api.UpdateWorkspace200JSONResponse(toWorkspaceResponse(&updated)), nil
 }
 
 // DeleteWorkspace deletes a workspace by ID.
@@ -182,6 +250,9 @@ func (a *API) DeleteWorkspace(ctx context.Context, request api.DeleteWorkspaceRe
 	if a.workspaceStore == nil {
 		return nil, workspaceStoreUnavailable()
 	}
+
+	a.workspaceWikiMu.Lock()
+	defer a.workspaceWikiMu.Unlock()
 
 	ws, err := a.workspaceStore.GetByID(ctx, request.WorkspaceId)
 	if err != nil {
@@ -198,6 +269,20 @@ func (a *API) DeleteWorkspace(ctx context.Context, request api.DeleteWorkspaceRe
 			Code:    api.ErrorCodeNotFound,
 			Message: "Workspace not found",
 		}, nil
+	}
+
+	wikiStore := a.wikiStore
+	if wikiStore != nil {
+		pageExists, directoryExists, err := wikiStore.PathExists(ctx, ws.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect workspace Wiki page path: %w", err)
+		}
+		if pageExists || directoryExists {
+			return api.DeleteWorkspace409JSONResponse{
+				Code:    api.ErrorCodeConflict,
+				Message: "Delete workspace Wiki pages before deleting the workspace",
+			}, nil
+		}
 	}
 
 	if err := a.workspaceStore.Delete(ctx, request.WorkspaceId); err != nil {

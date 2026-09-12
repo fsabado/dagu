@@ -12,7 +12,6 @@ import {
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { components } from '../../../api/v1/schema';
 import { AppBarContext } from '../../../contexts/AppBarContext';
-import { usePageContext } from '../../../contexts/PageContext';
 import { RemoteNodeProvider } from '../../../contexts/RemoteNodeContext';
 import { UnsavedChangesProvider } from '../../../contexts/UnsavedChangesContext';
 import {
@@ -38,6 +37,7 @@ import {
   WorkspaceKind,
   workspaceNameFromLabels,
 } from '../../../lib/workspace';
+import { I18nText } from '@/i18n/I18nText';
 
 type Params = {
   fileName: string;
@@ -51,7 +51,6 @@ function DAGDetails() {
   const params = useParams<Params>();
   const navigate = useNavigate();
   const appBarContext = useContext(AppBarContext);
-  const { setContext } = usePageContext();
   const [searchParams] = useSearchParams();
 
   const dagRunId = searchParams.get('dagRunId');
@@ -83,24 +82,10 @@ function DAGDetails() {
   );
   const fileName = params.fileName || '';
 
-  // Set page context for agent chat
-  useEffect(() => {
-    if (fileName) {
-      setContext({
-        dagFile: fileName,
-        dagRunId: dagRunId || undefined,
-        source: 'dag-details-page',
-      });
-    }
-    return () => {
-      setContext(null);
-    };
-  }, [fileName, dagRunId, setContext]);
-
   const dagSSE = useDAGSSE(fileName, !!fileName, remoteNode);
 
   // Determine active tab
-  const tab = params.tab || 'status';
+  const tab = params.tab === 'docs' ? 'wiki' : params.tab || 'status';
 
   // Format duration utility function
   const formatDuration = useCallback(
@@ -148,6 +133,12 @@ function DAGDetails() {
     },
     [fileName, navigate, buildUrl]
   );
+
+  useEffect(() => {
+    if (params.tab === 'docs' && fileName) {
+      navigate(buildUrl(`/dags/${fileName}/wiki`), { replace: true });
+    }
+  }, [buildUrl, fileName, navigate, params.tab]);
 
   // Navigate to status tab - convenience wrapper for handleTabChange
   const navigateToStatusTab = useCallback(() => {
@@ -346,7 +337,6 @@ function DAGDetails() {
                     dag={dagData.dag}
                     currentDAGRun={displayDAGRun}
                     fileName={fileName}
-                    filePath={dagData.filePath}
                     refreshFn={refreshData}
                     formatDuration={formatDuration}
                     navigateToStatusTab={navigateToStatusTab}
@@ -355,7 +345,6 @@ function DAGDetails() {
                   <div className="min-h-0 flex-1">
                     <DAGDetailsContent
                       fileName={fileName}
-                      filePath={dagData.filePath}
                       dag={dagData.dag}
                       currentDAGRun={displayDAGRun}
                       refreshFn={refreshData}
@@ -378,7 +367,7 @@ function DAGDetails() {
               )}
               {dagData?.dag && !dagMatchesWorkspace && (
                 <div className="p-6 text-sm text-muted-foreground">
-                  This DAG is not in the selected workspace.
+                  <I18nText text={"This DAG is not in the selected workspace."} />
                 </div>
               )}
             </div>

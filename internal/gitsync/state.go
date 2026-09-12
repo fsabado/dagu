@@ -4,30 +4,32 @@
 package gitsync
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
-// SyncStatus represents the synchronization status of a DAG.
+// SyncStatus represents the synchronization status of a tracked item.
 type SyncStatus string
 
 const (
-	// StatusSynced indicates the DAG is in sync with remote.
+	// StatusSynced indicates the item is in sync with remote.
 	StatusSynced SyncStatus = "synced"
 
-	// StatusModified indicates the DAG has local modifications.
+	// StatusModified indicates the item has local modifications.
 	StatusModified SyncStatus = "modified"
 
-	// StatusUntracked indicates the DAG exists only locally.
+	// StatusUntracked indicates the item exists only locally.
 	StatusUntracked SyncStatus = "untracked"
 
 	// StatusConflict indicates a conflict between local and remote versions.
@@ -38,58 +40,61 @@ const (
 )
 
 const (
-	agentMemoryDir = "memory"
-	agentSkillsDir = "skills"
-	agentSoulsDir  = "souls"
-	agentDocsDir   = "docs"
-	baseConfigID   = "base"
+	wikiDir       = "wiki"
+	legacyDocsDir = "docs"
+	baseConfigID  = "base"
+
+	// wikiPageAssetsDirName is the reserved subtree holding page attachments.
+	wikiPageAssetsDirName = ".attachments"
 )
 
-// DAGKind represents the type of tracked item in git sync.
-type DAGKind string
+// SyncItemKind identifies a supported Git Sync item type.
+type SyncItemKind string
 
 const (
-	// DAGKindDAG indicates a regular DAG definition file.
-	DAGKindDAG DAGKind = "dag"
-
-	// DAGKindMemory indicates an agent memory file under memory/.
-	DAGKindMemory DAGKind = "memory"
-
-	// DAGKindSkill indicates an agent skill file under skills/.
-	DAGKindSkill DAGKind = "skill"
-
-	// DAGKindSoul indicates an agent soul file under souls/.
-	DAGKindSoul DAGKind = "soul"
-
-	// DAGKindDoc indicates a document file under docs/.
-	DAGKindDoc DAGKind = "doc"
-
-	// DAGKindConfig indicates a global or workspace base config file.
-	DAGKindConfig DAGKind = "config"
+	SyncItemKindDAG      SyncItemKind = "dag"
+	SyncItemKindWikiPage SyncItemKind = "doc"
+	SyncItemKindFile     SyncItemKind = "file"
+	// SyncItemKindWikiPageAsset is a binary page attachment. Its ID keeps the
+	// file extension so names inside one attachment
+	// directory differ only by extension.
+	SyncItemKindWikiPageAsset SyncItemKind = "doc-asset"
 )
 
-// KindForDAGID returns the DAG kind derived from a DAG ID.
-func KindForDAGID(id string) DAGKind {
+// SyncItemKindForID derives the item type from its normalized ID.
+func SyncItemKindForID(id string) SyncItemKind {
 	id = normalizeDAGIDSeparators(id)
-	if isConfigFile(id) {
-		return DAGKindConfig
+	if hasWikiPrefix(id, wikiPageAssetsDirName+"/") {
+		return SyncItemKindWikiPageAsset
 	}
-	if strings.HasPrefix(id, agentMemoryDir+"/") {
-		return DAGKindMemory
+	if hasWikiPrefix(id, "") {
+		return SyncItemKindWikiPage
 	}
-	if strings.HasPrefix(id, agentSkillsDir+"/") {
-		return DAGKindSkill
-	}
-	if strings.HasPrefix(id, agentSoulsDir+"/") {
-		return DAGKindSoul
-	}
-	if strings.HasPrefix(id, agentDocsDir+"/") {
-		return DAGKindDoc
-	}
-	return DAGKindDAG
+	return SyncItemKindDAG
 }
 
-func isConfigFile(id string) bool {
+func hasWikiPrefix(id, suffix string) bool {
+	return strings.HasPrefix(id, wikiDir+"/"+suffix) ||
+		strings.HasPrefix(id, legacyDocsDir+"/"+suffix)
+}
+
+func isWikiPageFile(id string) bool {
+	return SyncItemKindForID(id) == SyncItemKindWikiPage
+}
+
+func isWikiPageAssetFile(id string) bool {
+	return SyncItemKindForID(id) == SyncItemKindWikiPageAsset
+}
+
+func wikiRepoDirForID(id string) string {
+	id = normalizeDAGIDSeparators(id)
+	if strings.HasPrefix(id, legacyDocsDir+"/") {
+		return legacyDocsDir
+	}
+	return wikiDir
+}
+
+func isBaseConfigID(id string) bool {
 	id = normalizeDAGIDSeparators(id)
 	if id == baseConfigID {
 		return true
@@ -116,26 +121,6 @@ func normalizeDAGIDSeparators(id string) string {
 	return strings.ReplaceAll(id, "\\", "/")
 }
 
-// isMemoryFile returns true if the file ID belongs to the memory directory.
-func isMemoryFile(id string) bool {
-	return KindForDAGID(id) == DAGKindMemory
-}
-
-// isSkillFile returns true if the file ID belongs to the skills directory.
-func isSkillFile(id string) bool {
-	return KindForDAGID(id) == DAGKindSkill
-}
-
-// isSoulFile returns true if the file ID belongs to the souls directory.
-func isSoulFile(id string) bool {
-	return KindForDAGID(id) == DAGKindSoul
-}
-
-// isDocFile returns true if the file ID belongs to the docs directory.
-func isDocFile(id string) bool {
-	return KindForDAGID(id) == DAGKindDoc
-}
-
 // State represents the overall sync state.
 type State struct {
 	// Version is the state file format version.
@@ -159,28 +144,31 @@ type State struct {
 	// LastError is the error message from the last failed sync.
 	LastError *string `json:"lastError,omitempty"`
 
-	// DAGs contains the sync state for each DAG.
-	DAGs map[string]*DAGState `json:"dags"`
+	// Items contains sync state keyed by normalized item ID.
+	Items map[string]*SyncItemState `json:"dags"`
 }
 
-// DAGState represents the sync state for a single DAG.
-type DAGState struct {
+// SyncItemState represents the sync state for a single item.
+type SyncItemState struct {
 	// Status is the current sync status.
 	Status SyncStatus `json:"status"`
 
-	// Kind identifies whether this item is a DAG or memory file.
-	Kind DAGKind `json:"kind,omitempty"`
+	// Kind identifies the tracked item type.
+	Kind SyncItemKind `json:"kind,omitempty"`
 
-	// BaseCommit is the commit hash when the DAG was last synced.
+	// FileExtension is the extension used by the tracked file.
+	FileExtension string `json:"fileExtension,omitempty"`
+
+	// BaseCommit is the commit hash when the item was last synced.
 	BaseCommit string `json:"baseCommit,omitempty"`
 
-	// LastSyncedHash is the content hash when the DAG was last synced.
+	// LastSyncedHash is the content hash when the item was last synced.
 	LastSyncedHash string `json:"lastSyncedHash,omitempty"`
 
-	// LastSyncedAt is when the DAG was last synced.
+	// LastSyncedAt is when the item was last synced.
 	LastSyncedAt *time.Time `json:"lastSyncedAt,omitempty"`
 
-	// ModifiedAt is when the DAG was last modified locally.
+	// ModifiedAt is when the item was last modified locally.
 	ModifiedAt *time.Time `json:"modifiedAt,omitempty"`
 
 	// LocalHash is the current local content hash.
@@ -194,6 +182,18 @@ type DAGState struct {
 
 	// RemoteMessage is the commit message of the conflicting remote commit.
 	RemoteMessage string `json:"remoteMessage,omitempty"`
+
+	// LastSyncedExecutable is the executable bit at the last successful sync.
+	LastSyncedExecutable bool `json:"lastSyncedExecutable,omitempty"`
+
+	// LocalExecutable is the current local executable bit.
+	LocalExecutable bool `json:"localExecutable,omitempty"`
+
+	// RemoteExecutable is the executable bit of a conflicting remote file.
+	RemoteExecutable bool `json:"remoteExecutable,omitempty"`
+
+	// RemoteDeleted indicates that a conflicting remote file was deleted.
+	RemoteDeleted bool `json:"remoteDeleted,omitempty"`
 
 	// ConflictDetectedAt is when the conflict was detected.
 	ConflictDetectedAt *time.Time `json:"conflictDetectedAt,omitempty"`
@@ -236,7 +236,7 @@ func (m *StateManager) Load() (*State, error) {
 			// Return empty state
 			m.state = &State{
 				Version: 1,
-				DAGs:    make(map[string]*DAGState),
+				Items:   make(map[string]*SyncItemState),
 			}
 			return m.state, nil
 		}
@@ -248,12 +248,29 @@ func (m *StateManager) Load() (*State, error) {
 		return nil, fmt.Errorf("failed to parse state file: %w", err)
 	}
 
-	if state.DAGs == nil {
-		state.DAGs = make(map[string]*DAGState)
+	if state.Items == nil {
+		state.Items = make(map[string]*SyncItemState)
 	}
+	normalizeTrackedItems(&state)
 
 	m.state = &state
 	return m.state, nil
+}
+
+func normalizeTrackedItems(state *State) {
+	for itemID, itemState := range state.Items {
+		if itemState == nil {
+			delete(state.Items, itemID)
+			continue
+		}
+		switch itemState.Kind {
+		case "":
+			itemState.Kind = SyncItemKindForID(itemID)
+		case SyncItemKindDAG, SyncItemKindWikiPage, SyncItemKindWikiPageAsset, SyncItemKindFile:
+		default:
+			delete(state.Items, itemID)
+		}
+	}
 }
 
 // Save saves the state to disk.
@@ -301,7 +318,14 @@ func (m *StateManager) GetState() (*State, error) {
 
 // ComputeContentHash computes the SHA256 hash of content bytes.
 func ComputeContentHash(content []byte) string {
+	hash, _ := computeContentHash(bytes.NewReader(content))
+	return hash
+}
+
+func computeContentHash(reader io.Reader) (string, error) {
 	h := sha256.New()
-	h.Write(content)
-	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+	if _, err := io.Copy(h, reader); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }

@@ -17,15 +17,14 @@ import (
 	"strings"
 	"sync"
 	"text/template"
-	"time"
 
-	apiv1 "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/license"
-	"github.com/dagucloud/dagu/internal/service/frontend/api/pathutil"
-	workspacepkg "github.com/dagucloud/dagu/internal/workspace"
+	apiv1 "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/license"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/api/pathutil"
+	workspacepkg "github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 //go:embed templates/* assets/*
@@ -113,11 +112,6 @@ type UpdateChecker interface {
 	GetUpdateInfo() (updateAvailable bool, latestVersion string)
 }
 
-// AgentEnabledChecker provides the agent enabled status for template rendering.
-type AgentEnabledChecker interface {
-	IsEnabled(ctx context.Context) bool
-}
-
 type funcsConfig struct {
 	NavbarColor           string
 	NavbarTitle           string
@@ -132,19 +126,26 @@ type funcsConfig struct {
 	AuthMode              config.AuthMode
 	OIDCEnabled           bool
 	OIDCButtonLabel       string
+	ProxyEnabled          bool
+	ProxyButtonLabel      string
 	TerminalEnabled       bool
 	GitSyncEnabled        bool
 	WorkspaceStore        workspacepkg.Store
 
 	SetupRequiredChecker SetupRequiredChecker
 	UpdateChecker        UpdateChecker
-	AgentEnabledChecker  AgentEnabledChecker
 	LicenseChecker       license.Checker
 	LicenseManager       *license.Manager
 }
 
 func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 	boolStr := func(b bool) string { return strconv.FormatBool(b) }
+	licenseStatus := func() license.Status {
+		if cfg.LicenseManager != nil {
+			return cfg.LicenseManager.Status()
+		}
+		return license.StatusFor(cfg.LicenseChecker)
+	}
 
 	return template.FuncMap{
 		"defTitle":              func(v any) string { s, _ := v.(string); return s },
@@ -160,6 +161,7 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 		"remoteNodes":           func() string { return strings.Join(cfg.RemoteNodes, ",") },
 		"authMode":              func() string { return string(cfg.AuthMode) },
 		"oidcButtonLabel":       func() string { return cfg.OIDCButtonLabel },
+		"proxyButtonLabel":      func() string { return cfg.ProxyButtonLabel },
 		"initialWorkspacesJSON": func() string {
 			if cfg.WorkspaceStore == nil {
 				return "[]"
@@ -209,14 +211,17 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 			}
 			return "true"
 		},
-		"terminalEnabled": func() string { return boolStr(cfg.TerminalEnabled) },
-		"gitSyncEnabled":  func() string { return boolStr(cfg.GitSyncEnabled) },
-		"agentEnabled": func() string {
-			if cfg.AgentEnabledChecker == nil {
+		"proxyEnabled": func() string {
+			if !cfg.ProxyEnabled {
 				return "false"
 			}
-			return boolStr(cfg.AgentEnabledChecker.IsEnabled(context.Background()))
+			if cfg.LicenseChecker != nil && !cfg.LicenseChecker.IsFeatureEnabled(license.FeatureSSO) {
+				return "false"
+			}
+			return "true"
 		},
+		"terminalEnabled": func() string { return boolStr(cfg.TerminalEnabled) },
+		"gitSyncEnabled":  func() string { return boolStr(cfg.GitSyncEnabled) },
 
 		"setupRequired": func() string {
 			if cfg.SetupRequiredChecker == nil {
@@ -241,80 +246,54 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 
 		// License functions
 		"licenseValid": func() string {
-			if cfg.LicenseChecker == nil || cfg.LicenseChecker.IsCommunity() {
-				return "false"
-			}
-			claims := cfg.LicenseChecker.Claims()
-			if claims.ExpiresAt == nil {
-				return "true" // perpetual
-			}
-			if claims.ExpiresAt.After(time.Now()) {
-				return "true"
-			}
-			return "false"
+			return boolStr(licenseStatus().Valid)
 		},
 		"licensePlan": func() string {
-			if cfg.LicenseChecker == nil {
-				return ""
-			}
-			return cfg.LicenseChecker.Plan()
+			return licenseStatus().Plan
 		},
 		"licenseExpiry": func() string {
-			if cfg.LicenseChecker == nil {
+			status := licenseStatus()
+			if status.Expiry.IsZero() {
 				return ""
 			}
-			claims := cfg.LicenseChecker.Claims()
-			if claims == nil || claims.ExpiresAt == nil {
-				return ""
-			}
-			return claims.ExpiresAt.Format("2006-01-02T15:04:05Z")
+			return status.Expiry.Format("2006-01-02T15:04:05Z")
 		},
 		"licenseFeatures": func() string {
-			if cfg.LicenseChecker == nil {
+			features := licenseStatus().Features
+			if len(features) == 0 {
 				return "[]"
 			}
-			claims := cfg.LicenseChecker.Claims()
-			if claims == nil || len(claims.Features) == 0 {
-				return "[]"
-			}
-			b, err := json.Marshal(claims.Features)
+			b, err := json.Marshal(features)
 			if err != nil {
 				return "[]"
 			}
 			return string(b)
 		},
 		"licenseGracePeriod": func() string {
-			if cfg.LicenseChecker == nil {
-				return "false"
-			}
-			return boolStr(cfg.LicenseChecker.IsGracePeriod())
+			return boolStr(licenseStatus().GracePeriod)
 		},
 		"licenseGraceEndsAt": func() string {
-			if cfg.LicenseChecker == nil {
+			status := licenseStatus()
+			if status.GraceEndsAt.IsZero() {
 				return ""
 			}
-			return graceEndsAt(cfg.LicenseChecker.Claims())
+			return status.GraceEndsAt.Format("2006-01-02T15:04:05Z")
 		},
 		"licenseCommunity": func() string {
-			if cfg.LicenseChecker == nil {
-				return "true"
-			}
-			return boolStr(cfg.LicenseChecker.IsCommunity())
+			return boolStr(licenseStatus().Community)
 		},
 		"licenseWarningCode": func() string {
-			if cfg.LicenseChecker == nil {
-				return ""
-			}
-			return cfg.LicenseChecker.WarningCode()
+			return licenseStatus().WarningCode
+		},
+		"licenseError": func() string {
+			return licenseStatus().Failure
 		},
 		"licenseSource": func() string {
-			if cfg.LicenseManager == nil {
-				return ""
-			}
-			if cfg.LicenseManager.Source().IsEnv() {
+			source := licenseStatus().Source
+			if source.IsEnv() {
 				return "env"
 			}
-			if cfg.LicenseManager.Source() == license.SourceNone {
+			if source == license.SourceNone {
 				return ""
 			}
 			return "file"
@@ -326,6 +305,8 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 		"pathSuspendFlagsDir":    func() string { return cfg.Paths.SuspendFlagsDir },
 		"pathAdminLogsDir":       func() string { return cfg.Paths.AdminLogsDir },
 		"pathBaseConfig":         func() string { return cfg.Paths.BaseConfig },
+		"pathWikiDir":            func() string { return cfg.Paths.WikiDir },
+		"pathDocsDir":            func() string { return cfg.Paths.WikiDir },
 		"pathDAGRunsDir":         func() string { return cfg.Paths.DAGRunsDir },
 		"pathQueueDir":           func() string { return cfg.Paths.QueueDir },
 		"pathProcDir":            func() string { return cfg.Paths.ProcDir },
@@ -335,17 +316,4 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 		"pathGitSyncDir":         func() string { return path.Join(cfg.Paths.DataDir, "gitsync") },
 		"pathAuditLogsDir":       func() string { return path.Join(cfg.Paths.AdminLogsDir, "audit") },
 	}
-}
-
-func graceEndsAt(claims *license.LicenseClaims) string {
-	if claims == nil || claims.ExpiresAt == nil {
-		return ""
-	}
-
-	graceDays := 14
-	if claims.GraceDays != nil {
-		graceDays = max(*claims.GraceDays, 0)
-	}
-
-	return claims.ExpiresAt.Time.Add(time.Duration(graceDays) * 24 * time.Hour).Format("2006-01-02T15:04:05Z")
 }

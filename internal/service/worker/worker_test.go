@@ -7,17 +7,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/backoff"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/service/worker"
-	"github.com/dagucloud/dagu/internal/test"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/service/worker"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -387,6 +388,24 @@ func TestWorkerWithLabels(t *testing.T) {
 	})
 }
 
+func TestWorkerRejectsConflictingPlatformLabels(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := worker.NewWorker(
+		"conflicting-platform",
+		1,
+		newMockCoordinatorCli(),
+		map[string]string{"os": "not-" + runtime.GOOS},
+		&config.Config{},
+	)
+	w.SetHandler(&mockHandler{})
+
+	err := w.Start(ctx)
+	require.ErrorContains(t, err, `worker label "os" conflicts with built-in platform value`)
+}
+
 func TestWorkerHeartbeat(t *testing.T) {
 	t.Run("SendsHeartbeats", func(t *testing.T) {
 		// Setup test environment
@@ -429,6 +448,8 @@ func TestWorkerHeartbeat(t *testing.T) {
 				found = true
 				assert.Equal(t, int32(3), wk.TotalPollers)
 				assert.NotZero(t, wk.LastHeartbeatAt)
+				assert.Equal(t, runtime.GOOS, wk.Labels["os"])
+				assert.Equal(t, runtime.GOARCH, wk.Labels["arch"])
 				break
 			}
 		}
@@ -695,7 +716,7 @@ func TestWorkerCancellation(t *testing.T) {
 		var validationCalls atomic.Int32
 		executedTaskIDs := make(chan string, 2)
 
-		mockCoordinatorCli.RunHeartbeatFunc = func(_ context.Context, owner exec.HostInfo, req *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
+		mockCoordinatorCli.RunHeartbeatFunc = func(_ context.Context, owner serviceregistry.HostInfo, req *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
 			callNum := validationCalls.Add(1)
 			assert.Equal(t, "coord-a", owner.ID)
 			assert.Len(t, req.RunningTasks, 1)
@@ -777,7 +798,7 @@ func TestWorkerCancellation(t *testing.T) {
 
 	t.Run("OwnerValidationFailureDoesNotBlockExecution", func(t *testing.T) {
 		mockCoordinatorCli := newMockCoordinatorCli()
-		mockCoordinatorCli.RunHeartbeatFunc = func(_ context.Context, _ exec.HostInfo, _ *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
+		mockCoordinatorCli.RunHeartbeatFunc = func(_ context.Context, _ serviceregistry.HostInfo, _ *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
 			return nil, errors.New("owner unavailable")
 		}
 

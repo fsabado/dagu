@@ -16,20 +16,25 @@ import (
 	"strings"
 	"sync"
 
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	coreexec "github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
 var errForeachItemFailed = errors.New("one or more foreach item bodies failed")
 
+var _ executor.StatusDetailsProvider = (*foreachExecutor)(nil)
+
 type foreachExecutor struct {
-	step   core.Step
-	stdout io.Writer
-	stderr io.Writer
-	cancel context.CancelFunc
+	step          ir.Step
+	stdout        io.Writer
+	stderr        io.Writer
+	cancel        context.CancelFunc
+	statusDetails []ir.NodeStatusDetail
 }
 
 type expandedItem struct {
@@ -56,7 +61,7 @@ type aggregateOutput struct {
 	Outputs []map[string]string `json:"outputs"`
 }
 
-func newExecutor(_ context.Context, step core.Step) (executor.Executor, error) {
+func newExecutor(_ context.Context, step ir.Step) (executor.Executor, error) {
 	if step.Foreach == nil {
 		return nil, fmt.Errorf("foreach configuration is missing")
 	}
@@ -79,6 +84,7 @@ func (e *foreachExecutor) Kill(_ os.Signal) error {
 }
 
 func (e *foreachExecutor) Run(ctx context.Context) error {
+	e.statusDetails = nil
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
 	defer cancel()
@@ -89,10 +95,57 @@ func (e *foreachExecutor) Run(ctx context.Context) error {
 	}
 
 	results, runErr := e.runItems(ctx, items)
+	e.statusDetails = foreachStatusDetails(items, results, e.step.Foreach.Key != "")
 	if err := e.writeAggregate(results); err != nil {
 		return err
 	}
 	return runErr
+}
+
+func (e *foreachExecutor) GetStatusDetails() []ir.NodeStatusDetail {
+	return append([]ir.NodeStatusDetail(nil), e.statusDetails...)
+}
+
+func foreachStatusDetails(items []expandedItem, results []itemResult, useKey bool) []ir.NodeStatusDetail {
+	details := make([]ir.NodeStatusDetail, 0, len(results))
+	for i, result := range results {
+		if i >= len(items) {
+			break
+		}
+		details = append(details, ir.NodeStatusDetail{
+			Label:  foreachItemLabel(items[i], useKey),
+			Status: foreachItemStatus(result.Status),
+		})
+	}
+	return details
+}
+
+func foreachItemLabel(item expandedItem, useKey bool) string {
+	if useKey {
+		return item.key
+	}
+	if value, ok := item.value.(string); ok {
+		return value
+	}
+	if value, err := json.Marshal(item.value); err == nil {
+		return string(value)
+	}
+	return item.key
+}
+
+func foreachItemStatus(status string) ir.NodeStatus {
+	switch status {
+	case ir.NodeSucceeded.String():
+		return ir.NodeSucceeded
+	case ir.NodeFailed.String():
+		return ir.NodeFailed
+	case ir.NodeAborted.String():
+		return ir.NodeAborted
+	case ir.NodePartiallySucceeded.String():
+		return ir.NodePartiallySucceeded
+	default:
+		return ir.NodeNotStarted
+	}
 }
 
 func (e *foreachExecutor) expandItems(ctx context.Context) ([]expandedItem, error) {
@@ -101,8 +154,8 @@ func (e *foreachExecutor) expandItems(ctx context.Context) ([]expandedItem, erro
 	if err != nil {
 		return nil, err
 	}
-	if len(values) > core.MaxExpansionConcurrency {
-		return nil, fmt.Errorf("foreach expansion produced %d items; maximum is %d", len(values), core.MaxExpansionConcurrency)
+	if len(values) > ir.MaxExpansionConcurrency {
+		return nil, fmt.Errorf("foreach expansion produced %d items; maximum is %d", len(values), ir.MaxExpansionConcurrency)
 	}
 
 	items := make([]expandedItem, len(values))
@@ -134,7 +187,7 @@ func (e *foreachExecutor) expandItems(ctx context.Context) ([]expandedItem, erro
 	return items, nil
 }
 
-func resolveItems(ctx context.Context, cfg *core.ForeachConfig) ([]any, error) {
+func resolveItems(ctx context.Context, cfg *ir.ForeachConfig) ([]any, error) {
 	if cfg.ItemsExpr != "" {
 		resolved, err := resolveStringValue(ctx, cfg.ItemsExpr, "foreach.items")
 		if err != nil {
@@ -176,7 +229,7 @@ func (e *foreachExecutor) runItems(ctx context.Context, items []expandedItem) ([
 		results[item.index] = itemResult{
 			Index:  item.index,
 			Key:    item.key,
-			Status: core.NodeNotStarted.String(),
+			Status: ir.NodeNotStarted.String(),
 		}
 	}
 	if len(items) == 0 {
@@ -185,7 +238,7 @@ func (e *foreachExecutor) runItems(ctx context.Context, items []expandedItem) ([
 
 	maxConcurrent := e.step.Foreach.MaxConcurrent
 	if maxConcurrent <= 0 {
-		maxConcurrent = core.DefaultMaxConcurrent
+		maxConcurrent = ir.DefaultMaxConcurrent
 	}
 
 	var wg sync.WaitGroup
@@ -214,7 +267,7 @@ dispatch:
 
 	var failed bool
 	for _, result := range results {
-		if result.Status != core.NodeSucceeded.String() {
+		if result.Status != ir.NodeSucceeded.String() {
 			failed = true
 			break
 		}
@@ -228,12 +281,12 @@ dispatch:
 func (e *foreachExecutor) runItem(ctx context.Context, item expandedItem) itemResult {
 	itemCtx, err := contextWithItemScope(ctx, e.step.Foreach.As, item.index, item.key, item.value)
 	if err != nil {
-		return itemResult{Index: item.index, Key: item.key, Status: core.NodeFailed.String(), Error: err.Error()}
+		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: err.Error()}
 	}
 
 	plan, err := runtime.NewPlan(cloneSteps(e.step.Foreach.Steps)...)
 	if err != nil {
-		return itemResult{Index: item.index, Key: item.key, Status: core.NodeFailed.String(), Error: err.Error()}
+		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: err.Error()}
 	}
 
 	bodyRunID := bodyDAGRunID(ctx, item.index)
@@ -243,28 +296,28 @@ func (e *foreachExecutor) runItem(ctx context.Context, item expandedItem) itemRe
 	})
 	err = runner.Run(itemCtx, plan, nil)
 	status := runner.Status(itemCtx, plan)
-	if err != nil || status != core.Succeeded {
+	if err != nil || status != ir.Succeeded {
 		message := status.String()
 		if err != nil {
 			message = err.Error()
 		}
-		return itemResult{Index: item.index, Key: item.key, Status: core.NodeFailed.String(), Error: message}
+		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: message}
 	}
 
 	outputs, err := e.collectOutputs(itemCtx, plan)
 	if err != nil {
-		return itemResult{Index: item.index, Key: item.key, Status: core.NodeFailed.String(), Error: err.Error()}
+		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: err.Error()}
 	}
 	return itemResult{
 		Index:   item.index,
 		Key:     item.key,
-		Status:  core.NodeSucceeded.String(),
+		Status:  ir.NodeSucceeded.String(),
 		Outputs: outputs,
 	}
 }
 
-func cloneSteps(steps []core.Step) []core.Step {
-	cloned := make([]core.Step, len(steps))
+func cloneSteps(steps []ir.Step) []ir.Step {
+	cloned := make([]ir.Step, len(steps))
 	for i, step := range steps {
 		cloned[i] = step
 		if step.ExecutorConfig.Config != nil {
@@ -273,8 +326,8 @@ func cloneSteps(steps []core.Step) []core.Step {
 		}
 		cloned[i].Depends = append([]string(nil), step.Depends...)
 		cloned[i].Env = append([]string(nil), step.Env...)
-		cloned[i].Commands = append([]core.CommandEntry(nil), step.Commands...)
-		cloned[i].Outputs = append([]core.StepOutputDeclaration(nil), step.Outputs...)
+		cloned[i].Commands = append([]ir.CommandEntry(nil), step.Commands...)
+		cloned[i].Outputs = append([]ir.StepOutputDeclaration(nil), step.Outputs...)
 	}
 	return cloned
 }
@@ -286,7 +339,7 @@ func (e *foreachExecutor) collectOutputs(ctx context.Context, plan *runtime.Plan
 		return outputs, nil
 	}
 
-	env := runtime.NewPlanEnv(ctx, core.Step{}, plan)
+	env := runtime.NewPlanEnv(ctx, ir.Step{}, plan)
 	ctx = runtime.WithEnv(ctx, env)
 	for _, name := range sortedCollectNames(collect) {
 		value, err := resolveStringValue(ctx, collect[name], "foreach.collect."+name)
@@ -347,7 +400,7 @@ func (e *foreachExecutor) writeAggregate(results []itemResult) error {
 	}
 	output.Summary.Total = len(results)
 	for _, result := range results {
-		if result.Status == core.NodeSucceeded.String() {
+		if result.Status == ir.NodeSucceeded.String() {
 			output.Summary.Succeeded++
 			if result.Outputs == nil {
 				output.Outputs = append(output.Outputs, map[string]string{})
@@ -374,7 +427,7 @@ func (e *foreachExecutor) writeAggregate(results []itemResult) error {
 func bodyLogDir(ctx context.Context) string {
 	env := runtime.GetEnv(ctx)
 	if env.Scope != nil {
-		if stdout, ok := env.Scope.Get(coreexec.EnvKeyDAGRunStepStdoutFile); ok && stdout != "" {
+		if stdout, ok := env.Scope.Get(runenv.EnvKeyDAGRunStepStdoutFile); ok && stdout != "" {
 			return filepath.Join(filepath.Dir(stdout), "foreach")
 		}
 	}
@@ -407,5 +460,5 @@ func sortedCollectNames(values map[string]string) []string {
 }
 
 func init() {
-	executor.RegisterExecutor(core.ExecutorTypeForeach, newExecutor, nil, core.ExecutorCapabilities{})
+	executor.RegisterExecutor(ir.ExecutorTypeForeach, newExecutor, nil, registry.ExecutorCapabilities{})
 }

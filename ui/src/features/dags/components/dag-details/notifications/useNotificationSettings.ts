@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   components,
@@ -53,11 +53,15 @@ export function useNotificationSettings({
     useState<NotificationRouteSet | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<TestResult[]>([]);
+  const requestSequence = useRef(0);
 
   const fetchData = useCallback(async () => {
+    const requestID = ++requestSequence.current;
     setIsLoading(true);
     setError(null);
+    setLoadError(null);
     try {
       const settingsRequest = fetch(
         `${apiURL}/dags/${encodeURIComponent(fileName)}/notifications${query}`,
@@ -72,13 +76,12 @@ export function useNotificationSettings({
           headers: authHeaders(),
         }
       );
-      const workspaceRoutesRequest =
-        workspaceName
-          ? fetch(
-              `${apiURL}/notification-routes/workspaces/${encodeURIComponent(workspaceName)}${query}`,
-              { headers: authHeaders() }
-            )
-          : Promise.resolve<Response | null>(null);
+      const workspaceRoutesRequest = workspaceName
+        ? fetch(
+            `${apiURL}/notification-routes/workspaces/${encodeURIComponent(workspaceName)}${query}`,
+            { headers: authHeaders() }
+          )
+        : Promise.resolve<Response | null>(null);
       const [
         settingsResponse,
         channelsResponse,
@@ -91,6 +94,10 @@ export function useNotificationSettings({
         workspaceRoutesRequest,
       ]);
 
+      if (requestID !== requestSequence.current) {
+        return;
+      }
+
       if (settingsResponse.status === 404) {
         setDraft(defaultDraft());
         setHasDAGSettings(false);
@@ -100,6 +107,9 @@ export function useNotificationSettings({
         );
       } else {
         const data = (await settingsResponse.json()) as NotificationSettings;
+        if (requestID !== requestSequence.current) {
+          return;
+        }
         setDraft(draftFromAPI(data));
         setHasDAGSettings(true);
       }
@@ -111,6 +121,9 @@ export function useNotificationSettings({
       }
       const channelData =
         (await channelsResponse.json()) as components['schemas']['NotificationChannelListResponse'];
+      if (requestID !== requestSequence.current) {
+        return;
+      }
       setChannels(channelData.channels.map(draftChannelFromAPI));
 
       if (!globalRoutesResponse.ok) {
@@ -121,9 +134,12 @@ export function useNotificationSettings({
           )
         );
       }
-      setGlobalRoutes(
-        (await globalRoutesResponse.json()) as NotificationRouteSet
-      );
+      const nextGlobalRoutes =
+        (await globalRoutesResponse.json()) as NotificationRouteSet;
+      if (requestID !== requestSequence.current) {
+        return;
+      }
+      setGlobalRoutes(nextGlobalRoutes);
 
       if (workspaceRoutesResponse) {
         if (!workspaceRoutesResponse.ok) {
@@ -134,19 +150,28 @@ export function useNotificationSettings({
             )
           );
         }
-        setWorkspaceRoutes(
-          (await workspaceRoutesResponse.json()) as NotificationRouteSet
-        );
+        const nextWorkspaceRoutes =
+          (await workspaceRoutesResponse.json()) as NotificationRouteSet;
+        if (requestID !== requestSequence.current) {
+          return;
+        }
+        setWorkspaceRoutes(nextWorkspaceRoutes);
       } else {
         setWorkspaceRoutes(null);
       }
       setTestResults([]);
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Failed to load notifications'
-      );
+      if (requestID !== requestSequence.current) {
+        return;
+      }
+      const message =
+        err instanceof Error ? err.message : 'Failed to load notifications';
+      setError(message);
+      setLoadError(message);
     } finally {
-      setIsLoading(false);
+      if (requestID === requestSequence.current) {
+        setIsLoading(false);
+      }
     }
   }, [apiURL, fileName, query, workspaceName]);
 
@@ -198,6 +223,7 @@ export function useNotificationSettings({
     effectiveRouteSourceLabel,
     isLoading,
     error,
+    loadError,
     setError,
     testResults,
     setTestResults,

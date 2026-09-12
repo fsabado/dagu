@@ -1,33 +1,44 @@
+import { Bot } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { getHarnessStepSummary, type HarnessAttemptSummary } from '@/lib/harness-step';
+import {
+  getHarnessStepSummary,
+  type HarnessAttemptSummary,
+  type HarnessStepSummary as HarnessSummary,
+} from '@/lib/harness-step';
 import { cn } from '@/lib/utils';
-import { Bot } from 'lucide-react';
 import { components } from '../../../../api/v1/schema';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 type Props = {
   step: components['schemas']['Step'];
   className?: string;
+  compact?: boolean;
 };
 
 const visibleOptionCount = 3;
 const promptTooltipThreshold = 120;
 
-function HarnessStepSummary({ step, className }: Props) {
+function HarnessStepSummary({ step, className, compact = false }: Props) {
   const summary = getHarnessStepSummary(step);
 
   if (!summary) {
     return null;
   }
 
+  if (compact) {
+    return <CompactHarnessSummary summary={summary} className={className} />;
+  }
+
   const promptContent = summary.prompt ? (
     <div className="rounded-md border border-border/70 bg-background/70 px-2 py-1.5">
       <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        Prompt
+        <I18nText text={'Prompt'} />
       </div>
       <div className="line-clamp-3 whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground/90">
         {summary.prompt}
@@ -48,7 +59,7 @@ function HarnessStepSummary({ step, className }: Props) {
           className="h-6 gap-1.5 px-2.5 normal-case tracking-normal"
         >
           <Bot className="h-3.5 w-3.5" />
-          Harness
+          <I18nText text={'Harness'} />
         </Badge>
       </div>
 
@@ -60,8 +71,7 @@ function HarnessStepSummary({ step, className }: Props) {
         />
       ))}
 
-      {summary.prompt &&
-      summary.prompt.length > promptTooltipThreshold ? (
+      {summary.prompt && summary.prompt.length > promptTooltipThreshold ? (
         <Tooltip>
           <TooltipTrigger asChild>
             <div className="cursor-help">{promptContent}</div>
@@ -75,6 +85,69 @@ function HarnessStepSummary({ step, className }: Props) {
       ) : (
         promptContent
       )}
+    </div>
+  );
+}
+
+function CompactHarnessSummary({
+  summary,
+  className,
+}: {
+  summary: HarnessSummary;
+  className?: string;
+}) {
+  const primary = summary.attempts[0];
+  const fallbackCount = Math.max(summary.attempts.length - 1, 0);
+  const optionCount = summary.attempts.reduce(
+    (count, attempt) => count + attempt.options.length,
+    0
+  );
+
+  return (
+    <div className={cn('min-w-0 space-y-1.5', className)}>
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <Badge variant="info" className="normal-case tracking-normal">
+          <Bot className="h-3 w-3" />
+          <I18nText text={'Harness'} />
+        </Badge>
+        {primary?.provider ? (
+          <I18nProps>
+            <Badge
+              variant="secondary"
+              className="font-mono normal-case tracking-normal"
+              title="Primary provider"
+            >
+              {primary.provider}
+            </Badge>
+          </I18nProps>
+        ) : null}
+        {optionCount > 0 ? (
+          <Badge variant="outline" className="normal-case tracking-normal">
+            <I18nText
+              text={optionCount === 1 ? '{count} option' : '{count} options'}
+              values={{ count: optionCount }}
+            />
+          </Badge>
+        ) : null}
+        {fallbackCount > 0 ? (
+          <Badge variant="outline" className="normal-case tracking-normal">
+            <I18nText
+              text={
+                fallbackCount === 1 ? '{count} fallback' : '{count} fallbacks'
+              }
+              values={{ count: fallbackCount }}
+            />
+          </Badge>
+        ) : null}
+      </div>
+      {summary.prompt ? (
+        <div
+          className="truncate text-xs text-muted-foreground"
+          title={summary.prompt}
+        >
+          {summary.prompt}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -121,7 +194,10 @@ function HarnessAttemptRow({
               variant="outline"
               className="h-5 cursor-help px-2 normal-case tracking-normal"
             >
-              +{hiddenOptions.length} more
+              <I18nText
+                text="+{count} more"
+                values={{ count: hiddenOptions.length }}
+              />
             </Badge>
           </TooltipTrigger>
           <TooltipContent className="max-w-[480px]">

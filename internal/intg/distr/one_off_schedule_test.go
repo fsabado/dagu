@@ -4,14 +4,15 @@
 package distr_test
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,9 +43,9 @@ steps:
 		return scheduledAt
 	})
 
-	status := f.waitForStatus(core.Succeeded, 20*time.Second)
+	status := f.waitForStatus(ir.Succeeded, 20*time.Second)
 
-	oneOffSchedule, err := core.NewOneOffSchedule(scheduledAt.Format(time.RFC3339))
+	oneOffSchedule, err := ir.NewOneOffSchedule(scheduledAt.Format(time.RFC3339))
 	require.NoError(t, err)
 
 	require.Equal(
@@ -61,13 +62,18 @@ steps:
 		return scheduledAt.Add(time.Minute)
 	})
 
-	require.Never(t, func() bool {
-		statuses, err := f.coord.DAGRunStore.ListStatuses(
-			f.coord.Context,
-			exec.WithExactName(f.dagWrapper.Name),
-			exec.WithAllHistory(),
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		statuses, err := f.coord.DAGRunRepository.ListStatuses(
+			ctx, persis.DAGRunListOptions{ExactName: f.dagWrapper.Name, AllHistory: true},
 		)
+		cancel()
 		require.NoError(t, err)
-		return len(statuses) != 1
-	}, 3*time.Second, 100*time.Millisecond)
+		require.Len(t, statuses, 1)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

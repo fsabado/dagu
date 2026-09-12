@@ -6,13 +6,15 @@ package cmd_test
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,6 +54,72 @@ func commandLogWaitTimeout() time.Duration {
 		return 30 * time.Second
 	}
 	return 10 * time.Second
+}
+
+func assertSecondInterruptTerminatesBlockedCleanup(t *testing.T, commandName, shutdownLog string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes are not available on Windows")
+	}
+
+	th := test.SetupCommand(t, test.WithBuiltExecutable())
+	cleanupDir := filepath.Join(th.Config.Paths.DataDir, "agent-session-cleanups")
+	require.NoError(t, os.MkdirAll(cleanupDir, 0o750))
+	require.NoError(t, exec.Command("mkfifo", filepath.Join(cleanupDir, "blocked.json")).Run())
+
+	args := test.WithConfigFlag([]string{
+		commandName,
+		fmt.Sprintf("--port=%s", findPort(t)),
+	}, th.Config)
+	command := exec.Command(th.Config.Paths.Executable, args...) //nolint:gosec // Test executes the binary built from this repository.
+	command.Env = th.ChildEnv
+	output := th.LoggingOutput
+	command.Stdout = output
+	command.Stderr = output
+	require.NoError(t, command.Start())
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- command.Wait()
+	}()
+	exited := false
+	defer func() {
+		if !exited {
+			terminateTestCommand(command, waitCh)
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(output.String(), "Server is starting")
+	}, commandLogWaitTimeout(), 50*time.Millisecond, "output: %s", output.String())
+	require.NoError(t, command.Process.Signal(os.Interrupt))
+	require.Eventually(t, func() bool {
+		return strings.Contains(output.String(), shutdownLog)
+	}, commandLogWaitTimeout(), 50*time.Millisecond, "output: %s", output.String())
+	require.NoError(t, command.Process.Signal(os.Interrupt))
+
+	select {
+	case err := <-waitCh:
+		exited = true
+		exitErr, ok := err.(*exec.ExitError)
+		require.True(t, ok, "expected signal exit, got %v", err)
+		waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+		require.True(t, ok, "expected Unix wait status, got %T", exitErr.Sys())
+		require.True(t, waitStatus.Signaled(), "expected signal exit, got %v", waitStatus)
+		require.Equal(t, syscall.SIGINT, waitStatus.Signal())
+	case <-time.After(2 * time.Second):
+		terminateTestCommand(command, waitCh)
+		exited = true
+		t.Fatalf("second interrupt did not terminate blocked cleanup; output: %s", output.String())
+	}
+}
+
+func terminateTestCommand(command *exec.Cmd, waitCh <-chan error) {
+	_ = command.Process.Kill()
+	select {
+	case <-waitCh:
+	case <-time.After(5 * time.Second):
+	}
 }
 
 func newHoldFile(t *testing.T) string {
@@ -105,7 +173,8 @@ func releaseHoldFileWhenRecentStatusCountAtLeastWithin(
 	go func() {
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
-			if len(th.DAGRunMgr.ListRecentStatus(th.Context, dagName, count)) >= count {
+			statuses, err := th.DAGRunRepository.RecentStatuses(th.Context, dagName, count)
+			if err == nil && len(statuses) >= count {
 				done <- os.WriteFile(path, []byte("release"), 0o600)
 				return
 			}

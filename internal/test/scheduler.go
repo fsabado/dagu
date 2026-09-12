@@ -9,12 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file"
-	"github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,8 +24,8 @@ import (
 type Scheduler struct {
 	Helper
 	EntryReader    scheduler.EntryReader
-	QueueStore     exec.QueueStore
-	CoordinatorCli exec.Dispatcher
+	QueueStore     queue.QueueStore
+	CoordinatorCli dispatch.Dispatcher
 }
 
 // SetupScheduler creates a test scheduler instance with all dependencies
@@ -58,23 +60,27 @@ func SetupScheduler(t *testing.T, opts ...HelperOption) *Scheduler {
 	helper.Config.Scheduler.LockRetryInterval = 50 * time.Millisecond
 
 	// Create additional stores needed for scheduler
-	ds, err := file.NewDAGStore(helper.Config, file.WithDAGSkipExamples(true))
+	ds, err := file.NewDAGRepository(helper.Config, file.WithDAGSkipExamples(true))
 	require.NoError(t, err)
-	drs := file.NewDAGRunStore(helper.Config)
-	ps := newProcStore(helper.Config)
-	qs := store.NewQueueStore(file.NewCollection(helper.Config.Paths.QueueDir))
+	dagRunRepository := file.NewDAGRunRepository(helper.Config)
+	ps := newProcRepository(helper.Config)
+	qs := store.NewQueueStore(helper.Backend.Collection(persis.CollectionQueue))
 
 	// Create DAG run manager
-	drm := runtime.NewManager(drs, ps, helper.Config)
+	drm := runtime.NewManager(dagRunRepository, ps, helper.Config)
 
 	// Create entry reader
-	coordinatorCli := coordinator.New(helper.ServiceRegistry, coordinator.DefaultConfig())
-	em := scheduler.NewEntryReader(helper.Config.Paths.DAGsDir, ds)
+	coordinatorCli := coordinator.New(helper.ServiceRegistry, CoordinatorClientConfig(helper.Config.Paths.DataDir))
+	em := scheduler.NewFileEntryReader(
+		helper.Config.Paths.DAGsDir,
+		ds,
+		helper.Config.DAGDiscovery.Recursive,
+	)
 
 	// Update helper with scheduler-specific stores
-	helper.DAGStore = ds
-	helper.DAGRunStore = drs
-	helper.ProcStore = ps
+	helper.DAGRepository = ds
+	helper.DAGRunRepository = dagRunRepository
+	helper.ProcRepository = ps
 	helper.DAGRunMgr = drm
 
 	sch := &Scheduler{
@@ -91,17 +97,16 @@ func SetupScheduler(t *testing.T, opts ...HelperOption) *Scheduler {
 func (s *Scheduler) NewSchedulerInstance(t *testing.T) (*scheduler.Scheduler, error) {
 	t.Helper()
 
-	return scheduler.New(
-		s.Config,
-		s.EntryReader,
-		s.DAGRunMgr,
-		s.DAGRunStore,
-		s.QueueStore,
-		s.ProcStore,
-		s.ServiceRegistry,
-		s.CoordinatorCli,
-		nil,
-	)
+	return scheduler.New(s.Config, scheduler.Dependencies{
+		EntryReader:       s.EntryReader,
+		DAGRunManager:     s.DAGRunMgr,
+		DAGRepository:     s.DAGRepository,
+		DAGRunRepository:  s.DAGRunRepository,
+		QueueStore:        s.QueueStore,
+		ProcRepository:    s.ProcRepository,
+		ServiceRegistry:   s.ServiceRegistry,
+		CoordinatorClient: s.CoordinatorCli,
+	})
 }
 
 // Start starts the scheduler instance

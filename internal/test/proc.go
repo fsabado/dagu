@@ -14,40 +14,42 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/proc"
 	"github.com/stretchr/testify/require"
 )
 
-func newProcStore(cfg *config.Config) exec.ProcStore {
-	return file.NewProcStore(cfg)
+func newProcRepository(cfg *config.Config) *persis.ProcRepository {
+	return file.NewProcRepository(cfg)
 }
 
 func procGroupDir(procDir, groupName, dagName string) string {
 	return filepath.Join(procDir, groupName, dagName)
 }
 
-// ProcHeartbeatObserver is the proc-store surface needed by heartbeat liveness tests.
+// ProcHeartbeatObserver is the process-repository surface needed by heartbeat liveness tests.
 type ProcHeartbeatObserver interface {
-	LatestHeartbeat(ctx context.Context, groupName string, dagRun exec.DAGRunRef) (*exec.ProcHeartbeat, error)
+	LatestHeartbeat(ctx context.Context, groupName string, dagRun ir.DAGRunRef) (*proc.ProcHeartbeat, error)
 }
 
 // WaitForProcHeartbeat returns the latest heartbeat observation for dagRun once it exists.
 func WaitForProcHeartbeat(
 	t *testing.T,
 	ctx context.Context,
-	procStore ProcHeartbeatObserver,
+	observer ProcHeartbeatObserver,
 	groupName string,
-	dagRun exec.DAGRunRef,
+	dagRun ir.DAGRunRef,
 	timeout time.Duration,
-) exec.ProcHeartbeat {
+) proc.ProcHeartbeat {
 	t.Helper()
 
-	var heartbeat *exec.ProcHeartbeat
+	var heartbeat *proc.ProcHeartbeat
 	var lastErr error
 	require.Eventually(t, func() bool {
-		heartbeat, lastErr = procStore.LatestHeartbeat(ctx, groupName, dagRun)
+		heartbeat, lastErr = observer.LatestHeartbeat(ctx, groupName, dagRun)
 		if lastErr != nil {
 			return false
 		}
@@ -61,18 +63,18 @@ func WaitForProcHeartbeat(
 func RequireProcHeartbeatAdvance(
 	t *testing.T,
 	ctx context.Context,
-	procStore ProcHeartbeatObserver,
+	observer ProcHeartbeatObserver,
 	groupName string,
-	dagRun exec.DAGRunRef,
+	dagRun ir.DAGRunRef,
 	timeout time.Duration,
 ) {
 	t.Helper()
 
-	initial := WaitForProcHeartbeat(t, ctx, procStore, groupName, dagRun, timeout)
+	initial := WaitForProcHeartbeat(t, ctx, observer, groupName, dagRun, timeout)
 
 	var lastErr error
 	require.Eventually(t, func() bool {
-		next, err := procStore.LatestHeartbeat(ctx, groupName, dagRun)
+		next, err := observer.LatestHeartbeat(ctx, groupName, dagRun)
 		if err != nil {
 			lastErr = err
 			return false
@@ -86,7 +88,7 @@ func CreateStaleLegacyProcFile(
 	t *testing.T,
 	procDir string,
 	groupName string,
-	dagRun exec.DAGRunRef,
+	dagRun ir.DAGRunRef,
 	startedAt time.Time,
 	age time.Duration,
 ) string {
@@ -98,7 +100,7 @@ func CreateStaleLegacyProcFileWithAttempt(
 	t *testing.T,
 	procDir string,
 	groupName string,
-	dagRun exec.DAGRunRef,
+	dagRun ir.DAGRunRef,
 	attemptID string,
 	startedAt time.Time,
 	age time.Duration,
@@ -140,10 +142,10 @@ func CreateStaleLegacyProcFileWithAttempt(
 }
 
 // ReadRunStatus loads the persisted status for the given dag-run reference.
-func ReadRunStatus(ctx context.Context, t *testing.T, store exec.DAGRunStore, dagRun exec.DAGRunRef) *exec.DAGRunStatus {
+func ReadRunStatus(ctx context.Context, t *testing.T, repository *persis.DAGRunRepository, dagRun ir.DAGRunRef) *ir.DAGRunStatus {
 	t.Helper()
 
-	attempt, err := store.FindAttempt(ctx, dagRun)
+	attempt, err := repository.FindAttempt(ctx, dagRun)
 	require.NoError(t, err)
 	status, err := attempt.ReadStatus(ctx)
 	require.NoError(t, err)

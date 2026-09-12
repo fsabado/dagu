@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	llmpkg "github.com/dagucloud/dagu/internal/llm"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	llmpkg "github.com/dagucloud/dagu/v2/internal/llm"
+	"github.com/dagucloud/dagu/v2/internal/runctx"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,41 +28,41 @@ func TestExecutor_MessageSaving(t *testing.T) {
 		t.Parallel()
 
 		executor := &Executor{
-			step: core.Step{
-				LLM: &core.LLMConfig{
+			step: ir.Step{
+				LLM: &ir.LLMConfig{
 					Provider: "openai",
 					Model:    "gpt-4o",
 				},
 			},
-			messages: []exec.LLMMessage{
-				{Role: exec.RoleUser, Content: "Hello"},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
 			},
-			contextMessages: []exec.LLMMessage{
-				{Role: exec.RoleSystem, Content: "You are helpful"},
-				{Role: exec.RoleUser, Content: "Previous question"},
-				{Role: exec.RoleAssistant, Content: "Previous answer"},
+			contextMessages: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "You are helpful"},
+				{Role: ir.LLMRoleUser, Content: "Previous question"},
+				{Role: ir.LLMRoleAssistant, Content: "Previous answer"},
 			},
 		}
 
 		// Simulate what happens after Run() completes
 		allMessages := append(executor.contextMessages, executor.messages...)
-		metadata := &exec.LLMMessageMetadata{
+		metadata := &ir.LLMMessageMetadata{
 			Provider:         "openai",
 			Model:            "gpt-4o",
 			PromptTokens:     10,
 			CompletionTokens: 5,
 			TotalTokens:      15,
 		}
-		executor.savedMessages = append(allMessages, exec.LLMMessage{
-			Role:     exec.RoleAssistant,
+		executor.savedMessages = append(allMessages, ir.LLMMessage{
+			Role:     ir.LLMRoleAssistant,
 			Content:  "Hello there!",
 			Metadata: metadata,
 		})
 
 		saved := executor.GetMessages()
 		assert.Len(t, saved, 5) // 3 inherited + 1 user + 1 assistant
-		assert.Equal(t, exec.RoleSystem, saved[0].Role)
-		assert.Equal(t, exec.RoleAssistant, saved[4].Role)
+		assert.Equal(t, ir.LLMRoleSystem, saved[0].Role)
+		assert.Equal(t, ir.LLMRoleAssistant, saved[4].Role)
 		assert.NotNil(t, saved[4].Metadata)
 		assert.Equal(t, 15, saved[4].Metadata.TotalTokens)
 	})
@@ -69,26 +71,26 @@ func TestExecutor_MessageSaving(t *testing.T) {
 		t.Parallel()
 
 		executor := &Executor{
-			step: core.Step{
-				LLM: &core.LLMConfig{
+			step: ir.Step{
+				LLM: &ir.LLMConfig{
 					Provider: "gemini",
 					Model:    "gemini-pro",
 				},
 			},
-			messages: []exec.LLMMessage{
-				{Role: exec.RoleUser, Content: "Test"},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Test"},
 			},
 		}
 
-		metadata := &exec.LLMMessageMetadata{
+		metadata := &ir.LLMMessageMetadata{
 			Provider:         "gemini",
 			Model:            "gemini-pro",
 			PromptTokens:     5,
 			CompletionTokens: 3,
 			TotalTokens:      8,
 		}
-		executor.savedMessages = append(executor.messages, exec.LLMMessage{
-			Role:     exec.RoleAssistant,
+		executor.savedMessages = append(executor.messages, ir.LLMMessage{
+			Role:     ir.LLMRoleAssistant,
 			Content:  "Response",
 			Metadata: metadata,
 		})
@@ -97,7 +99,7 @@ func TestExecutor_MessageSaving(t *testing.T) {
 		assert.Len(t, saved, 2)
 
 		assistantMsg := saved[1]
-		assert.Equal(t, exec.RoleAssistant, assistantMsg.Role)
+		assert.Equal(t, ir.LLMRoleAssistant, assistantMsg.Role)
 		assert.NotNil(t, assistantMsg.Metadata)
 		assert.Equal(t, "gemini", assistantMsg.Metadata.Provider)
 		assert.Equal(t, "gemini-pro", assistantMsg.Metadata.Model)
@@ -112,10 +114,10 @@ func TestExecutor_SetContext(t *testing.T) {
 
 	executor := &Executor{}
 
-	messages := []exec.LLMMessage{
-		{Role: exec.RoleSystem, Content: "System prompt"},
-		{Role: exec.RoleUser, Content: "User message"},
-		{Role: exec.RoleAssistant, Content: "Assistant response"},
+	messages := []ir.LLMMessage{
+		{Role: ir.LLMRoleSystem, Content: "System prompt"},
+		{Role: ir.LLMRoleUser, Content: "User message"},
+		{Role: ir.LLMRoleAssistant, Content: "Assistant response"},
 	}
 
 	executor.SetContext(messages)
@@ -127,17 +129,17 @@ func TestExecutor_PushBackExecutionMessagesUsePreviousConversationAndFeedback(t 
 	t.Parallel()
 
 	executor := &Executor{
-		messages: []exec.LLMMessage{
-			{Role: exec.RoleSystem, Content: "current system"},
-			{Role: exec.RoleUser, Content: "original YAML prompt should not repeat"},
+		messages: []ir.LLMMessage{
+			{Role: ir.LLMRoleSystem, Content: "current system"},
+			{Role: ir.LLMRoleUser, Content: "original YAML prompt should not repeat"},
 		},
-		contextMessages: []exec.LLMMessage{
-			{Role: exec.RoleSystem, Content: "previous system"},
-			{Role: exec.RoleUser, Content: "original prompt"},
-			{Role: exec.RoleAssistant, Content: "previous answer"},
+		contextMessages: []ir.LLMMessage{
+			{Role: ir.LLMRoleSystem, Content: "previous system"},
+			{Role: ir.LLMRoleUser, Content: "original prompt"},
+			{Role: ir.LLMRoleAssistant, Content: "previous answer"},
 		},
-		step: core.Step{
-			Approval: &core.ApprovalConfig{Input: []string{"FEEDBACK"}},
+		step: ir.Step{
+			Approval: &ir.ApprovalConfig{Input: []string{"FEEDBACK"}},
 		},
 	}
 	executor.SetPushBackContext(map[string]string{
@@ -149,7 +151,7 @@ func TestExecutor_PushBackExecutionMessagesUsePreviousConversationAndFeedback(t 
 	require.NoError(t, err)
 
 	require.Len(t, messages, 4)
-	assert.Equal(t, exec.RoleSystem, messages[0].Role)
+	assert.Equal(t, ir.LLMRoleSystem, messages[0].Role)
 	assert.Equal(t, "current system", messages[0].Content)
 	assert.Equal(t, "original prompt", messages[1].Content)
 	assert.Equal(t, "previous answer", messages[2].Content)
@@ -173,56 +175,17 @@ func TestExecutor_GetMessages(t *testing.T) {
 		t.Parallel()
 
 		executor := &Executor{
-			savedMessages: []exec.LLMMessage{
-				{Role: exec.RoleUser, Content: "Hello"},
-				{Role: exec.RoleAssistant, Content: "Hi"},
+			savedMessages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
+				{Role: ir.LLMRoleAssistant, Content: "Hi"},
 			},
 		}
 
 		saved := executor.GetMessages()
 		assert.Len(t, saved, 2)
-		assert.Equal(t, exec.RoleUser, saved[0].Role)
-		assert.Equal(t, exec.RoleAssistant, saved[1].Role)
+		assert.Equal(t, ir.LLMRoleUser, saved[0].Role)
+		assert.Equal(t, ir.LLMRoleAssistant, saved[1].Role)
 	})
-}
-
-func TestNormalizeEnvVarExpr(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "EmptyString",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "PlainVariableName",
-			input:    "OPENAI_API_KEY",
-			expected: "${OPENAI_API_KEY}",
-		},
-		{
-			name:     "DollarPrefix",
-			input:    "$ANTHROPIC_KEY",
-			expected: "${ANTHROPIC_KEY}",
-		},
-		{
-			name:     "BracedFormat",
-			input:    "${MY_API_KEY}",
-			expected: "${MY_API_KEY}",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			result := normalizeEnvVarExpr(tc.input)
-			assert.Equal(t, tc.expected, result)
-		})
-	}
 }
 
 func TestNewChatExecutor(t *testing.T) {
@@ -231,7 +194,7 @@ func TestNewChatExecutor(t *testing.T) {
 	t.Run("NilLLMConfig", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{Name: "test"}
+		step := ir.Step{Name: "test"}
 		_, err := newChatExecutor(context.Background(), step)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "llm configuration is required")
@@ -240,9 +203,9 @@ func TestNewChatExecutor(t *testing.T) {
 	t.Run("InvalidProvider", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
+		step := ir.Step{
 			Name: "test",
-			LLM:  &core.LLMConfig{Provider: "invalid-provider"},
+			LLM:  &ir.LLMConfig{Provider: "invalid-provider"},
 		}
 		_, err := newChatExecutor(context.Background(), step)
 		require.Error(t, err)
@@ -252,9 +215,9 @@ func TestNewChatExecutor(t *testing.T) {
 	t.Run("ValidConfigWithOpenAI", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
+		step := ir.Step{
 			Name: "test",
-			LLM: &core.LLMConfig{
+			LLM: &ir.LLMConfig{
 				Provider: "openai",
 				Model:    "gpt-4o",
 			},
@@ -267,9 +230,9 @@ func TestNewChatExecutor(t *testing.T) {
 	t.Run("WithSystemMessage", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
+		step := ir.Step{
 			Name: "test",
-			LLM: &core.LLMConfig{
+			LLM: &ir.LLMConfig{
 				Provider: "anthropic",
 				Model:    "claude-sonnet-4-6",
 				System:   "You are a helpful assistant",
@@ -280,22 +243,22 @@ func TestNewChatExecutor(t *testing.T) {
 
 		e := exec.(*Executor)
 		assert.Len(t, e.messages, 1)
-		assert.Equal(t, core.LLMRoleSystem, e.messages[0].Role)
+		assert.Equal(t, ir.LLMRoleSystem, e.messages[0].Role)
 		assert.Equal(t, "You are a helpful assistant", e.messages[0].Content)
 	})
 
 	t.Run("WithStepMessages", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
+		step := ir.Step{
 			Name: "test",
-			LLM: &core.LLMConfig{
+			LLM: &ir.LLMConfig{
 				Provider: "openai",
 				Model:    "gpt-4o",
 			},
-			Messages: []core.LLMMessage{
-				{Role: core.LLMRoleUser, Content: "Hello"},
-				{Role: core.LLMRoleAssistant, Content: "Hi there"},
+			Messages: []ir.PromptMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
+				{Role: ir.LLMRoleAssistant, Content: "Hi there"},
 			},
 		}
 		exec, err := newChatExecutor(context.Background(), step)
@@ -303,22 +266,22 @@ func TestNewChatExecutor(t *testing.T) {
 
 		e := exec.(*Executor)
 		assert.Len(t, e.messages, 2)
-		assert.Equal(t, core.LLMRoleUser, e.messages[0].Role)
-		assert.Equal(t, core.LLMRoleAssistant, e.messages[1].Role)
+		assert.Equal(t, ir.LLMRoleUser, e.messages[0].Role)
+		assert.Equal(t, ir.LLMRoleAssistant, e.messages[1].Role)
 	})
 
 	t.Run("WithSystemAndStepMessages", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
+		step := ir.Step{
 			Name: "test",
-			LLM: &core.LLMConfig{
+			LLM: &ir.LLMConfig{
 				Provider: "gemini",
 				Model:    "gemini-pro",
 				System:   "Be concise",
 			},
-			Messages: []core.LLMMessage{
-				{Role: core.LLMRoleUser, Content: "What is 2+2?"},
+			Messages: []ir.PromptMessage{
+				{Role: ir.LLMRoleUser, Content: "What is 2+2?"},
 			},
 		}
 		exec, err := newChatExecutor(context.Background(), step)
@@ -326,16 +289,16 @@ func TestNewChatExecutor(t *testing.T) {
 
 		e := exec.(*Executor)
 		assert.Len(t, e.messages, 2)
-		assert.Equal(t, core.LLMRoleSystem, e.messages[0].Role)
-		assert.Equal(t, core.LLMRoleUser, e.messages[1].Role)
+		assert.Equal(t, ir.LLMRoleSystem, e.messages[0].Role)
+		assert.Equal(t, ir.LLMRoleUser, e.messages[1].Role)
 	})
 
 	t.Run("CustomAPIKeyName", func(t *testing.T) {
 		t.Parallel()
 
-		step := core.Step{
+		step := ir.Step{
 			Name: "test",
-			LLM: &core.LLMConfig{
+			LLM: &ir.LLMConfig{
 				Provider:   "openai",
 				Model:      "gpt-4o",
 				APIKeyName: "MY_CUSTOM_KEY",
@@ -347,6 +310,118 @@ func TestNewChatExecutor(t *testing.T) {
 		e := exec.(*Executor)
 		assert.Equal(t, "MY_CUSTOM_KEY", e.apiKeyEnvVar)
 	})
+
+	t.Run("ProviderReferenceIsResolvedAtRunTime", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM: &ir.LLMConfig{
+				Provider: "${params.PROVIDER}",
+				Model:    "${params.MODEL}",
+			},
+		}
+		_, err := newChatExecutor(context.Background(), step)
+		require.NoError(t, err)
+	})
+}
+
+func TestResolveModels(t *testing.T) {
+	t.Parallel()
+
+	ctx := chatRuntimeContext(t, []string{"PROVIDER=anthropic", "MODEL=claude-sonnet-4-6"})
+
+	t.Run("ResolvesProviderAndModelReferences", func(t *testing.T) {
+		t.Parallel()
+
+		models, err := runtime.ResolveModels(ctx, []ir.ModelEntry{
+			{Provider: "${params.PROVIDER}", Name: "${params.MODEL}", BaseURL: "https://${params.PROVIDER}.example"},
+		})
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+		assert.Equal(t, "anthropic", models[0].Provider)
+		assert.Equal(t, "claude-sonnet-4-6", models[0].Name)
+		// base_url is resolved later, once shared config has been merged in.
+		assert.Equal(t, "https://${params.PROVIDER}.example", models[0].BaseURL)
+	})
+
+	t.Run("LeavesLiteralEntriesUnchanged", func(t *testing.T) {
+		t.Parallel()
+
+		models, err := runtime.ResolveModels(ctx, []ir.ModelEntry{
+			{Provider: "openai", Name: "gpt-4o"},
+			{Provider: "${params.PROVIDER}", Name: "${params.MODEL}"},
+		})
+		require.NoError(t, err)
+		require.Len(t, models, 2)
+		assert.Equal(t, ir.ModelEntry{Provider: "openai", Name: "gpt-4o"}, models[0])
+		assert.Equal(t, ir.ModelEntry{Provider: "anthropic", Name: "claude-sonnet-4-6"}, models[1])
+	})
+}
+
+func TestResolveModelsRejectsEmptyValues(t *testing.T) {
+	t.Parallel()
+
+	ctx := chatRuntimeContext(t, []string{"EMPTY=", "PROVIDER=openai", "MODEL=gpt-4o"})
+
+	tests := []struct {
+		name    string
+		llm     ir.LLMConfig
+		wantErr string
+	}{
+		{
+			name:    "string form model resolves to empty",
+			llm:     ir.LLMConfig{Provider: "${params.PROVIDER}", Model: "${params.EMPTY}"},
+			wantErr: `llm model "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name:    "string form provider resolves to empty",
+			llm:     ir.LLMConfig{Provider: "${params.EMPTY}", Model: "${params.MODEL}"},
+			wantErr: `llm provider "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name: "array form model resolves to empty",
+			llm: ir.LLMConfig{Models: []ir.ModelEntry{
+				{Provider: "openai", Name: "gpt-4o"},
+				{Provider: "${params.PROVIDER}", Name: "${params.EMPTY}"},
+			}},
+			wantErr: `llm model "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name: "array form provider resolves to empty",
+			llm: ir.LLMConfig{Models: []ir.ModelEntry{
+				{Provider: "${params.EMPTY}", Name: "${params.MODEL}"},
+			}},
+			wantErr: `llm provider "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name:    "inherited config carries no model",
+			llm:     ir.LLMConfig{Provider: "openai"},
+			wantErr: "llm model is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := runtime.ResolveModels(ctx, tt.llm.GetModels())
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+// chatRuntimeContext builds a runtime context whose DAG declares params.
+func chatRuntimeContext(t *testing.T, params []string) context.Context {
+	t.Helper()
+
+	dag := &ir.DAG{Name: "test", Params: params}
+	for _, param := range params {
+		name, _, _ := strings.Cut(param, "=")
+		dag.ParamDefs = append(dag.ParamDefs, ir.ParamDef{Name: name, Type: ir.ParamDefTypeString})
+	}
+	ctx := runctx.NewContext(context.Background(), dag, "run-1", "/tmp/log")
+	return runtime.WithEnv(ctx, runtime.NewEnv(ctx, ir.Step{Name: "test"}))
 }
 
 func TestExecutor_SetStdout(t *testing.T) {
@@ -388,10 +463,10 @@ func TestToLLMMessages(t *testing.T) {
 	t.Run("ConvertMessages", func(t *testing.T) {
 		t.Parallel()
 
-		msgs := []exec.LLMMessage{
-			{Role: exec.RoleSystem, Content: "System prompt"},
-			{Role: exec.RoleUser, Content: "User message"},
-			{Role: exec.RoleAssistant, Content: "Assistant response"},
+		msgs := []ir.LLMMessage{
+			{Role: ir.LLMRoleSystem, Content: "System prompt"},
+			{Role: ir.LLMRoleUser, Content: "User message"},
+			{Role: ir.LLMRoleAssistant, Content: "Assistant response"},
 		}
 		result := toLLMMessages(msgs)
 
@@ -410,36 +485,36 @@ func TestBuildMessageList(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		stepMsgs        []exec.LLMMessage
-		contextMsgs     []exec.LLMMessage
+		stepMsgs        []ir.LLMMessage
+		contextMsgs     []ir.LLMMessage
 		wantFirstSystem string
 		wantLen         int
 	}{
 		{
 			name: "step system takes precedence",
-			stepMsgs: []exec.LLMMessage{
-				{Role: exec.RoleSystem, Content: "step system"},
-				{Role: exec.RoleUser, Content: "user"},
+			stepMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "step system"},
+				{Role: ir.LLMRoleUser, Content: "user"},
 			},
-			contextMsgs: []exec.LLMMessage{
-				{Role: exec.RoleSystem, Content: "context system"},
+			contextMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "context system"},
 			},
 			wantFirstSystem: "step system",
 			wantLen:         2,
 		},
 		{
 			name:     "context system used when step has none",
-			stepMsgs: []exec.LLMMessage{{Role: exec.RoleUser, Content: "user"}},
-			contextMsgs: []exec.LLMMessage{
-				{Role: exec.RoleSystem, Content: "context system"},
+			stepMsgs: []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "user"}},
+			contextMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "context system"},
 			},
 			wantFirstSystem: "context system",
 			wantLen:         2,
 		},
 		{
 			name: "no context",
-			stepMsgs: []exec.LLMMessage{
-				{Role: exec.RoleSystem, Content: "step system"},
+			stepMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "step system"},
 			},
 			contextMsgs:     nil,
 			wantFirstSystem: "step system",
@@ -454,7 +529,7 @@ func TestBuildMessageList(t *testing.T) {
 			result := buildMessageList(tt.stepMsgs, tt.contextMsgs)
 
 			require.Len(t, result, tt.wantLen)
-			assert.Equal(t, exec.RoleSystem, result[0].Role)
+			assert.Equal(t, ir.LLMRoleSystem, result[0].Role)
 			assert.Equal(t, tt.wantFirstSystem, result[0].Content)
 		})
 	}
@@ -474,9 +549,9 @@ func TestToThinkingRequest(t *testing.T) {
 		t.Parallel()
 
 		budget := 1024
-		cfg := &core.ThinkingConfig{
+		cfg := &ir.ThinkingConfig{
 			Enabled:         true,
-			Effort:          core.ThinkingEffortHigh,
+			Effort:          ir.ThinkingEffortHigh,
 			BudgetTokens:    &budget,
 			IncludeInOutput: true,
 		}
@@ -492,7 +567,7 @@ func TestToThinkingRequest(t *testing.T) {
 	t.Run("DefaultValues", func(t *testing.T) {
 		t.Parallel()
 
-		cfg := &core.ThinkingConfig{}
+		cfg := &ir.ThinkingConfig{}
 		result := toThinkingRequest(cfg)
 
 		require.NotNil(t, result)
@@ -525,11 +600,11 @@ func TestExecutor_RunSimpleForModel_RetriesTransientChatFailure(t *testing.T) {
 
 	var calls atomic.Int32
 	stream := false
-	cfg := &core.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
 	var stdout bytes.Buffer
 	executor := &Executor{
 		stdout: stdoutWriter(&stdout),
-		step:   core.Step{LLM: cfg},
+		step:   ir.Step{LLM: cfg},
 	}
 
 	provider := &mockProvider{
@@ -550,7 +625,7 @@ func TestExecutor_RunSimpleForModel_RetriesTransientChatFailure(t *testing.T) {
 		},
 	}
 
-	err := executor.runSimpleForModel(context.Background(), provider, []exec.LLMMessage{{Role: exec.RoleUser, Content: "hello"}}, cfg)
+	err := executor.runSimpleForModel(context.Background(), provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), calls.Load())
 	assert.Contains(t, stdout.String(), "done")
@@ -563,11 +638,11 @@ func TestExecutor_RunSimpleForModel_RetriesStreamBeforeFirstDelta(t *testing.T) 
 
 	var calls atomic.Int32
 	stream := true
-	cfg := &core.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
 	var stdout bytes.Buffer
 	executor := &Executor{
 		stdout: stdoutWriter(&stdout),
-		step:   core.Step{LLM: cfg},
+		step:   ir.Step{LLM: cfg},
 	}
 
 	provider := &mockProvider{
@@ -586,7 +661,7 @@ func TestExecutor_RunSimpleForModel_RetriesStreamBeforeFirstDelta(t *testing.T) 
 		},
 	}
 
-	err := executor.runSimpleForModel(context.Background(), provider, []exec.LLMMessage{{Role: exec.RoleUser, Content: "hello"}}, cfg)
+	err := executor.runSimpleForModel(context.Background(), provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), calls.Load())
 	assert.Equal(t, "done\n", stdout.String())
@@ -597,11 +672,11 @@ func TestExecutor_RunSimpleForModel_DoesNotRetryStreamAfterDelta(t *testing.T) {
 
 	var calls atomic.Int32
 	stream := true
-	cfg := &core.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
 	var stdout bytes.Buffer
 	executor := &Executor{
 		stdout: stdoutWriter(&stdout),
-		step:   core.Step{LLM: cfg},
+		step:   ir.Step{LLM: cfg},
 	}
 
 	provider := &mockProvider{
@@ -618,7 +693,7 @@ func TestExecutor_RunSimpleForModel_DoesNotRetryStreamAfterDelta(t *testing.T) {
 		},
 	}
 
-	err := executor.runSimpleForModel(context.Background(), provider, []exec.LLMMessage{{Role: exec.RoleUser, Content: "hello"}}, cfg)
+	err := executor.runSimpleForModel(context.Background(), provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
 	require.Error(t, err)
 	assert.Equal(t, int32(1), calls.Load())
 	assert.Equal(t, "partial", stdout.String())
@@ -629,10 +704,10 @@ func TestExecutor_ExecuteToolStep_RetriesTransientChatFailure(t *testing.T) {
 
 	var calls atomic.Int32
 	var stdout bytes.Buffer
-	cfg := &core.LLMConfig{Provider: "openai", Model: "gpt-4o"}
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o"}
 	executor := &Executor{
 		stdout: stdoutWriter(&stdout),
-		step:   core.Step{LLM: cfg},
+		step:   ir.Step{LLM: cfg},
 	}
 
 	provider := &mockProvider{
@@ -653,7 +728,7 @@ func TestExecutor_ExecuteToolStep_RetriesTransientChatFailure(t *testing.T) {
 		},
 	}
 
-	msgs, done, err := executor.executeToolStep(context.Background(), provider, cfg, nil, []exec.LLMMessage{{Role: exec.RoleUser, Content: "hello"}}, 0)
+	msgs, done, err := executor.executeToolStep(context.Background(), provider, cfg, nil, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, 0)
 	require.NoError(t, err)
 	assert.True(t, done)
 	assert.Equal(t, int32(2), calls.Load())
@@ -675,8 +750,8 @@ func createContextWithSecrets(secrets map[string]string) context.Context {
 	for k, v := range secrets {
 		secretEnvs = append(secretEnvs, k+"="+v)
 	}
-	return exec.NewContext(context.Background(), &core.DAG{Name: "test"}, "run-1", "/tmp/log",
-		exec.WithSecrets(secretEnvs))
+	return runctx.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1", "/tmp/log",
+		runctx.WithSecrets(secretEnvs))
 }
 
 func TestMaskSecretsForProvider(t *testing.T) {
@@ -685,30 +760,30 @@ func TestMaskSecretsForProvider(t *testing.T) {
 	tests := []struct {
 		name       string
 		secrets    map[string]string
-		messages   []exec.LLMMessage
+		messages   []ir.LLMMessage
 		wantMasked []string
 	}{
 		{
 			name:    "no secrets in context",
 			secrets: nil,
-			messages: []exec.LLMMessage{
-				{Role: exec.RoleUser, Content: "Hello"},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
 			},
 			wantMasked: []string{"Hello"},
 		},
 		{
 			name:    "empty secrets",
 			secrets: map[string]string{},
-			messages: []exec.LLMMessage{
-				{Role: exec.RoleUser, Content: "Hello"},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
 			},
 			wantMasked: []string{"Hello"},
 		},
 		{
 			name:    "masks secret in content",
 			secrets: map[string]string{"API_KEY": "secret123"},
-			messages: []exec.LLMMessage{
-				{Role: exec.RoleUser, Content: "My key is secret123"},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "My key is secret123"},
 			},
 			wantMasked: []string{"My key is *******"},
 		},
@@ -718,9 +793,9 @@ func TestMaskSecretsForProvider(t *testing.T) {
 				"DB_PASS": "dbpass",
 				"API_KEY": "apikey",
 			},
-			messages: []exec.LLMMessage{
-				{Role: exec.RoleSystem, Content: "Use dbpass for DB"},
-				{Role: exec.RoleUser, Content: "Key is apikey"},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "Use dbpass for DB"},
+				{Role: ir.LLMRoleUser, Content: "Key is apikey"},
 			},
 			wantMasked: []string{
 				"Use ******* for DB",
@@ -730,21 +805,21 @@ func TestMaskSecretsForProvider(t *testing.T) {
 		{
 			name:    "preserves role and metadata for multiple messages",
 			secrets: map[string]string{"SECRET": "xyz"},
-			messages: []exec.LLMMessage{
+			messages: []ir.LLMMessage{
 				{
-					Role:     exec.RoleUser,
+					Role:     ir.LLMRoleUser,
 					Content:  "Value: xyz",
 					Metadata: nil,
 				},
 				{
-					Role:     exec.RoleAssistant,
+					Role:     ir.LLMRoleAssistant,
 					Content:  "Response with xyz",
-					Metadata: &exec.LLMMessageMetadata{Model: "gpt-4", PromptTokens: 10, CompletionTokens: 5},
+					Metadata: &ir.LLMMessageMetadata{Model: "gpt-4", PromptTokens: 10, CompletionTokens: 5},
 				},
 				{
-					Role:     exec.RoleUser,
+					Role:     ir.LLMRoleUser,
 					Content:  "Another xyz message",
-					Metadata: &exec.LLMMessageMetadata{Provider: "openai"},
+					Metadata: &ir.LLMMessageMetadata{Provider: "openai"},
 				},
 			},
 			wantMasked: []string{"Value: *******", "Response with *******", "Another ******* message"},

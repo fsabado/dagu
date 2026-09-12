@@ -16,18 +16,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	coreexec "github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
-	dockerexec "github.com/dagucloud/dagu/internal/runtime/builtin/docker"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
-	"github.com/dagucloud/dagu/internal/runtime/resourcelimit"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/opencodehost"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	dockerexec "github.com/dagucloud/dagu/v2/internal/runtime/builtin/docker"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/runtime/resourcelimit"
 	"github.com/goccy/go-yaml"
 	dockerclient "github.com/moby/moby/client"
 )
@@ -36,6 +38,9 @@ var _ executor.Executor = (*harnessExecutor)(nil)
 var _ executor.Stopper = (*harnessExecutor)(nil)
 var _ executor.ExitCoder = (*harnessExecutor)(nil)
 var _ executor.ChatMessageHandler = (*harnessExecutor)(nil)
+var _ executor.AgentSessionHandler = (*harnessExecutor)(nil)
+var _ executor.ProgressCallbackAware = (*harnessExecutor)(nil)
+var _ executor.NodeStatusDeterminer = (*harnessExecutor)(nil)
 var _ executor.PushBackAware = (*harnessExecutor)(nil)
 var _ executor.PushBackPreviousStdoutAware = (*harnessExecutor)(nil)
 
@@ -43,14 +48,17 @@ const failedStdoutTailLimit = 1024
 
 type providerConfig struct {
 	name       string
-	builtin    bool
-	provider   Provider
-	definition *core.HarnessDefinition
+	provider   *providerDescriptor
+	definition *ir.HarnessDefinition
 	flags      map[string]any
+	managed    bool
+	required   bool
+	modeReason string
 }
 
-type defaultConfigProvider interface {
-	DefaultConfig() map[string]any
+type containerRunResult struct {
+	exitCode int
+	err      error
 }
 
 type harnessExecutor struct {
@@ -60,18 +68,21 @@ type harnessExecutor struct {
 	stderr                 io.Writer
 	exitCode               int
 	stderrTail             *executor.TailWriter
-	step                   core.Step
+	step                   ir.Step
 	configs                []providerConfig
 	prompt                 string
 	script                 string // piped to stdin if present
 	workDir                string
-	cancelBuiltin          context.CancelFunc
-	builtinStopped         bool
-	contextMessages        []coreexec.LLMMessage
-	savedMessages          []coreexec.LLMMessage
+	contextMessages        []ir.LLMMessage
+	savedMessages          []ir.LLMMessage
 	pushBackInputs         map[string]string
 	pushBackIteration      int
 	pushBackPreviousStdout string
+	agentSession           *ir.AgentSession
+	progressCallback       func()
+	managedHost            opencodehost.Config
+	determinedStatus       ir.NodeStatus
+	hasDeterminedStatus    bool
 
 	// container-run state (SDK path); set under mu while a containerized step runs
 	containerClient *dockerexec.Client
@@ -93,15 +104,46 @@ func (e *harnessExecutor) SetStderr(out io.Writer) {
 	e.stderr = out
 }
 
-func (e *harnessExecutor) SetContext(msgs []coreexec.LLMMessage) {
-	e.contextMessages = append([]coreexec.LLMMessage(nil), msgs...)
+func (e *harnessExecutor) SetContext(msgs []ir.LLMMessage) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.contextMessages = append([]ir.LLMMessage(nil), msgs...)
 }
 
-func (e *harnessExecutor) GetMessages() []coreexec.LLMMessage {
+func (e *harnessExecutor) GetMessages() []ir.LLMMessage {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.savedMessages == nil {
-		return append([]coreexec.LLMMessage(nil), e.contextMessages...)
+		return append([]ir.LLMMessage(nil), e.contextMessages...)
 	}
-	return append([]coreexec.LLMMessage(nil), e.savedMessages...)
+	return append([]ir.LLMMessage(nil), e.savedMessages...)
+}
+
+func (e *harnessExecutor) SetAgentSession(session *ir.AgentSession) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.agentSession = ir.CloneAgentSession(session)
+}
+
+func (e *harnessExecutor) GetAgentSession() *ir.AgentSession {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return ir.CloneAgentSession(e.agentSession)
+}
+
+func (e *harnessExecutor) SetProgressCallback(callback func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.progressCallback = callback
+}
+
+func (e *harnessExecutor) DetermineNodeStatus() (ir.NodeStatus, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.hasDeterminedStatus {
+		return e.determinedStatus, nil
+	}
+	return ir.NodeRunning, nil
 }
 
 func (e *harnessExecutor) Kill(sig os.Signal) error {
@@ -114,41 +156,40 @@ func (e *harnessExecutor) Stop(intent cmdutil.TerminationIntent) error {
 
 func (e *harnessExecutor) stop(req cmdutil.StopRequest) error {
 	e.mu.Lock()
-	if e.process == nil {
-		if e.cancelBuiltin != nil {
-			e.builtinStopped = true
-			e.cancelBuiltin()
-			e.cancelBuiltin = nil
-		}
-		// Containerized run: cancel the run context and stop the container via
-		// the SDK so a cancelled step leaves no running orphan (Close auto-removes
-		// when AutoRemove is set, i.e. keep_container is false).
-		if e.containerClient != nil || e.containerCancel != nil {
-			cli := e.containerClient
-			cancel := e.containerCancel
-			e.containerCancel = nil
-			e.mu.Unlock()
-			if cancel != nil {
-				cancel()
-			}
-			if cli != nil {
-				return cli.Stop(req.Intent.Signal)
-			}
-			return nil
-		}
-		if e.sharedContainerCancel != nil {
-			cancel := e.sharedContainerCancel
-			e.sharedContainerCancel = nil
-			e.mu.Unlock()
-			cancel()
-			return nil
-		}
-		e.mu.Unlock()
-		return nil
+	host := e.managedHost
+	sessionID := ""
+	if e.agentSession != nil {
+		sessionID = e.agentSession.SessionID
 	}
-	defer e.mu.Unlock()
-	_, err := e.process.Stop(req)
-	return err
+	workDir := e.workDir
+	process := e.process
+	cli := e.containerClient
+	containerCancel := e.containerCancel
+	sharedContainerCancel := e.sharedContainerCancel
+	e.containerCancel = nil
+	e.sharedContainerCancel = nil
+	e.mu.Unlock()
+
+	var stopErr error
+	if host.URL != "" && sessionID != "" {
+		stopErr = abortManagedOpenCode(context.Background(), host, sessionID, workDir)
+	}
+	if process != nil {
+		_, err := process.Stop(req)
+		return errors.Join(stopErr, err)
+	}
+	// Containerized runs are cancelled before the SDK stop so a cancelled
+	// step cannot leave a running container.
+	if containerCancel != nil {
+		containerCancel()
+	}
+	if cli != nil {
+		return errors.Join(stopErr, cli.Stop(req.Intent.Signal))
+	}
+	if sharedContainerCancel != nil {
+		sharedContainerCancel()
+	}
+	return stopErr
 }
 
 func (e *harnessExecutor) SetPushBackContext(inputs map[string]string, iteration int) {
@@ -229,13 +270,46 @@ func (e *harnessExecutor) Run(ctx context.Context) error {
 
 func (e *harnessExecutor) runOnce(ctx context.Context, cfg providerConfig) (*os.File, error) {
 	hasRootContainer := rootContainerConfigured(ctx)
-
-	if cfg.builtin {
-		if e.step.Container != nil || hasRootContainer {
-			e.exitCode = 1
-			return nil, fmt.Errorf("harness: builtin provider does not support container execution")
+	if cfg.managed && e.step.Container == nil && !hasRootContainer {
+		host, available, err := opencodehost.ConfigFromContext(ctx)
+		if err != nil && cfg.required {
+			return nil, fmt.Errorf("harness: managed OpenCode is unavailable: %w", err)
 		}
-		return e.runBuiltinOnce(ctx, cfg)
+		fallbackReported := false
+		if err == nil && available {
+			stdout, managedErr := e.runManagedOpenCode(ctx, cfg, host)
+			if managedErr == nil || cfg.required {
+				return stdout, managedErr
+			}
+			e.mu.Lock()
+			sessionStarted := e.agentSession != nil && e.agentSession.SessionID != ""
+			if !sessionStarted {
+				e.agentSession = nil
+				e.managedHost = opencodehost.Config{}
+			}
+			e.mu.Unlock()
+			if sessionStarted {
+				return nil, managedErr
+			}
+			_, _ = fmt.Fprintf(e.stderrWriter(), "harness: managed OpenCode startup failed; using legacy CLI: %v\n", managedErr)
+			fallbackReported = true
+		} else if err != nil {
+			_, _ = fmt.Fprintf(e.stderrWriter(), "harness: managed OpenCode is unavailable; using legacy CLI: %v\n", err)
+			fallbackReported = true
+		}
+		if cfg.required {
+			return nil, errors.New("harness: managed OpenCode requires a Dagu server or worker execution host")
+		}
+		if !fallbackReported {
+			_, _ = fmt.Fprintln(e.stderrWriter(), "harness: using legacy OpenCode CLI because no managed execution host is available")
+		}
+	} else if cfg.managed {
+		if cfg.required {
+			return nil, errors.New("harness: managed OpenCode is not supported inside containers")
+		}
+		_, _ = fmt.Fprintln(e.stderrWriter(), "harness: using legacy OpenCode CLI because the step runs in a container")
+	} else if cfg.modeReason != "" {
+		_, _ = fmt.Fprintln(e.stderrWriter(), "harness: using legacy OpenCode CLI: "+cfg.modeReason)
 	}
 
 	if e.step.Container != nil {
@@ -352,8 +426,8 @@ func mergedContainerEnv(inherited, explicit []string) []string {
 // container entrypoint (image mode) so an image ENTRYPOINT does not double it.
 func buildHarnessContainerRunConfig(
 	workDir string,
-	ct core.Container,
-	registryAuths map[string]*core.AuthConfig,
+	ct ir.Container,
+	registryAuths map[string]*ir.AuthConfig,
 	binaryName string,
 	args []string,
 	inheritedEnv []string,
@@ -534,14 +608,10 @@ func (e *harnessExecutor) runContainerOnce(ctx context.Context, cfg providerConf
 		cancel()
 	}()
 
-	// Run the container in a goroutine and watch ctx so a cancelled step (e.g.
-	// timeout_sec, which arrives only as ctx cancellation, not as a Stop() call)
-	// stops the container instead of blocking forever in Client.Run's post-wait
-	// loop. Mirrors the host subprocess path in startAndWaitLocked.
-	type containerRunResult struct {
-		exitCode int
-		err      error
-	}
+	// Run the container in a goroutine and watch ctx so a cancelled step
+	// (timeout_sec is ctx-only; the runner does not call Kill) can set exit 124.
+	// Client.Run stops the container as part of its own cancellation path, so the
+	// cancel branch waits for it to unwind rather than stopping the container here.
 	runDone := make(chan containerRunResult, 1)
 	go func() {
 		ec, re := cli.Run(runCtx, runCmd, stdout, tw)
@@ -552,12 +622,12 @@ func (e *harnessExecutor) runContainerOnce(ctx context.Context, cfg providerConf
 	var runErr error
 	select {
 	case <-ctx.Done():
-		// Stop the container via the SDK, then wait for Run to unwind.
-		_ = e.stop(cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonTimeout})
-		<-runDone
+		// Client.Run owns cancellation cleanup and stops the container before it returns.
+		// Closing the client here would race that teardown, so wait for Run to finish.
+		runErr = waitForCanceledContainerRun(ctx, runDone)
 		e.exitCode = 124
 		_ = cleanupStdoutSpool(stdout)
-		return nil, ctx.Err()
+		return nil, runErr
 	case res := <-runDone:
 		exitCode, runErr = res.exitCode, res.err
 	}
@@ -584,6 +654,14 @@ func (e *harnessExecutor) runContainerOnce(ctx context.Context, cfg providerConf
 		return nil, fmt.Errorf("harness: failed to rewind stdout spool: %w", err)
 	}
 	return stdout, nil
+}
+
+func waitForCanceledContainerRun(ctx context.Context, runDone <-chan containerRunResult) error {
+	result := <-runDone
+	if result.err != nil {
+		return result.err
+	}
+	return ctx.Err()
 }
 
 func (e *harnessExecutor) runSharedContainerOnce(ctx context.Context, cfg providerConfig) (*os.File, error) {
@@ -634,7 +712,6 @@ func (e *harnessExecutor) runSharedContainerOnce(ctx context.Context, cfg provid
 	exitCode, runErr := cli.Exec(runCtx, runCmd, stdout, tw, dockerexec.ExecOptions{
 		Env:               sharedContainerHarnessEnv(env.UserEnvsMap()),
 		Direct:            true,
-		PIDFile:           sharedContainerHarnessPIDFile(e.step.Name),
 		TerminateOnCancel: true,
 	})
 	e.exitCode = exitCode
@@ -664,14 +741,15 @@ func (e *harnessExecutor) runSharedContainerOnce(ctx context.Context, cfg provid
 }
 
 var sharedContainerHostPathEnvKeys = map[string]struct{}{
-	"PWD":                                        {},
-	coreexec.EnvKeyDAGDocsDir:                    {},
-	coreexec.EnvKeyDAGRunArtifactsDir:            {},
-	coreexec.EnvKeyDAGRunLogFile:                 {},
-	coreexec.EnvKeyDAGRunStepStderrFile:          {},
-	coreexec.EnvKeyDAGRunStepStdoutFile:          {},
-	coreexec.EnvKeyDAGRunWorkDir:                 {},
-	coreexec.EnvKeyDAGPushBackPreviousStdoutFile: {},
+	"PWD":                                      {},
+	runenv.EnvKeyDAGWikiDir:                    {},
+	runenv.EnvKeyDAGDocsDir:                    {},
+	runenv.EnvKeyDAGRunArtifactsDir:            {},
+	runenv.EnvKeyDAGRunLogFile:                 {},
+	runenv.EnvKeyDAGRunStepStderrFile:          {},
+	runenv.EnvKeyDAGRunStepStdoutFile:          {},
+	runenv.EnvKeyDAGRunWorkDir:                 {},
+	runenv.EnvKeyDAGPushBackPreviousStdoutFile: {},
 }
 
 func sharedContainerHarnessEnv(userEnv map[string]string) []string {
@@ -689,14 +767,6 @@ func sharedContainerHarnessEnv(userEnv map[string]string) []string {
 		envs = append(envs, key+"="+userEnv[key])
 	}
 	return envs
-}
-
-func sharedContainerHarnessPIDFile(stepName string) string {
-	safeStepName := fileutil.SafeName(stepName)
-	if safeStepName == "" {
-		safeStepName = "step"
-	}
-	return fmt.Sprintf("/tmp/dagu-harness-%s-%d.pid", safeStepName, time.Now().UnixNano())
 }
 
 func (e *harnessExecutor) startAndWaitLocked(ctx context.Context, cmd *exec.Cmd, stdout *os.File, tw *executor.TailWriter, logEncoding string) (*os.File, error) {
@@ -780,6 +850,7 @@ func (e *harnessExecutor) stderrWriter() io.Writer {
 var reservedKeys = map[string]bool{
 	"provider": true,
 	"fallback": true,
+	"managed":  true,
 }
 
 // configToFlags converts config map entries into CLI flags.
@@ -791,7 +862,7 @@ var reservedKeys = map[string]bool{
 //
 // Reserved keys are skipped. Built-in providers normalize snake_case keys to
 // kebab-case. Keys are sorted for deterministic output.
-func configToFlags(cfg map[string]any, definition *core.HarnessDefinition) []string {
+func configToFlags(cfg map[string]any, definition *ir.HarnessDefinition) []string {
 	keys := make([]string, 0, len(cfg))
 	for k := range cfg {
 		if reservedKeys[k] {
@@ -854,13 +925,13 @@ func configToFlags(cfg map[string]any, definition *core.HarnessDefinition) []str
 	return args
 }
 
-func newHarness(ctx context.Context, step core.Step) (executor.Executor, error) {
+func newHarness(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	if err := validatePromptCommand(step); err != nil {
 		return nil, err
 	}
 
 	cfg := normalizeConfigMap(step.ExecutorConfig.Config)
-	var defs core.HarnessDefinitions
+	var defs ir.HarnessDefinitions
 	env := runtime.GetEnv(ctx)
 	if env.DAG != nil {
 		defs = env.DAG.Harnesses
@@ -883,7 +954,7 @@ func newHarness(ctx context.Context, step core.Step) (executor.Executor, error) 
 	}, nil
 }
 
-func buildProviderConfigs(cfg map[string]any, defs core.HarnessDefinitions) ([]providerConfig, error) {
+func buildProviderConfigs(cfg map[string]any, defs ir.HarnessDefinitions) ([]providerConfig, error) {
 	if err := validateProviderConfigs(cfg); err != nil {
 		return nil, err
 	}
@@ -907,6 +978,18 @@ func buildProviderConfigs(cfg map[string]any, defs core.HarnessDefinitions) ([]p
 			return nil, fmt.Errorf("harness: invalid fallback[%d]: %w", i-1, err)
 		}
 		resolved.flags = mergeProviderDefaultConfig(resolved.provider, attempts[i])
+		if resolved.name == "opencode" && resolved.definition == nil {
+			mode, managedErr := opencodehost.Mode(resolved.flags)
+			if managedErr != nil {
+				if i == 0 {
+					return nil, managedErr
+				}
+				return nil, fmt.Errorf("harness: invalid fallback[%d]: %w", i-1, managedErr)
+			}
+			resolved.managed = mode.Managed
+			resolved.required = mode.Required
+			resolved.modeReason = mode.Reason
+		}
 		configs = append(configs, resolved)
 	}
 
@@ -949,26 +1032,13 @@ func fallbackConfigsFromValue(raw any) ([]map[string]any, error) {
 	}
 }
 
-func resolveProvider(cfg map[string]any, defs core.HarnessDefinitions) (providerConfig, error) {
+func resolveProvider(cfg map[string]any, defs ir.HarnessDefinitions) (providerConfig, error) {
 	providerName, _ := cfg["provider"].(string)
 	if providerName == "" {
 		return providerConfig{}, fmt.Errorf("harness: config.provider is required")
 	}
 	if isTemplatedValue(providerName) {
 		return providerConfig{}, fmt.Errorf("harness: unresolved provider template %q", providerName)
-	}
-	if core.IsBuiltinAgentHarnessProvider(providerName) {
-		return providerConfig{name: providerName, builtin: true}, nil
-	}
-	if core.IsBuiltinCLIHarnessProvider(providerName) {
-		provider, err := getProvider(providerName)
-		if err != nil {
-			return providerConfig{}, err
-		}
-		return providerConfig{
-			name:     provider.Name(),
-			provider: provider,
-		}, nil
 	}
 	if defs != nil {
 		if def, ok := defs[providerName]; ok && def != nil {
@@ -978,24 +1048,30 @@ func resolveProvider(cfg map[string]any, defs core.HarnessDefinitions) (provider
 			}, nil
 		}
 	}
+	if ir.IsBuiltinCLIHarnessProvider(providerName) {
+		provider, err := getProvider(providerName)
+		if err != nil {
+			return providerConfig{}, err
+		}
+		return providerConfig{
+			name:     provider.name,
+			provider: provider,
+		}, nil
+	}
 	return providerConfig{}, fmt.Errorf("harness: unknown provider %q; registered: %v", providerName, knownProviders(defs))
 }
 
-func mergeProviderDefaultConfig(provider Provider, cfg map[string]any) map[string]any {
+func mergeProviderDefaultConfig(provider *providerDescriptor, cfg map[string]any) map[string]any {
 	merged := cloneConfigMap(cfg)
 	if provider == nil {
 		return merged
 	}
-	defaultProvider, ok := provider.(defaultConfigProvider)
-	if !ok {
-		return merged
-	}
-	defaults := defaultProvider.DefaultConfig()
+	defaults := maps.Clone(provider.defaultConfig)
 	if len(defaults) == 0 {
 		return merged
 	}
-	defaults = core.NormalizeBuiltinHarnessFlagKeys(defaults)
-	merged = core.NormalizeBuiltinHarnessFlagKeys(merged)
+	defaults = ir.NormalizeBuiltinHarnessFlagKeys(defaults)
+	merged = ir.NormalizeBuiltinHarnessFlagKeys(merged)
 	withDefaults := cloneConfigMap(defaults)
 	maps.Copy(withDefaults, merged)
 	return withDefaults
@@ -1104,7 +1180,7 @@ func cloneConfigValue(value any) any {
 	}
 }
 
-func extractPrompt(step core.Step) string {
+func extractPrompt(step ir.Step) string {
 	if len(step.Commands) == 0 {
 		return ""
 	}
@@ -1121,7 +1197,7 @@ func extractPrompt(step core.Step) string {
 	return cmd.Command
 }
 
-func validateHarnessStep(step core.Step) error {
+func validateHarnessStep(step ir.Step) error {
 	if err := validatePromptCommand(step); err != nil {
 		return err
 	}
@@ -1132,26 +1208,26 @@ func validateHarnessStep(step core.Step) error {
 	// time, since the executor advertises both Script and Container capability.
 	// Use container.exec or drop script: to run a scripted harness in a container.
 	if step.Container != nil && strings.TrimSpace(step.Script) != "" {
-		return core.NewValidationError("script", nil,
+		return ir.NewValidationError("script", nil,
 			fmt.Errorf("action %q does not support script with a container; the containerized agent has no stdin", "harness"))
 	}
 	cfg := step.ExecutorConfig.Config
 	if cfg == nil {
-		return core.NewValidationError("with", nil, fmt.Errorf("config is required"))
+		return ir.NewValidationError("with", nil, fmt.Errorf("config is required"))
 	}
 
 	if err := validateProviderConfigs(cfg); err != nil {
-		return core.NewValidationError("with", nil, err)
+		return ir.NewValidationError("with", nil, err)
 	}
 	return nil
 }
 
-func validatePromptCommand(step core.Step) error {
+func validatePromptCommand(step ir.Step) error {
 	if len(step.Commands) > 1 {
-		return core.NewValidationError("command", nil, fmt.Errorf("action %q supports only one command", "harness"))
+		return ir.NewValidationError("command", nil, fmt.Errorf("action %q supports only one command", "harness"))
 	}
 	if len(step.Commands) == 0 || extractPrompt(step) == "" {
-		return core.NewValidationError("command", nil, fmt.Errorf("command field (prompt) is required"))
+		return ir.NewValidationError("command", nil, fmt.Errorf("command field (prompt) is required"))
 	}
 	return nil
 }
@@ -1174,7 +1250,6 @@ func validateProviderConfigs(cfg map[string]any) error {
 }
 
 func validateProviderConfig(cfg map[string]any, allowFallback bool) error {
-	providerStr, _ := cfg["provider"].(string)
 	if _, exists := cfg["binary"]; exists {
 		return fmt.Errorf("harness: config.binary is not supported; define a named harness under top-level harnesses and reference it via config.provider")
 	}
@@ -1186,18 +1261,15 @@ func validateProviderConfig(cfg map[string]any, allowFallback bool) error {
 			return fmt.Errorf("harness: config.fallback is not supported inside fallback providers")
 		}
 	}
-	if providerStr == "" {
+	if providerStr, _ := cfg["provider"].(string); providerStr == "" {
 		return fmt.Errorf("harness: config.provider is required")
-	}
-	if core.IsBuiltinAgentHarnessProvider(providerStr) {
-		return core.ValidateBuiltinAgentHarnessConfig(cfg)
 	}
 	return nil
 }
 
 func (cfg providerConfig) binaryName() string {
 	if cfg.provider != nil {
-		return cfg.provider.BinaryName()
+		return cfg.provider.binary
 	}
 	if cfg.definition != nil {
 		return cfg.definition.Binary
@@ -1207,13 +1279,7 @@ func (cfg providerConfig) binaryName() string {
 
 func (cfg providerConfig) buildInvocation(prompt, script string) ([]string, io.Reader, error) {
 	if cfg.provider != nil {
-		args := cfg.provider.BaseArgs(prompt)
-		args = append(args, configToFlags(cfg.flags, nil)...)
-
-		if script == "" {
-			return args, nil, nil
-		}
-		return args, strings.NewReader(script), nil
+		return cfg.provider.buildInvocation(cfg.flags, prompt, script)
 	}
 
 	if cfg.definition == nil {
@@ -1224,9 +1290,9 @@ func (cfg providerConfig) buildInvocation(prompt, script string) ([]string, io.R
 	flags := configToFlags(cfg.flags, cfg.definition)
 
 	switch cfg.definition.PromptMode {
-	case core.HarnessPromptModeArg:
+	case ir.HarnessPromptModeArg:
 		promptArgs := []string{prompt}
-		if cfg.definition.PromptPosition == core.HarnessPromptPositionAfterFlags {
+		if cfg.definition.PromptPosition == ir.HarnessPromptPositionAfterFlags {
 			args = append(args, flags...)
 			args = append(args, promptArgs...)
 		} else {
@@ -1237,9 +1303,9 @@ func (cfg providerConfig) buildInvocation(prompt, script string) ([]string, io.R
 			return args, nil, nil
 		}
 		return args, strings.NewReader(script), nil
-	case core.HarnessPromptModeFlag:
+	case ir.HarnessPromptModeFlag:
 		promptArgs := []string{cfg.definition.PromptFlag, prompt}
-		if cfg.definition.PromptPosition == core.HarnessPromptPositionAfterFlags {
+		if cfg.definition.PromptPosition == ir.HarnessPromptPositionAfterFlags {
 			args = append(args, flags...)
 			args = append(args, promptArgs...)
 		} else {
@@ -1250,7 +1316,7 @@ func (cfg providerConfig) buildInvocation(prompt, script string) ([]string, io.R
 			return args, nil, nil
 		}
 		return args, strings.NewReader(script), nil
-	case core.HarnessPromptModeStdin:
+	case ir.HarnessPromptModeStdin:
 		args = append(args, flags...)
 		return args, strings.NewReader(promptAndScript(prompt, script)), nil
 	default:
@@ -1258,7 +1324,7 @@ func (cfg providerConfig) buildInvocation(prompt, script string) ([]string, io.R
 	}
 }
 
-func flagTokenForKey(key string, definition *core.HarnessDefinition) string {
+func flagTokenForKey(key string, definition *ir.HarnessDefinition) string {
 	if definition != nil && definition.OptionFlags != nil {
 		if token, ok := definition.OptionFlags[key]; ok && strings.TrimSpace(token) != "" {
 			return token
@@ -1267,7 +1333,7 @@ func flagTokenForKey(key string, definition *core.HarnessDefinition) string {
 	if definition == nil {
 		key = strings.ReplaceAll(key, "_", "-")
 	}
-	if definition != nil && definition.FlagStyle == core.HarnessFlagStyleSingleDash {
+	if definition != nil && definition.FlagStyle == ir.HarnessFlagStyleSingleDash {
 		return "-" + key
 	}
 	return "--" + key
@@ -1284,23 +1350,30 @@ func promptAndScript(prompt, script string) string {
 	}
 }
 
-func knownProviders(defs core.HarnessDefinitions) []string {
-	names := core.BuiltinHarnessProviderNames()
+func knownProviders(defs ir.HarnessDefinitions) []string {
+	known := make(map[string]struct{})
+	for _, name := range ir.BuiltinCLIHarnessProviderNames() {
+		known[name] = struct{}{}
+	}
 	for name, def := range defs {
 		if def == nil {
 			continue
 		}
+		known[name] = struct{}{}
+	}
+	names := make([]string, 0, len(known))
+	for name := range known {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
 }
 
-func cloneDefinition(def *core.HarnessDefinition) *core.HarnessDefinition {
+func cloneDefinition(def *ir.HarnessDefinition) *ir.HarnessDefinition {
 	if def == nil {
 		return nil
 	}
-	return &core.HarnessDefinition{
+	return &ir.HarnessDefinition{
 		Binary:         def.Binary,
 		PrefixArgs:     append([]string(nil), def.PrefixArgs...),
 		PromptMode:     def.PromptMode,
@@ -1444,15 +1517,14 @@ func exitCodeFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		return exitErr.ExitCode()
 	}
 	return 1
 }
 
 func init() {
-	caps := core.ExecutorCapabilities{
+	caps := registry.ExecutorCapabilities{
 		Command:   true,
 		Script:    true,
 		Container: true,

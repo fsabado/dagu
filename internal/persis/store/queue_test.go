@@ -6,7 +6,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,10 +18,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file"
-	"github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 )
 
 func newQueueStore(t *testing.T) *store.QueueStore {
@@ -29,11 +31,11 @@ func newQueueStore(t *testing.T) *store.QueueStore {
 	return store.NewQueueStore(testutil.NewMemoryBackend().Collection("queue"))
 }
 
-func queueRef(name, id string) exec.DAGRunRef {
-	return exec.NewDAGRunRef(name, id)
+func queueRef(name, id string) ir.DAGRunRef {
+	return ir.NewDAGRunRef(name, id)
 }
 
-func requireQueuedRef(t *testing.T, item exec.QueuedItemData) exec.DAGRunRef {
+func requireQueuedRef(t *testing.T, item queue.QueuedItemData) ir.DAGRunRef {
 	t.Helper()
 	ref, err := item.Data()
 	require.NoError(t, err)
@@ -46,8 +48,22 @@ func TestQueueStore_EnqueueListAndDequeue(t *testing.T) {
 	ctx := context.Background()
 	s := newQueueStore(t)
 
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityLow, queueRef("dag-low", "run-low")))
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityHigh, queueRef("dag-high", "run-high")))
+	revision, err := s.Revision(ctx, "main")
+	require.NoError(t, err)
+	assert.Zero(t, revision)
+
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, queueRef("dag-low", "run-low")))
+	firstRevision, err := s.Revision(ctx, "main")
+	require.NoError(t, err)
+	assert.Positive(t, firstRevision)
+
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityHigh, queueRef("dag-high", "run-high")))
+	secondRevision, err := s.Revision(ctx, "main")
+	require.NoError(t, err)
+	assert.Greater(t, secondRevision, firstRevision)
+	stableRevision, err := s.Revision(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, secondRevision, stableRevision)
 
 	n, err := s.Len(ctx, "main")
 	require.NoError(t, err)
@@ -59,17 +75,43 @@ func TestQueueStore_EnqueueListAndDequeue(t *testing.T) {
 	assert.Equal(t, queueRef("dag-high", "run-high"), requireQueuedRef(t, items[0]))
 	assert.Equal(t, queueRef("dag-low", "run-low"), requireQueuedRef(t, items[1]))
 
-	first, err := s.DequeueByName(ctx, "main")
+	deleted, err := s.DeleteByItemIDs(ctx, "main", []string{items[0].ID()})
 	require.NoError(t, err)
-	assert.NotContains(t, first.ID(), "main/")
-	assert.Equal(t, queueRef("dag-high", "run-high"), requireQueuedRef(t, first))
-
-	second, err := s.DequeueByName(ctx, "main")
+	assert.Equal(t, 1, deleted)
+	thirdRevision, err := s.Revision(ctx, "main")
 	require.NoError(t, err)
-	assert.Equal(t, queueRef("dag-low", "run-low"), requireQueuedRef(t, second))
+	assert.Greater(t, thirdRevision, secondRevision)
 
-	_, err = s.DequeueByName(ctx, "main")
-	assert.ErrorIs(t, err, exec.ErrQueueEmpty)
+	items, err = s.List(ctx, "main")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, queueRef("dag-low", "run-low"), requireQueuedRef(t, items[0]))
+
+	deleted, err = s.DeleteByItemIDs(ctx, "main", []string{items[0].ID()})
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+	revision, err = s.Revision(ctx, "main")
+	require.NoError(t, err)
+	assert.Zero(t, revision)
+}
+
+func TestQueueStore_GetByItemID(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := newQueueStore(t)
+	want := queueRef("dag", "run")
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, want))
+	items, err := s.List(ctx, "main")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	item, err := s.GetByItemID(ctx, "main", items[0].ID())
+	require.NoError(t, err)
+	assert.Equal(t, want, requireQueuedRef(t, item))
+
+	_, err = s.GetByItemID(ctx, "main", "missing-item")
+	assert.ErrorIs(t, err, queue.ErrQueueItemNotFound)
 }
 
 func TestQueueStore_EnqueueRejectsInvalidInputs(t *testing.T) {
@@ -78,10 +120,10 @@ func TestQueueStore_EnqueueRejectsInvalidInputs(t *testing.T) {
 	ctx := context.Background()
 	s := newQueueStore(t)
 
-	assert.ErrorContains(t, s.Enqueue(ctx, "", exec.QueuePriorityLow, queueRef("dag", "run")), "queue name is required")
-	assert.ErrorContains(t, s.Enqueue(ctx, "main", exec.QueuePriorityLow, queueRef("", "run")), "dag-run reference is required")
-	assert.ErrorContains(t, s.Enqueue(ctx, "main", exec.QueuePriorityLow, queueRef("dag", "")), "dag-run reference is required")
-	assert.ErrorContains(t, s.Enqueue(ctx, "main", exec.QueuePriority(99), queueRef("dag", "run")), "invalid queue priority")
+	assert.ErrorContains(t, s.Enqueue(ctx, "", queue.QueuePriorityLow, queueRef("dag", "run")), "queue name is required")
+	assert.ErrorContains(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, queueRef("", "run")), "dag-run reference is required")
+	assert.ErrorContains(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, queueRef("dag", "")), "dag-run reference is required")
+	assert.ErrorContains(t, s.Enqueue(ctx, "main", queue.QueuePriority(99), queueRef("dag", "run")), "invalid queue priority")
 }
 
 func TestQueueStore_ListCursor(t *testing.T) {
@@ -90,9 +132,9 @@ func TestQueueStore_ListCursor(t *testing.T) {
 	ctx := context.Background()
 	s := newQueueStore(t)
 
-	require.NoError(t, s.Enqueue(ctx, "cursor-q", exec.QueuePriorityHigh, queueRef("dag-high", "run-high")))
-	require.NoError(t, s.Enqueue(ctx, "cursor-q", exec.QueuePriorityLow, queueRef("dag-low-1", "run-low-1")))
-	require.NoError(t, s.Enqueue(ctx, "cursor-q", exec.QueuePriorityLow, queueRef("dag-low-2", "run-low-2")))
+	require.NoError(t, s.Enqueue(ctx, "cursor-q", queue.QueuePriorityHigh, queueRef("dag-high", "run-high")))
+	require.NoError(t, s.Enqueue(ctx, "cursor-q", queue.QueuePriorityLow, queueRef("dag-low-1", "run-low-1")))
+	require.NoError(t, s.Enqueue(ctx, "cursor-q", queue.QueuePriorityLow, queueRef("dag-low-2", "run-low-2")))
 
 	firstPage, err := s.ListCursor(ctx, "cursor-q", "", 2)
 	require.NoError(t, err)
@@ -110,7 +152,7 @@ func TestQueueStore_ListCursor(t *testing.T) {
 	assert.Equal(t, queueRef("dag-low-2", "run-low-2"), requireQueuedRef(t, secondPage.Items[0]))
 
 	_, err = s.ListCursor(ctx, "cursor-q", "not-a-valid-cursor", 10)
-	assert.ErrorIs(t, err, exec.ErrInvalidCursor)
+	assert.ErrorIs(t, err, pagination.ErrInvalidCursor)
 }
 
 func TestQueueStore_ListCursorDecodesOnlyPageItems(t *testing.T) {
@@ -151,7 +193,7 @@ func TestQueueStore_FileLayoutCompatibility(t *testing.T) {
 	root := t.TempDir()
 	s := store.NewQueueStore(file.NewCollection(root))
 
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityLow, queueRef("dag", "run-file-layout")))
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, queueRef("dag", "run-file-layout")))
 
 	queueDir := filepath.Join(root, "main")
 	entries, err := os.ReadDir(queueDir)
@@ -193,9 +235,9 @@ func TestQueueStore_DequeueByDAGRunIDAndDeleteByItemIDs(t *testing.T) {
 	target := queueRef("dag-target", "run-target")
 	other := queueRef("dag-other", "run-other")
 
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityLow, target))
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityHigh, target))
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityLow, other))
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, target))
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityHigh, target))
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, other))
 
 	removed, err := s.DequeueByDAGRunID(ctx, "main", target)
 	require.NoError(t, err)
@@ -217,7 +259,7 @@ func TestQueueStore_DequeueByDAGRunIDAndDeleteByItemIDs(t *testing.T) {
 	assert.Zero(t, n)
 
 	_, err = s.DequeueByDAGRunID(ctx, "main", target)
-	assert.ErrorIs(t, err, exec.ErrQueueItemNotFound)
+	assert.ErrorIs(t, err, queue.ErrQueueItemNotFound)
 }
 
 func TestQueueStore_DeleteByItemIDsNormalizesFilePaths(t *testing.T) {
@@ -226,7 +268,7 @@ func TestQueueStore_DeleteByItemIDsNormalizesFilePaths(t *testing.T) {
 	ctx := context.Background()
 	s := newQueueStore(t)
 
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityLow, queueRef("dag", "run")))
+	require.NoError(t, s.Enqueue(ctx, "main", queue.QueuePriorityLow, queueRef("dag", "run")))
 	items, err := s.List(ctx, "main")
 	require.NoError(t, err)
 	require.Len(t, items, 1)
@@ -262,25 +304,6 @@ func TestQueueStore_DeleteByItemIDsRemovesInvalidItemRecords(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, deleted)
 	assert.NoFileExists(t, itemPath)
-}
-
-func TestQueueStore_DequeueByNameRestoresInvalidClaimedItem(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	root := t.TempDir()
-	queueName := "invalid-q"
-	itemFile := "item_high_20260101_000000_000000001Z_run-invalid.json"
-	raw := `{"fileName":"` + itemFile + `","dagRun":{"name":"","id":""},"queuedAt":"2026-01-01T00:00:00.000000001Z"}`
-
-	itemPath := filepath.Join(root, queueName, itemFile)
-	require.NoError(t, os.MkdirAll(filepath.Dir(itemPath), 0o750))
-	require.NoError(t, os.WriteFile(itemPath, []byte(raw), 0o600))
-
-	s := store.NewQueueStore(file.NewCollection(root))
-	_, err := s.DequeueByName(ctx, queueName)
-	require.ErrorContains(t, err, "invalid dag-run")
-	assert.FileExists(t, itemPath)
 }
 
 func TestQueueStore_ListSurfacesInvalidItemRecords(t *testing.T) {
@@ -338,9 +361,9 @@ func TestQueueStore_AllQueueListAndListByDAGName(t *testing.T) {
 	ctx := context.Background()
 	s := newQueueStore(t)
 
-	require.NoError(t, s.Enqueue(ctx, "queue-a", exec.QueuePriorityLow, queueRef("dag-shared", "run-a-low")))
-	require.NoError(t, s.Enqueue(ctx, "queue-b", exec.QueuePriorityHigh, queueRef("dag-other", "run-b-high")))
-	require.NoError(t, s.Enqueue(ctx, "queue-a", exec.QueuePriorityHigh, queueRef("dag-shared", "run-a-high")))
+	require.NoError(t, s.Enqueue(ctx, "queue-a", queue.QueuePriorityLow, queueRef("dag-shared", "run-a-low")))
+	require.NoError(t, s.Enqueue(ctx, "queue-b", queue.QueuePriorityHigh, queueRef("dag-other", "run-b-high")))
+	require.NoError(t, s.Enqueue(ctx, "queue-a", queue.QueuePriorityHigh, queueRef("dag-shared", "run-a-high")))
 
 	queues, err := s.QueueList(ctx)
 	require.NoError(t, err)
@@ -364,26 +387,31 @@ func TestQueueStore_AllQueueListAndListByDAGName(t *testing.T) {
 	assert.Equal(t, queueRef("dag-shared", "run-a-low"), requireQueuedRef(t, all[2]))
 }
 
-func TestQueueStore_ConcurrentDequeueIsExclusive(t *testing.T) {
+func TestQueueStore_ConcurrentDeleteByItemIDHasOneWinner(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	s := newQueueStore(t)
-	require.NoError(t, s.Enqueue(ctx, "main", exec.QueuePriorityHigh, queueRef("dag", "run")))
+	root := t.TempDir()
+	stores := []*store.QueueStore{
+		store.NewQueueStore(file.NewCollection(root)),
+		store.NewQueueStore(file.NewCollection(root)),
+	}
+	require.NoError(t, stores[0].Enqueue(ctx, "main", queue.QueuePriorityHigh, queueRef("dag", "run")))
+	items, err := stores[0].List(ctx, "main")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
 
-	var claimed atomic.Int32
+	var deleted atomic.Int32
 	errs := make(chan error, 16)
 	var wg sync.WaitGroup
-	for range 16 {
+	for i := range 16 {
 		wg.Go(func() {
-			_, err := s.DequeueByName(ctx, "main")
-			switch {
-			case err == nil:
-				claimed.Add(1)
-			case errors.Is(err, exec.ErrQueueEmpty):
-			default:
+			count, err := stores[i%len(stores)].DeleteByItemIDs(ctx, "main", []string{items[0].ID()})
+			if err != nil {
 				errs <- err
+				return
 			}
+			deleted.Add(int32(count))
 		})
 	}
 	wg.Wait()
@@ -392,7 +420,45 @@ func TestQueueStore_ConcurrentDequeueIsExclusive(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
-	assert.Equal(t, int32(1), claimed.Load())
+	assert.Equal(t, int32(1), deleted.Load())
+	page, err := stores[0].ListCursor(ctx, "main", "", 1)
+	require.NoError(t, err)
+	assert.Empty(t, page.Items)
+}
+
+func TestQueueStore_ConcurrentEnqueuePreservesIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	stores := []*store.QueueStore{
+		store.NewQueueStore(file.NewCollection(root)),
+		store.NewQueueStore(file.NewCollection(root)),
+	}
+
+	const itemCount = 16
+	errCh := make(chan error, itemCount)
+	var wg sync.WaitGroup
+	for i := range itemCount {
+		wg.Go(func() {
+			errCh <- stores[i%len(stores)].Enqueue(
+				ctx,
+				"main",
+				queue.QueuePriority(i%2),
+				queueRef("dag", fmt.Sprintf("run-%02d", i)),
+			)
+		})
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	page, err := stores[0].ListCursor(ctx, "main", "", itemCount)
+	require.NoError(t, err)
+	assert.Len(t, page.Items, itemCount)
+	assert.False(t, page.HasMore)
 }
 
 func TestQueueStore_ReadsFileQueueItems(t *testing.T) {
@@ -417,8 +483,8 @@ func TestQueueStore_ReadsFileQueueItems(t *testing.T) {
 	assert.Equal(t, "item_high_20260101_000000_000000001Z_run-file", items[0].ID())
 	assert.Equal(t, queueRef("file-dag", "run-file"), requireQueuedRef(t, items[0]))
 
-	claimed, err := s.DequeueByName(ctx, queueName)
+	deleted, err := s.DeleteByItemIDs(ctx, queueName, []string{items[0].ID()})
 	require.NoError(t, err)
-	assert.Equal(t, items[0].ID(), claimed.ID())
+	assert.Equal(t, 1, deleted)
 	assert.NoFileExists(t, itemPath)
 }

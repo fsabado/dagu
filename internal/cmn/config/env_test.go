@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -90,6 +90,16 @@ func TestLoadBaseEnvWithExtras_ExactNamesAndPrefixes(t *testing.T) {
 	require.Equal(t, "name-value", envMap["EXTRA_ALLOWED_NAME"])
 	require.Equal(t, "prefix-value", envMap["EXTRA_ALLOWED_PREFIX_ONE"])
 	_, found := envMap["EXTRA_BLOCKED"]
+	require.False(t, found)
+}
+
+func TestLoadBaseEnvWithExtras_NeverIncludesInternalTransport(t *testing.T) {
+	t.Setenv("_DAGU_INTERNAL_OPENCODE_PASSWORD", "secret")
+	baseEnv := config.LoadBaseEnvWithExtras(
+		[]string{"_DAGU_INTERNAL_OPENCODE_PASSWORD"},
+		[]string{"_DAGU_INTERNAL_"},
+	)
+	_, found := parseEnvSlice(baseEnv.AsSlice())["_DAGU_INTERNAL_OPENCODE_PASSWORD"]
 	require.False(t, found)
 }
 

@@ -8,11 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -28,16 +27,15 @@ func TestStopCommand(t *testing.T) {
     run: %q
 `, holdUntilFileExistsCommand(release)))
 
-		done := make(chan struct{})
+		done := make(chan error, 1)
 		go func() {
 			// Start the DAG to stop.
 			args := []string{"start", dag.Location}
-			th.RunCommand(t, cmd.Start(), test.CmdTest{Args: args})
-			close(done)
+			done <- th.ExecuteCommand(cmd.Start(), test.CmdTest{Args: args})
 		}()
 
 		// Wait for the dag-run running.
-		dag.AssertLatestStatus(t, core.Running)
+		dag.AssertLatestStatus(t, ir.Running)
 
 		// Stop the dag-run.
 		th.RunCommand(t, cmd.Stop(), test.CmdTest{
@@ -45,8 +43,8 @@ func TestStopCommand(t *testing.T) {
 			ExpectedOut: []string{"stop/cancel completed"}})
 
 		// Check the dag-run is stopped.
-		dag.AssertLatestStatus(t, core.Aborted)
-		<-done
+		dag.AssertLatestStatus(t, ir.Aborted)
+		require.NoError(t, <-done)
 	})
 	t.Run("StopDAGRunWithRunID", func(t *testing.T) {
 		t.Parallel()
@@ -58,17 +56,16 @@ func TestStopCommand(t *testing.T) {
     run: %q
 `, holdUntilFileExistsCommand(release)))
 
-		done := make(chan struct{})
+		done := make(chan error, 1)
 		dagRunID := uuid.Must(uuid.NewV7()).String()
 		go func() {
 			// Start the dag-run to stop.
 			args := []string{"start", "--run-id=" + dagRunID, dag.Location}
-			th.RunCommand(t, cmd.Start(), test.CmdTest{Args: args})
-			close(done)
+			done <- th.ExecuteCommand(cmd.Start(), test.CmdTest{Args: args})
 		}()
 
 		// Wait for the dag-run running
-		dag.AssertLatestStatus(t, core.Running)
+		dag.AssertLatestStatus(t, ir.Running)
 
 		// Stop the dag-run with a specific run ID.
 		th.RunCommand(t, cmd.Stop(), test.CmdTest{
@@ -76,8 +73,8 @@ func TestStopCommand(t *testing.T) {
 			ExpectedOut: []string{"stop/cancel completed"}})
 
 		// Check the dag-run is stopped.
-		dag.AssertLatestStatus(t, core.Aborted)
-		<-done
+		dag.AssertLatestStatus(t, ir.Aborted)
+		require.NoError(t, <-done)
 	})
 	t.Run("CancelFailedAutoRetryPendingDAGRunWithRunID", func(t *testing.T) {
 		t.Parallel()
@@ -100,7 +97,7 @@ steps:
 			ExpectedOut: []string{"stop/cancel completed"},
 		})
 
-		dag.AssertLatestStatus(t, core.Aborted)
+		dag.AssertLatestStatus(t, ir.Aborted)
 	})
 	t.Run("StopWithoutRunIDDoesNotCancelFailedAutoRetryPendingDAGRun", func(t *testing.T) {
 		t.Parallel()
@@ -123,30 +120,30 @@ steps:
 			ExpectedOut: []string{"No running DAG runs found"},
 		})
 
-		dag.AssertLatestStatus(t, core.Failed)
+		dag.AssertLatestStatus(t, ir.Failed)
 	})
 }
 
 func seedFailedAutoRetryPendingRun(t *testing.T, th test.Command, dag test.DAG, dagRunID string, autoRetryCount int) {
 	t.Helper()
 
-	attempt, err := th.DAGRunStore.CreateAttempt(
+	attempt, err := th.DAGRunRepository.CreateAttempt(
 		th.Context,
 		dag.DAG,
 		time.Now(),
 		dagRunID,
-		exec.NewDAGRunAttemptOptions{},
+		persis.DAGRunCreateAttemptOptions{},
 	)
 	require.NoError(t, err)
 
-	status := transform.NewStatusBuilder(dag.DAG).Create(
+	status := ir.NewStatusBuilder(dag.DAG).Create(
 		dagRunID,
-		core.Failed,
+		ir.Failed,
 		0,
 		time.Now().Add(-time.Minute),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithAutoRetryCount(autoRetryCount),
-		transform.WithError("step failed"),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithAutoRetryCount(autoRetryCount),
+		ir.WithError("step failed"),
 	)
 	status.FinishedAt = time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
 

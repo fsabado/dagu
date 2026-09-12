@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	runtimeagent "github.com/dagucloud/dagu/internal/runtime/agent"
-	"github.com/dagucloud/dagu/internal/test"
-	"github.com/dagucloud/dagu/internal/test/intgharness"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/proc"
+	runtimeagent "github.com/dagucloud/dagu/v2/internal/runtime/agent"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/test/intgharness"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,7 +29,7 @@ func assertEquivalentPath(t *testing.T, expected, actual string) {
 func dagAgentWithProc(t *testing.T, th test.Helper, dag test.DAG) *test.Agent {
 	t.Helper()
 
-	dagRunID, err := th.DAGRunMgr.GenDAGRunID(th.Context)
+	dagRunID, err := ir.NewDAGRunID()
 	require.NoError(t, err)
 
 	compactRunID := strings.ReplaceAll(dagRunID, "-", "")
@@ -38,7 +38,7 @@ func dagAgentWithProc(t *testing.T, th test.Helper, dag test.DAG) *test.Agent {
 	}
 	attemptID := "attempt-" + compactRunID
 
-	proc, err := th.ProcStore.Acquire(th.Context, dag.ProcGroup(), exec.ProcMeta{
+	proc, err := th.ProcRepository.Acquire(th.Context, dag.ProcGroup(), proc.ProcMeta{
 		StartedAt:    time.Now().Unix(),
 		Name:         dag.Name,
 		DAGRunID:     dagRunID,
@@ -63,9 +63,9 @@ func TestHandlerOn(t *testing.T) {
 	tests := []struct {
 		name         string
 		dagYAML      string
-		setupFunc    func(*testing.T, *core.DAG) // Optional: verify DAG parsing
+		setupFunc    func(*testing.T, *ir.DAG) // Optional: verify DAG parsing
 		runFunc      func(*testing.T, context.Context, *test.Agent)
-		validateFunc func(*testing.T, *exec.DAGRunStatus)
+		validateFunc func(*testing.T, *ir.DAGRunStatus)
 	}{
 		{
 			name: "InitHandler_Success",
@@ -78,17 +78,17 @@ steps:
   - name: step1
     run: "true"
 `,
-			setupFunc: func(t *testing.T, dag *core.DAG) {
+			setupFunc: func(t *testing.T, dag *ir.DAG) {
 				require.NotNil(t, dag.HandlerOn.Init)
 				require.Equal(t, "onInit", dag.HandlerOn.Init.Name)
 			},
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 				require.NotNil(t, status.OnInit, "init handler should have been executed")
-				require.Equal(t, core.NodeSucceeded, status.OnInit.Status)
+				require.Equal(t, ir.NodeSucceeded, status.OnInit.Status)
 			},
 		},
 		{
@@ -107,19 +107,19 @@ steps:
 			runFunc: func(_ *testing.T, ctx context.Context, agent *test.Agent) {
 				_ = agent.Run(ctx)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
 				// Init failure causes DAG to be aborted (canceled internally)
-				require.Equal(t, core.Aborted, status.Status)
+				require.Equal(t, ir.Aborted, status.Status)
 				require.NotNil(t, status.OnInit, "init handler should have been executed")
-				require.Equal(t, core.NodeFailed, status.OnInit.Status)
+				require.Equal(t, ir.NodeFailed, status.OnInit.Status)
 
 				// Exit handler should have run
 				require.NotNil(t, status.OnExit, "exit handler should have been executed")
-				require.Equal(t, core.NodeSucceeded, status.OnExit.Status)
+				require.Equal(t, ir.NodeSucceeded, status.OnExit.Status)
 
 				// Steps should not have run
 				require.Len(t, status.Nodes, 1)
-				require.Equal(t, core.NodeNotStarted, status.Nodes[0].Status)
+				require.Equal(t, ir.NodeNotStarted, status.Nodes[0].Status)
 			},
 		},
 		{
@@ -137,13 +137,13 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 				require.NotNil(t, status.OnInit, "init handler node should exist")
-				require.Equal(t, core.NodeSkipped, status.OnInit.Status)
+				require.Equal(t, ir.NodeSkipped, status.OnInit.Status)
 
 				// Steps should have run
-				require.Equal(t, core.NodeSucceeded, status.Nodes[0].Status)
+				require.Equal(t, ir.NodeSucceeded, status.Nodes[0].Status)
 			},
 		},
 		{
@@ -162,13 +162,13 @@ steps:
 			runFunc: func(_ *testing.T, ctx context.Context, agent *test.Agent) {
 				_ = agent.Run(ctx)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
-				require.Equal(t, core.Aborted, status.Status)
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
+				require.Equal(t, ir.Aborted, status.Status)
 
 				// Init handler should not have run (DAG precondition failed first)
 				// OnInit may be nil or NotStarted when the runner doesn't execute it
 				if status.OnInit != nil {
-					require.Equal(t, core.NodeNotStarted, status.OnInit.Status)
+					require.Equal(t, ir.NodeNotStarted, status.OnInit.Status)
 				}
 
 				// Steps should not have run - they remain in NotStarted state when preconditions fail
@@ -176,7 +176,7 @@ steps:
 				require.NotEmpty(t, status.Nodes)
 				// The node could be NotStarted or Aborted depending on timing
 				nodeStatus := status.Nodes[0].Status
-				require.True(t, nodeStatus == core.NodeNotStarted || nodeStatus == core.NodeAborted,
+				require.True(t, nodeStatus == ir.NodeNotStarted || nodeStatus == ir.NodeAborted,
 					"expected NotStarted or Aborted, got %v", nodeStatus)
 			},
 		},
@@ -197,10 +197,10 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunError(t)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
-				require.Equal(t, core.Failed, status.Status)
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
+				require.Equal(t, ir.Failed, status.Status)
 				require.NotNil(t, status.OnFailure, "failure handler should have been executed")
-				require.Equal(t, core.NodeSucceeded, status.OnFailure.Status)
+				require.Equal(t, ir.NodeSucceeded, status.OnFailure.Status)
 			},
 		},
 		{
@@ -217,10 +217,10 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 				require.NotNil(t, status.OnSuccess, "success handler should have been executed")
-				require.Equal(t, core.NodeSucceeded, status.OnSuccess.Status)
+				require.Equal(t, ir.NodeSucceeded, status.OnSuccess.Status)
 			},
 		},
 		{
@@ -237,10 +237,10 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 				require.NotNil(t, status.OnExit, "exit handler should have been executed")
-				require.Equal(t, core.NodeSucceeded, status.OnExit.Status)
+				require.Equal(t, ir.NodeSucceeded, status.OnExit.Status)
 			},
 		},
 		{
@@ -255,17 +255,17 @@ steps:
     run: "true"
     approval: {}
 `,
-			setupFunc: func(t *testing.T, dag *core.DAG) {
+			setupFunc: func(t *testing.T, dag *ir.DAG) {
 				require.NotNil(t, dag.HandlerOn.Wait)
 				require.Equal(t, "onWait", dag.HandlerOn.Wait.Name)
 			},
 			runFunc: func(_ *testing.T, ctx context.Context, agent *test.Agent) {
 				_ = agent.Run(ctx)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
-				require.Equal(t, core.Waiting, status.Status)
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
+				require.Equal(t, ir.Waiting, status.Status)
 				require.NotNil(t, status.OnWait, "wait handler should have been executed")
-				require.Equal(t, core.NodeSucceeded, status.OnWait.Status)
+				require.Equal(t, ir.NodeSucceeded, status.OnWait.Status)
 			},
 		},
 		{
@@ -283,11 +283,11 @@ steps:
 			runFunc: func(_ *testing.T, ctx context.Context, agent *test.Agent) {
 				_ = agent.Run(ctx)
 			},
-			validateFunc: func(t *testing.T, status *exec.DAGRunStatus) {
+			validateFunc: func(t *testing.T, status *ir.DAGRunStatus) {
 				// DAG should still be in Wait status even if handler failed
-				require.Equal(t, core.Waiting, status.Status)
+				require.Equal(t, ir.Waiting, status.Status)
 				require.NotNil(t, status.OnWait, "wait handler should have been executed")
-				require.Equal(t, core.NodeFailed, status.OnWait.Status)
+				require.Equal(t, ir.NodeFailed, status.OnWait.Status)
 			},
 		},
 	}
@@ -361,9 +361,9 @@ steps:
 
 	// Verify the abort handler was executed
 	status := dagAgent.Status(th.Context)
-	require.Equal(t, core.Aborted, status.Status)
+	require.Equal(t, ir.Aborted, status.Status)
 	require.NotNil(t, status.OnAbort, "abort handler should have been executed")
-	require.Equal(t, core.NodeSucceeded, status.OnAbort.Status)
+	require.Equal(t, ir.NodeSucceeded, status.OnAbort.Status)
 }
 
 // TestHandlerOn_EnvironmentVariables tests that special environment variables
@@ -417,7 +417,7 @@ steps:
 
 		status := agent.Status(th.Context)
 		require.NotNil(t, status.OnInit, "init handler should have been executed")
-		require.Equal(t, core.NodeSucceeded, status.OnInit.Status)
+		require.Equal(t, ir.NodeSucceeded, status.OnInit.Status)
 		require.NotNil(t, status.OnInit.OutputVariables, "init handler should have output variables")
 
 		output, ok := status.OnInit.OutputVariables.Load("INIT_ENV_OUTPUT")
@@ -493,7 +493,7 @@ steps:
 
 		status := agent.Status(th.Context)
 		require.NotNil(t, status.OnSuccess, "success handler should have been executed")
-		require.Equal(t, core.NodeSucceeded, status.OnSuccess.Status)
+		require.Equal(t, ir.NodeSucceeded, status.OnSuccess.Status)
 		require.NotNil(t, status.OnSuccess.OutputVariables)
 
 		output, ok := status.OnSuccess.OutputVariables.Load("SUCCESS_ENV_OUTPUT")
@@ -534,7 +534,7 @@ steps:
 
 		status := agent.Status(th.Context)
 		require.NotNil(t, status.OnFailure, "failure handler should have been executed")
-		require.Equal(t, core.NodeSucceeded, status.OnFailure.Status)
+		require.Equal(t, ir.NodeSucceeded, status.OnFailure.Status)
 		require.NotNil(t, status.OnFailure.OutputVariables)
 
 		output, ok := status.OnFailure.OutputVariables.Load("FAILURE_ENV_OUTPUT")
@@ -572,7 +572,7 @@ steps:
 
 		status := agent.Status(th.Context)
 		require.NotNil(t, status.OnExit, "exit handler should have been executed")
-		require.Equal(t, core.NodeSucceeded, status.OnExit.Status)
+		require.Equal(t, ir.NodeSucceeded, status.OnExit.Status)
 		require.NotNil(t, status.OnExit.OutputVariables)
 
 		output, ok := status.OnExit.OutputVariables.Load("EXIT_ENV_OUTPUT")
@@ -610,7 +610,7 @@ steps:
 
 		status := agent.Status(th.Context)
 		require.NotNil(t, status.OnExit, "exit handler should have been executed")
-		require.Equal(t, core.NodeSucceeded, status.OnExit.Status)
+		require.Equal(t, ir.NodeSucceeded, status.OnExit.Status)
 		require.NotNil(t, status.OnExit.OutputVariables)
 
 		output, ok := status.OnExit.OutputVariables.Load("EXIT_ENV_OUTPUT")
@@ -666,7 +666,7 @@ steps:
 
 		status := dagAgent.Status(th.Context)
 		require.NotNil(t, status.OnAbort, "abort handler should have been executed")
-		require.Equal(t, core.NodeSucceeded, status.OnAbort.Status)
+		require.Equal(t, ir.NodeSucceeded, status.OnAbort.Status)
 		require.NotNil(t, status.OnAbort.OutputVariables)
 
 		output, ok := status.OnAbort.OutputVariables.Load("ABORT_ENV_OUTPUT")
@@ -823,9 +823,9 @@ steps:
 		_ = agent.Run(th.Context)
 
 		status := agent.Status(th.Context)
-		require.Equal(t, core.Waiting, status.Status)
+		require.Equal(t, ir.Waiting, status.Status)
 		require.NotNil(t, status.OnWait, "wait handler should have been executed")
-		require.Equal(t, core.NodeSucceeded, status.OnWait.Status)
+		require.Equal(t, ir.NodeSucceeded, status.OnWait.Status)
 		require.NotNil(t, status.OnWait.OutputVariables)
 
 		output, ok := status.OnWait.OutputVariables.Load("WAIT_HANDLER_OUTPUT")
@@ -866,7 +866,7 @@ steps:
 		_ = agent.Run(th.Context)
 
 		status := agent.Status(th.Context)
-		require.Equal(t, core.Waiting, status.Status)
+		require.Equal(t, ir.Waiting, status.Status)
 		require.NotNil(t, status.OnWait)
 		require.NotNil(t, status.OnWait.OutputVariables)
 
@@ -937,7 +937,7 @@ steps:
 		_ = agent.Run(th.Context)
 
 		status := agent.Status(th.Context)
-		require.Equal(t, core.Waiting, status.Status)
+		require.Equal(t, ir.Waiting, status.Status)
 		require.NotNil(t, status.OnWait)
 		assertEquivalentPath(t, filepath.Join(tempDir, "wait_approval-gate.log"), status.OnWait.Step.Stdout)
 

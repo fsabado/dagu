@@ -9,7 +9,6 @@ import { Button } from '@/components/ui/button';
 import type { StatusTab } from '@/features/dags/components/DAGStatus';
 import { cn } from '@/lib/utils';
 import { components } from '../../../../api/v1/schema';
-import { usePageContext } from '../../../../contexts/PageContext';
 import { useRemoteNode } from '../../../../contexts/RemoteNodeContext';
 import { shouldIgnoreKeyboardShortcuts } from '../../../../lib/keyboard-shortcuts';
 import LoadingIndicator from '@/components/ui/loading-indicator';
@@ -18,6 +17,8 @@ import { useBoundedDAGRunDetails } from '../../hooks/useBoundedDAGRunDetails';
 import { matchesRequestedDAGRunDetails } from '../../hooks/dagRunDetailsRequest';
 import { buildDAGRunPageURL } from '../../lib/dagRunUrls';
 import DAGRunDetailsContent from './DAGRunDetailsContent';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 type DAGRunDetailsModalProps = {
   name: string;
@@ -41,7 +42,6 @@ function DAGRunDetailsModal({
   initialTab = 'status',
 }: DAGRunDetailsModalProps): React.ReactElement | null {
   const navigate = useNavigate();
-  const { setContext } = usePageContext();
 
   const [shouldRender, setShouldRender] = useState(isOpen);
   const [isVisible, setIsVisible] = useState(false);
@@ -125,8 +125,6 @@ function DAGRunDetailsModal({
   const displayDagRunId = freshDetails
     ? dagRunId
     : (previousDataRef.current?.dagRunId ?? dagRunId);
-  const fillContentHeight = initialTab === 'artifacts';
-
   useEffect(() => {
     if (freshDetails) {
       previousDataRef.current = { name, dagRunId, dagRunDetails: freshDetails };
@@ -142,17 +140,6 @@ function DAGRunDetailsModal({
     isValidating &&
     previousData !== null &&
     (previousData.dagRunId !== dagRunId || previousData.name !== name);
-
-  useEffect(() => {
-    if (isOpen && name) {
-      setContext({
-        dagFile: name,
-        dagRunId: dagRunId || undefined,
-        dagRunName: name,
-        source: 'dag-run-details-modal',
-      });
-    }
-  }, [isOpen, name, dagRunId, setContext]);
 
   const refreshFn = useCallback(() => {
     setTimeout(() => {
@@ -230,8 +217,7 @@ function DAGRunDetailsModal({
 
       <div
         className={cn(
-          'fixed top-0 bottom-0 right-0 z-50 h-screen w-full border-l border-indigo-500/30 bg-background transition-all duration-150 ease-out md:w-3/4',
-          fillContentHeight ? 'overflow-hidden' : 'overflow-y-auto',
+          'fixed top-0 bottom-0 right-0 z-50 h-screen w-full overflow-hidden border-l border-indigo-500/30 bg-background transition-all duration-150 ease-out md:w-3/4',
           modalVisibilityClass
         )}
       >
@@ -245,17 +231,17 @@ function DAGRunDetailsModal({
           <div className="p-6 w-full flex flex-col h-full dagRun-modal-content">
             <div className="flex justify-between items-center mb-4">
               <p className="text-xs text-muted-foreground">
-                Use{' '}
+                <I18nText text={"Use"} />{' '}
                 <kbd className="px-1 py-0.5 bg-muted rounded text-xs font-mono">
                   ↑
                 </kbd>{' '}
                 <kbd className="px-1 py-0.5 bg-muted rounded text-xs font-mono">
                   ↓
                 </kbd>{' '}
-                to navigate histories
+                <I18nText text={"to navigate histories"} />
               </p>
               <div className="flex gap-2 items-center">
-                <Button
+                <I18nProps><Button
                   variant="outline"
                   size="icon"
                   onClick={handleFullscreenClick}
@@ -264,10 +250,10 @@ function DAGRunDetailsModal({
                 >
                   <Maximize2 className="h-4 w-4" />
                   <span className="absolute -bottom-1 -right-1 bg-muted text-muted-foreground text-xs font-medium px-1 rounded-sm border opacity-0 group-hover:opacity-100 transition-opacity">
-                    F
+                    <I18nText text={"F"} />
                   </span>
-                </Button>
-                <Button
+                </Button></I18nProps>
+                <I18nProps><Button
                   variant="outline"
                   size="icon"
                   onClick={onClose}
@@ -276,18 +262,13 @@ function DAGRunDetailsModal({
                 >
                   <X className="h-4 w-4" />
                   <span className="absolute -bottom-1 -right-1 bg-muted text-muted-foreground text-xs font-medium px-1 rounded-sm border opacity-0 group-hover:opacity-100 transition-opacity">
-                    Esc
+                    <I18nText text={"Esc"} />
                   </span>
-                </Button>
+                </Button></I18nProps>
               </div>
             </div>
 
-            <div
-              className={cn(
-                'relative min-h-0 flex-1',
-                fillContentHeight ? 'overflow-hidden' : 'overflow-y-auto'
-              )}
-            >
+            <div className="relative min-h-0 flex-1 overflow-hidden">
               {isTransitioning && (
                 <div className="absolute top-2 right-2 z-10">
                   <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -302,7 +283,7 @@ function DAGRunDetailsModal({
               {!isInitialLoading && error && !displayData && (
                 <div className="p-4">
                   <div className="rounded-lg border border-error/30 bg-error-muted p-4 text-sm text-error">
-                    {error.message || 'Failed to load DAG run details'}
+                    {error.message || <I18nText text={"Failed to load DAG run details"} />}
                   </div>
                 </div>
               )}
@@ -313,7 +294,7 @@ function DAGRunDetailsModal({
                   refreshFn={refreshFn}
                   dagRunId={displayDagRunId}
                   initialTab={initialTab}
-                  fillHeight={fillContentHeight}
+                  fillHeight
                 />
               )}
             </div>

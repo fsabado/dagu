@@ -6,10 +6,12 @@ package cmd_test
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,8 +19,8 @@ func TestServerCommand(t *testing.T) {
 	t.Run("StartServer", func(t *testing.T) {
 		th := test.SetupCommand(t)
 		cancelWhenLogContains(t, th, "Server is starting")
-		port := findPort(t)
-		th.RunCommand(t, cmd.Server(), test.CmdTest{
+		listener, port := test.ReserveServerListener(t)
+		th.RunCommand(t, cmd.Server(frontend.WithListener(listener)), test.CmdTest{
 			Args:        []string{"server", fmt.Sprintf("--port=%s", port)},
 			ExpectedOut: []string{"Server is starting", port},
 		})
@@ -26,12 +28,18 @@ func TestServerCommand(t *testing.T) {
 	})
 	t.Run("StartServerWithConfig", func(t *testing.T) {
 		th := test.SetupCommand(t)
-		cancelWhenLogContains(t, th, "54321")
-		th.RunCommand(t, cmd.Server(), test.CmdTest{
-			Args:        []string{"server", "--config", test.TestdataPath(t, "cli/config_test.yaml")},
-			ExpectedOut: []string{"54321"},
+		listener, port := test.ReserveServerListener(t)
+		configFile := th.TempFile(t, "server-config.yaml", fmt.Appendf(nil, "host: 127.0.0.1\nport: %s\n", port))
+		cancelWhenLogContains(t, th, "Server is starting")
+		th.RunCommand(t, cmd.Server(frontend.WithListener(listener)), test.CmdTest{
+			Args:        []string{"server", "--config", configFile, "--dagu-home", filepath.Dir(th.Config.Paths.DataDir)},
+			ExpectedOut: []string{port},
 		})
 	})
+}
+
+func TestServerSecondInterruptTerminatesBlockedCleanup(t *testing.T) {
+	assertSecondInterruptTerminatesBlockedCleanup(t, "server", "Resource monitoring service stopped")
 }
 
 // findPort finds an available port.

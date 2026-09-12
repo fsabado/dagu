@@ -7,15 +7,17 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type testQueuedItem struct {
 	id  string
-	ref *exec.DAGRunRef
+	ref *ir.DAGRunRef
 	err error
 }
 
@@ -23,7 +25,7 @@ func (i testQueuedItem) ID() string {
 	return i.id
 }
 
-func (i testQueuedItem) Data() (*exec.DAGRunRef, error) {
+func (i testQueuedItem) Data() (*ir.DAGRunRef, error) {
 	if i.err != nil {
 		return nil, i.err
 	}
@@ -37,13 +39,13 @@ func TestQueueDispatcher_SelectRunnableQueueItemsSkipsOutstandingReservations(t 
 
 	f.enqueueRuns(2)
 
-	reservedRef := exec.NewDAGRunRef(f.dag.Name, "run-1")
-	reservedAttempt, err := f.dagRunStore.FindAttempt(f.ctx, reservedRef)
+	reservedRef := ir.NewDAGRunRef(f.dag.Name, "run-1")
+	reservedAttempt, err := f.dagRunRepository.FindAttempt(f.ctx, reservedRef)
 	require.NoError(t, err)
 	reservedStatus, err := reservedAttempt.ReadStatus(f.ctx)
 	require.NoError(t, err)
 
-	require.NoError(t, f.dispatchStore.Enqueue(f.ctx, &exec.DispatchTask{
+	require.NoError(t, f.dispatchStore.Enqueue(f.ctx, &dispatch.DispatchTask{
 		DAGRunID:   reservedRef.ID,
 		Target:     f.dag.Name,
 		QueueName:  f.dag.Name,
@@ -55,7 +57,7 @@ func TestQueueDispatcher_SelectRunnableQueueItemsSkipsOutstandingReservations(t 
 	require.NoError(t, err)
 
 	dispatcher := newQueueDispatcher(queueDispatchDeps{
-		dagRunStore:         f.dagRunStore,
+		dagRunRepository:    f.dagRunRepository,
 		dispatchTaskStore:   f.dispatchStore,
 		leaseStaleThreshold: freshDistributedTestThreshold,
 	})
@@ -70,13 +72,14 @@ func TestQueueDispatcher_SelectRunnableQueueItemsSkipsOutstandingReservations(t 
 
 func TestQueueDispatcher_SelectRunnableQueueItemsSkipsInvalidItems(t *testing.T) {
 	dispatcher := newQueueDispatcher(queueDispatchDeps{})
-	validRef := exec.NewDAGRunRef("dag", "run-ok")
+	validRef := ir.NewDAGRunRef("dag", "run-ok")
 
-	runnable, err := dispatcher.selectRunnableQueueItems(t.Context(), []exec.QueuedItemData{
+	runnable, retryScan, err := dispatcher.selectRunnableQueueItemsInQueue(t.Context(), "", []queuedomain.QueuedItemData{
 		testQueuedItem{id: "bad", err: fmt.Errorf("invalid queued item")},
 		testQueuedItem{id: "ok", ref: &validRef},
-	}, 1)
+	}, 1, &workerHeartbeatSnapshot{})
 	require.NoError(t, err)
 	require.Len(t, runnable, 1)
 	assert.Equal(t, "ok", runnable[0].ID())
+	assert.True(t, retryScan)
 }

@@ -14,18 +14,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/launcher"
-	"github.com/dagucloud/dagu/internal/persis/file"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/scheduler"
-	"github.com/dagucloud/dagu/internal/service/worker"
-	"github.com/dagucloud/dagu/internal/test"
-	"github.com/dagucloud/dagu/internal/test/intgharness"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/launcher"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	persiststore "github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/service/worker"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/test/intgharness"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -40,6 +43,7 @@ type fixtureConfig struct {
 	dagsDir                 string
 	baseConfigPath          string
 	workerBaseConfigPath    string // Override worker's base config path (for testing embedded base config)
+	isolatedWorker          bool
 	procConfig              *procConfig
 	staleHeartbeatThreshold time.Duration
 	staleLeaseThreshold     time.Duration
@@ -47,9 +51,8 @@ type fixtureConfig struct {
 }
 
 type procConfig struct {
-	heartbeatInterval     time.Duration
-	heartbeatSyncInterval time.Duration
-	staleThreshold        time.Duration
+	heartbeatInterval time.Duration
+	staleThreshold    time.Duration
 }
 
 type fixtureOption func(*fixtureConfig)
@@ -105,12 +108,15 @@ func withWorkerBaseConfigPath(path string) fixtureOption {
 	return func(c *fixtureConfig) { c.workerBaseConfigPath = path }
 }
 
-func withProcConfig(heartbeatInterval, heartbeatSyncInterval, staleThreshold time.Duration) fixtureOption {
+func withIsolatedWorker() fixtureOption {
+	return func(c *fixtureConfig) { c.isolatedWorker = true }
+}
+
+func withProcConfig(heartbeatInterval, staleThreshold time.Duration) fixtureOption {
 	return func(c *fixtureConfig) {
 		c.procConfig = &procConfig{
-			heartbeatInterval:     heartbeatInterval,
-			heartbeatSyncInterval: heartbeatSyncInterval,
-			staleThreshold:        staleThreshold,
+			heartbeatInterval: heartbeatInterval,
+			staleThreshold:    staleThreshold,
 		}
 	}
 }
@@ -163,7 +169,6 @@ func newTestFixture(t *testing.T, yaml string, opts ...fixtureOption) *testFixtu
 		c.Scheduler.Port = 0
 		if cfg.procConfig != nil {
 			c.Proc.HeartbeatInterval = cfg.procConfig.heartbeatInterval
-			c.Proc.HeartbeatSyncInterval = cfg.procConfig.heartbeatSyncInterval
 			c.Proc.StaleThreshold = cfg.procConfig.staleThreshold
 		}
 		if cfg.zombieDetectionInterval > 0 {
@@ -204,7 +209,7 @@ func newTestFixture(t *testing.T, yaml string, opts ...fixtureOption) *testFixtu
 
 	for i := range cfg.workerCount {
 		workerID := fmt.Sprintf("worker-%d", i+1)
-		w := f.setupWorker(workerID, cfg.workerLabels, cfg.workerBaseConfigPath)
+		w := f.setupWorkerMode(workerID, cfg.workerLabels, cfg.workerBaseConfigPath, cfg.isolatedWorker, nil)
 		f.workers = append(f.workers, w)
 	}
 
@@ -214,13 +219,23 @@ func newTestFixture(t *testing.T, yaml string, opts ...fixtureOption) *testFixtu
 }
 
 func (f *testFixture) setupWorker(workerID string, labels map[string]string, workerBaseConfigPath string) *worker.Worker {
-	return f.setupWorkerWithAfterAckHook(workerID, labels, workerBaseConfigPath, nil)
+	return f.setupWorkerMode(workerID, labels, workerBaseConfigPath, false, nil)
 }
 
 func (f *testFixture) setupWorkerWithAfterAckHook(
 	workerID string,
 	labels map[string]string,
 	workerBaseConfigPath string,
+	afterAckHook func(context.Context, *coordinatorv1.Task) bool,
+) *worker.Worker {
+	return f.setupWorkerMode(workerID, labels, workerBaseConfigPath, false, afterAckHook)
+}
+
+func (f *testFixture) setupWorkerMode(
+	workerID string,
+	labels map[string]string,
+	workerBaseConfigPath string,
+	isolated bool,
 	afterAckHook func(context.Context, *coordinatorv1.Task) bool,
 ) *worker.Worker {
 	f.t.Helper()
@@ -235,18 +250,38 @@ func (f *testFixture) setupWorkerWithAfterAckHook(
 		cfgCopy.Paths = pathsCopy
 		workerConfig = &cfgCopy
 	}
+	if isolated {
+		cfgCopy := *workerConfig
+		pathsCopy := cfgCopy.Paths
+		workerDataDir := filepath.Join(f.t.TempDir(), workerID)
+		pathsCopy.DataDir = workerDataDir
+		pathsCopy.LogDir = filepath.Join(workerDataDir, "logs")
+		pathsCopy.ArtifactDir = filepath.Join(workerDataDir, "artifacts")
+		pathsCopy.ToolsDir = filepath.Join(workerDataDir, "tools")
+		pathsCopy.DAGRunWorkDir = filepath.Join(workerDataDir, "work")
+		for _, dir := range []string{
+			pathsCopy.DataDir, pathsCopy.LogDir, pathsCopy.ArtifactDir,
+			pathsCopy.ToolsDir, pathsCopy.DAGRunWorkDir,
+		} {
+			require.NoError(f.t, os.MkdirAll(dir, 0755))
+		}
+		cfgCopy.Paths = pathsCopy
+		workerConfig = &cfgCopy
+	}
 
 	handlerCfg := worker.RemoteTaskHandlerConfig{
 		WorkerID:          workerID,
 		CoordinatorClient: f.coordinatorClient,
-		DAGStore:          f.coord.DAGStore,
-		DAGRunMgr:         f.coord.DAGRunMgr,
-		ServiceRegistry:   f.coord.ServiceRegistry,
 		PeerConfig:        f.coord.Config.Core.Peer,
 		Config:            workerConfig,
 	}
+	if !isolated {
+		handlerCfg.DAGRepository = f.coord.DAGRepository
+		handlerCfg.DAGRunMgr = f.coord.DAGRunMgr
+		handlerCfg.ServiceRegistry = f.coord.ServiceRegistry
+	}
 
-	w := worker.NewWorker(workerID, f.workerMaxActiveRuns, f.coordinatorClient, labels, f.coord.Config)
+	w := worker.NewWorker(workerID, f.workerMaxActiveRuns, f.coordinatorClient, labels, workerConfig)
 	w.SetHandler(worker.NewRemoteTaskHandler(handlerCfg))
 	if afterAckHook != nil {
 		w.SetAfterTaskAckHook(afterAckHook)
@@ -299,10 +334,10 @@ func (f *testFixture) startSchedulerWithClock(timeout time.Duration, clock sched
 	f.startSchedulerWithOptions(
 		timeout,
 		clock,
-		func() scheduler.WatermarkStore {
-			wmBackend, err := file.New(f.coord.Config.Paths.DataDir)
-			require.NoError(f.t, err)
-			return scheduler.NewWatermarkStore(wmBackend.Collection("scheduler"))
+		func() schedulerstate.Store {
+			return persiststore.NewSchedulerStateStore(
+				file.NewCollection(filepath.Join(f.coord.Config.Paths.DataDir, "scheduler")),
+			)
 		}(),
 	)
 }
@@ -310,25 +345,32 @@ func (f *testFixture) startSchedulerWithClock(timeout time.Duration, clock sched
 func (f *testFixture) startSchedulerWithOptions(
 	timeout time.Duration,
 	clock scheduler.Clock,
-	watermarkStore scheduler.WatermarkStore,
+	stateStore schedulerstate.Store,
 ) {
 	f.t.Helper()
 
-	em := scheduler.NewEntryReader(f.coord.Config.Paths.DAGsDir, f.coord.DAGStore)
-
-	schedulerInst, err := scheduler.New(
-		f.coord.Config,
-		em,
-		f.coord.DAGRunMgr,
-		f.coord.DAGRunStore,
-		f.coord.QueueStore,
-		f.coord.ProcStore,
-		f.coord.ServiceRegistry,
-		f.coordinatorClient,
-		watermarkStore,
+	em := scheduler.NewFileEntryReader(
+		f.coord.Config.Paths.DAGsDir,
+		f.coord.DAGRepository,
+		f.coord.Config.DAGDiscovery.Recursive,
 	)
+
+	schedulerInst, err := scheduler.New(f.coord.Config, scheduler.Dependencies{
+		EntryReader:          em,
+		DAGRunManager:        f.coord.DAGRunMgr,
+		DAGRepository:        f.coord.DAGRepository,
+		DAGRunRepository:     f.coord.DAGRunRepository,
+		QueueStore:           f.coord.QueueStore,
+		ProcRepository:       f.coord.ProcRepository,
+		ServiceRegistry:      f.coord.ServiceRegistry,
+		CoordinatorClient:    f.coordinatorClient,
+		SchedulerStateStore:  stateStore,
+		DAGRunLeaseStore:     f.coord.DAGRunLeaseStore,
+		DispatchTaskStore:    f.coord.DispatchTaskStore,
+		WorkerHeartbeatStore: f.coord.WorkerHeartbeatStore,
+		WorkerStaleAfter:     f.coord.StaleHeartbeatThreshold,
+	})
 	require.NoError(f.t, err)
-	schedulerInst.SetDAGRunLeaseStore(f.coord.DAGRunLeaseStore)
 	if clock != nil {
 		schedulerInst.SetClock(clock)
 	}
@@ -406,10 +448,20 @@ func (f *testFixture) enqueueWithParams(params string) error {
 	return launcher.Run(f.coord.Context, enqueueSpec)
 }
 
+func (f *testFixture) enqueueWithProfile(name string) error {
+	f.t.Helper()
+	subCmdBuilder := launcher.NewSubCmdBuilder(f.coord.Config)
+	enqueueSpec := subCmdBuilder.Enqueue(f.dagWrapper.DAG, launcher.EnqueueOptions{
+		Quiet:       true,
+		ProfileName: name,
+	})
+	return launcher.Run(f.coord.Context, enqueueSpec)
+}
+
 func (f *testFixture) enqueueDirect() error {
 	f.t.Helper()
 
-	runID, err := f.coord.DAGRunMgr.GenDAGRunID(f.coord.Context)
+	runID, err := ir.NewDAGRunID()
 	if err != nil {
 		return err
 	}
@@ -417,7 +469,7 @@ func (f *testFixture) enqueueDirect() error {
 	dagCopy := f.dagWrapper.Clone()
 	dagCopy.Location = ""
 
-	att, err := f.coord.DAGRunStore.CreateAttempt(f.coord.Context, dagCopy, time.Now(), runID, exec.NewDAGRunAttemptOptions{})
+	att, err := f.coord.DAGRunRepository.CreateAttempt(f.coord.Context, dagCopy, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 	if err != nil {
 		return err
 	}
@@ -427,15 +479,15 @@ func (f *testFixture) enqueueDirect() error {
 		return err
 	}
 
-	status := transform.NewStatusBuilder(dagCopy).Create(
+	status := ir.NewStatusBuilder(dagCopy).Create(
 		runID,
-		core.Queued,
+		ir.Queued,
 		0,
 		time.Time{},
-		transform.WithLogFilePath(logFile),
-		transform.WithAttemptID(att.ID()),
-		transform.WithHierarchyRefs(exec.NewDAGRunRef(dagCopy.Name, runID), exec.DAGRunRef{}),
-		transform.WithTriggerType(core.TriggerTypeManual),
+		ir.WithLogFilePath(logFile),
+		ir.WithAttemptID(att.ID()),
+		ir.WithHierarchyRefs(ir.NewDAGRunRef(dagCopy.Name, runID), ir.DAGRunRef{}),
+		ir.WithTriggerType(ir.TriggerTypeManual),
 	)
 
 	if err := att.Open(f.coord.Context); err != nil {
@@ -452,29 +504,31 @@ func (f *testFixture) enqueueDirect() error {
 	return f.coord.QueueStore.Enqueue(
 		f.coord.Context,
 		dagCopy.ProcGroup(),
-		exec.QueuePriorityLow,
-		exec.NewDAGRunRef(dagCopy.Name, runID),
+		queue.QueuePriorityLow,
+		ir.NewDAGRunRef(dagCopy.Name, runID),
 	)
 }
 
 func (f *testFixture) enqueueCatchup(scheduleTime time.Time) (string, error) {
 	f.t.Helper()
 
-	runID, err := f.coord.DAGRunMgr.GenDAGRunID(f.coord.Context)
+	runID, err := ir.NewDAGRunID()
 	if err != nil {
 		return "", err
 	}
 
 	err = scheduler.EnqueueCatchupRun(
 		f.coord.Context,
-		f.coord.DAGRunStore,
+		f.coord.DAGRunRepository,
 		f.coord.QueueStore,
 		f.coord.Config.Paths.LogDir,
 		f.coord.Config.Paths.ArtifactDir,
 		f.coord.Config.Paths.BaseConfig,
+		"",
+		f.dagWrapper.FileName(),
 		f.dagWrapper.DAG,
 		runID,
-		core.TriggerTypeCatchUp,
+		ir.TriggerTypeCatchUp,
 		scheduleTime,
 		"",
 	)
@@ -500,7 +554,7 @@ func (f *testFixture) startWithLabels(labels string) error {
 func (f *testFixture) retry(dagRunID string) error {
 	f.t.Helper()
 	subCmdBuilder := launcher.NewSubCmdBuilder(f.coord.Config)
-	retrySpec := subCmdBuilder.Retry(f.dagWrapper.DAG, dagRunID, "")
+	retrySpec := subCmdBuilder.Retry(f.dagWrapper.DAG, launcher.RetryOptions{DAGRunID: dagRunID})
 	return launcher.Start(f.coord.Context, retrySpec)
 }
 
@@ -512,9 +566,9 @@ func (f *testFixture) waitForQueued() {
 	})
 }
 
-func (f *testFixture) waitForStatus(expected core.Status, timeout time.Duration) exec.DAGRunStatus {
+func (f *testFixture) waitForStatus(expected ir.Status, timeout time.Duration) ir.DAGRunStatus {
 	f.t.Helper()
-	var status exec.DAGRunStatus
+	var status ir.DAGRunStatus
 	f.requireEventuallyNoSchedulerError(fmt.Sprintf("timeout waiting for status %s", expected), timeout, 100*time.Millisecond, func() bool {
 		var err error
 		status, err = f.latestStoredStatus()
@@ -526,9 +580,9 @@ func (f *testFixture) waitForStatus(expected core.Status, timeout time.Duration)
 	return status
 }
 
-func (f *testFixture) waitForStatusIn(expected []core.Status, timeout time.Duration) exec.DAGRunStatus {
+func (f *testFixture) waitForStatusIn(expected []ir.Status, timeout time.Duration) ir.DAGRunStatus {
 	f.t.Helper()
-	var status exec.DAGRunStatus
+	var status ir.DAGRunStatus
 	f.requireEventuallyNoSchedulerError(fmt.Sprintf("timeout waiting for status in %v", expected), timeout, 100*time.Millisecond, func() bool {
 		var err error
 		status, err = f.latestStoredStatus()
@@ -593,24 +647,24 @@ func (f *testFixture) pollSchedulerErr() error {
 	return f.schedulerErr
 }
 
-func (f *testFixture) latestStatus() (exec.DAGRunStatus, error) {
+func (f *testFixture) latestStatus() (ir.DAGRunStatus, error) {
 	return f.latestStoredStatus()
 }
 
-func (f *testFixture) latestStoredStatus() (exec.DAGRunStatus, error) {
-	store := file.NewDAGRunStore(f.coord.Config)
+func (f *testFixture) latestStoredStatus() (ir.DAGRunStatus, error) {
+	repository := file.NewDAGRunRepository(f.coord.Config)
 
-	attempt, err := store.LatestAttempt(f.coord.Context, f.dagWrapper.Name)
+	attempt, err := repository.LatestAttempt(f.coord.Context, f.dagWrapper.Name, persis.DAGRunLatestAttemptOptions{})
 	if err != nil {
-		return exec.DAGRunStatus{}, err
+		return ir.DAGRunStatus{}, err
 	}
 
 	status, err := attempt.ReadStatus(f.coord.Context)
 	if err != nil {
-		return exec.DAGRunStatus{}, err
+		return ir.DAGRunStatus{}, err
 	}
 	if status == nil {
-		return exec.DAGRunStatus{}, exec.ErrCorruptedStatusFile
+		return ir.DAGRunStatus{}, dagrun.ErrCorruptedStatusData
 	}
 
 	return *status, nil
@@ -659,14 +713,14 @@ func (f *testFixture) stopScheduler() {
 	}
 }
 
-func (f *testFixture) assertAllNodesSucceeded(status exec.DAGRunStatus) {
+func (f *testFixture) assertAllNodesSucceeded(status ir.DAGRunStatus) {
 	f.t.Helper()
 	for _, node := range status.Nodes {
-		require.Equal(f.t, core.NodeSucceeded, node.Status, "step %s should have succeeded", node.Step.Name)
+		require.Equal(f.t, ir.NodeSucceeded, node.Status, "step %s should have succeeded", node.Step.Name)
 	}
 }
 
-func (f *testFixture) assertWorkerID(status exec.DAGRunStatus, expected string) {
+func (f *testFixture) assertWorkerID(status ir.DAGRunStatus, expected string) {
 	f.t.Helper()
 	require.Equal(f.t, expected, status.WorkerID, "unexpected worker ID")
 }

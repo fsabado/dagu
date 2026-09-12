@@ -13,12 +13,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/test"
-	"github.com/dagucloud/dagu/internal/test/intgharness"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/test/intgharness"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,17 +52,25 @@ steps:
 	require.NoError(t, err)
 
 	var dispatchCount atomic.Int32
-	schedulerInstance.SetDispatchFunc(func(_ context.Context, dag *core.DAG, _ string, trigger core.TriggerType, _ time.Time) error {
-		if dag != nil && dag.Name == "cron-test" && trigger == core.TriggerTypeScheduler {
+	var dispatchMu sync.Mutex
+	var dispatchTimes []time.Time
+	schedulerInstance.SetDispatchFunc(func(_ context.Context, entry scheduler.DAGEntry, _ string, trigger ir.TriggerType, scheduled time.Time) error {
+		dag := entry.DAG
+		if dag != nil && dag.Name == "cron-test" && trigger == ir.TriggerTypeScheduler {
+			dispatchMu.Lock()
+			dispatchTimes = append(dispatchTimes, scheduled)
+			dispatchMu.Unlock()
 			dispatchCount.Add(1)
 		}
 		return nil
 	})
 
 	clockBase := time.Date(2026, 1, 1, 0, 0, 59, 0, time.UTC)
-	// Keep the simulated clock stable so scheduler startup latency cannot skip
-	// the initial tick. The cron loop advances its tick cursor independently.
+	// Keep startup time stable, then advance after the first scheduled dispatch.
 	schedulerInstance.SetClock(func() time.Time {
+		if dispatchCount.Load() > 0 {
+			return clockBase.Add(time.Minute)
+		}
 		return clockBase
 	})
 
@@ -78,7 +88,13 @@ steps:
 	})
 	probe.Stop(context.Background(), cancel, 5*time.Second)
 
-	require.GreaterOrEqual(t, dispatchCount.Load(), int32(2))
+	dispatchMu.Lock()
+	defer dispatchMu.Unlock()
+	require.Len(t, dispatchTimes, 2)
+	for i, scheduled := range dispatchTimes {
+		want := clockBase.Truncate(time.Minute).Add(time.Duration(i) * time.Minute)
+		require.True(t, want.Equal(scheduled), "unexpected scheduled time: %s", scheduled)
+	}
 }
 
 func TestScheduleEditWhileSuspendedDoesNotSuppressNewSlot(t *testing.T) {
@@ -104,24 +120,24 @@ func TestScheduleEditWhileSuspendedDoesNotSuppressNewSlot(t *testing.T) {
 	writeSpec("0 10 * * *")
 
 	th := test.SetupScheduler(t, test.WithDAGsDir(dagsDir))
-	dag, err := th.DAGStore.GetDetails(th.Context, dagName)
+	dag, err := th.DAGRepository.GetDetails(th.Context, dagName, persis.DAGLoadOptions{})
 	require.NoError(t, err)
 
 	require.NoError(t, os.MkdirAll(th.Config.Paths.SuspendFlagsDir, 0o755))
 	suspendFlag := filepath.Join(th.Config.Paths.SuspendFlagsDir, dag.SuspendFlagName())
 	require.NoError(t, os.WriteFile(suspendFlag, []byte{}, 0o644))
 
-	attempt, err := th.DAGRunStore.CreateAttempt(th.Context, dag, oldSlot, "old-success", exec.NewDAGRunAttemptOptions{})
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dag, oldSlot, "old-success", persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
-	status := exec.InitialStatus(dag)
+	status := ir.InitialStatus(dag)
 	status.DAGRunID = "old-success"
 	status.AttemptID = attempt.ID()
-	status.Status = core.Succeeded
-	status.TriggerType = core.TriggerTypeScheduler
-	status.ScheduleTime = exec.FormatTime(oldSlot)
-	status.StartedAt = exec.FormatTime(oldSlot.Add(15 * time.Second))
-	status.FinishedAt = exec.FormatTime(oldSlot.Add(45 * time.Second))
+	status.Status = ir.Succeeded
+	status.TriggerType = ir.TriggerTypeScheduler
+	status.ScheduleTime = stringutil.FormatTime(oldSlot)
+	status.StartedAt = stringutil.FormatTime(oldSlot.Add(15 * time.Second))
+	status.FinishedAt = stringutil.FormatTime(oldSlot.Add(45 * time.Second))
 
 	require.NoError(t, attempt.Open(th.Context))
 	require.NoError(t, attempt.Write(th.Context, status))
@@ -134,9 +150,10 @@ func TestScheduleEditWhileSuspendedDoesNotSuppressNewSlot(t *testing.T) {
 		dispatchCount    atomic.Int32
 		lastDispatchMu   sync.Mutex
 		lastDispatchTime time.Time
-		lastDispatchType core.TriggerType
+		lastDispatchType ir.TriggerType
 	)
-	sc.SetDispatchFunc(func(_ context.Context, dag *core.DAG, _ string, trigger core.TriggerType, scheduleTime time.Time) error {
+	sc.SetDispatchFunc(func(_ context.Context, entry scheduler.DAGEntry, _ string, trigger ir.TriggerType, scheduleTime time.Time) error {
+		dag := entry.DAG
 		if dag != nil && dag.Name == dagName {
 			dispatchCount.Add(1)
 			lastDispatchMu.Lock()
@@ -171,7 +188,7 @@ func TestScheduleEditWhileSuspendedDoesNotSuppressNewSlot(t *testing.T) {
 	})
 	require.Equal(t, int32(1), dispatchCount.Load(), "edited schedules should dispatch exactly once")
 	lastDispatchMu.Lock()
-	require.Equal(t, core.TriggerTypeScheduler, lastDispatchType)
+	require.Equal(t, ir.TriggerTypeScheduler, lastDispatchType)
 	require.Equal(t, newSlot, lastDispatchTime)
 	lastDispatchMu.Unlock()
 

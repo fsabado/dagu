@@ -10,22 +10,22 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/cmn/masking"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	llmpkg "github.com/dagucloud/dagu/internal/llm"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	llmpkg "github.com/dagucloud/dagu/v2/internal/llm"
 
 	// Import all providers to register them
-	_ "github.com/dagucloud/dagu/internal/llm/allproviders"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	_ "github.com/dagucloud/dagu/v2/internal/llm/allproviders"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
 var _ executor.Executor = (*Executor)(nil)
@@ -38,12 +38,12 @@ var _ executor.ToolDefinitionProvider = (*Executor)(nil)
 type Executor struct {
 	stdout            io.Writer
 	stderr            io.Writer
-	step              core.Step
+	step              ir.Step
 	providerType      llmpkg.ProviderType
 	apiKeyEnvVar      string
-	messages          []exec.LLMMessage
-	contextMessages   []exec.LLMMessage
-	savedMessages     []exec.LLMMessage
+	messages          []ir.LLMMessage
+	contextMessages   []ir.LLMMessage
+	savedMessages     []ir.LLMMessage
 	pushBackInputs    map[string]string
 	pushBackIteration int
 
@@ -52,14 +52,14 @@ type Executor struct {
 	toolExecutor *ToolExecutor
 
 	// Collected sub-runs from tool executions for UI drill-down
-	collectedSubRuns []exec.SubDAGRun
+	collectedSubRuns []ir.SubDAGRun
 
 	// Tool definitions that were available to the LLM (for UI visibility)
-	savedToolDefinitions []exec.ToolDefinition
+	savedToolDefinitions []ir.ToolDefinition
 }
 
 // newChatExecutor creates a new chat executor from a step configuration.
-func newChatExecutor(ctx context.Context, step core.Step) (executor.Executor, error) {
+func newChatExecutor(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	if step.LLM == nil {
 		return nil, fmt.Errorf("llm configuration is required for chat step")
 	}
@@ -73,10 +73,16 @@ func newChatExecutor(ctx context.Context, step core.Step) (executor.Executor, er
 		primaryProvider = cfg.Provider
 	}
 
-	// Parse provider type (required field, validated in spec)
-	providerType, err := llmpkg.ParseProviderType(primaryProvider)
-	if err != nil {
-		return nil, fmt.Errorf("invalid provider: %w", err)
+	// Parse provider type. A provider carrying a value reference only has a final
+	// value once the step runs, so leave it unparsed here and let
+	// createProviderForModel reject an unsupported value after resolution.
+	var providerType llmpkg.ProviderType
+	if !cmnvalue.HasValueReference(primaryProvider) {
+		var err error
+		providerType, err = llmpkg.ParseProviderType(primaryProvider)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Determine which environment variable to use for API key
@@ -88,21 +94,21 @@ func newChatExecutor(ctx context.Context, step core.Step) (executor.Executor, er
 		apiKeyEnvVar = llmpkg.DefaultAPIKeyEnvVar(providerType)
 	}
 
-	// Convert messages from core.LLMMessage to execution.LLMMessage
+	// Convert messages from ir.PromptMessage to execution.LLMMessage
 	// Messages are now at step level, not inside LLM config
-	messages := make([]exec.LLMMessage, 0, len(step.Messages)+1)
+	messages := make([]ir.LLMMessage, 0, len(step.Messages)+1)
 
 	// Add system message from config if specified
 	if cfg.System != "" {
-		messages = append(messages, exec.LLMMessage{
-			Role:    core.LLMRoleSystem,
+		messages = append(messages, ir.LLMMessage{
+			Role:    ir.LLMRoleSystem,
 			Content: cfg.System,
 		})
 	}
 
 	// Add step-level messages
 	for _, msg := range step.Messages {
-		messages = append(messages, exec.LLMMessage{
+		messages = append(messages, ir.LLMMessage{
 			Role:    msg.Role,
 			Content: msg.Content,
 		})
@@ -148,13 +154,13 @@ func (e *Executor) Kill(sig os.Signal) error {
 }
 
 // SetContext sets the session context from prior steps.
-func (e *Executor) SetContext(messages []exec.LLMMessage) {
+func (e *Executor) SetContext(messages []ir.LLMMessage) {
 	e.contextMessages = messages
 }
 
 // GetMessages returns the complete session messages after execution.
 // This includes inherited messages, step messages, and the assistant response.
-func (e *Executor) GetMessages() []exec.LLMMessage {
+func (e *Executor) GetMessages() []ir.LLMMessage {
 	return e.savedMessages
 }
 
@@ -165,24 +171,24 @@ func (e *Executor) SetPushBackContext(inputs map[string]string, iteration int) {
 
 // GetSubRuns returns the collected sub-DAG runs from tool executions.
 // This implements the SubRunProvider interface for UI drill-down functionality.
-func (e *Executor) GetSubRuns() []exec.SubDAGRun {
+func (e *Executor) GetSubRuns() []ir.SubDAGRun {
 	return e.collectedSubRuns
 }
 
 // GetToolDefinitions returns the tool definitions that were available to the LLM.
 // This implements the ToolDefinitionProvider interface for UI visibility.
-func (e *Executor) GetToolDefinitions() []exec.ToolDefinition {
+func (e *Executor) GetToolDefinitions() []ir.ToolDefinition {
 	return e.savedToolDefinitions
 }
 
 // buildMessageList orders messages so step's system message takes precedence over context.
-func buildMessageList(stepMsgs, contextMsgs []exec.LLMMessage) []exec.LLMMessage {
-	var result []exec.LLMMessage
-	var stepSystemMsg *exec.LLMMessage
-	var stepOtherMsgs []exec.LLMMessage
+func buildMessageList(stepMsgs, contextMsgs []ir.LLMMessage) []ir.LLMMessage {
+	var result []ir.LLMMessage
+	var stepSystemMsg *ir.LLMMessage
+	var stepOtherMsgs []ir.LLMMessage
 
 	for i := range stepMsgs {
-		if stepMsgs[i].Role == exec.RoleSystem {
+		if stepMsgs[i].Role == ir.LLMRoleSystem {
 			stepSystemMsg = &stepMsgs[i]
 		} else {
 			stepOtherMsgs = append(stepOtherMsgs, stepMsgs[i])
@@ -195,10 +201,10 @@ func buildMessageList(stepMsgs, contextMsgs []exec.LLMMessage) []exec.LLMMessage
 	result = append(result, contextMsgs...)
 	result = append(result, stepOtherMsgs...)
 
-	return exec.DeduplicateSystemMessages(result)
+	return ir.DeduplicateSystemMessages(result)
 }
 
-func (e *Executor) executionMessages(ctx context.Context) ([]exec.LLMMessage, error) {
+func (e *Executor) executionMessages(ctx context.Context) ([]ir.LLMMessage, error) {
 	evaluatedMessages, err := evalMessages(ctx, e.messages)
 	if err != nil {
 		return nil, err
@@ -208,24 +214,24 @@ func (e *Executor) executionMessages(ctx context.Context) ([]exec.LLMMessage, er
 	}
 
 	pushBackMessages := systemMessages(evaluatedMessages)
-	pushBackMessages = append(pushBackMessages, exec.LLMMessage{
-		Role:    exec.RoleUser,
+	pushBackMessages = append(pushBackMessages, ir.LLMMessage{
+		Role:    ir.LLMRoleUser,
 		Content: formatPushBackFeedback(e.pushBackInputs, e.pushBackIteration, e.step.Approval),
 	})
 	return buildMessageList(pushBackMessages, e.contextMessages), nil
 }
 
-func systemMessages(messages []exec.LLMMessage) []exec.LLMMessage {
-	var result []exec.LLMMessage
+func systemMessages(messages []ir.LLMMessage) []ir.LLMMessage {
+	var result []ir.LLMMessage
 	for _, msg := range messages {
-		if msg.Role == exec.RoleSystem {
+		if msg.Role == ir.LLMRoleSystem {
 			result = append(result, msg)
 		}
 	}
 	return result
 }
 
-func formatPushBackFeedback(inputs map[string]string, iteration int, approval *core.ApprovalConfig) string {
+func formatPushBackFeedback(inputs map[string]string, iteration int, approval *ir.ApprovalConfig) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "The reviewer has requested changes to your previous work for push-back iteration %d.\n", iteration)
 
@@ -259,7 +265,7 @@ func formatPushBackFeedback(inputs map[string]string, iteration int, approval *c
 }
 
 // toLLMMessages converts execution.LLMMessage to llmpkg.Message for provider calls.
-func toLLMMessages(msgs []exec.LLMMessage) []llmpkg.Message {
+func toLLMMessages(msgs []ir.LLMMessage) []llmpkg.Message {
 	result := make([]llmpkg.Message, len(msgs))
 	for i, msg := range msgs {
 		result[i] = llmpkg.Message{
@@ -285,8 +291,8 @@ func toLLMMessages(msgs []exec.LLMMessage) []llmpkg.Message {
 	return result
 }
 
-// toThinkingRequest converts core.ThinkingConfig to llmpkg.ThinkingRequest.
-func toThinkingRequest(cfg *core.ThinkingConfig) *llmpkg.ThinkingRequest {
+// toThinkingRequest converts ir.ThinkingConfig to llmpkg.ThinkingRequest.
+func toThinkingRequest(cfg *ir.ThinkingConfig) *llmpkg.ThinkingRequest {
 	if cfg == nil {
 		return nil
 	}
@@ -298,8 +304,8 @@ func toThinkingRequest(cfg *core.ThinkingConfig) *llmpkg.ThinkingRequest {
 	}
 }
 
-// toWebSearchRequest converts core.WebSearchConfig to llmpkg.WebSearchRequest.
-func toWebSearchRequest(cfg *core.WebSearchConfig) *llmpkg.WebSearchRequest {
+// toWebSearchRequest converts ir.WebSearchConfig to llmpkg.WebSearchRequest.
+func toWebSearchRequest(cfg *ir.WebSearchConfig) *llmpkg.WebSearchRequest {
 	if cfg == nil || !cfg.Enabled {
 		return nil
 	}
@@ -320,33 +326,15 @@ func toWebSearchRequest(cfg *core.WebSearchConfig) *llmpkg.WebSearchRequest {
 	return result
 }
 
-// normalizeEnvVarExpr converts an environment variable reference to ${VAR} format.
-// Handles: VAR → ${VAR}, $VAR → ${VAR}, ${VAR} → ${VAR}, "" → ""
-func normalizeEnvVarExpr(expr string) string {
-	if expr == "" {
-		return ""
-	}
-	if strings.HasPrefix(expr, "${") {
-		// Already in ${VAR} format, use as-is
-		return expr
-	}
-	if after, ok := strings.CutPrefix(expr, "$"); ok {
-		// Convert $VAR to ${VAR}
-		return "${" + after + "}"
-	}
-	// Plain variable name, wrap in ${...}
-	return "${" + expr + "}"
-}
-
 // evalMessages evaluates variable substitution in message content.
-func evalMessages(ctx context.Context, msgs []exec.LLMMessage) ([]exec.LLMMessage, error) {
-	result := make([]exec.LLMMessage, len(msgs))
+func evalMessages(ctx context.Context, msgs []ir.LLMMessage) ([]ir.LLMMessage, error) {
+	result := make([]ir.LLMMessage, len(msgs))
 	for i, msg := range msgs {
 		content, err := runtime.ResolveString(ctx, msg.Content, cmnvalue.WorkflowField("messages.content"))
 		if err != nil {
 			return nil, fmt.Errorf("failed to evaluate message content: %w", err)
 		}
-		result[i] = exec.LLMMessage{
+		result[i] = ir.LLMMessage{
 			Role:       msg.Role,
 			Content:    content,
 			ToolCallID: msg.ToolCallID,
@@ -359,35 +347,8 @@ func evalMessages(ctx context.Context, msgs []exec.LLMMessage) ([]exec.LLMMessag
 
 // maskSecretsForProvider masks secret values in messages before sending to LLM provider.
 // This prevents secrets from being leaked to external LLM APIs.
-func maskSecretsForProvider(ctx context.Context, msgs []exec.LLMMessage) []exec.LLMMessage {
-	// Use EnvScope.AllSecrets() for unified source tracking
-	rCtx := runtime.GetDAGContext(ctx)
-	if rCtx.EnvScope == nil {
-		return msgs
-	}
-	secrets := rCtx.EnvScope.AllSecrets()
-	if len(secrets) == 0 {
-		return msgs
-	}
-
-	envPairs := make([]string, 0, len(secrets))
-	for k, v := range secrets {
-		envPairs = append(envPairs, k+"="+v)
-	}
-
-	masker := masking.NewMasker(masking.SourcedEnvVars{Secrets: envPairs})
-
-	result := make([]exec.LLMMessage, len(msgs))
-	for i, msg := range msgs {
-		result[i] = exec.LLMMessage{
-			Role:       msg.Role,
-			Content:    masker.MaskString(msg.Content),
-			ToolCallID: msg.ToolCallID,
-			ToolCalls:  msg.ToolCalls, // Preserve tool calls (no secrets in IDs/names)
-			Metadata:   msg.Metadata,
-		}
-	}
-	return result
+func maskSecretsForProvider(ctx context.Context, msgs []ir.LLMMessage) []ir.LLMMessage {
+	return runtime.MaskSecretsForProvider(ctx, msgs)
 }
 
 // Run executes the chat request.
@@ -397,7 +358,10 @@ func (e *Executor) Run(ctx context.Context) error {
 		return err
 	}
 
-	models := e.step.LLM.GetModels()
+	models, err := runtime.ResolveModels(ctx, e.step.LLM.GetModels())
+	if err != nil {
+		return err
+	}
 
 	// If only one model, use simple path (no fallback)
 	if len(models) == 1 {
@@ -416,7 +380,7 @@ func (e *Executor) Run(ctx context.Context) error {
 			slog.String("model", model.Name),
 			slog.Int("attemptIndex", i))
 
-		err := e.runWithModel(ctx, model, allMessages)
+		err = e.runWithModel(ctx, model, allMessages)
 		if err == nil {
 			return nil // Success
 		}
@@ -438,7 +402,7 @@ func (e *Executor) Run(ctx context.Context) error {
 }
 
 // runWithModel executes a chat request with a specific model.
-func (e *Executor) runWithModel(ctx context.Context, model core.ModelEntry, allMessages []exec.LLMMessage) error {
+func (e *Executor) runWithModel(ctx context.Context, model ir.ModelEntry, allMessages []ir.LLMMessage) error {
 	// Build effective config for this model
 	effectiveCfg := e.buildEffectiveConfig(model)
 
@@ -463,102 +427,17 @@ func (e *Executor) runWithModel(ctx context.Context, model core.ModelEntry, allM
 }
 
 // buildEffectiveConfig merges model-specific overrides with shared config.
-func (e *Executor) buildEffectiveConfig(model core.ModelEntry) *core.LLMConfig {
-	cfg := e.step.LLM
-
-	return &core.LLMConfig{
-		Provider:          model.Provider,
-		Model:             model.Name,
-		System:            cfg.System,
-		Stream:            cfg.Stream,
-		Thinking:          cfg.Thinking,
-		Tools:             cfg.Tools,
-		MaxToolIterations: cfg.MaxToolIterations,
-		WebSearch:         cfg.WebSearch,
-		Temperature:       coalescePtr(model.Temperature, cfg.Temperature),
-		MaxTokens:         coalescePtr(model.MaxTokens, cfg.MaxTokens),
-		TopP:              coalescePtr(model.TopP, cfg.TopP),
-		BaseURL:           coalesceStr(model.BaseURL, cfg.BaseURL),
-		APIKeyName:        coalesceStr(model.APIKeyName, cfg.APIKeyName),
-	}
-}
-
-// coalescePtr returns the first non-nil pointer.
-func coalescePtr[T any](override, fallback *T) *T {
-	if override != nil {
-		return override
-	}
-	return fallback
-}
-
-// coalesceStr returns the first non-empty string.
-func coalesceStr(override, fallback string) string {
-	if override != "" {
-		return override
-	}
-	return fallback
+func (e *Executor) buildEffectiveConfig(model ir.ModelEntry) *ir.LLMConfig {
+	return runtime.EffectiveLLMConfig(e.step.LLM, model)
 }
 
 // createProviderForModel creates an LLM provider for a specific model.
-func (e *Executor) createProviderForModel(ctx context.Context, model core.ModelEntry, cfg *core.LLMConfig) (llmpkg.Provider, error) {
-	// Parse provider type for this model
-	providerType, err := llmpkg.ParseProviderType(cfg.Provider)
-	if err != nil {
-		return nil, fmt.Errorf("invalid provider: %w", err)
-	}
-
-	// Determine API key env var
-	apiKeyEnvVar := cfg.APIKeyName
-	if apiKeyEnvVar == "" {
-		apiKeyEnvVar = llmpkg.DefaultAPIKeyEnvVar(providerType)
-	}
-
-	// Evaluate API key from environment variable
-	var apiKey string
-	if apiKeyEnvVar != "" {
-		apiKeyExpr := normalizeEnvVarExpr(apiKeyEnvVar)
-		apiKey, err = runtime.ResolveString(ctx, apiKeyExpr, cmnvalue.WorkflowField("api_key"))
-		if err != nil {
-			return nil, fmt.Errorf("failed to evaluate API key: %w", err)
-		}
-	}
-
-	// Evaluate base URL if specified
-	baseURL := cfg.BaseURL
-	if baseURL != "" {
-		baseURL, err = runtime.ResolveString(ctx, baseURL, cmnvalue.WorkflowField("base_url"))
-		if err != nil {
-			return nil, fmt.Errorf("failed to evaluate baseURL: %w", err)
-		}
-	}
-
-	// Use default base URL if not specified
-	if baseURL == "" {
-		baseURL = llmpkg.DefaultBaseURL(providerType)
-	}
-
-	// Build provider config
-	providerCfg := llmpkg.Config{
-		APIKey:          apiKey,
-		BaseURL:         baseURL,
-		Timeout:         5 * time.Minute,
-		MaxRetries:      3,
-		InitialInterval: 1 * time.Second,
-		MaxInterval:     30 * time.Second,
-		Multiplier:      2.0,
-	}
-
-	// Create provider
-	provider, err := llmpkg.NewProvider(providerType, providerCfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create LLM provider: %w", err)
-	}
-
-	return provider, nil
+func (e *Executor) createProviderForModel(ctx context.Context, _ ir.ModelEntry, cfg *ir.LLMConfig) (llmpkg.Provider, error) {
+	return runtime.NewLLMProvider(ctx, cfg)
 }
 
 // runSimpleForModel executes a chat request without tool calling, using the given config.
-func (e *Executor) runSimpleForModel(ctx context.Context, provider llmpkg.Provider, allMessages []exec.LLMMessage, cfg *core.LLMConfig) error {
+func (e *Executor) runSimpleForModel(ctx context.Context, provider llmpkg.Provider, allMessages []ir.LLMMessage, cfg *ir.LLMConfig) error {
 	maskedForProvider := maskSecretsForProvider(ctx, allMessages)
 
 	req := &llmpkg.ChatRequest{
@@ -594,7 +473,7 @@ func (e *Executor) runSimpleForModel(ctx context.Context, provider llmpkg.Provid
 	}
 
 	// Build metadata for the assistant response
-	metadata := &exec.LLMMessageMetadata{
+	metadata := &ir.LLMMessageMetadata{
 		Provider: cfg.Provider,
 		Model:    cfg.Model,
 	}
@@ -605,8 +484,8 @@ func (e *Executor) runSimpleForModel(ctx context.Context, provider llmpkg.Provid
 	}
 
 	// Save full session (inherited + step messages + response)
-	e.savedMessages = append(allMessages, exec.LLMMessage{
-		Role:     exec.RoleAssistant,
+	e.savedMessages = append(allMessages, ir.LLMMessage{
+		Role:     ir.LLMRoleAssistant,
 		Content:  responseContent,
 		Metadata: metadata,
 	})
@@ -620,7 +499,7 @@ func (e *Executor) runSimpleForModel(ctx context.Context, provider llmpkg.Provid
 // 2. If LLM requests tool calls, execute them
 // 3. Add tool results to session
 // 4. Repeat until LLM provides final response (no more tool calls) or max iterations
-func (e *Executor) runWithToolsForModel(ctx context.Context, provider llmpkg.Provider, allMessages []exec.LLMMessage, cfg *core.LLMConfig) error {
+func (e *Executor) runWithToolsForModel(ctx context.Context, provider llmpkg.Provider, allMessages []ir.LLMMessage, cfg *ir.LLMConfig) error {
 	maxIterations := cfg.GetMaxToolIterations()
 	workDir := runtime.GetEnv(ctx).WorkingDir
 
@@ -631,9 +510,9 @@ func (e *Executor) runWithToolsForModel(ctx context.Context, provider llmpkg.Pro
 	tools := e.toolRegistry.ToLLMTools()
 
 	// Store tool definitions for UI visibility
-	e.savedToolDefinitions = make([]exec.ToolDefinition, len(tools))
+	e.savedToolDefinitions = make([]ir.ToolDefinition, len(tools))
 	for i, t := range tools {
-		e.savedToolDefinitions[i] = exec.ToolDefinition{
+		e.savedToolDefinitions[i] = ir.ToolDefinition{
 			Name:        t.Function.Name,
 			Description: t.Function.Description,
 			Parameters:  t.Function.Parameters,
@@ -646,7 +525,7 @@ func (e *Executor) runWithToolsForModel(ctx context.Context, provider llmpkg.Pro
 	)
 
 	// Working copy of messages for the tool loop
-	sessionMessages := make([]exec.LLMMessage, len(allMessages))
+	sessionMessages := make([]ir.LLMMessage, len(allMessages))
 	copy(sessionMessages, allMessages)
 
 	for iteration := range maxIterations {
@@ -671,11 +550,11 @@ func (e *Executor) runWithToolsForModel(ctx context.Context, provider llmpkg.Pro
 func (e *Executor) executeToolStep(
 	ctx context.Context,
 	provider llmpkg.Provider,
-	cfg *core.LLMConfig,
+	cfg *ir.LLMConfig,
 	tools []llmpkg.Tool,
-	msgs []exec.LLMMessage,
+	msgs []ir.LLMMessage,
 	iteration int,
-) ([]exec.LLMMessage, bool, error) {
+) ([]ir.LLMMessage, bool, error) {
 	logger.Debug(ctx, "Tool loop iteration",
 		slog.Int("iteration", iteration+1),
 		slog.Int("message_count", len(msgs)),
@@ -706,8 +585,8 @@ func (e *Executor) executeToolStep(
 	if len(resp.ToolCalls) == 0 {
 		e.handleFinalResponse(ctx, msgs, resp, cfg, iteration)
 		// Return updated messages including the final response
-		finalMsgs := append(msgs, exec.LLMMessage{
-			Role:     exec.RoleAssistant,
+		finalMsgs := append(msgs, ir.LLMMessage{
+			Role:     ir.LLMRoleAssistant,
 			Content:  resp.Content,
 			Metadata: e.createResponseMetadata(cfg, &resp.Usage),
 		})
@@ -797,9 +676,9 @@ func waitForStreamRetry(ctx context.Context, cfg llmpkg.LogicalRetryConfig, fail
 // handleFinalResponse processes and logs the final response from the LLM.
 func (e *Executor) handleFinalResponse(
 	ctx context.Context,
-	msgs []exec.LLMMessage,
+	msgs []ir.LLMMessage,
 	resp *llmpkg.ChatResponse,
-	cfg *core.LLMConfig,
+	cfg *ir.LLMConfig,
 	iteration int,
 ) {
 	logger.Info(ctx, "LLM provided final response (no tool calls)",
@@ -816,29 +695,29 @@ func (e *Executor) handleFinalResponse(
 // processToolCalls handles the execution of tool calls requested by the LLM.
 func (e *Executor) processToolCalls(
 	ctx context.Context,
-	msgs []exec.LLMMessage,
+	msgs []ir.LLMMessage,
 	resp *llmpkg.ChatResponse,
 	iteration int,
-) ([]exec.LLMMessage, bool, error) {
+) ([]ir.LLMMessage, bool, error) {
 	logger.Info(ctx, "LLM requested tool calls",
 		slog.Int("tool_call_count", len(resp.ToolCalls)),
 	)
 
 	// Add assistant message with tool calls
-	execToolCalls := make([]exec.ToolCall, len(resp.ToolCalls))
+	execToolCalls := make([]ir.ToolCall, len(resp.ToolCalls))
 	for i, tc := range resp.ToolCalls {
-		execToolCalls[i] = exec.ToolCall{
+		execToolCalls[i] = ir.ToolCall{
 			ID:   tc.ID,
 			Type: tc.Type,
-			Function: exec.ToolCallFunction{
+			Function: ir.ToolCallFunction{
 				Name:      tc.Function.Name,
 				Arguments: tc.Function.Arguments,
 			},
 		}
 	}
 
-	assistantMsg := exec.LLMMessage{
-		Role:      exec.RoleAssistant,
+	assistantMsg := ir.LLMMessage{
+		Role:      ir.LLMRoleAssistant,
 		Content:   resp.Content,
 		ToolCalls: execToolCalls,
 	}
@@ -850,8 +729,8 @@ func (e *Executor) processToolCalls(
 	// Append results
 	for _, tcr := range toolCallResults {
 		result := tcr.Result
-		toolMsg := exec.LLMMessage{
-			Role:       exec.RoleTool,
+		toolMsg := ir.LLMMessage{
+			Role:       ir.LLMRoleTool,
 			Content:    result.Content,
 			ToolCallID: result.ToolCallID,
 		}
@@ -882,7 +761,7 @@ func (e *Executor) processToolCalls(
 func (e *Executor) handleMaxIterationsReached(
 	ctx context.Context,
 	maxIterations int,
-	msgs []exec.LLMMessage,
+	msgs []ir.LLMMessage,
 ) error {
 	logger.Warn(ctx, "Max tool iterations reached",
 		slog.Int("max_iterations", maxIterations),
@@ -891,9 +770,9 @@ func (e *Executor) handleMaxIterationsReached(
 	lastContent := fmt.Sprintf("[Max tool iterations (%d) reached. The LLM may not have provided a complete response.]", maxIterations)
 
 	// Try to find the last assistant message
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == exec.RoleAssistant {
-			lastContent = msgs[i].Content
+	for _, msg := range slices.Backward(msgs) {
+		if msg.Role == ir.LLMRoleAssistant {
+			lastContent = msg.Content
 			break
 		}
 	}
@@ -907,8 +786,8 @@ func (e *Executor) handleMaxIterationsReached(
 }
 
 // createResponseMetadata builds metadata for the assistant response.
-func (e *Executor) createResponseMetadata(cfg *core.LLMConfig, usage *llmpkg.Usage) *exec.LLMMessageMetadata {
-	metadata := &exec.LLMMessageMetadata{
+func (e *Executor) createResponseMetadata(cfg *ir.LLMConfig, usage *llmpkg.Usage) *ir.LLMMessageMetadata {
+	metadata := &ir.LLMMessageMetadata{
 		Provider: cfg.Provider,
 		Model:    cfg.Model,
 	}
@@ -921,7 +800,7 @@ func (e *Executor) createResponseMetadata(cfg *core.LLMConfig, usage *llmpkg.Usa
 }
 
 func init() {
-	executor.RegisterExecutor(core.ExecutorTypeChat, newChatExecutor, nil, core.ExecutorCapabilities{
+	executor.RegisterExecutor(ir.ExecutorTypeChat, newChatExecutor, nil, registry.ExecutorCapabilities{
 		LLM: true,
 		// All others false - chat doesn't support command, script, shell, container, subdag
 	})

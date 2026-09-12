@@ -1,66 +1,107 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Package file implements [persis.Backend] on the local filesystem.
-// Each collection maps to a subdirectory; each record maps to a .json file
-// whose relative path mirrors the record ID with "/" as the path separator.
 package file
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
-// Backend implements [persis.Backend] on the local filesystem.
+// Backend maps logical control-plane collections to the released file layout.
 type Backend struct {
-	root string
-	cols sync.Map // map[string]*Collection
+	dataDir string
+	specs   map[string]collectionSpec
+	cols    sync.Map
+}
+
+type collectionSpec struct {
+	dir        string
+	idPrefixes []string
+	indented   bool
 }
 
 var _ persis.Backend = (*Backend)(nil)
 
-// New creates a Backend rooted at dir, creating it if necessary.
-func New(dir string) (*Backend, error) {
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return nil, fmt.Errorf("file backend: create root %q: %w", dir, err)
-	}
-	return &Backend{root: dir}, nil
+const schedulerStateDirName = "scheduler"
+
+// SchedulerStateDir returns the file-backend directory for scheduler state.
+func SchedulerStateDir(paths config.PathsConfig) string {
+	return filepath.Join(paths.DataDir, schedulerStateDirName)
 }
 
-// Collection returns the collection with the given name, creating it lazily.
+// NewBackend creates a file backend from the configured persistence paths.
+// It does not access the filesystem; collections create directories lazily.
+func NewBackend(paths config.PathsConfig) *Backend {
+	distributedDir := filepath.Join(paths.DataDir, "distributed")
+	return &Backend{
+		dataDir: paths.DataDir,
+		specs: map[string]collectionSpec{
+			persis.CollectionAPIKeys:               {dir: paths.APIKeysDir, indented: true},
+			persis.CollectionActiveDistributedRuns: {dir: filepath.Join(distributedDir, "active-runs")},
+			persis.CollectionAgentSessionCleanups:  {dir: filepath.Join(paths.DataDir, "agent-session-cleanups")},
+			persis.CollectionDAGRunLeases:          {dir: filepath.Join(distributedDir, "leases")},
+			persis.CollectionDAGSettings:           {dir: filepath.Join(paths.DataDir, "dag-settings"), indented: true},
+			persis.CollectionDAGState:              {dir: paths.DAGStateDir},
+			persis.CollectionDispatchTasks: {
+				dir:        distributedDir,
+				idPrefixes: []string{"pending/", "claims/", "admissions/"},
+			},
+			persis.CollectionIncidents:        {dir: filepath.Join(paths.DataDir, "incidents"), indented: true},
+			persis.CollectionLicense:          {dir: filepath.Join(paths.DataDir, "license"), indented: true},
+			persis.CollectionNotifications:    {dir: filepath.Join(paths.DataDir, "notifications"), indented: true},
+			persis.CollectionProfiles:         {dir: filepath.Join(paths.DataDir, "profiles"), indented: true},
+			persis.CollectionQueue:            {dir: paths.QueueDir},
+			persis.CollectionRemoteNodes:      {dir: paths.RemoteNodesDir, indented: true},
+			persis.CollectionSchedulerState:   {dir: SchedulerStateDir(paths), indented: true},
+			persis.CollectionSecrets:          {dir: filepath.Join(paths.DataDir, "secrets"), indented: true},
+			persis.CollectionUpgradeCheck:     {dir: filepath.Join(paths.DataDir, "upgrade"), indented: true},
+			persis.CollectionUsers:            {dir: paths.UsersDir, indented: true},
+			persis.CollectionViews:            {dir: paths.ViewsDir, indented: true},
+			persis.CollectionWebhooks:         {dir: paths.WebhooksDir, indented: true},
+			persis.CollectionWorkerHeartbeats: {dir: filepath.Join(distributedDir, "workers")},
+			persis.CollectionWorkspaces:       {dir: paths.WorkspacesDir, indented: true},
+		},
+	}
+}
+
+// Collection returns the collection identified by name.
 func (b *Backend) Collection(name string) persis.Collection {
-	v, _ := b.cols.LoadOrStore(name, &Collection{
-		dir: filepath.Join(b.root, name),
-	})
-	return v.(*Collection)
-}
-
-// CollectionOption configures a file-backed [Collection].
-type CollectionOption func(*Collection)
-
-// WithIndentedJSON stores records as 2-space indented JSON on disk, matching
-// the pre-refactor (<= v2.7.4) released format for human-readable stores such
-// as users, API keys, secrets, and webhooks. Records are normalized back to
-// compact JSON in memory on read, so callers see canonical Record.Data
-// regardless of on-disk indentation.
-func WithIndentedJSON() CollectionOption {
-	return func(c *Collection) { c.indent = true }
-}
-
-// NewCollection creates a [persis.Collection] backed by the given directory.
-// Unlike [New]+[Collection], this skips the root MkdirAll — the directory
-// is created lazily on the first write.
-func NewCollection(dir string, opts ...CollectionOption) persis.Collection {
-	c := &Collection{dir: dir}
-	for _, opt := range opts {
-		opt(c)
+	if !validCollectionName(name) {
+		panic(fmt.Sprintf("file backend: invalid collection name %q", name))
 	}
-	return c
+	if col, ok := b.cols.Load(name); ok {
+		return col.(*Collection)
+	}
+
+	spec, ok := b.specs[name]
+	if !ok {
+		spec.dir = filepath.Join(b.dataDir, name)
+	}
+	var opts []CollectionOption
+	if spec.indented {
+		opts = append(opts, WithIndentedJSON())
+	}
+	if len(spec.idPrefixes) > 0 {
+		opts = append(opts, withIDPrefixes(spec.idPrefixes...))
+	}
+	col, _ := b.cols.LoadOrStore(name, NewCollection(spec.dir, opts...))
+	return col.(*Collection)
 }
 
-// Close is a no-op; the file backend holds no persistent resources.
-func (b *Backend) Close() error { return nil }
+func validCollectionName(name string) bool {
+	if name == "" {
+		return false
+	}
+	return strings.IndexFunc(name, func(r rune) bool {
+		return r != '-' && r != '_' &&
+			(r < '0' || r > '9') &&
+			(r < 'A' || r > 'Z') &&
+			(r < 'a' || r > 'z')
+	}) == -1
+}

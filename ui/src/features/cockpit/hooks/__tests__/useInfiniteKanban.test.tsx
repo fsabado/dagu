@@ -22,9 +22,10 @@ const testConfig: Config = {
   setupRequired: false,
   oidcEnabled: false,
   oidcButtonLabel: '',
+  proxyEnabled: false,
+  proxyButtonLabel: '',
   terminalEnabled: false,
   gitSyncEnabled: false,
-  agentEnabled: false,
   updateAvailable: false,
   latestVersion: '',
   permissions: {

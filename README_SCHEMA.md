@@ -50,7 +50,9 @@ The root `type:` controls how the workflow executes:
   parallel.
 - `graph` is the default when `type:` is omitted.
 - `chain` runs steps in order.
-- `agent` is reserved for agent-oriented execution.
+- `agent` creates an Agent DAG: `steps:` becomes a catalog of actions and the configured
+  LLM chooses which one runs next until every entry in `tasks:` is complete. It
+  requires `llm:` and `tasks:`, and forbids `depends:`.
 
 Do not confuse root `type:` with legacy step-level `type:`. Step-level
 `type:` is deprecated; use `action:` for named executors.
@@ -103,7 +105,7 @@ Common step fields:
 | `repeat_policy` | Repeat or polling behavior. |
 | `continue_on` | Continue after selected failure, skip, exit-code, or output conditions. |
 | `preconditions` | Conditions that must pass before the step starts. |
-| `worker_selector` | Required worker labels. |
+| `worker_selector` | Required worker labels. Keys and values support variable substitution (e.g. `${VAR}`); parallel sub-DAG steps can reference `${ITEM}`. |
 | `stdout`, `stderr`, `log_output` | Step log output configuration. `stdout` can also publish DAG/action outputs. |
 | `output` | Captured stdout variable or structured step-scoped output. |
 | `output_schema` | JSON Schema for stdout JSON validation. |
@@ -196,11 +198,11 @@ Current builtin actions:
 | `jq.filter` | jq transforms | `filter`, plus `data` or `input` |
 | `dag.run` | Child DAG execution | `dag`, optional `params` |
 | `dag.enqueue` | Asynchronous child DAG enqueue | `dag`, optional `params`, optional `queue` |
+| `human.task` | Operator input before downstream steps continue | `prompt`, optional flat scalar `form` |
 | `router.route` | Conditional routing | `value`, `routes` |
 | `chat.completion` | LLM chat completion | `prompt` or `messages`, model config |
-| `agent.run` | Agent step execution | `task`, `prompt`, or `messages`, agent config |
 | `harness.run` | CLI coding-agent harnesses | `prompt`, provider config, optional `stdin` |
-| `template.render` | Text/template rendering | `template`, optional data/config |
+| `template.render` | Text/template rendering | Exactly one of `template` or `template_ref`, optional data/config |
 | `log.write` | Log messages | `message` |
 | `mail.send` | Email sending | mail executor config |
 | `archive.create`, `archive.extract`, `archive.list` | Archive operations | archive config |
@@ -214,7 +216,7 @@ Current builtin actions:
 
 `run:` and `action:` are mutually exclusive on a step. Do not combine either
 with legacy execution fields such as `command:`, `script:`, step-level `type:`,
-`call:`, `messages:`, `agent:`, `llm:`, `value:`, or `routes:`.
+`call:`, `messages:`, `llm:`, `value:`, or `routes:`.
 
 Remote action packages contain a `dagu-action.yaml` manifest and a DAG
 entrypoint. GitHub refs such as `acme/dagu-action-notify@v1.2.0` and official
@@ -229,6 +231,34 @@ object published by `stdout.outputs` or `action: outputs.write` before it is
 exposed to the parent step as `${step.outputs.*}`.
 
 ## Common Action Examples
+
+### Human Task
+
+Use `human.task` for a standalone processless step that waits for operator input. It requires an explicit `id` and `with.prompt`; omit `with.form` for acknowledgement-only tasks. Human tasks are allowed only in root DAGs. A root DAG containing one may run locally or on a distributed worker selected by its DAG-level `worker_selector`.
+
+```yaml
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Choose the deployment target
+      form:
+        type: object
+        properties:
+          environment:
+            type: string
+            enum: [staging, production]
+          notify:
+            type: boolean
+            default: true
+        required: [environment]
+
+  - id: deploy
+    depends: [review]
+    run: ./deploy.sh '${steps.review.outputs.environment}'
+```
+
+Form `additionalProperties` defaults to `false`. Every declared form property is a step output, published when submitted or defaulted, and available as `${steps.<step_id>.outputs.<name>}`; do not author `outputs:` on the human task. Complete a waiting task from a local CLI context with `dagu human-task complete --run-id=<run-id> --step=review <dag-name>`, adding repeated `--input key=value` flags or one `--inputs-json` object when the form accepts input. The scheduler must be running to resume a distributed run.
 
 ### SQL Query
 
@@ -322,7 +352,7 @@ steps:
 Use `timeout_sec` to cap total wait time for polling actions such as
 `wait.file` and `wait.http`.
 
-### Agent Harness
+### Harness
 
 ```yaml
 harnesses:
@@ -338,6 +368,10 @@ steps:
       provider: codex-cli
       prompt: Review the current branch and list actionable issues.
 ```
+
+Prefer `action: harness.run` for new workflows. Compatibility note: a
+top-level `harness:` config supplies defaults only to explicit harness steps. It
+does not change ordinary `run:`, `exec:`, or `script:` steps into harness steps.
 
 ## Reusable Custom Actions
 
@@ -481,9 +515,9 @@ Implementation-level references:
 
 - `internal/cmn/schema/dag.schema.json` - generated JSON Schema used by editor
   tooling and schema navigation
-- `internal/core/spec/step_v2.go` - `run:` and `action:` normalization
-- `internal/core/spec/step_types.go` - custom `actions:` and legacy
+- `internal/spec/step_v2.go` - `run:` and `action:` normalization
+- `internal/spec/step_types.go` - custom `actions:` and legacy
   `step_types:` handling
-- `internal/core/spec/deprecation.go` - deprecated v1 syntax warnings
+- `internal/spec/deprecation.go` - deprecated v1 syntax warnings
 - [`SCHEMA_MIGRATION.md`](./SCHEMA_MIGRATION.md) - migration notes from v1
   syntax to the current schema

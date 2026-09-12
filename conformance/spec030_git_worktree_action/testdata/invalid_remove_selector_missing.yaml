@@ -1,0 +1,3 @@
+steps:
+  - action: git.worktree.remove
+    with: {}

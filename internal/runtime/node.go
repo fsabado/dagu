@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,20 +21,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+
 	"syscall"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/collections"
-	"github.com/dagucloud/dagu/internal/cmn/datapath"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/cmn/signal"
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/datapath"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/signal"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/goccy/go-yaml"
 	"github.com/google/jsonschema-go/jsonschema"
 )
@@ -60,7 +62,7 @@ type Node struct {
 	outputSchemaErr  error
 }
 
-func NewNode(step core.Step, state NodeState) *Node {
+func NewNode(step ir.Step, state NodeState) *Node {
 	return &Node{Data: newSafeData(NodeData{Step: step, State: state})}
 }
 
@@ -120,32 +122,32 @@ func (n *Node) ShouldContinue(ctx context.Context) bool {
 
 	s := n.Status()
 	switch s {
-	case core.NodeSucceeded:
+	case ir.NodeSucceeded:
 		return true
 
-	case core.NodeFailed:
+	case ir.NodeFailed:
 		if continueOn.Failure {
 			return true
 		}
 
-	case core.NodeAborted:
+	case ir.NodeAborted:
 		return false
 
-	case core.NodeSkipped:
+	case ir.NodeSkipped:
 		if continueOn.Skipped {
 			return true
 		}
 		return false
 
-	case core.NodePartiallySucceeded:
+	case ir.NodePartiallySucceeded:
 		// Partial success is treated like success for continue on
 		return true
 
-	case core.NodeRejected:
+	case ir.NodeRejected:
 		// Rejected nodes should not allow dependents to continue
 		return false
 
-	case core.NodeNotStarted, core.NodeRunning, core.NodeRetrying, core.NodeWaiting:
+	case ir.NodeNotStarted, ir.NodeRunning, ir.NodeRetrying, ir.NodeWaiting:
 		// Unexpected state
 		logger.Error(ctx, "Unexpected node status",
 			tag.Status(s.String()),
@@ -245,7 +247,7 @@ func (n *Node) startOutputFlusher() *flusherControl {
 			case <-ctrl.done:
 				return
 			case <-ticker.C:
-				_ = n.outputs.flushWriters()
+				_ = n.outputs.flushWritersIfDue()
 			}
 		}
 	}()
@@ -281,7 +283,7 @@ func (n *Node) runCommand(ctx context.Context, cmd executor.Executor, stepTimeou
 }
 
 // handleTimeout handles step-level timeout errors.
-func (n *Node) handleTimeout(ctx context.Context, _ core.Step, stepTimeout, elapsed time.Duration) (int, error) {
+func (n *Node) handleTimeout(ctx context.Context, _ ir.Step, stepTimeout, elapsed time.Duration) (int, error) {
 	timeoutErr := fmt.Errorf("step timed out after %v (timeout: %v): %w",
 		elapsed.Truncate(time.Millisecond), stepTimeout, context.DeadlineExceeded)
 	logger.Error(ctx, "Step execution timed out",
@@ -289,7 +291,7 @@ func (n *Node) handleTimeout(ctx context.Context, _ core.Step, stepTimeout, elap
 		tag.Duration(elapsed),
 	)
 	n.SetError(timeoutErr)
-	n.SetStatus(core.NodeFailed)
+	n.SetStatus(ir.NodeFailed)
 	return 124, timeoutErr // Standard timeout exit code
 }
 
@@ -360,6 +362,10 @@ func (n *Node) captureOutput(ctx context.Context) error {
 		}
 	}
 
+	// The last mechanism to publish wins, matching the order the legacy outputs
+	// object is built below.
+	var capturedOutputs string
+
 	if step.HasStructuredOutput() {
 		value, err := n.evaluateStructuredOutput(ctx, stdout, stdoutCaptured)
 		if err != nil {
@@ -367,10 +373,12 @@ func (n *Node) captureOutput(ctx context.Context) error {
 		}
 		n.setOutputValue(value)
 		n.setOutputsValue(value)
+		capturedOutputs = value
 	}
 
 	if step.HasOutputSchema() && !step.HasStructuredOutput() {
 		n.setOutputValue(schemaOutput)
+		capturedOutputs = schemaOutput
 	}
 	if step.HasStdoutOutputs() {
 		value, err := n.evaluateStdoutOutputs(ctx, stdout, stdoutCaptured)
@@ -378,7 +386,46 @@ func (n *Node) captureOutput(ctx context.Context) error {
 			return fmt.Errorf("failed to evaluate stdout outputs: %w", err)
 		}
 		n.setOutputsValue(value)
+		capturedOutputs = value
 	}
+	return n.publishCapturedStepOutputs(ctx, capturedOutputs)
+}
+
+// publishCapturedStepOutputs adds capture-published values to the strict
+// step-output channel behind ${steps.<id>.outputs.<name>}. A failed attempt
+// publishes nothing, matching outputs declared through DAGU_OUTPUT_FILE.
+//
+// A name already published by the step's own output contract keeps its value,
+// so the contract the build derived and the values a run publishes agree.
+func (n *Node) publishCapturedStepOutputs(ctx context.Context, payload string) error {
+	if payload == "" || n.Error() != nil {
+		return nil
+	}
+
+	var decoded any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return fmt.Errorf("failed to decode captured step outputs: %w", err)
+	}
+	// A payload that is not an object carries no addressable names, so an
+	// unconstrained schema keeps validating whatever a step prints.
+	merged, ok := decoded.(map[string]any)
+	if !ok || len(merged) == 0 {
+		return nil
+	}
+
+	if raw := n.State().StepOutputsValue; raw != nil && *raw != "" {
+		published := make(map[string]any)
+		if err := json.Unmarshal([]byte(*raw), &published); err != nil {
+			return fmt.Errorf("failed to decode step outputs before publishing captured outputs: %w", err)
+		}
+		maps.Copy(merged, published)
+	}
+
+	serialized, err := serializeOutputsValue(ctx, merged)
+	if err != nil {
+		return err
+	}
+	n.setStepOutputsValue(serialized)
 	return nil
 }
 
@@ -493,12 +540,12 @@ func (n *Node) evaluateStdoutOutputs(ctx context.Context, stdout string, stdoutC
 
 	decode := cfg.Decode
 	if decode == "" && cfg.Field == "" {
-		decode = core.StepOutputDecodeJSON
+		decode = ir.StepOutputDecodeJSON
 	}
-	if decode == "" || decode == core.StepOutputDecodeText {
+	if decode == "" || decode == ir.StepOutputDecodeText {
 		if cfg.Select != "" {
 			return "", fmt.Errorf("select requires decode to be %q or %q",
-				core.StepOutputDecodeJSON, core.StepOutputDecodeYAML)
+				ir.StepOutputDecodeJSON, ir.StepOutputDecodeYAML)
 		}
 		if cfg.Field == "" {
 			return "", fmt.Errorf("field is required when stdout outputs use text")
@@ -522,7 +569,7 @@ func (n *Node) evaluateStdoutOutputs(ctx context.Context, stdout string, stdoutC
 	return serializeOutputsValue(ctx, object)
 }
 
-func (n *Node) resolveStructuredOutputEntry(ctx context.Context, key string, entry core.StepOutputEntry, stdout string, stdoutCaptured bool) (any, error) {
+func (n *Node) resolveStructuredOutputEntry(ctx context.Context, key string, entry ir.StepOutputEntry, stdout string, stdoutCaptured bool) (any, error) {
 	if entry.HasValue {
 		value, err := n.evaluateStructuredLiteral(ctx, entry.Value)
 		if err != nil {
@@ -537,12 +584,12 @@ func (n *Node) resolveStructuredOutputEntry(ctx context.Context, key string, ent
 	}
 
 	switch entry.Decode {
-	case "", core.StepOutputDecodeText:
+	case "", ir.StepOutputDecodeText:
 		return strings.TrimSpace(raw), nil
-	case core.StepOutputDecodeJSON:
-		return decodeStructuredOutputValue(ctx, key, raw, entry.Select, core.StepOutputDecodeJSON)
-	case core.StepOutputDecodeYAML:
-		return decodeStructuredOutputValue(ctx, key, raw, entry.Select, core.StepOutputDecodeYAML)
+	case ir.StepOutputDecodeJSON:
+		return decodeStructuredOutputValue(ctx, key, raw, entry.Select, ir.StepOutputDecodeJSON)
+	case ir.StepOutputDecodeYAML:
+		return decodeStructuredOutputValue(ctx, key, raw, entry.Select, ir.StepOutputDecodeYAML)
 	default:
 		return nil, fmt.Errorf("%s: unsupported decode %q", key, entry.Decode)
 	}
@@ -578,9 +625,9 @@ func normalizedOutputObject(value any) (map[string]any, bool) {
 	}
 }
 
-func (n *Node) readStructuredOutputSource(ctx context.Context, key string, entry core.StepOutputEntry, stdout string, stdoutCaptured bool) (string, error) {
+func (n *Node) readStructuredOutputSource(ctx context.Context, key string, entry ir.StepOutputEntry, stdout string, stdoutCaptured bool) (string, error) {
 	switch entry.From {
-	case core.StepOutputSourceStdout:
+	case ir.StepOutputSourceStdout:
 		if stdoutCaptured {
 			return stdout, nil
 		}
@@ -589,13 +636,13 @@ func (n *Node) readStructuredOutputSource(ctx context.Context, key string, entry
 			return "", fmt.Errorf("%s: failed to capture stdout: %w", key, err)
 		}
 		return value, nil
-	case core.StepOutputSourceStderr:
+	case ir.StepOutputSourceStderr:
 		value, err := n.outputs.capturedStderr(ctx)
 		if err != nil {
 			return "", fmt.Errorf("%s: failed to capture stderr: %w", key, err)
 		}
 		return value, nil
-	case core.StepOutputSourceFile:
+	case ir.StepOutputSourceFile:
 		path, err := resolveRuntimeString(ctx, entry.Path, cmnvalue.StructuredOutputPathField("output."+key+".path"))
 		if err != nil {
 			return "", fmt.Errorf("%s: failed to evaluate file path: %w", key, err)
@@ -620,11 +667,11 @@ func decodeStructuredOutputValue(ctx context.Context, key, raw, selectPath, deco
 	var decoded any
 
 	switch decode {
-	case core.StepOutputDecodeJSON:
+	case ir.StepOutputDecodeJSON:
 		if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
 			return nil, fmt.Errorf("%s: failed to decode JSON: %w", key, err)
 		}
-	case core.StepOutputDecodeYAML:
+	case ir.StepOutputDecodeYAML:
 		if err := yaml.Unmarshal([]byte(raw), &decoded); err != nil {
 			return nil, fmt.Errorf("%s: failed to decode YAML: %w", key, err)
 		}
@@ -725,7 +772,7 @@ func (n *Node) evaluateStructuredLiteral(ctx context.Context, value any) (any, e
 
 func maxOutputSize(ctx context.Context) int64 {
 	maxSize := int64(defaultMaxOutputSizeBytes)
-	if rCtx := GetDAGContext(ctx); rCtx.DAG != nil && rCtx.DAG.MaxOutputSize > 0 {
+	if rCtx, ok := LookupDAGContext(ctx); ok && rCtx.DAG != nil && rCtx.DAG.MaxOutputSize > 0 {
 		maxSize = int64(rCtx.DAG.MaxOutputSize)
 	}
 	return maxSize
@@ -783,6 +830,16 @@ func (n *Node) setupExecutor(ctx context.Context) (context.Context, executor.Exe
 	if err != nil {
 		return ctx, nil, fmt.Errorf("failed to evaluate step configuration: %w", err)
 	}
+	if execConfig.Type == "template" && n.Step().Script == "" {
+		if templateText, ok := cfg["template_ref"]; ok {
+			resolvedTemplate, ok := templateText.(string)
+			if !ok {
+				return ctx, nil, fmt.Errorf("failed to evaluate step configuration: with.template_ref must resolve to a string")
+			}
+			n.SetScript(resolvedTemplate)
+			delete(cfg, "template_ref")
+		}
+	}
 	execConfig.Config = cfg
 	n.SetExecutorConfig(execConfig)
 
@@ -821,13 +878,13 @@ func (n *Node) setupExecutor(ctx context.Context) (context.Context, executor.Exe
 
 	// Handle sub DAG execution
 	if subDAG := n.Step().SubDAG; subDAG != nil {
-		subRuns, err := n.BuildSubDAGRuns(ctx, subDAG)
+		runParams, err := n.buildChildRunParams(ctx, subDAG)
 		if err != nil {
 			return ctx, nil, err
 		}
-		n.SetSubRuns(subRuns)
+		n.SetSubRuns(subRunsFromParams(runParams))
 
-		if err := n.configureSubDAGExecutor(cmd, subRuns); err != nil {
+		if err := n.configureSubDAGExecutor(cmd, runParams); err != nil {
 			return ctx, nil, err
 		}
 	}
@@ -836,6 +893,7 @@ func (n *Node) setupExecutor(ctx context.Context) (context.Context, executor.Exe
 }
 
 func (n *Node) setupStepOutputFile(ctx context.Context) (context.Context, error) {
+	n.clearOutputsValue()
 	n.clearStepOutputsValue()
 	n.setStepOutputFile("")
 
@@ -862,7 +920,7 @@ func (n *Node) setupStepOutputFile(ctx context.Context) (context.Context, error)
 	}
 
 	env := GetEnv(ctx)
-	env.Scope = env.Scope.WithEntry(exec.EnvKeyDAGUOutputFile, path, cmnvalue.EnvSourceStepEnv)
+	env.Scope = env.Scope.WithEntry(runenv.EnvKeyDAGUOutputFile, path, cmnvalue.EnvSourceStepEnv)
 	return WithEnv(ctx, env), nil
 }
 
@@ -878,19 +936,9 @@ func (n *Node) cleanupStepOutputFile() error {
 	return nil
 }
 
-func evalExecutorConfig(ctx context.Context, step core.Step) (map[string]any, error) {
-	env := GetEnv(ctx)
+func evalExecutorConfig(ctx context.Context, step ir.Step) (map[string]any, error) {
 	if step.ExecutorConfig.Type == "template" {
-		scope := env.Scope
-		if scope == nil {
-			scope = cmnvalue.NewEnvScope(nil, false)
-		}
-		scope = scope.WithEntries(templateConfigEvalVariables(env), cmnvalue.EnvSourceStepEnv)
-		got, err := resolveRuntimeObjectWithScope(ctx, env, scope, step.ExecutorConfig.Config, cmnvalue.TemplateConfigField("with"))
-		if err != nil {
-			return nil, err
-		}
-		return objectAsConfig(got)
+		return evalTemplateConfig(ctx, step.ExecutorConfig.Config)
 	}
 	got, err := resolveRuntimeObject(ctx, step.ExecutorConfig.Config, cmnvalue.ExecutorConfigField("with"))
 	if err != nil {
@@ -899,11 +947,52 @@ func evalExecutorConfig(ctx context.Context, step core.Step) (map[string]any, er
 	return objectAsConfig(got)
 }
 
-func scriptField(ctx context.Context, step core.Step) cmnvalue.Field {
+func evalTemplateConfig(ctx context.Context, config map[string]any) (map[string]any, error) {
+	env := GetEnv(ctx)
+	scope := env.Scope
+	if scope == nil {
+		scope = cmnvalue.NewEnvScope(nil, false)
+	}
+	scope = scope.WithEntries(templateConfigEvalVariables(env), cmnvalue.EnvSourceStepEnv)
+
+	config = maps.Clone(config)
+	rawRef, hasRef := config["template_ref"]
+	delete(config, "template_ref")
+
+	got, err := resolveRuntimeObjectWithScope(ctx, env, scope, config, cmnvalue.TemplateConfigField("with"))
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := objectAsConfig(got)
+	if err != nil {
+		return nil, err
+	}
+	if !hasRef {
+		return resolved, nil
+	}
+
+	ref, ok := rawRef.(string)
+	if !ok {
+		return nil, fmt.Errorf("with.template_ref must be a string")
+	}
+	env.Scope = scope
+	templateText, err := resolverFromEnv(ctx, env).ResolveRef(
+		ctx,
+		ref,
+		cmnvalue.TemplateConfigField("with.template_ref"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	resolved["template_ref"] = templateText
+	return resolved, nil
+}
+
+func scriptField(ctx context.Context, step ir.Step) cmnvalue.Field {
 	if step.ExecutorConfig.Type == "template" {
 		return cmnvalue.TemplateScriptField("run")
 	}
-	command := step.ScriptResolution(ctx)
+	command := registry.ScriptResolution(ctx, step)
 	if step.ExecutorConfig.IsCommand() {
 		return cmnvalue.CommandScriptField("run", command)
 	}
@@ -913,7 +1002,7 @@ func scriptField(ctx context.Context, step core.Step) cmnvalue.Field {
 func resolveRuntimeObjectWithScope(ctx context.Context, env Env, scope *cmnvalue.EnvScope, obj any, field cmnvalue.Field) (any, error) {
 	copy := env
 	copy.Scope = scope
-	return resolverFromEnv(copy).Object(ctx, obj, field)
+	return resolverFromEnv(ctx, copy).Object(ctx, obj, field)
 }
 
 func objectAsConfig(obj any) (map[string]any, error) {
@@ -924,13 +1013,13 @@ func objectAsConfig(obj any) (map[string]any, error) {
 	return config, nil
 }
 
-func (n *Node) configureSubDAGExecutor(cmd executor.Executor, subRuns []SubDAGRun) error {
+func (n *Node) configureSubDAGExecutor(cmd executor.Executor, runParams []executor.RunParams) error {
 	if n.Step().Parallel == nil {
 		dagExecutor, ok := cmd.(executor.DAGExecutor)
 		if !ok {
 			return fmt.Errorf("action %q does not support sub DAG execution", n.Step().ExecutorConfig.Type)
 		}
-		dagExecutor.SetParams(runParams(subRuns[0]))
+		dagExecutor.SetParams(runParams[0])
 		return nil
 	}
 
@@ -938,24 +1027,21 @@ func (n *Node) configureSubDAGExecutor(cmd executor.Executor, subRuns []SubDAGRu
 	if !ok {
 		return fmt.Errorf("action %q does not support parallel execution", n.Step().ExecutorConfig.Type)
 	}
-	parallelExecutor.SetParamsList(runParamsList(subRuns))
+	parallelExecutor.SetParamsList(runParams)
 	return nil
 }
 
-func runParams(subRun SubDAGRun) executor.RunParams {
-	return executor.RunParams{
-		RunID:   subRun.DAGRunID,
-		Params:  subRun.Params,
-		DAGName: subRun.DAGName,
+func subRunsFromParams(params []executor.RunParams) []SubDAGRun {
+	subRuns := make([]SubDAGRun, len(params))
+	for i, run := range params {
+		subRuns[i] = SubDAGRun{
+			DAGRunID:     run.RunID,
+			Params:       run.Params,
+			ParallelItem: run.ParallelItem,
+			DAGName:      run.DAGName,
+		}
 	}
-}
-
-func runParamsList(subRuns []SubDAGRun) []executor.RunParams {
-	params := make([]executor.RunParams, 0, len(subRuns))
-	for _, subRun := range subRuns {
-		params = append(params, runParams(subRun))
-	}
-	return params
+	return subRuns
 }
 
 // evaluateCommandArgs evaluates the command and arguments of the node.
@@ -964,18 +1050,27 @@ func (n *Node) evaluateCommandArgs(ctx context.Context) error {
 		return nil
 	}
 
-	step := n.Step()
-	command := step.CommandResolution(ctx)
+	step, err := resolveStepCommandArgs(ctx, n.Step())
+	if err != nil {
+		return err
+	}
+	n.SetStep(step)
+	n.cmdEvaluated.Store(true)
+	return nil
+}
+
+func resolveStepCommandArgs(ctx context.Context, step ir.Step) (ir.Step, error) {
+	command := registry.CommandResolution(ctx, step)
 
 	if len(step.Commands) > 0 {
-		commands := make([]core.CommandEntry, len(step.Commands))
+		commands := make([]ir.CommandEntry, len(step.Commands))
 		for i, cmdEntry := range step.Commands {
 			fieldPath := commandEntryFieldPath(len(step.Commands), i)
 			commandName := cmdEntry.Command
 			if commandName != "" {
 				evaluated, err := resolveRuntimeString(ctx, commandName, cmnvalue.DirectCommandField(fieldPath, command))
 				if err != nil {
-					return fmt.Errorf("failed to eval command: %w", err)
+					return ir.Step{}, fmt.Errorf("failed to eval command: %w", err)
 				}
 				commandName = evaluated
 			}
@@ -984,7 +1079,7 @@ func (n *Node) evaluateCommandArgs(ctx context.Context) error {
 			for j, arg := range cmdEntry.Args {
 				value, err := resolveRuntimeString(ctx, arg, cmnvalue.DirectCommandField(fieldPath, command))
 				if err != nil {
-					return fmt.Errorf("failed to eval command args: %w", err)
+					return ir.Step{}, fmt.Errorf("failed to eval command args: %w", err)
 				}
 				args[j] = value
 			}
@@ -994,30 +1089,23 @@ func (n *Node) evaluateCommandArgs(ctx context.Context) error {
 			if cmdWithArgs != "" {
 				evaluated, err := resolveRuntimeString(ctx, cmdWithArgs, cmnvalue.ShellCommandField(fieldPath, command))
 				if err != nil {
-					return fmt.Errorf("failed to eval command with args: %w", err)
+					return ir.Step{}, fmt.Errorf("failed to eval command with args: %w", err)
 				}
 				if commandFormRunRejectsLineBreak(step) && commandTextHasLineBreak(evaluated) {
-					return fmt.Errorf("resolved command text for %s contains a line break", fieldPath)
+					return ir.Step{}, fmt.Errorf("resolved command text for %s contains a line break", fieldPath)
 				}
 				cmdWithArgs = evaluated
 			}
 
-			commands[i] = core.CommandEntry{
+			commands[i] = ir.CommandEntry{
 				Command:     commandName,
 				Args:        args,
 				CmdWithArgs: cmdWithArgs,
 			}
 		}
 		step.Commands = commands
-
-		n.SetStep(step)
-		n.cmdEvaluated.Store(true)
-		return nil
 	}
-
-	// No commands to evaluate
-	n.cmdEvaluated.Store(true)
-	return nil
+	return step, nil
 }
 
 func commandEntryFieldPath(count, index int) string {
@@ -1031,7 +1119,7 @@ func commandTextHasLineBreak(text string) bool {
 	return strings.ContainsAny(text, "\r\n")
 }
 
-func commandFormRunRejectsLineBreak(step core.Step) bool {
+func commandFormRunRejectsLineBreak(step ir.Step) bool {
 	if step.Script != "" {
 		return false
 	}
@@ -1051,7 +1139,7 @@ func (n *Node) Signal(ctx context.Context, sig os.Signal, allowOverride bool) {
 func (n *Node) Stop(ctx context.Context, intent cmdutil.TerminationIntent, allowOverride bool) {
 	n.mu.Lock()
 	status := n.Status()
-	if status != core.NodeRunning {
+	if status != ir.NodeRunning {
 		n.mu.Unlock()
 		return
 	}
@@ -1059,7 +1147,7 @@ func (n *Node) Stop(ctx context.Context, intent cmdutil.TerminationIntent, allow
 	stopIntent := n.stopIntentToSend(intent, allowOverride)
 	isTermination := stopIntent.IsTermination()
 	if isTermination {
-		n.SetStatus(core.NodeAborted)
+		n.SetStatus(ir.NodeAborted)
 	}
 	cancel := n.execCancel
 	cmd := n.cmd
@@ -1103,8 +1191,8 @@ func (n *Node) Cancel() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	status := n.Status()
-	if status == core.NodeRunning || status == core.NodeWaiting {
-		n.SetStatus(core.NodeAborted)
+	if status == ir.NodeRunning || status == ir.NodeWaiting {
+		n.SetStatus(ir.NodeAborted)
 	}
 }
 
@@ -1113,11 +1201,10 @@ func (n *Node) SetupEnv(ctx context.Context) context.Context {
 	defer n.mu.RUnlock()
 	env := GetEnv(ctx)
 	env.Scope = env.Scope.WithEntry(
-		exec.EnvKeyDAGRunStepStdoutFile, n.GetStdout(), cmnvalue.EnvSourceStepEnv,
+		runenv.EnvKeyDAGRunStepStdoutFile, n.GetStdout(), cmnvalue.EnvSourceStepEnv,
 	).WithEntry(
-		exec.EnvKeyDAGRunStepStderrFile, n.GetStderr(), cmnvalue.EnvSourceStepEnv,
+		runenv.EnvKeyDAGRunStepStderrFile, n.GetStderr(), cmnvalue.EnvSourceStepEnv,
 	)
-	ctx = logger.WithValues(ctx, tag.Step(n.Name()))
 	return WithEnv(ctx, env)
 }
 
@@ -1151,6 +1238,20 @@ func (n *Node) Prepare(ctx context.Context, logDir string, dagRunID string) erro
 		return fmt.Errorf("failed to setup repeat policy: %w", err)
 	}
 	return nil
+}
+
+// ResetForRerun returns the node to its declared definition so it can execute
+// again. It clears the command-evaluation cache along with the run state, since
+// arguments holding runtime references must be resolved against current values
+// rather than those captured on the first attempt.
+func (n *Node) ResetForRerun(step ir.Step) {
+	n.ClearState(step)
+	n.cmdEvaluated.Store(false)
+}
+
+func (n *Node) resetForBuildAttempt(step ir.Step) {
+	n.SetStep(step)
+	n.cmdEvaluated.Store(false)
 }
 
 func (n *Node) Teardown() error {
@@ -1200,7 +1301,7 @@ func (n *Node) LogContainsPattern(ctx context.Context, patterns []string) (bool,
 
 	// Get maxOutputSize from DAG configuration
 	var maxOutputSize = defaultMaxOutputSizeBytes
-	if rCtx := GetDAGContext(ctx); rCtx.DAG != nil && rCtx.DAG.MaxOutputSize > 0 {
+	if rCtx, ok := LookupDAGContext(ctx); ok && rCtx.DAG != nil && rCtx.DAG.MaxOutputSize > 0 {
 		maxOutputSize = rCtx.DAG.MaxOutputSize
 	}
 
@@ -1246,8 +1347,16 @@ func (n *Node) Init() {
 	}
 }
 
-// BuildSubDAGRuns constructs the sub DAG runs based on parallel configuration
-func (n *Node) BuildSubDAGRuns(ctx context.Context, subDAG *core.SubDAG) ([]SubDAGRun, error) {
+// BuildSubDAGRuns constructs the sub DAG runs based on parallel configuration.
+func (n *Node) BuildSubDAGRuns(ctx context.Context, subDAG *ir.SubDAG) ([]SubDAGRun, error) {
+	runParams, err := n.buildChildRunParams(ctx, subDAG)
+	if err != nil {
+		return nil, err
+	}
+	return subRunsFromParams(runParams), nil
+}
+
+func (n *Node) buildChildRunParams(ctx context.Context, subDAG *ir.SubDAG) ([]executor.RunParams, error) {
 	parallel := n.Step().Parallel
 
 	// Single sub DAG execution (non-parallel)
@@ -1261,11 +1370,20 @@ func (n *Node) BuildSubDAGRuns(ctx context.Context, subDAG *core.SubDAG) ([]SubD
 		if repeated && len(n.State().SubRuns) > 0 {
 			n.AddSubRunsRepeated(n.State().SubRuns[0])
 		}
+		workerSelector, err := resolveWorkerSelector(
+			ctx,
+			GetEnv(ctx).Scope,
+			n.Step().WorkerSelector,
+		)
+		if err != nil {
+			return nil, err
+		}
 		dagRunID := GenerateSubDAGRunIDForTarget(ctx, dagName, params, repeated)
-		return []SubDAGRun{{
-			DAGRunID: dagRunID,
-			Params:   params,
-			DAGName:  dagName,
+		return []executor.RunParams{{
+			RunID:          dagRunID,
+			Params:         params,
+			DAGName:        dagName,
+			WorkerSelector: workerSelector,
 		}}, nil
 	}
 
@@ -1298,7 +1416,7 @@ func (n *Node) BuildSubDAGRuns(ctx context.Context, subDAG *core.SubDAG) ([]SubD
 				items = append(items, value)
 			} else if len(item.Params) > 0 {
 				// evaluate each value in Params
-				m := make(collections.DeterministicMap)
+				m := make(map[string]string)
 				for key, value := range item.Params {
 					evaluatedValue, err := resolveRuntimeString(ctx, value, cmnvalue.ParallelItemParamField("parallel.items.params."+key))
 					if err != nil {
@@ -1327,8 +1445,7 @@ func (n *Node) BuildSubDAGRuns(ctx context.Context, subDAG *core.SubDAG) ([]SubD
 		return nil, fmt.Errorf("parallel execution exceeds maximum limit: %d items (max: %d)", len(items), maxParallelItems)
 	}
 
-	// Build sub runs with deduplication
-	subRunMap := make(map[string]SubDAGRun)
+	runParamsByID := make(map[string]executor.RunParams)
 	repeated := n.IsRepeated()
 
 	if repeated {
@@ -1359,6 +1476,7 @@ func (n *Node) BuildSubDAGRuns(ctx context.Context, subDAG *core.SubDAG) ([]SubD
 
 		// Merge the item param with the step's params if they exist
 		finalParams := param
+		parallelItem := ""
 		if subDAG.Params != "" {
 			params := subDAG.Params
 			evaluatedStepParams, err := resolveWithEnvScope(ctx, env, scope, params, cmnvalue.ParallelSubDAGField("parallel.sub_dag.params"))
@@ -1366,24 +1484,77 @@ func (n *Node) BuildSubDAGRuns(ctx context.Context, subDAG *core.SubDAG) ([]SubD
 				return nil, fmt.Errorf("failed to eval step params: %w", err)
 			}
 			finalParams = evaluatedStepParams
+			parallelItem = param
+		}
+
+		workerSelector, err := resolveWorkerSelector(ctx, scope, n.Step().WorkerSelector)
+		if err != nil {
+			return nil, err
 		}
 
 		dagRunID := GenerateSubDAGRunIDForTarget(ctx, dagName, finalParams, repeated)
-		// Use dagRunID as key to deduplicate - same params will generate same ID
-		subRunMap[dagRunID] = SubDAGRun{
-			DAGRunID: dagRunID,
-			Params:   finalParams,
-			DAGName:  dagName,
+		if existing, ok := runParamsByID[dagRunID]; ok &&
+			!maps.Equal(existing.WorkerSelector, workerSelector) {
+			return nil, fmt.Errorf(
+				"parallel items resolve to the same sub-DAG run %q with different worker selectors",
+				dagRunID,
+			)
+		}
+		if existing, ok := runParamsByID[dagRunID]; ok && existing.ParallelItem != parallelItem {
+			dagRunID = GenerateSubDAGRunIDForTarget(ctx, dagName, finalParams+"\x00"+parallelItem, repeated)
+		}
+		runParamsByID[dagRunID] = executor.RunParams{
+			RunID:          dagRunID,
+			Params:         finalParams,
+			ParallelItem:   parallelItem,
+			DAGName:        dagName,
+			WorkerSelector: workerSelector,
 		}
 	}
 
-	// Convert map back to slice
-	var subRuns []SubDAGRun
-	for _, run := range subRunMap {
-		subRuns = append(subRuns, run)
+	var runParams []executor.RunParams
+	for _, params := range runParamsByID {
+		runParams = append(runParams, params)
 	}
 
-	return subRuns, nil
+	return runParams, nil
+}
+
+func resolveWorkerSelector(
+	ctx context.Context,
+	scope *cmnvalue.EnvScope,
+	selector map[string]string,
+) (map[string]string, error) {
+	if len(selector) == 0 {
+		return nil, nil
+	}
+	if scope == nil {
+		scope = cmnvalue.NewEnvScope(nil, false)
+	}
+
+	resolver := ValueResolverWithScope(ctx, scope)
+	field := cmnvalue.WorkflowField("worker_selector")
+	resolved := make(map[string]string, len(selector))
+	for rawKey, rawValue := range selector {
+		key, err := resolver.String(ctx, rawKey, field)
+		if err != nil {
+			return nil, fmt.Errorf("failed to eval worker selector key %q: %w", rawKey, err)
+		}
+		value, err := resolver.String(ctx, rawValue, field)
+		if err != nil {
+			return nil, fmt.Errorf("failed to eval worker selector value %q: %w", rawValue, err)
+		}
+
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("worker selector key %q resolved to an empty key", rawKey)
+		}
+		if _, ok := resolved[key]; ok {
+			return nil, fmt.Errorf("worker selector keys resolve to duplicate key %q", key)
+		}
+		resolved[key] = strings.TrimSpace(value)
+	}
+	return resolved, nil
 }
 
 // ItemToParam converts a parallel item to a parameter string
@@ -1519,13 +1690,16 @@ func (n *Node) setupRepeatPolicy(ctx context.Context) error {
 }
 
 func (node *Node) evalPreconditions(ctx context.Context) error {
-	if len(node.Step().Preconditions) == 0 {
+	conditions := node.Step().Preconditions
+	if len(conditions) == 0 {
 		return nil
 	}
 	logger.Infof(ctx, "Checking preconditions for \"%s\"", node.Name())
 	env := GetEnv(ctx)
 	shell := env.Shell(ctx)
-	if err := EvalConditions(ctx, shell, node.Step().Preconditions); err != nil {
+	results, err := EvaluateConditions(ctx, shell, conditions)
+	node.SetPreconditionResults(results)
+	if err != nil {
 		logger.Infof(ctx, "Preconditions failed for \"%s\"", node.Name())
 		return err
 	}

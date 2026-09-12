@@ -11,6 +11,7 @@ const defaultLicense: LicenseStatus = {
   community: true,
   source: '',
   warningCode: '',
+  error: '',
 };
 
 export function useLicense(): LicenseStatus {

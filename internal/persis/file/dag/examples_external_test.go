@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	filedag "github.com/dagucloud/dagu/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	filedag "github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 
 	"github.com/stretchr/testify/require"
 )
@@ -24,10 +24,8 @@ func TestFirstLaunchExamplesLoadAndRun(t *testing.T) {
 	ctx := context.Background()
 
 	dagsDir := t.TempDir()
-	store := filedag.New(dagsDir)
-	initializer, ok := store.(interface{ Initialize() error })
-	require.True(t, ok)
-	require.NoError(t, initializer.Initialize())
+	store := filedag.NewStore(dagsDir)
+	require.NoError(t, store.Initialize())
 
 	files := yamlFiles(t, dagsDir)
 	require.NotEmpty(t, files)
@@ -62,7 +60,7 @@ func TestFirstLaunchExamplesLoadAndRun(t *testing.T) {
 			status, err := run.Wait(runCtx)
 			require.NoError(t, err)
 			require.NotNil(t, status)
-			require.Equal(t, core.Succeeded.String(), status.Status)
+			require.Equal(t, ir.Succeeded.String(), status.Status)
 		})
 	}
 }

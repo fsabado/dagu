@@ -11,9 +11,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/dagucloud/dagu/internal/cmn/dirlock"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 const latestAttemptFileName = ".dagrun.latest"
@@ -84,7 +85,7 @@ func updateLatestAttemptPointer(ctx context.Context, statusFile string) error {
 	return nil
 }
 
-func (dr DataRoot) latestAttemptFromPointer(ctx context.Context, cache *fileutil.Cache[*exec.DAGRunStatus], cutoff exec.TimeInUTC) (*Attempt, error) {
+func (dr DataRoot) latestAttemptFromPointer(ctx context.Context, cache *fileutil.Cache[*ir.DAGRunStatus], cutoff persis.TimeInUTC) (*Attempt, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -143,7 +144,7 @@ func parseAttemptStatusFileInfo(statusFile string) (attemptStatusFileInfo, bool)
 
 	attemptDir := filepath.Dir(cleanStatusFile)
 	attemptDirName := filepath.Base(attemptDir)
-	if !reAttemptDir.MatchString(attemptDirName) {
+	if !IsAttemptDirName(attemptDirName) {
 		return attemptStatusFileInfo{}, false
 	}
 
@@ -182,7 +183,7 @@ func attemptStatusFileInfoLess(a, b attemptStatusFileInfo) bool {
 	if a.runDirName != b.runDirName {
 		return a.runDirName < b.runDirName
 	}
-	return a.attemptDirName < b.attemptDirName
+	return attemptDirOlder(a.attemptDirName, b.attemptDirName)
 }
 
 func latestAttemptPointerPath(dagRunsDir string) string {

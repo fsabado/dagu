@@ -10,11 +10,11 @@ import (
 	"os"
 	"sync"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // CloseExecutor safely closes an executor if it implements io.Closer.
@@ -45,10 +45,10 @@ type Stopper interface {
 }
 
 // ExecutorFactory is a function type that creates an Executor based on the step configuration.
-type ExecutorFactory func(ctx context.Context, step core.Step) (Executor, error)
+type ExecutorFactory func(ctx context.Context, step ir.Step) (Executor, error)
 
 // NewExecutor creates a new Executor based on the step's executor type.
-func NewExecutor(ctx context.Context, step core.Step) (Executor, error) {
+func NewExecutor(ctx context.Context, step ir.Step) (Executor, error) {
 	executorRegistryMu.RLock()
 	factory, ok := executorRegistry[step.ExecutorConfig.Type]
 	executorRegistryMu.RUnlock()
@@ -64,21 +64,23 @@ func NewExecutor(ctx context.Context, step core.Step) (Executor, error) {
 }
 
 // RegisterExecutor registers a new executor type with its factory, validator, and capabilities.
-func RegisterExecutor(executorType string, factory ExecutorFactory, validator core.StepValidator, caps core.ExecutorCapabilities) {
+func RegisterExecutor(executorType string, factory ExecutorFactory, validator registry.StepValidator, caps registry.ExecutorCapabilities) {
 	executorRegistryMu.Lock()
 	executorRegistry[executorType] = factory
 	executorRegistryMu.Unlock()
 	if validator != nil {
-		core.RegisterStepValidator(executorType, validator)
+		registry.RegisterStepValidator(executorType, validator)
 	}
-	core.RegisterExecutorCapabilities(executorType, caps)
+	registry.RegisterExecutorCapabilities(executorType, caps)
 }
 
 // UnregisterExecutor removes a registered executor type.
 func UnregisterExecutor(executorType string) {
 	executorRegistryMu.Lock()
-	defer executorRegistryMu.Unlock()
 	delete(executorRegistry, executorType)
+	executorRegistryMu.Unlock()
+	registry.UnregisterStepValidator(executorType)
+	registry.UnregisterExecutorCapabilities(executorType)
 }
 
 var executorRegistry = make(map[string]ExecutorFactory)
@@ -92,7 +94,7 @@ type ExitCoder interface {
 
 // NodeStatusDeterminer is an interface for reporting the status of a node execution.
 type NodeStatusDeterminer interface {
-	DetermineNodeStatus() (core.NodeStatus, error)
+	DetermineNodeStatus() (ir.NodeStatus, error)
 }
 
 // DAGExecutor is an interface for sub DAG executors.
@@ -113,15 +115,28 @@ type ParallelExecutor interface {
 
 // RunParams holds the parameters for running a sub DAG.
 type RunParams struct {
-	RunID   string
-	Params  string
-	DAGName string
+	RunID          string
+	Params         string
+	ParallelItem   string
+	DAGName        string
+	WorkerSelector map[string]string
 }
 
 // ChatMessageHandler is an interface for executors that handle chat session messages.
 type ChatMessageHandler interface {
-	SetContext([]exec.LLMMessage)
-	GetMessages() []exec.LLMMessage
+	SetContext([]ir.LLMMessage)
+	GetMessages() []ir.LLMMessage
+}
+
+// AgentSessionHandler exchanges durable managed-agent state with the runtime.
+type AgentSessionHandler interface {
+	SetAgentSession(*ir.AgentSession)
+	GetAgentSession() *ir.AgentSession
+}
+
+// ProgressCallbackAware reports executor side-channel changes during execution.
+type ProgressCallbackAware interface {
+	SetProgressCallback(func())
 }
 
 // PushBackAware is implemented by executors that can incorporate
@@ -140,17 +155,28 @@ type PushBackPreviousStdoutAware interface {
 // This is used by executors like chat (with tools) to report sub-runs
 // for UI drill-down functionality.
 type SubRunProvider interface {
-	GetSubRuns() []exec.SubDAGRun
+	GetSubRuns() []ir.SubDAGRun
+}
+
+// StatusDetailsProvider reports independently tracked executions within a node.
+type StatusDetailsProvider interface {
+	GetStatusDetails() []ir.NodeStatusDetail
 }
 
 // ToolDefinitionProvider is an interface for executors that provide tool definitions.
 // This is used by chat executors to report what tools were available to the LLM
 // for debugging and visibility purposes.
 type ToolDefinitionProvider interface {
-	GetToolDefinitions() []exec.ToolDefinition
+	GetToolDefinitions() []ir.ToolDefinition
 }
 
 // OutputsProvider is implemented by executors that publish DAG/action outputs.
 type OutputsProvider interface {
 	GetOutputs() map[string]any
+}
+
+// DeclaredOutputsProvider marks executor outputs as available to strict step output references.
+type DeclaredOutputsProvider interface {
+	OutputsProvider
+	PublishesDeclaredOutputs() bool
 }

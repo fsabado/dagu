@@ -9,13 +9,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 // ErrCorrupt reports that a record exists but its payload could not be decoded.
 // It is distinct from a backend read failure so callers can choose to recover
 // (for example, start from a fresh value) rather than propagate the error.
-var ErrCorrupt = errors.New("persis/store: corrupt record")
+var ErrCorrupt = persis.ErrCorrupt
 
 // SingleRecord persists one value at a fixed record ID within a collection.
 //

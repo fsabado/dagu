@@ -4,13 +4,15 @@
 import { useState, useEffect, useContext } from 'react';
 import { useConfig } from '@/contexts/ConfigContext';
 import { AppBarContext } from '@/contexts/AppBarContext';
-import { components, UserRole } from '@/api/v1/schema';
+import { components, UserAuthProvider, UserRole } from '@/api/v1/schema';
 import {
   defaultWorkspaceAccess,
   emptyWorkspaceAccess,
   normalizeWorkspaceAccess,
   WorkspaceAccessEditor,
+  WorkspaceAccessSummary,
 } from '@/components/WorkspaceAccessEditor';
+import { Badge } from '@/components/ui/badge';
 import {
   Dialog,
   DialogContent,
@@ -28,6 +30,9 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { AlertCircle, Check, UserPlus, X } from 'lucide-react';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { useI18n } from '@/i18n/I18nProvider';
 
 type User = components['schemas']['User'];
 type WorkspaceAccess = components['schemas']['WorkspaceAccess'];
@@ -35,14 +40,28 @@ type WorkspaceAccess = components['schemas']['WorkspaceAccess'];
 type UserFormModalProps = {
   open: boolean;
   user?: User;
+  managedRoleProviders?: UserAuthProvider[];
+  managedWorkspaceAccessProviders?: UserAuthProvider[];
   onClose: () => void;
   onSuccess: () => void;
 };
 
 const ROLES = [
-  { value: 'admin', label: 'Admin', description: 'Full access including user management' },
-  { value: 'manager', label: 'Manager', description: 'DAG create/edit/delete, execution, and audit logs' },
-  { value: 'developer', label: 'Developer', description: 'DAG create/edit/delete and execution' },
+  {
+    value: 'admin',
+    label: 'Admin',
+    description: 'Full access including user management',
+  },
+  {
+    value: 'manager',
+    label: 'Manager',
+    description: 'DAG create/edit/delete, execution, and audit logs',
+  },
+  {
+    value: 'developer',
+    label: 'Developer',
+    description: 'DAG create/edit/delete and execution',
+  },
   { value: 'operator', label: 'Operator', description: 'DAG execution only' },
   { value: 'viewer', label: 'Viewer', description: 'Read-only access' },
 ] as const;
@@ -56,10 +75,37 @@ const ROLES = [
  * @param props.onSuccess - Callback invoked after a successful create or update operation.
  * @returns The modal JSX element containing the user form.
  */
-export function UserFormModal({ open, user, onClose, onSuccess }: UserFormModalProps) {
+export function UserFormModal({
+  open,
+  user,
+  managedRoleProviders = [],
+  managedWorkspaceAccessProviders = [],
+  onClose,
+  onSuccess,
+}: UserFormModalProps) {
+  const { ts } = useI18n();
   const config = useConfig();
   const appBarContext = useContext(AppBarContext);
   const isEditing = !!user;
+  const roleManaged =
+    isEditing &&
+    !!user.authProvider &&
+    managedRoleProviders.includes(user.authProvider);
+  const workspaceAccessManaged =
+    isEditing &&
+    !!user.authProvider &&
+    managedWorkspaceAccessProviders.includes(user.authProvider);
+  const authorizationManaged = roleManaged || workspaceAccessManaged;
+  const managedProviderLabel =
+    user?.authProvider === UserAuthProvider.proxy ? 'Proxy' : 'SSO';
+  let managedBadgeLabel = ts('Workspace access managed by {provider}', {
+    provider: managedProviderLabel,
+  });
+  if (roleManaged) {
+    managedBadgeLabel = workspaceAccessManaged
+      ? ts('Managed by {provider}', { provider: managedProviderLabel })
+      : ts('Role managed by {provider}', { provider: managedProviderLabel });
+  }
 
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -69,6 +115,7 @@ export function UserFormModal({ open, user, onClose, onSuccess }: UserFormModalP
   );
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const effectiveRole = workspaceAccess.all ? role : UserRole.viewer;
 
   useEffect(() => {
     if (user) {
@@ -93,7 +140,11 @@ export function UserFormModal({ open, user, onClose, onSuccess }: UserFormModalP
       setError('Password must be at least 8 characters');
       return;
     }
-    if (!workspaceAccess.all && workspaceAccess.grants.length === 0) {
+    if (
+      !workspaceAccessManaged &&
+      !workspaceAccess.all &&
+      workspaceAccess.grants.length === 0
+    ) {
       setError('Select at least one workspace');
       return;
     }
@@ -105,44 +156,31 @@ export function UserFormModal({ open, user, onClose, onSuccess }: UserFormModalP
       if (!token) {
         throw new Error('Not authenticated');
       }
-      const remoteNode = encodeURIComponent(appBarContext.selectedRemoteNode || 'local');
-      const effectiveRole = workspaceAccess.all ? role : UserRole.viewer;
+      const remoteNode = encodeURIComponent(
+        appBarContext.selectedRemoteNode || 'local'
+      );
       const payload = {
         username,
-        role: effectiveRole,
-        workspaceAccess,
+        ...(!roleManaged && { role: effectiveRole }),
+        ...(!workspaceAccessManaged && { workspaceAccess }),
       };
+      const endpoint = user
+        ? `${config.apiURL}/users/${user.id}?remoteNode=${remoteNode}`
+        : `${config.apiURL}/users?remoteNode=${remoteNode}`;
+      const response = await fetch(endpoint, {
+        method: user ? 'PATCH' : 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(user ? payload : { ...payload, password }),
+      });
 
-      if (isEditing) {
-        // Update user
-        const response = await fetch(`${config.apiURL}/users/${user.id}?remoteNode=${remoteNode}`, {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(payload),
-        });
-
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(data.message || 'Failed to update user');
-        }
-      } else {
-        // Create user
-        const response = await fetch(`${config.apiURL}/users?remoteNode=${remoteNode}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({ ...payload, password }),
-        });
-
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(data.message || 'Failed to create user');
-        }
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(
+          data.message || `Failed to ${user ? 'update' : 'create'} user`
+        );
       }
 
       onSuccess();
@@ -157,7 +195,18 @@ export function UserFormModal({ open, user, onClose, onSuccess }: UserFormModalP
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{isEditing ? 'Edit User' : 'Create User'}</DialogTitle>
+          <div className="flex items-center gap-2">
+            <DialogTitle>
+              {isEditing ? (
+                <I18nText text={'Edit User'} />
+              ) : (
+                <I18nText text={'Create User'} />
+              )}
+            </DialogTitle>
+            {authorizationManaged && (
+              <Badge variant="info">{managedBadgeLabel}</Badge>
+            )}
+          </div>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="space-y-4 mt-2">
@@ -170,7 +219,7 @@ export function UserFormModal({ open, user, onClose, onSuccess }: UserFormModalP
 
           <div className="space-y-1.5">
             <Label htmlFor="username" className="text-sm">
-              Username
+              <I18nText text={'Username'} />
             </Label>
             <Input
               id="username"
@@ -186,65 +235,112 @@ export function UserFormModal({ open, user, onClose, onSuccess }: UserFormModalP
           {!isEditing && (
             <div className="space-y-1.5">
               <Label htmlFor="password" className="text-sm">
-                Password
+                <I18nText text={'Password'} />
               </Label>
-              <Input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                autoComplete="new-password"
-                className="h-9"
-                placeholder="Minimum 8 characters"
-              />
+              <I18nProps>
+                <Input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  autoComplete="new-password"
+                  className="h-9"
+                  placeholder="Minimum 8 characters"
+                />
+              </I18nProps>
             </div>
           )}
 
           <div className="space-y-1.5">
             <Label htmlFor="role" className="text-sm">
-              Role
+              <I18nText text={'Role'} />
             </Label>
-            <Select
-              value={workspaceAccess.all ? role : UserRole.viewer}
-              onValueChange={setRole}
-              disabled={!workspaceAccess.all}
-            >
-              <SelectTrigger className="h-9">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {ROLES.map((r) => (
-                  <SelectItem key={r.value} value={r.value}>
-                    <div className="flex flex-col">
-                      <span>{r.label}</span>
-                      <span className="text-xs text-muted-foreground">{r.description}</span>
-                    </div>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {roleManaged ? (
+              <div
+                aria-label={ts('Role managed by {provider}', {
+                  provider: managedProviderLabel,
+                })}
+                className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm capitalize"
+              >
+                <I18nText text={user.role} />
+              </div>
+            ) : (
+              <Select
+                value={effectiveRole}
+                onValueChange={setRole}
+                disabled={!workspaceAccess.all}
+              >
+                <SelectTrigger className="h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ROLES.map((r) => (
+                    <SelectItem key={r.value} value={r.value}>
+                      <div className="flex flex-col">
+                        <span>
+                          <I18nText text={r.label} />
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          <I18nText text={r.description} />
+                        </span>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
           </div>
 
-          <WorkspaceAccessEditor
-            value={workspaceAccess}
-            onChange={(next) => {
-              setWorkspaceAccess(next);
-              if (!next.all) {
-                setRole(UserRole.viewer);
-              }
-            }}
-            workspaces={appBarContext.workspaces ?? []}
-          />
+          {workspaceAccessManaged ? (
+            <div className="space-y-1.5">
+              <Label className="text-sm">
+                <I18nText text={'Workspace Access'} />
+              </Label>
+              <WorkspaceAccessSummary
+                value={workspaceAccess}
+                workspaces={appBarContext.workspaces}
+              />
+              <p className="text-xs text-slate-500 dark:text-slate-500">
+                {ts(
+                  roleManaged
+                    ? 'Role and workspace access are updated by {provider} at sign-in.'
+                    : 'Workspace access is updated by {provider} at sign-in.',
+                  { provider: managedProviderLabel }
+                )}
+              </p>
+            </div>
+          ) : (
+            <WorkspaceAccessEditor
+              value={workspaceAccess}
+              onChange={(next) => {
+                setWorkspaceAccess(next);
+                if (!next.all) {
+                  setRole(UserRole.viewer);
+                }
+              }}
+              workspaces={appBarContext.workspaces ?? []}
+            />
+          )}
 
           <div className="flex justify-end gap-2 pt-2">
             <Button type="button" variant="ghost" onClick={onClose}>
               <X className="h-4 w-4" />
-              Cancel
+              <I18nText text={'Cancel'} />
             </Button>
             <Button type="submit" disabled={isLoading}>
-              {isEditing ? <Check className="h-4 w-4" /> : <UserPlus className="h-4 w-4" />}
-              {isLoading ? 'Saving...' : isEditing ? 'Update' : 'Create'}
+              {isEditing ? (
+                <Check className="h-4 w-4" />
+              ) : (
+                <UserPlus className="h-4 w-4" />
+              )}
+              {isLoading ? (
+                <I18nText text={'Saving...'} />
+              ) : isEditing ? (
+                <I18nText text={'Update'} />
+              ) : (
+                <I18nText text={'Create'} />
+              )}
             </Button>
           </div>
         </form>

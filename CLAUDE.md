@@ -1,84 +1,146 @@
-# CLAUDE.md
+# Dagu repository guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Project
 
-## What is Dagu?
+Dagu is a local-first workflow orchestrator. Workflows are YAML DAGs. The root
+Go module builds one binary containing the CLI, server, scheduler, coordinator,
+and worker. Runtime state is file-backed; no control-plane database or broker is
+required.
 
-Dagu is a self-contained, single-binary workflow orchestration engine. Workflows are defined as DAGs (Directed Acyclic Graphs) in YAML. It requires no external databases or message brokers — all data is stored locally in files. It supports local, queue-based, and distributed (coordinator/worker) execution modes.
+The root package, `github.com/dagucloud/dagu/v2`, also exposes an experimental
+embedded engine API.
 
-## Build & Development Commands
+## Repository map
 
-| Command | Description |
-|---------|-------------|
-| `make build` | Build frontend UI + Go binary |
-| `make bin` | Build Go binary only (output: `.local/bin/dagu`) |
-| `make ui` | Build frontend only (cleans node_modules, installs, webpack builds) |
-| `make run` | Run frontend server + scheduler (requires built UI assets) |
-| `make run-server` | Run backend server only |
-| `make test` | Run all tests (`gotestsum` with race detection) |
-| `make test TEST_TARGET=./internal/core/...` | Run tests for a specific package |
-| `make test-coverage` | Run tests with coverage, opens HTML report |
-| `make lint` | Run `golangci-lint` |
-| `make fmt` | Auto-format: `go fix` + `go fmt` + `golangci-lint --fix` |
-| `make check` | CI-style check: formatting + linting without modifications |
-| `make api` | Generate server code from OpenAPI spec (`api/v1/api.yaml`) |
-| `make api-validate` | Validate OpenAPI spec |
-| `make protoc` | Generate gRPC code from proto files |
+- `cmd/`: binary entry point. Command implementations live in `internal/cmd/`.
+- `internal/spec/`: workflow YAML decoding, normalization, and validation.
+- `internal/ir/`: canonical DAG definitions and persisted run state.
+- `internal/intake/`: local and queued run admission.
+- `internal/runtime/`: planning, execution, retries, and run lifecycle.
+- `internal/runtime/builtin/`: built-in executor implementations.
+- `internal/executor/registry/`: executor metadata, schemas, and validators.
+- `internal/persis/`: persistence contracts and repositories.
+- `internal/persis/file/`: file-backed persistence adapters.
+- `internal/persis/store/`: collection-backed domain stores.
+- `internal/service/frontend/`: HTTP API, SSE, MCP, and embedded UI assets.
+- `internal/service/scheduler/`: schedules, queues, retries, and run dispatch.
+- `internal/service/coordinator/`: distributed execution coordinator.
+- `internal/service/worker/`: distributed worker.
+- `internal/engine/`: implementation behind the root embedded API.
+- `api/v1/`: OpenAPI source and generated Go server types.
+- `proto/`: coordinator and index protobuf APIs.
+- `ui/`: React and TypeScript frontend.
+- `specs/`: normative behavior specifications.
+- `conformance/`: binary-level tests for those specifications.
+- `internal/intg/`: Go integration tests.
+- `examples/`: example workflows and embedded API programs.
 
-**Frontend dev server**: `cd ui && pnpm install && pnpm dev` (runs on port 8081, backend on 8080).
+## Runtime flow
 
-## Architecture Overview
-
-### Go Backend (`internal/`)
-
-- **`core/`** — DAG and step definitions, validation, status types. The DAG spec is rich (~100 fields) supporting schedules, lifecycle hooks, container specs, parameters, and three execution types: `graph`, `chain`, `agent`.
-- **`core/exec/`** — Interfaces for DAG run tracking, queue, and process stores (`DAGRunStore`, `QueueStore`, `ProcStore`, `Dispatcher`).
-- **`runtime/`** — Execution engine. `runner.go` orchestrates parallel execution with dependency resolution. `node.go` manages individual step execution with retry logic. `manager.go` coordinates the overall lifecycle.
-- **`runtime/builtin/`** — 18+ built-in executor implementations: `command`, `docker`, `http`, `ssh`, `jq`, `mail`, `sql`, `redis`, `s3`, `dag` (sub-DAG), `chat` (LLM), `router`, `agentstep`, etc.
-- **`runtime/executor/`** — Executor factory pattern with global registry. Executors implement `Run(ctx) error` with stdout/stderr/kill support.
-- **`persis/`** — File-based persistence layer. Store implementations include legacy file-backed packages (`filedag`, `filedagrun`, `fileproc`, etc.) and collection-backed adapters in `persis/store` such as the queue, user, session, and API-key stores.
-- **`service/frontend/`** — HTTP server using Chi router. REST API v1 with 43+ endpoint handlers, SSE for real-time updates, static asset serving. API handlers are in `api/v1/`.
-- **`service/scheduler/`** — Cron scheduling with timezone support, zombie detection, queue processing, distributed coordination.
-- **`service/coordinator/`** — gRPC server for distributed execution and service registry.
-- **`service/worker/`** — Polls coordinator for work, executes DAGs locally, reports status.
-- **`auth/`** — Authentication with RBAC roles (admin, manager, operator, viewer, developer). Supports Basic, OIDC, and built-in JWT auth.
-- **`cmn/`** — Shared utilities: config loading, expression evaluation, file operations, structured logging, secret management, OpenTelemetry, backoff strategies.
-- **`agent/`** — LLM-powered agent for workflow generation with session/skill/memory management.
-- **`cmd/`** — CLI command implementations (Cobra). ~20 commands: `start`, `stop`, `server`, `scheduler`, `coord`, `worker`, `validate`, `dry`, etc.
-
-### Frontend (`ui/`)
-
-React 19 + TypeScript with Webpack 5. Uses Tailwind CSS 4, Radix UI/shadcn components, Monaco editor for YAML, xterm.js for terminal, SWR for data fetching, and `openapi-fetch` for typed API calls. API types generated from OpenAPI spec via `pnpm gen:api`.
-
-### Key Data Flow
-
-```
-CLI/API/UI → Command Handler (cmd/) → DAG Loader & Validator (core/)
-  → Runtime Engine (runtime/runner.go) → Node Execution (runtime/node.go)
-  → Executor (runtime/builtin/*) → File Storage (persis/)
-  → SSE → Web UI
+```text
+CLI / REST API / UI
+        |
+        v
+spec -> ir -> intake -> runtime plan -> runner -> node -> executor
+                         |                              |
+                         +---------- persis -----------+
 ```
 
-For distributed mode: Scheduler → Queue → Coordinator (gRPC) → Worker → Report back.
+Distributed runs continue through scheduler dispatch, coordinator gRPC, and a
+worker before reporting state and logs back.
 
-## Code Generation
+## Architecture rules
 
-- **REST API**: OpenAPI spec at `api/v1/api.yaml` → generated Go server code via `oapi-codegen`. Run `make api`.
-- **gRPC**: Proto files at `proto/coordinator/v1/` → generated Go code via `protoc`. Run `make protoc`.
-- **Frontend API types**: `cd ui && pnpm gen:api` generates TypeScript types from the OpenAPI spec.
+- Keep authored YAML decoding and build-time validation in `internal/spec/`.
+- Pass normalized `internal/ir` values into persistence and runtime code.
+- Keep mutable execution state in `internal/runtime/`, not `internal/ir/`.
+- Route run admission through `internal/intake/`.
+- Put persistence interfaces and repository behavior in `internal/persis/`.
+- Keep file mechanics behind `internal/persis/file/`.
+- Do not import `internal/service/*` from `internal/persis/*`.
+- Keep `internal/cmn/*` domain-independent. `internal/cmn/config` may import
+  `internal/auth` and `internal/workspace`; no other domain imports belong there.
+- Keep service handlers above domain and persistence layers. Do not call storage
+  adapters directly from HTTP handlers.
+- Register executors through the runtime executor registry. Register associated
+  config schemas, validators, and capabilities with the executor registry.
+- Preserve local and distributed execution behavior when changing run lifecycle
+  or persistence code.
+- The root package is a public API. Avoid exposing internal types through it.
 
-## Key Conventions
+## Commands
 
-- All storage is behind interfaces (in `core/exec/`) with file-based implementations (in `persis/`).
-- Executors follow the factory pattern — registered globally, instantiated dynamically by type name.
-- DAGs can compose hierarchically — a step can invoke another DAG via the `dag` executor.
-- Configuration uses `DAGU_*` environment variables, with fallback to `~/.config/dagu/config.yaml`.
-- Go commit message guidelines apply. Run `make fmt` before committing.
-- License: GPL v3. License headers on source files managed via `make addlicense`.
+### Go
 
-## Tech Stack Summary
+```sh
+make bin                         # build .local/bin/dagu
+make build                       # build UI and binary
+make test                        # Go tests with race detection
+make test TEST_TARGET=./internal/runtime/...
+make conformance                 # binary-level specification tests
+make fmt                         # go fix, go fmt, and lint fixes
+make check                       # formatting and lint checks, including Windows
+```
 
-- **Go 1.26**, Chi router, Cobra CLI, gRPC, SQLite (modernc), pgx, go-redis
-- **Frontend**: React 19, TypeScript, pnpm, Webpack 5, Tailwind CSS 4, Vitest
-- **Linting**: golangci-lint v2 (errcheck, govet, staticcheck, gosec, revive, etc.)
-- **Testing**: gotestsum with race detection, stretchr/testify assertions
+For a fast package-level check:
+
+```sh
+go test ./internal/spec/...
+```
+
+### Frontend
+
+```sh
+cd ui
+pnpm install --frozen-lockfile
+pnpm test
+pnpm typecheck
+pnpm build
+pnpm dev
+```
+
+The frontend development server listens on port 8081 and proxies the backend on
+port 8080.
+
+Run browser tests from the repository root:
+
+```sh
+make test-e2e
+```
+
+## Generated code
+
+Do not hand-edit generated files.
+
+- Edit `api/v1/api.yaml`, then run `make api`.
+- Edit `proto/**/*.proto`, then run `make proto`.
+- After OpenAPI changes, run `cd ui && pnpm gen:api`.
+- Build and copy frontend assets with `make ui`.
+
+Review generated diffs with the source change that caused them.
+
+## Change discipline
+
+- Work in the current worktree. Preserve unrelated changes and untracked files.
+- Make the smallest change that solves the requested behavior.
+- Respect package ownership and existing dependency direction.
+- Reuse nearby patterns before adding abstractions or dependencies.
+- Keep exported APIs unchanged unless the task requires an API change.
+- Use constants for protocol values and repeated or meaningful literals.
+- Add short comments only for non-obvious invariants or constraints.
+- Keep comments current and impersonal. Godoc describes caller-visible contracts.
+- Use braces for every `if`, including one-line branches.
+- Keep Go test names short; explain complex intent in a comment above the test.
+
+## Testing
+
+- For bug fixes, add a focused regression test first and confirm it fails.
+- Prefer behavior and public-contract assertions over implementation details.
+- Extend an existing test file when it already owns the behavior.
+- Run the narrowest relevant test during development.
+- Run all affected package tests after the change.
+- Run `make fmt` and inspect its diff before committing Go changes.
+- Run `make check` for broad Go validation when practical.
+- Run `make conformance` when workflow semantics or CLI behavior changes.
+- Run frontend tests, type checking, and build checks for UI changes.
+- Run `make test-e2e` for user-visible flows that need browser coverage.

@@ -6,12 +6,18 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"maps"
 	nethttp "net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	daguruntime "github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -28,9 +34,9 @@ func TestHTTPExecutor_SkipTLSVerify(t *testing.T) {
 		defer server.Close()
 
 		// Test with skip_tls_verify = true (should succeed)
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET", Args: []string{server.URL + "/test"}}},
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET", Args: []string{server.URL + "/test"}}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 				Config: map[string]any{
 					"skip_tls_verify": true,
@@ -63,9 +69,9 @@ func TestHTTPExecutor_SkipTLSVerify(t *testing.T) {
 		defer server.Close()
 
 		// Test with skip_tls_verify = false (should fail due to certificate verification)
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET", Args: []string{server.URL + "/test"}}},
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET", Args: []string{server.URL + "/test"}}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 				Config: map[string]any{
 					"skip_tls_verify": false,
@@ -89,8 +95,8 @@ func TestHTTPExecutor_SkipTLSVerify(t *testing.T) {
 	})
 
 	t.Run("ConfigParsingWithSkipTLSVerify", func(t *testing.T) {
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET", Args: []string{"https://example.com"}}},
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET", Args: []string{"https://example.com"}}},
 			Script: `{
 				"skip_tls_verify": true,
 				"timeout": 30,
@@ -121,9 +127,9 @@ func TestHTTPExecutor_StandardFeatures(t *testing.T) {
 		}))
 		defer server.Close()
 
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 				Config: map[string]any{
 					"headers": map[string]string{
@@ -152,11 +158,194 @@ func TestHTTPExecutor_StandardFeatures(t *testing.T) {
 	})
 }
 
+func TestHTTPExecutor_MultipartUpload(t *testing.T) {
+	t.Parallel()
+
+	type receivedRequest struct {
+		contentType string
+		fileName    string
+		fileBody    string
+		description string
+		err         error
+	}
+
+	received := make(chan receivedRequest, 1)
+	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		result := receivedRequest{contentType: r.Header.Get("Content-Type")}
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			result.err = err
+			received <- result
+			nethttp.Error(w, err.Error(), nethttp.StatusBadRequest)
+			return
+		}
+
+		file, header, err := r.FormFile("document")
+		if err != nil {
+			result.err = err
+			received <- result
+			nethttp.Error(w, err.Error(), nethttp.StatusBadRequest)
+			return
+		}
+		defer func() { _ = file.Close() }()
+
+		body, err := io.ReadAll(file)
+		if err != nil {
+			result.err = err
+			received <- result
+			nethttp.Error(w, err.Error(), nethttp.StatusInternalServerError)
+			return
+		}
+
+		result.fileName = header.Filename
+		result.fileBody = string(body)
+		result.description = r.FormValue("description")
+		received <- result
+		w.WriteHeader(nethttp.StatusOK)
+		_, _ = w.Write([]byte("uploaded"))
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "report.txt")
+	require.NoError(t, os.WriteFile(filePath, []byte("report contents"), 0o600))
+
+	step := ir.Step{
+		Commands: []ir.CommandEntry{{Command: "POST", Args: []string{server.URL}}},
+		ExecutorConfig: ir.ExecutorConfig{
+			Type: "http",
+			Config: map[string]any{
+				"files":  map[string]string{"document": filePath},
+				"form":   map[string]string{"description": "nightly report"},
+				"silent": true,
+			},
+		},
+	}
+
+	exec, err := newHTTP(context.Background(), step)
+	require.NoError(t, err)
+
+	out := &testWriter{}
+	httpExec, ok := exec.(*http)
+	require.True(t, ok)
+	httpExec.SetStdout(out)
+	httpExec.SetStderr(&testWriter{})
+
+	require.NoError(t, httpExec.Run(context.Background()))
+	result := <-received
+	require.NoError(t, result.err)
+	assert.Contains(t, result.contentType, "multipart/form-data; boundary=")
+	assert.Equal(t, "report.txt", result.fileName)
+	assert.Equal(t, "report contents", result.fileBody)
+	assert.Equal(t, "nightly report", result.description)
+	assert.Equal(t, "uploaded", out.String())
+}
+
+func TestHTTPExecutor_MultipartUploadResolvesRelativeFilePath(t *testing.T) {
+	t.Parallel()
+
+	received := make(chan string, 1)
+	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		file, _, err := r.FormFile("payload")
+		if err != nil {
+			nethttp.Error(w, err.Error(), nethttp.StatusBadRequest)
+			return
+		}
+		defer func() { _ = file.Close() }()
+
+		body, err := io.ReadAll(file)
+		if err != nil {
+			nethttp.Error(w, err.Error(), nethttp.StatusInternalServerError)
+			return
+		}
+		received <- string(body)
+		w.WriteHeader(nethttp.StatusNoContent)
+	}))
+	defer server.Close()
+
+	workingDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(workingDir, "inputs"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(workingDir, "inputs", "payload.txt"), []byte("payload contents"), 0o600))
+
+	ctx := daguruntime.WithEnv(context.Background(), daguruntime.Env{WorkingDir: workingDir})
+	step := ir.Step{
+		Commands: []ir.CommandEntry{{Command: "POST", Args: []string{server.URL}}},
+		ExecutorConfig: ir.ExecutorConfig{
+			Type: "http",
+			Config: map[string]any{
+				"files":  map[string]string{"payload": filepath.Join("inputs", "payload.txt")},
+				"silent": true,
+			},
+		},
+	}
+
+	exec, err := newHTTP(ctx, step)
+	require.NoError(t, err)
+
+	httpExec, ok := exec.(*http)
+	require.True(t, ok)
+	httpExec.SetStdout(&testWriter{})
+	httpExec.SetStderr(&testWriter{})
+
+	require.NoError(t, httpExec.Run(context.Background()))
+	assert.Equal(t, "payload contents", <-received)
+}
+
+func TestHTTPExecutor_MultipartUploadRejectsBody(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		multipart map[string]any
+	}{
+		{
+			name:      "File",
+			multipart: map[string]any{"files": map[string]string{"document": "report.txt"}},
+		},
+		{
+			name:      "FormField",
+			multipart: map[string]any{"form": map[string]string{"description": "report"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			config := map[string]any{"body": `{"name":"report"}`}
+			maps.Copy(config, tt.multipart)
+
+			_, err := newHTTP(context.Background(), ir.Step{
+				Commands: []ir.CommandEntry{{Command: "POST", Args: []string{"https://example.com/upload"}}},
+				ExecutorConfig: ir.ExecutorConfig{
+					Type:   "http",
+					Config: config,
+				},
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "body cannot be combined with form or files")
+		})
+	}
+}
+
+func TestHTTPExecutor_MultipartSchemaRejectsNonStringValues(t *testing.T) {
+	t.Parallel()
+
+	for _, field := range []string{"form", "files"} {
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+
+			err := registry.ValidateExecutorConfig("http", map[string]any{
+				field: map[string]any{"document": 123},
+			})
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestHTTPExecutor_MissingMethodOrURLReturnsConfigError(t *testing.T) {
 	t.Run("MissingURL", func(t *testing.T) {
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET"}},
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET"}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 			},
 		}
@@ -167,8 +356,8 @@ func TestHTTPExecutor_MissingMethodOrURLReturnsConfigError(t *testing.T) {
 	})
 
 	t.Run("MissingMethod", func(t *testing.T) {
-		step := core.Step{
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 				Config: map[string]any{
 					"url": "https://example.com",
@@ -187,9 +376,10 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 	t.Run("BehaviorConsistencyAcrossPlatforms", func(t *testing.T) {
 		// Test data that should behave the same on all platforms
 		testCases := []struct {
-			name   string
-			method string
-			config map[string]any
+			name         string
+			method       string
+			config       map[string]any
+			expectedBody string
 		}{
 			{
 				name:   "SimpleGET",
@@ -197,8 +387,9 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 				config: map[string]any{"silent": true},
 			},
 			{
-				name:   "POSTWithJSON",
-				method: "POST",
+				name:         "POSTWithJSON",
+				method:       "POST",
+				expectedBody: `{"test": "data"}`,
 				config: map[string]any{
 					"headers": map[string]string{"Content-Type": "application/json"},
 					"body":    `{"test": "data"}`,
@@ -222,8 +413,15 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						nethttp.Error(w, err.Error(), nethttp.StatusInternalServerError)
+						return
+					}
+
 					// Echo back some request info
 					response := map[string]any{
+						"body":     string(body),
 						"method":   r.Method,
 						"platform": runtime.GOOS,
 						"headers":  r.Header,
@@ -236,9 +434,9 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 				}))
 				defer server.Close()
 
-				step := core.Step{
-					Commands: []core.CommandEntry{{Command: tc.method, Args: []string{server.URL}}},
-					ExecutorConfig: core.ExecutorConfig{
+				step := ir.Step{
+					Commands: []ir.CommandEntry{{Command: tc.method, Args: []string{server.URL}}},
+					ExecutorConfig: ir.ExecutorConfig{
 						Type:   "http",
 						Config: tc.config,
 					},
@@ -260,6 +458,7 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 				var response map[string]any
 				err = json.Unmarshal([]byte(out.String()), &response)
 				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedBody, response["body"])
 				assert.Equal(t, tc.method, response["method"])
 				assert.Equal(t, runtime.GOOS, response["platform"])
 
@@ -282,9 +481,9 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 		}))
 		defer server.Close()
 
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 				Config: map[string]any{
 					"format": "json",
@@ -330,9 +529,9 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 		}))
 		defer server.Close()
 
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 				Config: map[string]any{
 					"silent": false,
@@ -373,9 +572,9 @@ func TestHTTPExecutor_CrossPlatform(t *testing.T) {
 		}))
 		defer server.Close()
 
-		step := core.Step{
-			Commands: []core.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
-			ExecutorConfig: core.ExecutorConfig{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{Command: "GET", Args: []string{server.URL}}},
+			ExecutorConfig: ir.ExecutorConfig{
 				Type: "http",
 				Config: map[string]any{
 					"json": true,
@@ -413,13 +612,13 @@ func TestHTTPExecutor_CmdWithArgsExpansion(t *testing.T) {
 		}))
 		defer server.Close()
 
-		step := core.Step{
-			Commands: []core.CommandEntry{{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{
 				Command:     "${METHOD}",          // unexpanded
 				Args:        []string{server.URL}, // expanded
 				CmdWithArgs: "GET " + server.URL,  // expanded (as evaluateCommandArgs does)
 			}},
-			ExecutorConfig: core.ExecutorConfig{
+			ExecutorConfig: ir.ExecutorConfig{
 				Type:   "http",
 				Config: map[string]any{"silent": true},
 			},
@@ -449,12 +648,12 @@ func TestHTTPExecutor_CmdWithArgsExpansion(t *testing.T) {
 		}))
 		defer server.Close()
 
-		step := core.Step{
-			Commands: []core.CommandEntry{{
+		step := ir.Step{
+			Commands: []ir.CommandEntry{{
 				Command: "POST",
 				Args:    []string{server.URL},
 			}},
-			ExecutorConfig: core.ExecutorConfig{
+			ExecutorConfig: ir.ExecutorConfig{
 				Type:   "http",
 				Config: map[string]any{"silent": true},
 			},
@@ -483,10 +682,10 @@ func TestHTTPExecutor_CmdWithArgsExpansion(t *testing.T) {
 		}))
 		defer server.Close()
 
-		step := core.Step{
+		step := ir.Step{
 			Command: "GET",
 			Args:    []string{server.URL},
-			ExecutorConfig: core.ExecutorConfig{
+			ExecutorConfig: ir.ExecutorConfig{
 				Type:   "http",
 				Config: map[string]any{"silent": true},
 			},

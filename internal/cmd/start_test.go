@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -87,6 +87,23 @@ steps:
 	}
 }
 
+func TestStartCommandResolvesRelativeNestedDAGPath(t *testing.T) {
+	th := test.SetupCommand(t)
+	relativePath := filepath.Join("nested", "relative.yaml")
+	th.CreateDAGFile(t, relativePath, `
+steps:
+  - name: run
+    run: "true"
+`)
+	t.Chdir(th.Config.Paths.DAGsDir)
+
+	th.RunCommand(t, cmd.Start(), test.CmdTest{
+		Name:        "StartRelativeNestedDAG",
+		Args:        []string{"start", relativePath},
+		ExpectedOut: []string{"Step started"},
+	})
+}
+
 func TestStartCommand_BuiltExecutablePreservesExplicitEnv(t *testing.T) {
 	t.Parallel()
 
@@ -105,7 +122,7 @@ steps:
 
 	status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
 	require.NoError(t, err)
-	require.Equal(t, core.Succeeded, status.Status)
+	require.Equal(t, ir.Succeeded, status.Status)
 	require.Equal(t, "from-host|", test.StatusOutputValue(t, &status, "RESULT"))
 }
 
@@ -151,7 +168,7 @@ steps:
 
 		status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag)
 		require.NoError(t, err)
-		require.Equal(t, core.Succeeded, status.Status)
+		require.Equal(t, ir.Succeeded, status.Status)
 		require.Equal(t, "KEY=value", status.Params)
 	})
 }
@@ -220,7 +237,7 @@ steps:
 
 		status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag)
 		require.NoError(t, err)
-		require.Equal(t, core.Succeeded, status.Status)
+		require.Equal(t, ir.Succeeded, status.Status)
 		require.Contains(t, status.Params, "KEY=value")
 	})
 
@@ -259,7 +276,7 @@ steps:
 		ctx := context.Background()
 		originalStatus, err := th.DAGRunMgr.GetLatestStatus(ctx, dag.DAG)
 		require.NoError(t, err)
-		require.Equal(t, core.Succeeded, originalStatus.Status)
+		require.Equal(t, ir.Succeeded, originalStatus.Status)
 
 		newRunID := "rescheduled_run"
 		th.RunCommand(t, cmd.Start(), test.CmdTest{
@@ -273,7 +290,7 @@ steps:
 
 		require.Eventually(t, func() bool {
 			status, err := th.DAGRunMgr.GetCurrentStatus(ctx, dag.DAG, newRunID)
-			return err == nil && status != nil && status.Status == core.Succeeded
+			return err == nil && status != nil && status.Status == ir.Succeeded
 		}, 5*time.Second, 100*time.Millisecond)
 
 		newStatus, err := th.DAGRunMgr.GetCurrentStatus(ctx, dag.DAG, newRunID)
@@ -295,10 +312,10 @@ steps:
 `)
 
 	runID := "existing-run"
-	attempt, err := th.DAGRunStore.CreateAttempt(th.Context, dag.DAG, time.Now(), runID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dag.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
-	status := exec.InitialStatus(dag.DAG)
+	status := ir.InitialStatus(dag.DAG)
 	status.DAGRunID = runID
 	status.AttemptID = attempt.ID()
 	writeStatus(t, th.Context, attempt, status)
@@ -309,13 +326,13 @@ steps:
 	require.Error(t, err)
 	require.ErrorContains(t, err, "already exists")
 
-	latestAttempt, err := th.DAGRunStore.FindAttempt(th.Context, exec.NewDAGRunRef(dag.Name, runID))
+	latestAttempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, runID))
 	require.NoError(t, err)
 	require.Equal(t, attempt.ID(), latestAttempt.ID())
 
 	latestStatus, err := latestAttempt.ReadStatus(th.Context)
 	require.NoError(t, err)
-	require.Equal(t, core.NotStarted, latestStatus.Status)
+	require.Equal(t, ir.NotStarted, latestStatus.Status)
 	require.Empty(t, latestStatus.Error)
 }
 

@@ -7,9 +7,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/collections"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/cmn/collections"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,7 +26,7 @@ func TestCollectOutputsUsesCanonicalStringOutputValue(t *testing.T) {
 
 		plan, err := runtime.NewPlanFromNodes(
 			runtime.NodeWithData(runtime.NodeData{
-				Step: core.Step{Name: "publish", Output: "RESULT"},
+				Step: ir.Step{Name: "publish", Output: "RESULT"},
 				State: runtime.NodeState{
 					OutputValue:     &value,
 					OutputVariables: vars,
@@ -35,7 +35,7 @@ func TestCollectOutputsUsesCanonicalStringOutputValue(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		a := &Agent{plan: plan}
+		a := &Agent{plan: plan, runner: runtime.New(&runtime.Config{})}
 		assert.Equal(t, map[string]string{"result": "canonical"}, a.collectOutputs(context.Background()))
 	})
 
@@ -47,7 +47,7 @@ func TestCollectOutputsUsesCanonicalStringOutputValue(t *testing.T) {
 
 		plan, err := runtime.NewPlanFromNodes(
 			runtime.NodeWithData(runtime.NodeData{
-				Step: core.Step{Name: "publish", Output: "RESULT"},
+				Step: ir.Step{Name: "publish", Output: "RESULT"},
 				State: runtime.NodeState{
 					OutputVariables: vars,
 				},
@@ -55,7 +55,7 @@ func TestCollectOutputsUsesCanonicalStringOutputValue(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		a := &Agent{plan: plan}
+		a := &Agent{plan: plan, runner: runtime.New(&runtime.Config{})}
 		assert.Equal(t, map[string]string{"result": "legacy"}, a.collectOutputs(context.Background()))
 	})
 
@@ -65,7 +65,7 @@ func TestCollectOutputsUsesCanonicalStringOutputValue(t *testing.T) {
 		outputsValue := `{"messageId":"msg-123","accepted":true}`
 		plan, err := runtime.NewPlanFromNodes(
 			runtime.NodeWithData(runtime.NodeData{
-				Step: core.Step{Name: "publish"},
+				Step: ir.Step{Name: "publish"},
 				State: runtime.NodeState{
 					OutputsValue: &outputsValue,
 				},
@@ -73,7 +73,7 @@ func TestCollectOutputsUsesCanonicalStringOutputValue(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		a := &Agent{plan: plan}
+		a := &Agent{plan: plan, runner: runtime.New(&runtime.Config{})}
 		assert.Equal(t, map[string]string{
 			"messageId": "msg-123",
 			"accepted":  "true",

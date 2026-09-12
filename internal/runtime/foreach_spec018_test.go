@@ -6,6 +6,7 @@ package runtime_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"strconv"
@@ -13,9 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	_ "github.com/dagucloud/dagu/internal/runtime/builtin/foreach"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	_ "github.com/dagucloud/dagu/v2/internal/runtime/builtin/foreach"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,7 +32,7 @@ func TestForeachRuntimeRunsBodyAndPublishesAggregate(t *testing.T) {
 		map[string]any{"slug": "two", "url": "https://example.com/two"},
 	}, 2)
 
-	result := r.newPlan(t, parent).assertRun(t, core.Succeeded)
+	result := r.newPlan(t, parent).assertRun(t, ir.Succeeded)
 	node := result.nodeByName(t, "each")
 	raw, ok := node.NodeData().StringFormOutputValue()
 	require.True(t, ok)
@@ -44,13 +47,13 @@ func TestForeachRuntimeRunsBodyAndPublishesAggregate(t *testing.T) {
 	assert.Equal(t, foreachAggregateItem{
 		Index:   0,
 		Key:     "one",
-		Status:  core.NodeSucceeded.String(),
+		Status:  ir.NodeSucceeded.String(),
 		Outputs: map[string]string{"summary": "https://example.com/one"},
 	}, aggregate.Items[0])
 	assert.Equal(t, foreachAggregateItem{
 		Index:   1,
 		Key:     "two",
-		Status:  core.NodeSucceeded.String(),
+		Status:  ir.NodeSucceeded.String(),
 		Outputs: map[string]string{"summary": "https://example.com/two"},
 	}, aggregate.Items[1])
 	assert.Equal(t, []map[string]string{
@@ -73,9 +76,9 @@ func TestForeachRuntimeHonorsMaxConcurrent(t *testing.T) {
 		map[string]any{"slug": "b", "url": "b"},
 		map[string]any{"slug": "c", "url": "c"},
 	}, 2)
-	parent.Foreach.Steps[0].ExecutorConfig.Config["delay_ms"] = "80"
+	parent.Foreach.Steps[0].ExecutorConfig.Config["wait_for_active"] = "2"
 
-	r.newPlan(t, parent).assertRun(t, core.Succeeded)
+	r.newPlan(t, parent).assertRun(t, ir.Succeeded)
 
 	assert.Equal(t, 2, state.maxActive())
 }
@@ -98,21 +101,21 @@ type foreachAggregateItem struct {
 	Error   string            `json:"error,omitempty"`
 }
 
-func foreachRuntimeStep(probeType string, items []any, maxConcurrent int) core.Step {
-	return core.Step{
+func foreachRuntimeStep(probeType string, items []any, maxConcurrent int) ir.Step {
+	return ir.Step{
 		Name:           "each",
 		Output:         "RESULT",
-		ExecutorConfig: core.ExecutorConfig{Type: core.ExecutorTypeForeach},
-		Foreach: &core.ForeachConfig{
+		ExecutorConfig: ir.ExecutorConfig{Type: ir.ExecutorTypeForeach},
+		Foreach: &ir.ForeachConfig{
 			Items:         items,
 			As:            "episode",
 			Key:           "${foreach.episode.slug}",
 			MaxConcurrent: maxConcurrent,
-			Steps: []core.Step{
+			Steps: []ir.Step{
 				{
 					Name: "write",
 					ID:   "write",
-					ExecutorConfig: core.ExecutorConfig{
+					ExecutorConfig: ir.ExecutorConfig{
 						Type: probeType,
 						Config: map[string]any{
 							"value": "${foreach.episode.url}",
@@ -131,26 +134,27 @@ func foreachRuntimeStep(probeType string, items []any, maxConcurrent int) core.S
 func registerForeachProbeExecutor(t *testing.T) (string, *foreachProbeState) {
 	t.Helper()
 
-	state := &foreachProbeState{}
+	state := &foreachProbeState{activeChanged: make(chan struct{})}
 	executorType := "foreach_probe_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	executor.RegisterExecutor(executorType, func(_ context.Context, step core.Step) (executor.Executor, error) {
+	executor.RegisterExecutor(executorType, func(_ context.Context, step ir.Step) (executor.Executor, error) {
 		return &foreachProbeExecutor{
 			state: state,
 			cfg:   step.ExecutorConfig.Config,
 		}, nil
-	}, nil, core.ExecutorCapabilities{})
+	}, nil, registry.ExecutorCapabilities{})
 	t.Cleanup(func() {
 		executor.UnregisterExecutor(executorType)
-		core.UnregisterExecutorCapabilities(executorType)
+		registry.UnregisterExecutorCapabilities(executorType)
 	})
 	return executorType, state
 }
 
 type foreachProbeState struct {
-	mu     sync.Mutex
-	active int
-	max    int
-	seen   []foreachProbeRecord
+	mu            sync.Mutex
+	active        int
+	max           int
+	seen          []foreachProbeRecord
+	activeChanged chan struct{}
 }
 
 type foreachProbeRecord struct {
@@ -161,9 +165,35 @@ type foreachProbeRecord struct {
 func (s *foreachProbeState) start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.active++
 	if s.active > s.max {
 		s.max = s.active
+	}
+	close(s.activeChanged)
+	s.activeChanged = make(chan struct{})
+}
+
+func (s *foreachProbeState) waitForActive(ctx context.Context, minimum int) error {
+	timer := time.NewTimer(platformTestDuration(2*time.Second, 5*time.Second))
+	defer timer.Stop()
+
+	for {
+		s.mu.Lock()
+		maxActive := s.max
+		activeChanged := s.activeChanged
+		s.mu.Unlock()
+		if maxActive >= minimum {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timed out waiting for %d active foreach executions", minimum)
+		case <-activeChanged:
+		}
 	}
 }
 
@@ -214,6 +244,16 @@ func (e *foreachProbeExecutor) Run(ctx context.Context) error {
 			Key:   stringConfigValue(e.cfg["key"]),
 		})
 	}()
+
+	if value := stringConfigValue(e.cfg["wait_for_active"]); value != "" {
+		minimum, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if err := e.state.waitForActive(ctx, minimum); err != nil {
+			return err
+		}
+	}
 
 	if delay := stringConfigValue(e.cfg["delay_ms"]); delay != "" {
 		millis, err := strconv.Atoi(delay)

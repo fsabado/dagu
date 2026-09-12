@@ -34,6 +34,8 @@ const (
 	fieldDAGShell
 	fieldStepShell
 	fieldConditionValue
+	fieldConditionRuntimeValue
+	fieldConditionEval
 	fieldConditionCommand
 	fieldDirectCommand
 	fieldShellCommand
@@ -130,6 +132,16 @@ func StepShellField(path string) Field { return newField(path, fieldStepShell) }
 
 // ConditionValueField returns the policy for non-command condition values.
 func ConditionValueField(path string) Field { return newField(path, fieldConditionValue) }
+
+// ConditionRuntimeValueField returns the runtime policy for value-match condition text.
+func ConditionRuntimeValueField(path string) Field {
+	return newField(path, fieldConditionRuntimeValue)
+}
+
+// ConditionEvalField returns the runtime policy for dynamic precondition values.
+func ConditionEvalField(path string) Field {
+	return newField(path, fieldConditionEval)
+}
 
 // ConditionCommandField returns the policy for command condition values.
 func ConditionCommandField(path string, command CommandContext) Field {

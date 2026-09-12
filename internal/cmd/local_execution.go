@@ -5,35 +5,69 @@ package cmd
 
 import (
 	"context"
+	"os"
+	"slices"
+	"strings"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/dagrun/intake"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/intake"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
+
+type runOptions struct {
+	root              ir.DAGRunRef
+	parent            ir.DAGRunRef
+	workerID          string
+	attemptID         string
+	triggerType       ir.TriggerType
+	triggerActor      string
+	parallelItem      string
+	scheduleTime      string
+	profileName       string
+	definitionID      string
+	step              string
+	includeDownstream bool
+	retryPath         dagrun.RetryPath
+	preparedAttempt   dagrun.Attempt
+	noReuse           bool
+}
+
+func dagDefinitionIDFromEnv() string {
+	return os.Getenv(runenv.EnvKeyDAGDefinitionID)
+}
+
+func parallelItemFromEnv(env []string) string {
+	prefix := runenv.EnvKeyParallelItem + "="
+	for _, e := range slices.Backward(env) {
+		if after, ok := strings.CutPrefix(e, prefix); ok {
+			return after
+		}
+	}
+	return ""
+}
 
 func withPreparedLocalExecution(
 	ctx *Context,
-	dag *core.DAG,
+	dag *ir.DAG,
 	dagRunID string,
-	root exec.DAGRunRef,
-	parent exec.DAGRunRef,
-	triggerType core.TriggerType,
-	scheduleTime string,
-	profileName string,
-	buildAttempt func(context.Context) (exec.DAGRunAttempt, error),
-	run func(exec.DAGRunAttempt) error,
+	opts runOptions,
+	buildAttempt func(context.Context) (dagrun.Attempt, error),
+	run func(dagrun.Attempt) error,
 ) error {
 	prepared, err := intake.PrepareLocalExecution(ctx.Context, intake.LocalRequest{
-		ProcStore:       ctx.ProcStore,
+		ProcRepository:  ctx.Persistence.ProcRepository,
 		DAG:             dag,
 		DAGRunID:        dagRunID,
-		Root:            root,
-		Parent:          parent,
-		TriggerType:     triggerType,
-		ScheduleTime:    scheduleTime,
-		ProfileName:     profileName,
+		DefinitionID:    opts.definitionID,
+		Root:            opts.root,
+		Parent:          opts.parent,
+		TriggerType:     opts.triggerType,
+		TriggerActor:    opts.triggerActor,
+		ScheduleTime:    opts.scheduleTime,
+		ProfileName:     opts.profileName,
 		LogBaseDir:      ctx.Config.Paths.LogDir,
 		ArtifactBaseDir: ctx.Config.Paths.ArtifactDir,
 		BuildAttempt:    buildAttempt,

@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/output"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/output"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -87,7 +88,7 @@ func runStatus(ctx *Context, args []string) error {
 
 	// For running root DAGs, fetch real-time status via socket connection.
 	// Sub DAGs use stored status since they may run on different workers.
-	if dagStatus.Status == core.Running && subDAGRunID == "" {
+	if dagStatus.Status == ir.Running && subDAGRunID == "" {
 		// Use dagStatus.DAGRunID as fallback when --run-id flag is omitted
 		runIDForLookup := dagRunID
 		if runIDForLookup == "" {
@@ -107,7 +108,7 @@ func runStatus(ctx *Context, args []string) error {
 	return nil
 }
 
-func displayTreeStatus(dag *core.DAG, dagStatus *exec.DAGRunStatus) {
+func displayTreeStatus(dag *ir.DAG, dagStatus *ir.DAGRunStatus) {
 	config := output.DefaultConfig()
 	config.ColorEnabled = term.IsTerminal(int(os.Stdout.Fd()))
 
@@ -115,13 +116,13 @@ func displayTreeStatus(dag *core.DAG, dagStatus *exec.DAGRunStatus) {
 	fmt.Print(renderer.RenderDAGStatus(dag, dagStatus))
 }
 
-// extractAttemptForStatus returns the appropriate DAGRunAttempt based on the provided IDs.
+// extractAttemptForStatus returns the appropriate Attempt based on the provided IDs.
 // For sub DAG runs, it finds the nested attempt under the root run.
 // For root runs, it finds either the specified run or the latest run.
-func extractAttemptForStatus(ctx *Context, name, dagRunID, subDAGRunID string) (exec.DAGRunAttempt, error) {
+func extractAttemptForStatus(ctx *Context, name, dagRunID, subDAGRunID string) (dagrun.Attempt, error) {
 	if subDAGRunID != "" {
-		dagRunRef := exec.NewDAGRunRef(name, dagRunID)
-		attempt, err := ctx.DAGRunStore.FindSubAttempt(ctx, dagRunRef, subDAGRunID)
+		dagRunRef := ir.NewDAGRunRef(name, dagRunID)
+		attempt, err := ctx.Persistence.DAGRunRepository.FindSubAttempt(ctx, dagRunRef, subDAGRunID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find sub dag-run with ID %s under root %s: %w",
 				subDAGRunID, dagRunID, err)
@@ -130,15 +131,15 @@ func extractAttemptForStatus(ctx *Context, name, dagRunID, subDAGRunID string) (
 	}
 
 	if dagRunID != "" {
-		dagRunRef := exec.NewDAGRunRef(name, dagRunID)
-		attempt, err := ctx.DAGRunStore.FindAttempt(ctx, dagRunRef)
+		dagRunRef := ir.NewDAGRunRef(name, dagRunID)
+		attempt, err := ctx.Persistence.DAGRunRepository.FindAttempt(ctx, dagRunRef)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find run data for dag-run ID %s: %w", dagRunID, err)
 		}
 		return attempt, nil
 	}
 
-	attempt, err := ctx.DAGRunStore.LatestAttempt(ctx, name)
+	attempt, err := ctx.Persistence.DAGRunRepository.LatestAttempt(ctx, name, persis.DAGRunLatestAttemptOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to find the latest run data for DAG %s: %w", name, err)
 	}

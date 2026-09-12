@@ -5,7 +5,7 @@ info:
   title: "Dagu"
   contact:
     name: "Yota Hamada"
-    url: "https://github.com/yottahmd"
+    url: "https://dagu.sh"
   description: API for controlling and monitoring Dagu server.
   license:
     name: "GPL-3.0"
@@ -50,11 +50,9 @@ tags:
   - name: "events"
     description: "Centralized operational event log operations (manager or admin only)"
   - name: "sync"
-    description: "Git synchronization operations for DAGs"
-  - name: "agent"
-    description: "AI Agent configuration operations (admin only)"
-  - name: "docs"
-    description: "Document management operations"
+    description: "Git synchronization for workflows, Wiki content, and supporting files"
+  - name: "wiki"
+    description: "Wiki page management operations"
   - name: "remote-nodes"
     description: "Remote node management operations (admin only)"
   - name: "secrets"
@@ -62,7 +60,7 @@ tags:
   - name: "profiles"
     description: "Runtime profile operations for managed environment variables and secrets"
   - name: "views"
-    description: "Saved Overview view configurations (custom Kanban boards)"
+    description: "Shared saved view configurations"
 
 paths:
   /health:
@@ -227,7 +225,7 @@ paths:
   /auth/change-password:
     post:
       summary: "Change current user's password"
-      description: "Allows the authenticated user to change their own password"
+      description: "Allows a locally authenticated builtin user to change their own password. Externally authenticated users do not have Dagu passwords."
       operationId: "changePassword"
       tags:
         - "auth"
@@ -252,6 +250,12 @@ paths:
                 $ref: "#/components/schemas/Error"
         "401":
           description: "Not authenticated or wrong current password"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Password is managed by the authentication provider"
           content:
             application/json:
               schema:
@@ -484,7 +488,7 @@ paths:
   /users/{userId}/reset-password:
     post:
       summary: "Reset user's password"
-      description: "Resets a user's password to a new value. Requires admin role."
+      description: "Resets a locally authenticated builtin user's password to a new value. Requires admin role. Externally authenticated users do not have Dagu passwords."
       operationId: "resetUserPassword"
       tags:
         - "users"
@@ -516,7 +520,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: "Forbidden - requires admin role"
+          description: "Forbidden - requires admin role, or the target user uses an external authentication provider"
           content:
             application/json:
               schema:
@@ -785,7 +789,7 @@ paths:
   /dags:
     get:
       summary: "List all available DAGs"
-      description: "Retrieves DAG definitions with optional filtering by name and labels"
+      description: "Retrieves DAG definitions with optional filtering by name, labels, and active status (scheduled and not suspended)."
       operationId: "listDAGs"
       tags:
         - "dags"
@@ -806,6 +810,13 @@ paths:
           schema:
             type: "string"
           description: "Filter DAGs by labels (comma-separated). Returns DAGs that have ALL specified labels. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
+        - name: "active"
+          in: "query"
+          required: false
+          schema:
+            type: "boolean"
+            default: false
+          description: "Filter to DAGs that have a schedule and are not suspended."
         - name: "tags"
           in: "query"
           required: false
@@ -984,9 +995,6 @@ paths:
                 type: object
                 description: "Response object for getting details of a DAG"
                 properties:
-                  filePath:
-                    type: string
-                    description: "Absolute file path of the DAG file on disk"
                   dag:
                     $ref: "#/components/schemas/DAGDetails"
                   localDags:
@@ -1080,6 +1088,10 @@ paths:
                   type: boolean
                   description: "If true, prevent starting if DAG is already running (returns 409 conflict)"
                   default: false
+                noReuse:
+                  type: boolean
+                  description: "If true, execute eligible build steps without reusing prior materializations"
+                  default: false
                 labels:
                   $ref: "#/components/schemas/Labels"
                   description: "Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
@@ -1120,7 +1132,10 @@ paths:
   /dags/{fileName}/start-sync:
     post:
       summary: "Execute DAG synchronously and wait for completion"
+      deprecated: true
       description: |
+        **Deprecated:** Use `POST /dags/{fileName}/start`, then monitor the DAG run through the DAG-run status API or SSE.
+
         Creates a DAG-run from the DAG definition, starts its execution, waits for it to complete (or timeout), and returns the full execution details including node statuses.
 
         **Important behaviors:**
@@ -1157,6 +1172,10 @@ paths:
                 singleton:
                   type: boolean
                   description: "If true, prevent starting if DAG is already running (returns 409 conflict)"
+                  default: false
+                noReuse:
+                  type: boolean
+                  description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
                   $ref: "#/components/schemas/Labels"
@@ -1242,6 +1261,10 @@ paths:
                 singleton:
                   type: boolean
                   description: "If true, prevent enqueuing if DAG is already running or queued (returns 409 conflict)"
+                  default: false
+                noReuse:
+                  type: boolean
+                  description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
                   $ref: "#/components/schemas/Labels"
@@ -1643,31 +1666,42 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /search/docs:
+  /search/wiki:
     get:
-      summary: "Search documents"
-      description: "Returns cursor-based, lightweight document search results for the global search page."
-      operationId: "searchDocFeed"
+      summary: "Search Wiki pages"
+      description: "Returns cursor-based Wiki page search results in stable path order. Use nextCursor only with the same query, workspace, and prefix."
+      operationId: "searchWikiPageFeed"
       tags:
         - "search"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
+        - $ref: "#/components/parameters/WikiPagePrefix"
         - name: "q"
           in: "query"
           required: true
           schema:
             type: "string"
           description: "A search query string"
+        - name: tags
+          in: query
+          description: "Only return Wiki pages carrying every given tag (case-insensitive)"
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
         - $ref: "#/components/parameters/SearchCursor"
         - $ref: "#/components/parameters/SearchLimit"
       responses:
         "200":
-          description: "Cursor-based document search results"
+          description: "Cursor-based Wiki page search results"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DocSearchFeedResponse"
+                $ref: "#/components/schemas/WikiPageSearchFeedResponse"
         "400":
           description: "Invalid request"
           content:
@@ -1732,11 +1766,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /search/docs/matches:
+  /search/wiki/matches:
     get:
-      summary: "Search document match snippets"
-      description: "Returns cursor-based snippets for one matching document."
-      operationId: "searchDocMatches"
+      summary: "Search Wiki page match snippets"
+      description: "Returns cursor-based snippets for one matching Wiki page."
+      operationId: "searchWikiPageMatches"
       tags:
         - "search"
       parameters:
@@ -1744,10 +1778,10 @@ paths:
         - $ref: "#/components/parameters/Workspace"
         - name: "path"
           in: "query"
-          description: "Document path (may include slashes for nested docs)"
+          description: "Wiki page path (may include slashes for nested pages)"
           required: true
           schema:
-            $ref: "#/components/schemas/DocPath"
+            $ref: "#/components/schemas/WikiPagePath"
         - name: "q"
           in: "query"
           required: true
@@ -1758,7 +1792,7 @@ paths:
         - $ref: "#/components/parameters/SearchMatchLimit"
       responses:
         "200":
-          description: "Cursor-based document match snippets"
+          description: "Cursor-based Wiki page match snippets"
           content:
             application/json:
               schema:
@@ -1770,7 +1804,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: "Document not found"
+          description: "Wiki page not found"
           content:
             application/json:
               schema:
@@ -1925,6 +1959,10 @@ paths:
                   type: boolean
                   description: "If true, prevent starting if a DAG with the same name is already running (returns 409)"
                   default: false
+                noReuse:
+                  type: boolean
+                  description: "If true, execute eligible build steps without reusing prior materializations"
+                  default: false
                 labels:
                   $ref: "#/components/schemas/Labels"
                   description: "Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
@@ -2006,6 +2044,10 @@ paths:
                 singleton:
                   type: boolean
                   description: "If true, prevent enqueuing if DAG is already running or queued (returns 409 conflict)"
+                  default: false
+                noReuse:
+                  type: boolean
+                  description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
                   $ref: "#/components/schemas/Labels"
@@ -2693,7 +2735,7 @@ paths:
   /dag-runs/{name}/{dagRunId}/retry:
     post:
       summary: "Retry DAG-run execution"
-      description: "Creates a new DAG-run based on a previous execution"
+      description: "Retries the existing DAG-run by reusing its DAG-run ID rather than creating a new DAG-run. Resets only the selected step or reachable descendants."
       operationId: "retryDAGRun"
       tags:
         - "dag-runs"
@@ -2707,6 +2749,8 @@ paths:
           application/json:
             schema:
               type: object
+              required:
+                - dagRunId
               properties:
                 dagRunId:
                   allOf:
@@ -2714,12 +2758,137 @@ paths:
                     - description: "ID of the DAG-run to retry"
                 stepName:
                   type: string
-                  description: "Optional. If provided, only this step will be retried."
-              required:
-                - dagRunId
+                  description: "Optional. If provided, this step will be retried. Combine with includeDownstream to also reset reachable descendants."
+                includeDownstream:
+                  type: boolean
+                  description: "Optional. When true, retry the selected step and every reachable descendant. Requires stepName. Unrelated branches keep their existing status."
+                subDAGRunId:
+                  allOf:
+                    - $ref: "#/components/schemas/DAGRunId"
+                    - description: "Optional. Persisted child DAG-run containing the step. Requires stepName; the path and dagRunId remain the root DAG-run."
+              not:
+                allOf:
+                  - type: object
+                    required:
+                      - includeDownstream
+                    properties:
+                      includeDownstream:
+                        type: boolean
+                        enum:
+                          - true
+                  - not:
+                      type: object
+                      required:
+                        - stepName
       responses:
         "200":
           description: "A successful response"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dag-runs/{name}/{dagRunId}/human-tasks/{stepId}/complete:
+    post:
+      summary: "Complete a waiting human task"
+      description: "Validates typed input against the stored human-task form, completes the step atomically, and queues the same DAG-run when no manual steps remain waiting."
+      operationId: "completeHumanTask"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunConcreteId"
+        - $ref: "#/components/parameters/HumanTaskStepId"
+      requestBody:
+        required: true
+        description: "Typed form input. The JSON request body is limited to 16 MiB."
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HumanTaskInput"
+      responses:
+        "200":
+          description: "Human task completed or an identical prior completion confirmed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanTaskCompletionResponse"
+        "400":
+          description: "Malformed or invalid human-task input"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "DAG-run or human task not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Human task is not actionable or completion conflicts with current state"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "Human-task input exceeds the 16 MiB request-body limit"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Completion was stored but the DAG-run retry could not be queued"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dag-runs/{name}/{dagRunId}/human-tasks/resume:
+    post:
+      summary: "Queue a completed human-task checkpoint for resume"
+      description: "Queues a retry for a completed human-task checkpoint without requiring the previously submitted form values."
+      operationId: "resumeHumanTaskDAGRun"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunConcreteId"
+      responses:
+        "200":
+          description: "The retry was queued or was already queued or running"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanTaskResumeResponse"
+        "404":
+          description: "DAG-run not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "The DAG-run still has waiting steps or no recoverable human-task checkpoint"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "The retry could not be queued and remains retryable"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         default:
           description: "Generic error response"
           content:
@@ -2858,7 +3027,7 @@ paths:
   /dag-runs/{name}/{dagRunId}/steps/{stepName}/status:
     patch:
       summary: "Manually update a step's execution status"
-      description: "Changes the status of a specific step within a DAG-run"
+      description: "Changes the status of a specific step after the DAG-run is no longer active"
       operationId: "updateDAGRunStepStatus"
       tags:
         - "dag-runs"
@@ -3015,6 +3184,103 @@ paths:
                 $ref: "#/components/schemas/PushBackStepResponse"
         "400":
           description: "Step is not in Waiting status, missing required inputs, or step does not have approval config"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "DAG-run or step not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dag-runs/{name}/{dagRunId}/steps/{stepName}/agent-interactions/{interactionId}/respond:
+    post:
+      summary: "Respond to a managed-agent interaction"
+      operationId: "respondDAGRunStepAgentInteraction"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+        - $ref: "#/components/parameters/StepName"
+        - name: "interactionId"
+          in: "path"
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentInteractionResponseRequest"
+      responses:
+        "200":
+          description: "Interaction response stored and resume attempted"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentInteractionResponse"
+        "400":
+          description: "Invalid or stale interaction response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Managed session owner is unavailable or state changed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "DAG-run, step, or interaction not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dag-runs/{name}/{dagRunId}/steps/{stepName}/agent-session/restart:
+    post:
+      summary: "Restart a managed-agent session cleanly"
+      operationId: "restartDAGRunStepAgentSession"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+        - $ref: "#/components/parameters/StepName"
+      responses:
+        "200":
+          description: "Clean session restart queued"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentSessionRestartResponse"
+        "400":
+          description: "Step does not have a restartable managed-agent session"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Managed session state changed"
           content:
             application/json:
               schema:
@@ -3448,7 +3714,7 @@ paths:
   /dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/status:
     patch:
       summary: "Manually update a step's execution status in a sub DAG-run"
-      description: "Changes the status of a specific step within a sub DAG-run"
+      description: "Changes the status of a specific step after the sub DAG-run and its embedded root run are no longer active"
       operationId: "updateSubDAGRunStepStatus"
       tags:
         - "dag-runs"
@@ -3629,6 +3895,113 @@ paths:
                 $ref: "#/components/schemas/PushBackStepResponse"
         "400":
           description: "Step is not in Waiting status, missing required inputs, or step does not have approval config"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Sub DAG-run or step not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/agent-interactions/{interactionId}/respond:
+    post:
+      summary: "Respond to a managed-agent interaction in a sub DAG-run"
+      operationId: "respondSubDAGRunStepAgentInteraction"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+        - name: "subDAGRunId"
+          in: "path"
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/StepName"
+        - name: "interactionId"
+          in: "path"
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentInteractionResponseRequest"
+      responses:
+        "200":
+          description: "Interaction response stored and resume attempted"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentInteractionResponse"
+        "400":
+          description: "Invalid or stale interaction response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Managed session owner is unavailable or state changed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Sub DAG-run, step, or interaction not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/agent-session/restart:
+    post:
+      summary: "Restart a managed-agent session cleanly in a sub DAG-run"
+      operationId: "restartSubDAGRunStepAgentSession"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+        - name: "subDAGRunId"
+          in: "path"
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/StepName"
+      responses:
+        "200":
+          description: "Clean session restart queued"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentSessionRestartResponse"
+        "400":
+          description: "Step does not have a restartable managed-agent session"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Managed session state changed"
           content:
             application/json:
               schema:
@@ -3924,7 +4297,18 @@ paths:
             type: string
             pattern: '^sha256=[0-9a-fA-F]{64}$'
             example: "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-          description: "HMAC webhook signature in the format 'sha256=<hex>'. Required only when the webhook auth mode includes HMAC authentication with strict enforcement."
+          description: |
+            HMAC webhook signature in the format `sha256=<hex>`. Required only
+            when the webhook auth mode includes HMAC authentication with strict
+            enforcement. Sign the raw request body when `X-Dagu-Profile` is
+            absent. When it is present, sign
+            `x-dagu-profile:<profile>\n<raw-request-body>`.
+        - name: X-Dagu-Profile
+          in: header
+          required: false
+          schema:
+            $ref: "#/components/schemas/RuntimeProfileName"
+          description: "Runtime profile selected for this DAG run. The profile must be allowed by the webhook profile-selection policy. Omit the header to use the DAG's default profile resolution."
       requestBody:
         required: false
         content:
@@ -5015,6 +5399,51 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /dags/{fileName}/webhook/profile-selection:
+    put:
+      summary: "Configure webhook profile selection"
+      description: |
+        Replaces the runtime profiles that callers may select through the
+        `X-Dagu-Profile` header. An empty list disables caller selection.
+        Admin only.
+      operationId: "configureDAGWebhookProfileSelection"
+      tags:
+        - "webhooks"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGFileName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookProfileSelectionRequest"
+      responses:
+        "200":
+          description: "Webhook profile selection updated successfully"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDetails"
+        "400":
+          description: "Invalid or unavailable runtime profile"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "No webhook or runtime profile found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dags/{fileName}/webhook/toggle:
     post:
       summary: "Toggle webhook enabled state"
@@ -5845,7 +6274,7 @@ paths:
   /sync/status:
     get:
       summary: "Get Git sync status"
-      description: "Returns the overall Git sync status including status of all DAGs"
+      description: "Returns the overall Git sync status including all supported sync items"
       operationId: "getSyncStatus"
       tags:
         - "sync"
@@ -5890,8 +6319,8 @@ paths:
 
   /sync/publish-all:
     post:
-      summary: "Publish selected DAGs"
-      description: "Commits and pushes the specified item IDs. If itemIds is omitted, publishes all modified or untracked items."
+      summary: "Publish selected sync items"
+      description: "Commits and pushes the specified sync item IDs. If itemIds is omitted, publishes all modified or untracked items."
       operationId: "syncPublishAll"
       tags:
         - "sync"
@@ -6001,7 +6430,7 @@ paths:
         - $ref: "#/components/parameters/RemoteNode"
         - name: itemId
           in: path
-          description: "The sync item identifier (file path without extension)"
+          description: "The sync item identifier. Supporting file IDs include their extension."
           required: true
           schema:
             type: string
@@ -6013,7 +6442,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SyncItemDiffResponse"
         "404":
-          description: "Item not found"
+          description: "Sync item not found"
           content:
             application/json:
               schema:
@@ -6036,7 +6465,7 @@ paths:
         - $ref: "#/components/parameters/RemoteNode"
         - name: itemId
           in: path
-          description: "The sync item identifier (file path without extension)"
+          description: "The sync item identifier. Supporting file IDs include their extension."
           required: true
           schema:
             type: string
@@ -6048,13 +6477,13 @@ paths:
               $ref: "#/components/schemas/SyncPublishRequest"
       responses:
         "200":
-          description: "Item published successfully"
+          description: "Sync item published successfully"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SyncResultResponse"
         "404":
-          description: "Item not found"
+          description: "Sync item not found"
           content:
             application/json:
               schema:
@@ -6083,7 +6512,7 @@ paths:
         - $ref: "#/components/parameters/RemoteNode"
         - name: itemId
           in: path
-          description: "The sync item identifier (file path without extension)"
+          description: "The sync item identifier. Supporting file IDs include their extension."
           required: true
           schema:
             type: string
@@ -6095,7 +6524,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SuccessResponse"
         "404":
-          description: "Item not found"
+          description: "Sync item not found"
           content:
             application/json:
               schema:
@@ -6110,7 +6539,7 @@ paths:
   /sync/items/{itemId}/forget:
     post:
       summary: "Forget a sync item"
-      description: "Removes the state entry for a missing, untracked, or conflict sync item. Synced and modified items are rejected."
+      description: "Removes the state entry for a missing, untracked, or conflicting sync item. Synced and modified items are rejected."
       operationId: "forgetSyncItem"
       tags:
         - "sync"
@@ -6118,25 +6547,25 @@ paths:
         - $ref: "#/components/parameters/RemoteNode"
         - name: itemId
           in: path
-          description: "The sync item identifier (file path without extension)"
+          description: "The sync item identifier. Supporting file IDs include their extension."
           required: true
           schema:
             type: string
       responses:
         "200":
-          description: "Item forgotten successfully"
+          description: "Sync item forgotten successfully"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SuccessResponse"
         "400":
-          description: "Item cannot be forgotten"
+          description: "Sync item cannot be forgotten"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: "Item not found"
+          description: "Sync item not found"
           content:
             application/json:
               schema:
@@ -6151,7 +6580,7 @@ paths:
   /sync/items/{itemId}/delete:
     post:
       summary: "Delete a sync item"
-      description: "Removes an item from remote repository (git rm + commit + push), local disk, and sync state"
+      description: "Removes a sync item from the remote repository (git rm + commit + push), local disk, and sync state"
       operationId: "deleteSyncItem"
       tags:
         - "sync"
@@ -6159,7 +6588,7 @@ paths:
         - $ref: "#/components/parameters/RemoteNode"
         - name: itemId
           in: path
-          description: "The sync item identifier (file path without extension)"
+          description: "The sync item identifier. Supporting file IDs include their extension."
           required: true
           schema:
             type: string
@@ -6175,22 +6604,22 @@ paths:
                   description: "Commit message for the deletion"
                 force:
                   type: boolean
-                  description: "Force delete even if item has local modifications"
+                  description: "Force delete even if the sync item has local modifications"
       responses:
         "200":
-          description: "Item deleted successfully"
+          description: "Sync item deleted successfully"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SuccessResponse"
         "400":
-          description: "Item cannot be deleted"
+          description: "Sync item cannot be deleted"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: "Item not found"
+          description: "Sync item not found"
           content:
             application/json:
               schema:
@@ -6205,7 +6634,7 @@ paths:
   /sync/items/{itemId}/move:
     post:
       summary: "Move a sync item"
-      description: "Atomically renames an item across local filesystem, remote repository, and sync state"
+      description: "Renames a tracked sync item"
       operationId: "moveSyncItem"
       tags:
         - "sync"
@@ -6213,7 +6642,7 @@ paths:
         - $ref: "#/components/parameters/RemoteNode"
         - name: itemId
           in: path
-          description: "The current sync item identifier (file path without extension)"
+          description: "The current sync item identifier. Supporting file IDs include their extension."
           required: true
           schema:
             type: string
@@ -6226,30 +6655,30 @@ paths:
               properties:
                 newItemId:
                   type: string
-                  description: "The new item identifier to rename to"
+                  description: "The new sync item identifier"
                 message:
                   type: string
                   description: "Commit message for the move"
                 force:
                   type: boolean
-                  description: "Force move even if item has conflicts"
+                  description: "Force move even if the sync item has conflicts"
               required:
                 - newItemId
       responses:
         "200":
-          description: "Item moved successfully"
+          description: "Sync item moved successfully"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SuccessResponse"
         "400":
-          description: "Item cannot be moved"
+          description: "Sync item cannot be moved"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: "Item not found"
+          description: "Sync item not found"
           content:
             application/json:
               schema:
@@ -6270,7 +6699,7 @@ paths:
   /sync/delete-missing:
     post:
       summary: "Delete all missing sync items"
-      description: "Removes all missing items from remote repository, local disk, and sync state"
+      description: "Removes all missing sync items from the remote repository, local disk, and sync state"
       operationId: "syncDeleteMissing"
       tags:
         - "sync"
@@ -6288,7 +6717,7 @@ paths:
                   description: "Commit message for the deletion"
       responses:
         "200":
-          description: "Missing items deleted successfully"
+          description: "Missing sync items deleted successfully"
           content:
             application/json:
               schema:
@@ -6298,7 +6727,7 @@ paths:
                     type: array
                     items:
                       type: string
-                    description: "List of deleted item IDs"
+                    description: "List of deleted sync item IDs"
                   message:
                     type: string
                     description: "Summary message"
@@ -6321,7 +6750,7 @@ paths:
   /sync/delete-batch:
     post:
       summary: "Delete selected sync items"
-      description: "Removes the specified items from remote repository, local disk, and sync state in a single commit."
+      description: "Removes the specified sync items from the remote repository, local disk, and sync state in a single commit."
       operationId: "syncDeleteBatch"
       tags:
         - "sync"
@@ -6335,7 +6764,7 @@ paths:
               $ref: "#/components/schemas/SyncDeleteBatchRequest"
       responses:
         "200":
-          description: "Items deleted successfully"
+          description: "Sync items deleted successfully"
           content:
             application/json:
               schema:
@@ -6345,7 +6774,7 @@ paths:
                     type: array
                     items:
                       type: string
-                    description: "List of deleted item IDs"
+                    description: "List of deleted sync item IDs"
                   message:
                     type: string
                     description: "Summary message"
@@ -6359,7 +6788,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: "Item not found"
+          description: "Sync item not found"
           content:
             application/json:
               schema:
@@ -6392,7 +6821,7 @@ paths:
                     type: array
                     items:
                       type: string
-                    description: "List of forgotten item IDs"
+                    description: "List of forgotten sync item IDs"
                   message:
                     type: string
                     description: "Summary message"
@@ -6648,1284 +7077,22 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /settings/agent:
+  /license/status:
     get:
-      summary: "Get agent configuration"
-      description: "Returns the current AI agent configuration. Requires admin role."
-      operationId: "getAgentConfig"
+      summary: "Get license status"
+      description: "Returns the current public license status without exposing license credentials."
+      operationId: "getLicenseStatus"
       tags:
-        - "settings"
+        - "system"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
       responses:
         "200":
-          description: "Agent configuration"
+          description: "Current license status"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AgentConfigResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    patch:
-      summary: "Update agent configuration"
-      description: "Updates the AI agent configuration. Requires admin role."
-      operationId: "updateAgentConfig"
-      tags:
-        - "settings"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/UpdateAgentConfigRequest"
-      responses:
-        "200":
-          description: "Updated agent configuration"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentConfigResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/models:
-    get:
-      summary: "List agent models"
-      description: "Returns all configured AI agent models. Requires admin role."
-      operationId: "listAgentModels"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      responses:
-        "200":
-          description: "List of models"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ListModelsResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    post:
-      summary: "Create agent model"
-      description: "Creates a new AI agent model configuration. Requires admin role."
-      operationId: "createAgentModel"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateModelConfigRequest"
-      responses:
-        "201":
-          description: "Model created"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ModelConfigResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "409":
-          description: "Model already exists"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/auth/providers:
-    get:
-      summary: "List agent auth providers"
-      description: "Returns subscription-backed agent auth provider status for the selected node. Requires admin role."
-      operationId: "listAgentAuthProviders"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      responses:
-        "200":
-          description: "List of auth providers"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ListAgentAuthProvidersResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/auth/providers/{providerId}/login:
-    post:
-      summary: "Start agent auth provider login"
-      description: "Starts a manual OAuth login flow for the selected provider. Requires admin role."
-      operationId: "startAgentAuthProviderLogin"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: providerId
-          in: path
-          required: true
-          schema:
-            type: string
-          description: "Auth provider ID"
-      responses:
-        "200":
-          description: "Login flow started"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StartAgentAuthProviderLoginResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-    delete:
-      summary: "Disconnect agent auth provider login"
-      description: "Removes the stored OAuth credential for the selected provider. Requires admin role."
-      operationId: "disconnectAgentAuthProviderLogin"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: providerId
-          in: path
-          required: true
-          schema:
-            type: string
-          description: "Auth provider ID"
-      responses:
-        "204":
-          description: "Provider disconnected"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/auth/providers/{providerId}/login/complete:
-    post:
-      summary: "Complete agent auth provider login"
-      description: "Completes a manual OAuth login flow using the pasted redirect URL or authorization code. Requires admin role."
-      operationId: "completeAgentAuthProviderLogin"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: providerId
-          in: path
-          required: true
-          schema:
-            type: string
-          description: "Auth provider ID"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CompleteAgentAuthProviderLoginRequest"
-      responses:
-        "200":
-          description: "Login completed"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CompleteAgentAuthProviderLoginResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/models/{modelId}:
-    patch:
-      summary: "Update agent model"
-      description: "Updates an existing AI agent model configuration. Requires admin role."
-      operationId: "updateAgentModel"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: modelId
-          in: path
-          required: true
-          schema:
-            type: string
-          description: "Model ID"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/UpdateModelConfigRequest"
-      responses:
-        "200":
-          description: "Model updated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ModelConfigResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Model not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    delete:
-      summary: "Delete agent model"
-      description: "Deletes an AI agent model configuration. Requires admin role."
-      operationId: "deleteAgentModel"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: modelId
-          in: path
-          required: true
-          schema:
-            type: string
-          description: "Model ID"
-      responses:
-        "204":
-          description: "Model deleted"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Model not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/default-model:
-    put:
-      summary: "Set default agent model"
-      description: "Sets the default model for the AI agent. Requires admin role."
-      operationId: "setDefaultAgentModel"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SetDefaultModelRequest"
-      responses:
-        "200":
-          description: "Default model set"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SetDefaultModelResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Model not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/memory:
-    get:
-      summary: "Get agent memory"
-      description: "Returns global memory content and list of DAGs with memory. Requires admin role."
-      operationId: "getAgentMemory"
-      tags:
-        - "settings"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      responses:
-        "200":
-          description: "Agent memory overview"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentMemoryResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    put:
-      summary: "Update global agent memory"
-      description: "Updates the global MEMORY.md content. Requires admin role."
-      operationId: "updateAgentMemory"
-      tags:
-        - "settings"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/UpdateAgentMemoryRequest"
-      responses:
-        "200":
-          description: "Memory updated successfully"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    delete:
-      summary: "Clear global agent memory"
-      description: "Deletes the global MEMORY.md file. Requires admin role."
-      operationId: "deleteAgentMemory"
-      tags:
-        - "settings"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      responses:
-        "200":
-          description: "Memory cleared successfully"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/memory/dags/{dagName}:
-    get:
-      summary: "Get DAG-specific agent memory"
-      description: "Returns memory content for a specific DAG. Requires admin role."
-      operationId: "getAgentDAGMemory"
-      tags:
-        - "settings"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: dagName
-          in: path
-          required: true
-          schema:
-            $ref: "#/components/schemas/DAGName"
-          description: "Name of the DAG"
-      responses:
-        "200":
-          description: "DAG memory content"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentDAGMemoryResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    put:
-      summary: "Update DAG-specific agent memory"
-      description: "Updates the memory content for a specific DAG. Requires admin role."
-      operationId: "updateAgentDAGMemory"
-      tags:
-        - "settings"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: dagName
-          in: path
-          required: true
-          schema:
-            $ref: "#/components/schemas/DAGName"
-          description: "Name of the DAG"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/UpdateAgentMemoryRequest"
-      responses:
-        "200":
-          description: "DAG memory updated successfully"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    delete:
-      summary: "Clear DAG-specific agent memory"
-      description: "Deletes the memory file for a specific DAG. Requires admin role."
-      operationId: "deleteAgentDAGMemory"
-      tags:
-        - "settings"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - name: dagName
-          in: path
-          required: true
-          schema:
-            $ref: "#/components/schemas/DAGName"
-          description: "Name of the DAG"
-      responses:
-        "200":
-          description: "DAG memory cleared successfully"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/model-presets:
-    get:
-      summary: "List model presets"
-      description: "Returns hardcoded model presets with metadata. Requires admin role."
-      operationId: "listModelPresets"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      responses:
-        "200":
-          description: "List of model presets"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ListModelPresetsResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/tools:
-    get:
-      summary: "List agent tools"
-      description: "Returns metadata for all registered agent tools."
-      operationId: "listAgentTools"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      responses:
-        "200":
-          description: "List of tools"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ListAgentToolsResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/souls:
-    get:
-      summary: "List agent souls"
-      description: "Returns all configured agent souls (personalities). Requires admin role."
-      operationId: "listAgentSouls"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/PerPage"
-        - name: q
-          in: query
-          description: "Search query (matches name, description)"
-          required: false
-          schema:
-            type: string
-      responses:
-        "200":
-          description: "List of souls"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ListSoulsResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    post:
-      summary: "Create agent soul"
-      description: "Creates a new agent soul (personality). Requires admin role."
-      operationId: "createAgentSoul"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateSoulRequest"
-      responses:
-        "201":
-          description: "Soul created"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SoulResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "409":
-          description: "Soul already exists"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /settings/agent/souls/{soulId}:
-    get:
-      summary: "Get agent soul"
-      description: "Returns a single agent soul by ID. Requires admin role."
-      operationId: "getAgentSoul"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/SoulId"
-      responses:
-        "200":
-          description: "Soul details"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SoulResponse"
-        "400":
-          description: "Invalid soul ID"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Soul not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    patch:
-      summary: "Update agent soul"
-      description: "Updates an existing agent soul. Requires admin role."
-      operationId: "updateAgentSoul"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/SoulId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/UpdateSoulRequest"
-      responses:
-        "200":
-          description: "Soul updated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SoulResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Soul not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-    delete:
-      summary: "Delete agent soul"
-      description: "Deletes an agent soul. Requires admin role."
-      operationId: "deleteAgentSoul"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/SoulId"
-      responses:
-        "204":
-          description: "Soul deleted"
-        "400":
-          description: "Invalid soul ID"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: "Requires admin role"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Soul not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /agent/sessions:
-    post:
-      summary: "Create agent session"
-      description: "Creates a new agent session and sends the first message."
-      operationId: "createAgentSession"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AgentChatRequest"
-      responses:
-        "201":
-          description: "Session created"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CreateAgentSessionResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "503":
-          description: "Agent not configured"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-    get:
-      summary: "List agent sessions"
-      description: "Lists sessions for the current user. `listAgentSessions` uses `AgentSessionPaginationMode=cursor` or an `AgentSessionCursor` value to return cursor pages and `nextCursor`; cursor mode rejects `Page` because mixed cursor/page requests are ambiguous, while `PerPage` still controls page size. Without cursor mode it uses `Page` and `PerPage` offset pagination. `RemoteNode` selects the target node for either pagination mode. Malformed or invalid cursor values return 400."
-      operationId: "listAgentSessions"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/AgentSessionPaginationMode"
-        - $ref: "#/components/parameters/AgentSessionCursor"
-        - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/PerPage"
-      responses:
-        "200":
-          description: "Paginated list of sessions"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ListAgentSessionsResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /agent/sessions/{sessionId}:
-    get:
-      summary: "Get agent session"
-      description: "Returns session details including messages and current state."
-      operationId: "getAgentSession"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/AgentSessionId"
-      responses:
-        "200":
-          description: "Session details"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentSessionDetailResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Session not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /agent/sessions/{sessionId}/chat:
-    post:
-      summary: "Send message to agent session"
-      description: "Sends a message to an existing agent session."
-      operationId: "chatAgentSession"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/AgentSessionId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AgentChatRequest"
-      responses:
-        "202":
-          description: "Message accepted"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentStatusResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Session not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "503":
-          description: "Agent not configured"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /agent/sessions/{sessionId}/cancel:
-    post:
-      summary: "Cancel agent session"
-      description: "Cancels processing in an active agent session."
-      operationId: "cancelAgentSession"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/AgentSessionId"
-      responses:
-        "200":
-          description: "Session cancelled"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentStatusResponse"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Session not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        default:
-          description: "Unexpected error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /agent/sessions/{sessionId}/respond:
-    post:
-      summary: "Respond to agent prompt"
-      description: "Submits user's response to an agent prompt."
-      operationId: "respondAgentSession"
-      tags:
-        - "agent"
-      parameters:
-        - $ref: "#/components/parameters/RemoteNode"
-        - $ref: "#/components/parameters/AgentSessionId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AgentUserPromptResponse"
-      responses:
-        "200":
-          description: "Response accepted"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentStatusResponse"
-        "400":
-          description: "Invalid request"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: "Not authenticated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: "Session not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "410":
-          description: "Prompt expired or already answered"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/LicenseStatusResponse"
         default:
           description: "Unexpected error"
           content:
@@ -8027,24 +7194,38 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /docs:
+  /wiki:
     get:
-      summary: "List documents"
-      description: "Returns documents as a tree structure or flat list. All authenticated users can browse."
-      operationId: "listDocs"
+      summary: "List Wiki pages"
+      description: |
+        Returns Wiki pages as a tree structure or flat list. All authenticated users can browse.
+        In tree mode, page and perPage apply to direct children of the selected workspace or prefix;
+        each returned directory includes its descendants. In flat mode, they apply to individual Wiki pages.
+      operationId: "listWikiPages"
       tags:
-        - "docs"
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
+        - $ref: "#/components/parameters/WikiPagePrefix"
         - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/WikiPagesPerPage"
         - name: flat
           in: query
           description: "If true, returns flat list instead of tree"
           required: false
           schema:
             type: boolean
+        - name: tags
+          in: query
+          description: "Only return Wiki pages carrying every given tag (case-insensitive). Effective in flat mode only."
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
         - name: sort
           in: query
           required: false
@@ -8067,11 +7248,11 @@ paths:
           description: "Sort order. For type: asc=folders first. For mtime: desc=newest first."
       responses:
         "200":
-          description: "List of documents"
+          description: "List of Wiki pages"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DocListResponse"
+                $ref: "#/components/schemas/WikiPageListResponse"
         default:
           description: "Unexpected error"
           content:
@@ -8080,11 +7261,11 @@ paths:
                 $ref: "#/components/schemas/Error"
 
     post:
-      summary: "Create document"
-      description: "Creates a new document. Requires DAG write permission."
-      operationId: "createDoc"
+      summary: "Create Wiki page"
+      description: "Creates a new Wiki page. Requires DAG write permission."
+      operationId: "createWikiPage"
       tags:
-        - "docs"
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
@@ -8093,10 +7274,10 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreateDocRequest"
+              $ref: "#/components/schemas/CreateWikiPageRequest"
       responses:
         "201":
-          description: "Document created"
+          description: "Wiki page created"
           content:
             application/json:
               schema:
@@ -8111,7 +7292,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "409":
-          description: "Document already exists"
+          description: "Wiki page already exists"
           content:
             application/json:
               schema:
@@ -8123,13 +7304,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /docs/search:
+  /wiki/search:
     get:
-      summary: "Search documents"
-      description: "Searches document content for the given query."
-      operationId: "searchDocs"
+      summary: "Search Wiki pages"
+      description: "Searches Wiki page content for the given query."
+      operationId: "searchWikiPages"
       tags:
-        - "docs"
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
@@ -8145,7 +7326,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DocSearchResponse"
+                $ref: "#/components/schemas/WikiPageSearchResponse"
         "400":
           description: "Missing query parameter"
           content:
@@ -8159,31 +7340,258 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /docs/doc:
+  /wiki/backlinks:
     get:
-      summary: "Get document"
-      description: "Returns a single document by path."
-      operationId: "getDoc"
+      summary: "List Wiki page backlinks"
+      description: |
+        Returns Wiki pages whose wiki links resolve to the given target.
+        The target is a Wiki page path, or a scheme-prefixed wiki-link target
+        such as dag:name.
+      operationId: "listWikiPageBacklinks"
       tags:
-        - "docs"
+        - "wiki"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/Workspace"
+        - name: target
+          in: query
+          description: "Wiki page path or scheme-prefixed wiki-link target (for example dag:name)"
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 300
+      responses:
+        "200":
+          description: "Wiki pages linking to the target"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WikiPageBacklinksResponse"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /wiki/page/revisions:
+    get:
+      summary: "List Wiki page revisions"
+      description: "Returns stored prior versions of a Wiki page, newest first, without content."
+      operationId: "listWikiPageRevisions"
+      tags:
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
         - name: path
           in: query
-          description: "Document path (may include slashes for nested docs)"
+          description: "Wiki page path (may include slashes for nested pages)"
           required: true
           schema:
-            $ref: "#/components/schemas/DocPath"
+            $ref: "#/components/schemas/WikiPagePath"
       responses:
         "200":
-          description: "Document details"
+          description: "Stored revisions"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DocResponse"
+                $ref: "#/components/schemas/WikiPageRevisionsResponse"
         "404":
-          description: "Document not found"
+          description: "Wiki page not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /wiki/page/revision:
+    get:
+      summary: "Get Wiki page revision"
+      description: "Returns one stored revision including its content."
+      operationId: "getWikiPageRevision"
+      tags:
+        - "wiki"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/Workspace"
+        - name: path
+          in: query
+          description: "Wiki page path (may include slashes for nested pages)"
+          required: true
+          schema:
+            $ref: "#/components/schemas/WikiPagePath"
+        - name: rev
+          in: query
+          description: "Revision identifier from the revision list"
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+      responses:
+        "200":
+          description: "Revision with content"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WikiPageRevisionResponse"
+        "404":
+          description: "Wiki page or revision not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /wiki/page/attachment:
+    put:
+      summary: "Upload Wiki page attachment"
+      description: "Stores a binary attachment for an existing Wiki page, replacing any attachment with the same name. Requires DAG write permission."
+      operationId: "uploadWikiPageAttachment"
+      tags:
+        - "wiki"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/Workspace"
+        - name: path
+          in: query
+          description: "Wiki page path (may include slashes for nested pages)"
+          required: true
+          schema:
+            $ref: "#/components/schemas/WikiPagePath"
+        - name: name
+          in: query
+          description: "Attachment file name (single path segment)"
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: "Attachment stored"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WikiPageAttachmentResponse"
+        "400":
+          description: "Invalid attachment name"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Wiki page not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "Attachment too large"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    get:
+      summary: "Download Wiki page attachment"
+      description: "Streams a stored Wiki page attachment."
+      operationId: "downloadWikiPageAttachment"
+      tags:
+        - "wiki"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/Workspace"
+        - name: path
+          in: query
+          description: "Wiki page path (may include slashes for nested pages)"
+          required: true
+          schema:
+            $ref: "#/components/schemas/WikiPagePath"
+        - name: name
+          in: query
+          description: "Attachment file name (single path segment)"
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+      responses:
+        "200":
+          description: "Attachment content"
+          headers:
+            Content-Disposition:
+              schema:
+                type: "string"
+              description: "Attachment filename"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: "Wiki page or attachment not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /wiki/page:
+    get:
+      summary: "Get Wiki page"
+      description: "Returns a single Wiki page by path."
+      operationId: "getWikiPage"
+      tags:
+        - "wiki"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/Workspace"
+        - name: path
+          in: query
+          description: "Wiki page path (may include slashes for nested pages)"
+          required: true
+          schema:
+            $ref: "#/components/schemas/WikiPagePath"
+      responses:
+        "200":
+          description: "Wiki page details"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WikiPageResponse"
+        "404":
+          description: "Wiki page not found"
           content:
             application/json:
               schema:
@@ -8196,29 +7604,29 @@ paths:
                 $ref: "#/components/schemas/Error"
 
     patch:
-      summary: "Update document"
-      description: "Updates an existing document's content. Requires DAG write permission."
-      operationId: "updateDoc"
+      summary: "Update Wiki page"
+      description: "Updates an existing Wiki page's content. Requires DAG write permission."
+      operationId: "updateWikiPage"
       tags:
-        - "docs"
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
         - name: path
           in: query
-          description: "Document path (may include slashes for nested docs)"
+          description: "Wiki page path (may include slashes for nested pages)"
           required: true
           schema:
-            $ref: "#/components/schemas/DocPath"
+            $ref: "#/components/schemas/WikiPagePath"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/UpdateDocRequest"
+              $ref: "#/components/schemas/UpdateWikiPageRequest"
       responses:
         "200":
-          description: "Document updated"
+          description: "Wiki page updated"
           content:
             application/json:
               schema:
@@ -8227,7 +7635,7 @@ paths:
                   message:
                     type: string
         "404":
-          description: "Document not found"
+          description: "Wiki page not found"
           content:
             application/json:
               schema:
@@ -8240,25 +7648,25 @@ paths:
                 $ref: "#/components/schemas/Error"
 
     delete:
-      summary: "Delete document"
-      description: "Deletes a document. Requires DAG write permission."
-      operationId: "deleteDoc"
+      summary: "Delete Wiki page"
+      description: "Deletes a Wiki page. Requires DAG write permission."
+      operationId: "deleteWikiPage"
       tags:
-        - "docs"
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
         - name: path
           in: query
-          description: "Document path (may include slashes for nested docs)"
+          description: "Wiki page path (may include slashes for nested pages)"
           required: true
           schema:
-            $ref: "#/components/schemas/DocPath"
+            $ref: "#/components/schemas/WikiPagePath"
       responses:
         "204":
-          description: "Document deleted"
+          description: "Wiki page deleted"
         "404":
-          description: "Document not found"
+          description: "Wiki page not found"
           content:
             application/json:
               schema:
@@ -8270,31 +7678,31 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /docs/doc/rename:
+  /wiki/page/rename:
     post:
-      summary: "Rename document or directory"
-      description: "Renames/moves a document or directory to a new path. When a directory path is given, all documents under it are moved atomically. Requires DAG write permission."
-      operationId: "renameDoc"
+      summary: "Rename Wiki page or directory"
+      description: "Renames/moves a Wiki page or directory to a new path. When a directory path is given, all Wiki pages under it are moved atomically. Requires DAG write permission."
+      operationId: "renameWikiPage"
       tags:
-        - "docs"
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
         - name: path
           in: query
-          description: "Current document or directory path (may include slashes for nested docs)"
+          description: "Current Wiki page or directory path (may include slashes for nested pages)"
           required: true
           schema:
-            $ref: "#/components/schemas/DocPath"
+            $ref: "#/components/schemas/WikiPagePath"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RenameDocRequest"
+              $ref: "#/components/schemas/RenameWikiPageRequest"
       responses:
         "200":
-          description: "Document or directory renamed"
+          description: "Wiki page or directory renamed"
           content:
             application/json:
               schema:
@@ -8303,7 +7711,7 @@ paths:
                   message:
                     type: string
         "404":
-          description: "Document or directory not found"
+          description: "Wiki page or directory not found"
           content:
             application/json:
               schema:
@@ -8321,13 +7729,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /docs/delete-batch:
+  /wiki/delete-batch:
     post:
-      summary: "Delete multiple documents or directories"
-      description: "Deletes multiple documents and/or directories in a single operation. Supports recursive directory deletion. Not-found items are treated as successful deletes for idempotency. Requires DAG write permission."
-      operationId: "deleteDocBatch"
+      summary: "Delete multiple Wiki pages or directories"
+      description: "Deletes multiple Wiki pages and/or directories in a single operation. Supports recursive directory deletion. Not-found items are treated as successful deletes for idempotency. Requires DAG write permission."
+      operationId: "deleteWikiPageBatch"
       tags:
-        - "docs"
+        - "wiki"
       parameters:
         - $ref: "#/components/parameters/RemoteNode"
         - $ref: "#/components/parameters/Workspace"
@@ -8336,21 +7744,26 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/DocDeleteBatchRequest"
+              $ref: "#/components/schemas/WikiPageDeleteBatchRequest"
       responses:
         "200":
           description: "Batch delete completed (may include partial failures)"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DocDeleteBatchResponse"
+                $ref: "#/components/schemas/WikiPageDeleteBatchResponse"
+        "400":
+          description: "Invalid batch delete request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         default:
           description: "Unexpected error"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-
 
   /remote-nodes:
     get:
@@ -9477,7 +8890,7 @@ paths:
   /views:
     get:
       summary: "List saved views"
-      description: "Lists all saved Overview view configurations, ordered by creation time."
+      description: "Lists all shared saved view configurations visible to the caller, ordered by creation time."
       operationId: "listViews"
       tags:
         - "views"
@@ -9504,7 +8917,7 @@ paths:
                 $ref: "#/components/schemas/Error"
     post:
       summary: "Create a view"
-      description: "Creates a saved Overview view configuration. Views are global and shared across users."
+      description: "Creates a saved view configuration. Views are shared across users with access to their workspace scope."
       operationId: "createView"
       tags:
         - "views"
@@ -10213,7 +9626,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-
+        "409":
+          description: "Workspace still contains Wiki pages"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
 components:
   securitySchemes:
@@ -10265,37 +9683,35 @@ components:
         maximum: 1000
         default: 50
 
-    AgentSessionCursor:
-      name: cursor
+    WikiPagesPerPage:
+      name: perPage
       in: query
-      description: "Opaque cursor for loading the next page of older agent sessions"
+      description: "Number of Wiki page entries per page (default 50, max 200)"
       required: false
       schema:
-        type: string
-        minLength: 1
-
-    AgentSessionPaginationMode:
-      name: paginationMode
-      in: query
-      description: "Pagination mode. Use `cursor` for the agent session sidebar infinite-loading flow; omit or use `offset` for compatibility pagination."
-      required: false
-      schema:
-        type: string
-        enum:
-          - offset
-          - cursor
-        default: offset
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
 
     Workspace:
       name: workspace
       in: query
-      description: "Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. For document target APIs, use default or a workspace name; omitted means default."
+      description: "Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all."
       required: false
       schema:
         type: string
         minLength: 1
         maxLength: 64
         pattern: "^[A-Za-z0-9_-]+$"
+
+    WikiPagePrefix:
+      name: prefix
+      in: query
+      description: "Optional Wiki page path prefix within the selected workspace"
+      required: false
+      schema:
+        $ref: "#/components/schemas/WikiPagePath"
 
     SearchCursor:
       name: cursor
@@ -10350,6 +9766,16 @@ components:
       required: true
       schema:
         type: string
+
+    HumanTaskStepId:
+      name: stepId
+      in: path
+      description: explicit ID of the human-task step
+      required: true
+      schema:
+        type: string
+        pattern: "^[A-Za-z][A-Za-z0-9_]*$"
+        maxLength: 40
 
     ArtifactPath:
       name: path
@@ -10604,24 +10030,6 @@ components:
       required: false
       schema:
         $ref: "#/components/schemas/Stream"
-
-    AgentSessionId:
-      name: sessionId
-      in: path
-      description: "Unique identifier of the agent session"
-      required: true
-      schema:
-        type: string
-        minLength: 1
-
-    SoulId:
-      name: soulId
-      in: path
-      required: true
-      schema:
-        type: string
-        minLength: 1
-      description: The soul ID
 
     RemoteNodeId:
       name: remoteNodeId
@@ -11016,6 +10424,61 @@ components:
         - approvalIteration
         - resumed
 
+    AgentInteractionResponseRequest:
+      type: object
+      description: "Answer to a pending managed-agent permission or question"
+      properties:
+        decision:
+          type: string
+          enum:
+            - once
+            - session
+            - reject
+        answers:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+
+    AgentInteractionResponse:
+      type: object
+      properties:
+        dagRunId:
+          type: string
+        stepName:
+          type: string
+        interactionId:
+          type: string
+        resumed:
+          type: boolean
+        subDAGRunId:
+          type: string
+      required:
+        - dagRunId
+        - stepName
+        - interactionId
+        - resumed
+
+    AgentSessionRestartResponse:
+      type: object
+      properties:
+        dagRunId:
+          type: string
+        stepName:
+          type: string
+        generation:
+          type: integer
+        resumed:
+          type: boolean
+        subDAGRunId:
+          type: string
+      required:
+        - dagRunId
+        - stepName
+        - generation
+        - resumed
+
     ApprovalConfig:
       type: object
       description: "Configuration for a human approval gate on a step"
@@ -11036,6 +10499,67 @@ components:
         rewindTo:
           type: string
           description: "Optional step name to restart from when the approver pushes the step back. Must reference the step itself or an upstream dependency."
+
+    HumanTaskConfig:
+      type: object
+      description: "Resolved human-task instructions and optional normalized input form"
+      properties:
+        prompt:
+          type: string
+          description: "Instructions displayed to the operator. Run details contain the resolved, secret-masked snapshot."
+        form:
+          type: object
+          additionalProperties: true
+          description: "Normalized flat JSON Schema for typed completion input"
+      required:
+        - prompt
+
+    HumanTaskInput:
+      description: "Typed human-task completion input. An empty object acknowledges a task without a form."
+      type: object
+      additionalProperties: true
+
+    HumanTaskCompletionResponse:
+      type: object
+      description: "Result of completing or confirming one human task"
+      properties:
+        dagName:
+          $ref: "#/components/schemas/DAGName"
+        dagRunId:
+          $ref: "#/components/schemas/DAGRunId"
+        stepId:
+          type: string
+        alreadyCompleted:
+          type: boolean
+        queued:
+          type: boolean
+          description: "Whether this request durably queued the DAG-run retry"
+        remainingWaitingSteps:
+          type: integer
+          minimum: 0
+      required:
+        - dagName
+        - dagRunId
+        - stepId
+        - alreadyCompleted
+        - queued
+        - remainingWaitingSteps
+
+    HumanTaskResumeResponse:
+      type: object
+      description: "Result of queueing a completed human-task retry"
+      properties:
+        dagName:
+          $ref: "#/components/schemas/DAGName"
+        dagRunId:
+          $ref: "#/components/schemas/DAGRunId"
+        queued:
+          type: boolean
+          description: "Whether this request durably queued the DAG-run retry"
+      required:
+        - dagName
+        - dagRunId
+        - queued
 
     Error:
       type: object
@@ -11086,6 +10610,9 @@ components:
         - "auth.forbidden"
         - "timeout"
         - "rate_limited"
+        - "conflict"
+        - "human_task_resume_failed"
+        - "payload_too_large"
 
     WebhookRequest:
       type: object
@@ -11169,6 +10696,7 @@ components:
         - enabled
         - authMode
         - hmac
+        - profileSelection
         - createdAt
         - updatedAt
       properties:
@@ -11189,6 +10717,8 @@ components:
           $ref: "#/components/schemas/WebhookAuthMode"
         hmac:
           $ref: "#/components/schemas/WebhookHMACDetails"
+        profileSelection:
+          $ref: "#/components/schemas/WebhookProfileSelectionDetails"
         createdAt:
           type: string
           format: date-time
@@ -11239,6 +10769,31 @@ components:
           type: boolean
           description: "Whether to enable or disable the webhook"
 
+    WebhookProfileSelectionDetails:
+      type: object
+      description: "Runtime profiles that webhook callers may select"
+      required:
+        - allowedProfiles
+      properties:
+        allowedProfiles:
+          type: array
+          description: "Runtime profile names accepted through X-Dagu-Profile. An empty list disables caller selection."
+          items:
+            $ref: "#/components/schemas/RuntimeProfileName"
+
+    WebhookProfileSelectionRequest:
+      type: object
+      description: "Replacement runtime-profile allowlist for a webhook"
+      required:
+        - allowedProfiles
+      properties:
+        allowedProfiles:
+          type: array
+          uniqueItems: true
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/RuntimeProfileName"
+
     WebhookHMACConfigureRequest:
       type: object
       description: |
@@ -11280,13 +10835,15 @@ components:
         - webhook
         - slack
         - telegram
+        - teams
 
     NotificationEventType:
       type: string
-      description: "DAG run event that can trigger server-side notifications"
+      description: "DAG run event that can trigger server-side notifications. Rules configured for dag.run.succeeded also match dag.run.partially_succeeded; rules configured only for dag.run.partially_succeeded do not match clean successes."
       enum:
         - dag.run.waiting
         - dag.run.succeeded
+        - dag.run.partially_succeeded
         - dag.run.failed
         - dag.run.aborted
         - dag.run.rejected
@@ -11328,6 +10885,63 @@ components:
           type: boolean
           description: "Attach DAG and step logs when available"
 
+    NotificationSMTPOAuthProvider:
+      type: string
+      description: "SMTP OAuth token provider"
+      enum:
+        - microsoft
+        - google_service_account
+        - google_refresh
+
+    NotificationSMTPOAuthSettingsInput:
+      type: object
+      description: "SMTP OAuth credentials. Secret values are encrypted at rest and omitted from responses."
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: "#/components/schemas/NotificationSMTPOAuthProvider"
+        tenantId:
+          type: string
+          description: "Microsoft Entra tenant ID"
+        clientId:
+          type: string
+          description: "OAuth client ID"
+        clientSecret:
+          type: string
+          writeOnly: true
+          description: "OAuth client secret. Omit on updates to preserve the existing value when the OAuth identity is unchanged."
+        refreshToken:
+          type: string
+          writeOnly: true
+          description: "Google refresh token. Omit on updates to preserve the existing value when the OAuth identity is unchanged."
+        serviceAccountJson:
+          type: string
+          writeOnly: true
+          description: "Google service-account JSON. Omit on updates to preserve the existing value when the OAuth identity is unchanged."
+
+    NotificationSMTPOAuthSettings:
+      type: object
+      description: "Public SMTP OAuth settings. Secret values are never returned."
+      required:
+        - provider
+        - clientSecretConfigured
+        - refreshTokenConfigured
+        - serviceAccountJsonConfigured
+      properties:
+        provider:
+          $ref: "#/components/schemas/NotificationSMTPOAuthProvider"
+        tenantId:
+          type: string
+        clientId:
+          type: string
+        clientSecretConfigured:
+          type: boolean
+        refreshTokenConfigured:
+          type: boolean
+        serviceAccountJsonConfigured:
+          type: boolean
+
     NotificationSMTPSettingsInput:
       type: object
       description: "Workspace SMTP transport input for notification email delivery. Values are encrypted at rest where applicable."
@@ -11347,6 +10961,10 @@ components:
         clearPassword:
           type: boolean
           description: "Clear the stored SMTP password."
+        oauth:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/NotificationSMTPOAuthSettingsInput"
         from:
           type: string
           description: "Default sender address for notification email channels"
@@ -11366,6 +10984,8 @@ components:
         username:
           type: string
           description: "SMTP username"
+        oauth:
+          $ref: "#/components/schemas/NotificationSMTPOAuthSettings"
         from:
           type: string
           description: "Default sender address for notification email channels"
@@ -11542,6 +11162,9 @@ components:
         messageTemplate:
           type: string
           description: "Optional rendered message added to the webhook JSON payload as message."
+        bodyTemplate:
+          type: string
+          description: "Optional request body template. When set, it replaces the default Dagu payload and must render to valid JSON. One request is sent per event. Supports the same tokens as messageTemplate plus {{message}}."
         allowInsecureHttp:
           type: boolean
           description: "Allow plain HTTP webhook URLs. Disabled by default."
@@ -11573,6 +11196,9 @@ components:
         messageTemplate:
           type: string
           description: "Optional rendered message added to the webhook JSON payload as message."
+        bodyTemplate:
+          type: string
+          description: "Optional request body template that replaces the default Dagu payload."
         allowInsecureHttp:
           type: boolean
           description: "Whether this target allows plain HTTP webhook URLs"
@@ -11618,6 +11244,9 @@ components:
         chatId:
           type: string
           description: "Telegram chat ID"
+        topicId:
+          type: string
+          description: "Optional Telegram topic ID (message thread ID) for forum groups"
         messageTemplate:
           type: string
           description: "Optional Telegram message template. When omitted, Dagu sends the default notification text."
@@ -11637,9 +11266,40 @@ components:
         chatId:
           type: string
           description: "Telegram chat ID"
+        topicId:
+          type: string
+          description: "Optional Telegram topic ID (message thread ID) for forum groups"
         messageTemplate:
           type: string
           description: "Optional Telegram message template. When omitted, Dagu sends the default notification text."
+
+    NotificationTeamsTargetInput:
+      type: object
+      description: "Microsoft Teams incoming webhook target input. Values are encrypted at rest."
+      properties:
+        webhookUrl:
+          type: string
+          format: uri
+          description: "Microsoft Teams incoming webhook URL, from a Teams Workflows (Power Automate) trigger or a legacy connector. Must use HTTPS. Omit on updates to preserve the existing URL."
+        messageTemplate:
+          type: string
+          description: "Optional Teams message template. When omitted, Dagu sends the default notification text."
+
+    NotificationTeamsTarget:
+      type: object
+      description: "Public Microsoft Teams target details"
+      required:
+        - webhookUrlConfigured
+      properties:
+        webhookUrlConfigured:
+          type: boolean
+          description: "Whether a Microsoft Teams incoming webhook URL is configured"
+        webhookUrlPreview:
+          type: string
+          description: "Redacted Microsoft Teams webhook URL preview"
+        messageTemplate:
+          type: string
+          description: "Optional Teams message template. When omitted, Dagu sends the default notification text."
 
     NotificationTargetInput:
       type: object
@@ -11672,6 +11332,8 @@ components:
           $ref: "#/components/schemas/NotificationSlackTargetInput"
         telegram:
           $ref: "#/components/schemas/NotificationTelegramTargetInput"
+        teams:
+          $ref: "#/components/schemas/NotificationTeamsTargetInput"
 
     NotificationTarget:
       type: object
@@ -11705,6 +11367,8 @@ components:
           $ref: "#/components/schemas/NotificationSlackTarget"
         telegram:
           $ref: "#/components/schemas/NotificationTelegramTarget"
+        teams:
+          $ref: "#/components/schemas/NotificationTeamsTarget"
 
     NotificationChannelInput:
       type: object
@@ -11730,6 +11394,8 @@ components:
           $ref: "#/components/schemas/NotificationSlackTargetInput"
         telegram:
           $ref: "#/components/schemas/NotificationTelegramTargetInput"
+        teams:
+          $ref: "#/components/schemas/NotificationTeamsTargetInput"
 
     NotificationChannel:
       type: object
@@ -11761,6 +11427,8 @@ components:
           $ref: "#/components/schemas/NotificationSlackTarget"
         telegram:
           $ref: "#/components/schemas/NotificationTelegramTarget"
+        teams:
+          $ref: "#/components/schemas/NotificationTeamsTarget"
         createdAt:
           type: string
           format: date-time
@@ -12418,9 +12086,6 @@ components:
         fileName:
           type: string
           description: "File ID of the DAG file"
-        filePath:
-          type: string
-          description: "Absolute file path of the DAG file on disk"
         dag:
           $ref: "#/components/schemas/DAG"
         latestDAGRun:
@@ -12521,6 +12186,9 @@ components:
           type: string
           format: date-time
           description: "RFC 3339 timestamp with explicit offset for one-off schedules"
+        profile:
+          $ref: "#/components/schemas/RuntimeProfileName"
+          description: "Runtime profile name that activates this schedule entry"
 
     Status:
       type: integer
@@ -12544,7 +12212,7 @@ components:
         4: "Success"
         5: "Queued"
         6: "Partial Success"
-        7: "Waiting for approval"
+        7: "Waiting for manual action"
         8: "Rejected"
 
     StatusLabel:
@@ -12596,7 +12264,7 @@ components:
         4: "Success"
         5: "Skipped"
         6: "Partial Success"
-        7: "Waiting for approval"
+        7: "Waiting for manual action"
         8: "Rejected"
         9: "Retrying"
 
@@ -12737,6 +12405,15 @@ components:
       type: object
       description: "Detailed DAG configuration information"
       properties:
+        type:
+          type: string
+          enum: [graph, chain, agent, build]
+          description: "Execution type. 'graph' resolves dependencies, 'chain' runs steps in order, 'agent' lets an LLM choose each step, and 'build' adds file-derived dependencies and materialization reuse."
+        tasks:
+          type: array
+          description: "Goals an agent DAG must satisfy. Present only for type agent."
+          items:
+            $ref: "#/components/schemas/AgentTask"
         nextRun:
           type: string
           format: date-time
@@ -12855,6 +12532,16 @@ components:
             - self_reference
             - namespace_unavailable
             - unknown_context_field
+            - unknown_env_binding
+            - unknown_const_name
+        class:
+          type: string
+          description: >-
+            Whether the reference is a defect in the spec or its availability
+            depends on runtime values or lifecycle scope.
+          enum:
+            - defect
+            - runtime_only
       required:
         - message
 
@@ -13052,6 +12739,34 @@ components:
         exit:
           $ref: "#/components/schemas/Step"
 
+    DAGRunCondition:
+      type: object
+      description: "Type-keyed current-state runtime condition for a DAG-run. Each condition is the latest observation for its type, not a historical event."
+      properties:
+        type:
+          type: string
+          description: "Condition type"
+        status:
+          type: string
+          enum: ["True", "False", "Unknown"]
+          description: "Observed status of the condition"
+        reason:
+          type: string
+          description: "Machine-readable reason for the condition status"
+        message:
+          type: string
+          description: "Human-readable detail for the condition status"
+        checkedAt:
+          type: string
+          format: date-time
+          description: "RFC 3339 timestamp when the condition was observed"
+      required:
+        - type
+        - status
+        - reason
+        - message
+        - checkedAt
+
     DAGRunSummary:
       type: object
       description: "Current status of a DAG-run"
@@ -13089,6 +12804,9 @@ components:
         artifactsAvailable:
           type: boolean
           description: "Whether artifact files are available for this DAG-run"
+        noReuse:
+          type: boolean
+          description: "Whether reuse of prior build materializations was disabled for this DAG-run"
         params:
           type: string
           description: "Runtime parameters passed to the DAG-run in JSON format"
@@ -13100,6 +12818,14 @@ components:
           description: "ID of the worker that executed this DAG-run ('local' for local execution)"
         triggerType:
           $ref: "#/components/schemas/TriggerType"
+        triggerActor:
+          type: string
+          description: "Authenticated actor that initiated the DAG-run, when attribution is available"
+        conditions:
+          type: array
+          description: "Type-keyed current-state runtime conditions for the DAG-run. This list reports the latest condition for each type, not a history of queued reasons."
+          items:
+            $ref: "#/components/schemas/DAGRunCondition"
         labels:
           type: array
           items:
@@ -13151,6 +12877,8 @@ components:
               description: "Status of individual steps within the DAG-run"
               items:
                 $ref: "#/components/schemas/Node"
+            onInit:
+              $ref: "#/components/schemas/Node"
             onExit:
               $ref: "#/components/schemas/Node"
             onSuccess:
@@ -13159,17 +12887,32 @@ components:
               $ref: "#/components/schemas/Node"
             onAbort:
               $ref: "#/components/schemas/Node"
+            onWait:
+              $ref: "#/components/schemas/Node"
             preconditions:
               type: array
               description: "List of preconditions that must be met before the DAG-run can start"
               items:
                 $ref: "#/components/schemas/Condition"
+            agentTasks:
+              type: array
+              description: "Goal progress of an agent DAG-run. Absent for other DAG types."
+              items:
+                $ref: "#/components/schemas/AgentTask"
+            agentEvents:
+              type: array
+              description: "Ordered decision timeline of an agent DAG-run: what the agent ran, in what order, and when each task was satisfied. Absent for other DAG types."
+              items:
+                $ref: "#/components/schemas/AgentEvent"
             specFromFile:
               type: boolean
               description: "Whether this DAG-run still has a usable source file on disk, so reschedule can load the current spec from that file instead of the stored historical YAML snapshot."
             sourceFileName:
               $ref: "#/components/schemas/DAGFileName"
               description: "File name of the source DAG definition, derived from the DAG-run's source file path. Only set when the source file still exists on disk. Can be used to navigate to the DAG definition page."
+            humanTaskResumePending:
+              type: boolean
+              description: "Whether completed human-task input is durable but the same DAG-run still needs its retry queued"
           required:
             - rootDAGRunName
             - rootDAGRunId
@@ -13313,6 +13056,104 @@ components:
           type: string
           description: "JSON-serialized parameters passed to the DAG"
 
+    AgentEvent:
+      type: object
+      description: "One entry on an agent DAG-run's decision timeline"
+      required:
+        - turn
+        - kind
+      properties:
+        turn:
+          type: integer
+          description: "Agent turn this event belongs to, starting at 1"
+        kind:
+          type: string
+          enum: [action, task_status, ask_user, rejected, stalled]
+          description: "What the agent did on this turn"
+        name:
+          type: string
+          description: "Step or task the event concerns"
+        status:
+          type: string
+          description: "Resulting step status for an action event, or the new task status for a task_status event"
+        attempt:
+          type: integer
+          description: "Which run of this step it was, starting at 1"
+        reason:
+          type: string
+          description: "Agent's justification, or why the call was rejected"
+        startedAt:
+          type: string
+          description: "RFC3339 timestamp when the step started"
+        finishedAt:
+          type: string
+          description: "RFC3339 timestamp when the step finished"
+        childDagRunId:
+          type: string
+          description: "Child DAG-run this action produced, for linking to its run page. Absent for steps that run no child DAG."
+        childDagName:
+          type: string
+          description: "Name of the child DAG that ran"
+
+    AgentTask:
+      type: object
+      description: "A goal an agent DAG must satisfy before the run concludes"
+      required:
+        - name
+        - status
+      properties:
+        name:
+          type: string
+          description: "Unique task name"
+        description:
+          type: string
+          description: "Completion criteria the agent decides against"
+        status:
+          type: string
+          enum: [open, completed, skipped, failed]
+          description: "Where the task stands. The run ends once none is open, and fails if any is failed. A skipped task does not fail the run."
+        reason:
+          type: string
+          description: "Justification the agent gave for the current status"
+
+    BuildProducer:
+      type: object
+      description: "DAG-run that produced a reused materialization"
+      properties:
+        name:
+          type: string
+        id:
+          type: string
+
+    BuildExecution:
+      type: object
+      description: "Build execution decision and its explanation"
+      properties:
+        decision:
+          type: string
+          enum: [none, always, execute, reuse, deferred]
+        phase:
+          type: string
+          enum: [precondition, evaluate, execute, verify, commit, complete]
+        reason:
+          type: string
+          description: "Stable machine-readable reason for the decision"
+        detail:
+          type: string
+          description: "Human-readable explanation of the decision"
+        fingerprint:
+          type: string
+        materializationKey:
+          type: string
+        producerRun:
+          $ref: "#/components/schemas/BuildProducer"
+        producerAttemptId:
+          type: string
+      required:
+        - decision
+        - phase
+        - reason
+
     Node:
       type: object
       description: "Status of an individual step within a DAG-run"
@@ -13354,12 +13195,23 @@ components:
         error:
           type: string
           description: "Error message if the step failed"
+        build:
+          $ref: "#/components/schemas/BuildExecution"
+        humanTaskCompletedBy:
+          type: string
+          description: "Name of the subject that completed the human task"
+        humanTaskCompletedById:
+          type: string
+          description: "ID of the subject that completed the human task; local CLI IDs use the os:<uid> form"
         approvedAt:
           type: string
           description: "RFC3339 timestamp when the step was approved"
         approvedBy:
           type: string
           description: "Username of who approved the step"
+        approvedById:
+          type: string
+          description: "ID of the subject that approved the step"
         approvalInputs:
           type: object
           additionalProperties:
@@ -13371,6 +13223,9 @@ components:
         rejectedBy:
           type: string
           description: "Username of who rejected the step"
+        rejectedById:
+          type: string
+          description: "ID of the subject that rejected the step"
         rejectionReason:
           type: string
           description: "Optional reason for rejection"
@@ -13387,6 +13242,8 @@ components:
           description: "Chronological push-back history for this step"
           items:
             $ref: "#/components/schemas/PushBackHistoryEntry"
+        agentSession:
+          $ref: "#/components/schemas/AgentSession"
       required:
         - step
         - stdout
@@ -13397,6 +13254,176 @@ components:
         - statusLabel
         - retryCount
         - doneCount
+
+    AgentSession:
+      type: object
+      description: "Durable state for a managed coding-agent session"
+      properties:
+        provider:
+          type: string
+        providerVersion:
+          type: string
+        sessionId:
+          type: string
+        generation:
+          type: integer
+        agent:
+          type: string
+        model:
+          type: string
+        variant:
+          type: string
+        state:
+          $ref: "#/components/schemas/AgentSessionState"
+        lastError:
+          type: string
+        usage:
+          $ref: "#/components/schemas/AgentUsage"
+        interactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentInteraction"
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentSessionEvent"
+      required:
+        - provider
+        - state
+
+    AgentSessionState:
+      type: string
+      enum:
+        - starting
+        - running
+        - waiting
+        - succeeded
+        - failed
+        - aborted
+        - unavailable
+
+    AgentUsage:
+      type: object
+      properties:
+        inputTokens:
+          type: integer
+          format: int64
+        outputTokens:
+          type: integer
+          format: int64
+        reasoningTokens:
+          type: integer
+          format: int64
+        totalTokens:
+          type: integer
+          format: int64
+        cost:
+          type: number
+          format: double
+
+    AgentInteraction:
+      type: object
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [permission, question]
+        status:
+          type: string
+          enum: [pending, answered, rejected]
+        permission:
+          type: string
+        patterns:
+          type: array
+          items:
+            type: string
+        allowForSessionPatterns:
+          type: array
+          items:
+            type: string
+        questions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentQuestion"
+        decision:
+          type: string
+        answers:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+        createdAt:
+          type: string
+        respondedAt:
+          type: string
+        respondedBy:
+          type: string
+        respondedById:
+          type: string
+      required:
+        - id
+        - kind
+        - status
+
+    AgentQuestion:
+      type: object
+      properties:
+        header:
+          type: string
+        question:
+          type: string
+        options:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentQuestionOption"
+        multiple:
+          type: boolean
+        custom:
+          type: boolean
+      required:
+        - header
+        - question
+
+    AgentQuestionOption:
+      type: object
+      properties:
+        label:
+          type: string
+        description:
+          type: string
+      required:
+        - label
+
+    AgentSessionEvent:
+      type: object
+      properties:
+        sequence:
+          type: integer
+          format: int64
+        id:
+          type: string
+        type:
+          type: string
+        timestamp:
+          type: string
+        role:
+          type: string
+        content:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+        files:
+          type: array
+          items:
+            type: string
+      required:
+        - sequence
+        - id
+        - type
 
     PushBackHistoryEntry:
       type: object
@@ -13409,6 +13436,9 @@ components:
         by:
           type: string
           description: "Authenticated user who pushed the step back"
+        byId:
+          type: string
+          description: "ID of the subject that pushed the step back"
         at:
           type: string
           format: date-time
@@ -13466,8 +13496,12 @@ components:
 
     StepOutputDeclaration:
       type: object
-      description: "One file-based step output declaration published through DAGU_OUTPUT_FILE"
+      description: "One named value output or build file output"
       additionalProperties: false
+      not:
+        required:
+          - type
+          - path
       required:
         - name
       properties:
@@ -13481,12 +13515,31 @@ components:
             - string
             - json
           description: "Output value type. JSON outputs must contain valid JSON text."
+        path:
+          type: string
+          description: "Regular-file path published atomically by a build step"
+
+    StepInputDeclaration:
+      type: object
+      description: "One named regular-file input for build execution"
+      additionalProperties: false
+      required:
+        - name
+        - path
+      properties:
+        name:
+          type: string
+          pattern: "^[A-Za-z][A-Za-z0-9_]*$"
+        path:
+          type: string
 
     Step:
       type: object
       description: "Individual task definition that performs a specific operation in a DAG-run"
       x-dagu-required-with:
         outputs:
+          - id
+        inputs:
           - id
       properties:
         name:
@@ -13521,9 +13574,21 @@ components:
         outputs:
           type: array
           minItems: 1
-          description: "Declared file-based step outputs published through DAGU_OUTPUT_FILE for ${steps.<id>.outputs.<name>} references. Steps that declare outputs must also define id."
+          description: "Declared named outputs. Value outputs are published through DAGU_OUTPUT_FILE; path outputs publish a verified materialized file. Steps that declare outputs must also define id."
           items:
             $ref: "#/components/schemas/StepOutputDeclaration"
+        inputs:
+          type: array
+          minItems: 1
+          description: "Named regular-file inputs used for build fingerprints and inferred dependencies. Steps that declare inputs must also define id."
+          items:
+            $ref: "#/components/schemas/StepInputDeclaration"
+        dependencies:
+          type: array
+          minItems: 1
+          description: "Files, directories, or glob patterns relative to the DAG working directory to snapshot for local or distributed execution"
+          items:
+            type: string
         call:
           type: string
           description: "The name of the DAG to execute as a sub DAG-run"
@@ -13608,6 +13673,8 @@ components:
                     description: "Step names to route to"
         approval:
           $ref: "#/components/schemas/ApprovalConfig"
+        humanTask:
+          $ref: "#/components/schemas/HumanTaskConfig"
       required:
         - name
 
@@ -13676,9 +13743,9 @@ components:
         - results
         - hasMore
 
-    DocSearchPageItem:
+    WikiPageSearchPageItem:
       type: object
-      description: "Lightweight cursor-based search result item for a document"
+      description: "Lightweight cursor-based search result item for a Wiki page"
       properties:
         id:
           type: string
@@ -13686,16 +13753,25 @@ components:
           type: string
         description:
           type: string
-          description: "Short document description from YAML frontmatter"
+          description: "Short Wiki page description from YAML frontmatter"
+        tags:
+          type: array
+          items:
+            type: string
+          description: "Wiki page tags from YAML frontmatter"
         workspace:
           type: string
-          description: "Workspace that owns this document. Omitted for default documents."
+          description: "Workspace that owns this Wiki page. Omitted for default Wiki pages."
+        modifiedAt:
+          type: string
+          format: date-time
+          description: "Last modification time of the Wiki page file"
         hasMoreMatches:
           type: boolean
           description: "Whether additional snippets are available beyond the preview"
         nextMatchesCursor:
           type: string
-          description: "Opaque cursor for loading more snippets for this document result"
+          description: "Opaque cursor for loading more snippets for this Wiki page result"
         matches:
           type: array
           description: "Preview snippets for the result"
@@ -13708,14 +13784,14 @@ components:
         - hasMoreMatches
         - matches
 
-    DocSearchFeedResponse:
+    WikiPageSearchFeedResponse:
       type: object
-      description: "Cursor-based document search results"
+      description: "Cursor-based Wiki page search results"
       properties:
         results:
           type: array
           items:
-            $ref: "#/components/schemas/DocSearchPageItem"
+            $ref: "#/components/schemas/WikiPageSearchPageItem"
         hasMore:
           type: boolean
         nextCursor:
@@ -13758,6 +13834,315 @@ components:
         - matches
         - hasMore
 
+    WikiPageResponse:
+      type: object
+      description: "Full Wiki page with content"
+      required:
+        - id
+        - title
+        - description
+        - content
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+          description: "Short Wiki page description from YAML frontmatter"
+        tags:
+          type: array
+          items:
+            type: string
+          description: "Wiki page tags from YAML frontmatter"
+        workspace:
+          type: string
+          description: "Workspace that owns this Wiki page. Omitted for default Wiki pages."
+        content:
+          type: string
+          description: "Full file content including YAML frontmatter"
+        createdAt:
+          type: string
+          format: date-time
+          description: "RFC3339 timestamp when the Wiki page was created"
+        updatedAt:
+          type: string
+          format: date-time
+          description: "RFC3339 timestamp when the Wiki page was last updated"
+
+    WikiPageMetadataResponse:
+      type: object
+      description: "Lightweight Wiki page metadata"
+      required:
+        - id
+        - title
+        - description
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+          description: "Short Wiki page description from YAML frontmatter"
+        tags:
+          type: array
+          items:
+            type: string
+          description: "Wiki page tags from YAML frontmatter"
+        workspace:
+          type: string
+          description: "Workspace that owns this Wiki page. Omitted for default Wiki pages."
+        modifiedAt:
+          type: string
+          format: date-time
+          description: "Last modification time of the Wiki page file"
+
+    WikiPageTreeNodeResponse:
+      type: object
+      description: "A file or directory node in the Wiki page tree"
+      required:
+        - id
+        - name
+        - type
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        title:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+          description: "Wiki page tags from YAML frontmatter. Only present on file nodes."
+        workspace:
+          type: string
+          description: "Workspace that owns this node. Omitted for default nodes."
+        type:
+          type: string
+          enum:
+            - file
+            - directory
+        children:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiPageTreeNodeResponse"
+        modifiedAt:
+          type: string
+          format: date-time
+          description: "Last modification time. For files: file mtime. For directories: most recent descendant mtime."
+
+    WikiPageListResponse:
+      type: object
+      description: "Paginated Wiki page list (tree or flat)"
+      required:
+        - pagination
+      properties:
+        tree:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiPageTreeNodeResponse"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiPageMetadataResponse"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    WikiPageSearchResultItem:
+      type: object
+      description: "A search result for a single Wiki page"
+      required:
+        - id
+        - title
+        - description
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+          description: "Short Wiki page description from YAML frontmatter"
+        tags:
+          type: array
+          items:
+            type: string
+          description: "Wiki page tags from YAML frontmatter"
+        workspace:
+          type: string
+          description: "Workspace that owns this Wiki page. Omitted for default Wiki pages."
+        modifiedAt:
+          type: string
+          format: date-time
+          description: "Last modification time of the Wiki page file"
+        matchCount:
+          type: integer
+          description: "Total number of query matches in the Wiki page"
+        matches:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchMatchItem"
+
+    WikiPageSearchResponse:
+      type: object
+      description: "Search results"
+      required:
+        - results
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiPageSearchResultItem"
+
+    WikiPageBacklinksResponse:
+      type: object
+      description: "Wiki pages linking to a wiki-link target"
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiPageMetadataResponse"
+
+    WikiPageRevisionResponse:
+      type: object
+      description: "A stored prior version of a Wiki page"
+      required:
+        - rev
+        - savedAt
+        - size
+      properties:
+        rev:
+          type: string
+          description: "Opaque revision identifier"
+        savedAt:
+          type: string
+          format: date-time
+          description: "When the revision was stored"
+        size:
+          type: integer
+          format: int64
+          description: "Revision content size in bytes"
+        content:
+          type: string
+          description: "Revision content. Present only when fetching a single revision."
+
+    WikiPageRevisionsResponse:
+      type: object
+      description: "Stored revisions of a Wiki page, newest first"
+      required:
+        - revisions
+      properties:
+        revisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiPageRevisionResponse"
+
+    WikiPageAttachmentResponse:
+      type: object
+      description: "A stored Wiki page attachment"
+      required:
+        - name
+        - size
+      properties:
+        name:
+          type: string
+          description: "Attachment file name"
+        size:
+          type: integer
+          format: int64
+          description: "Attachment size in bytes"
+
+    WikiPagePath:
+      type: string
+      minLength: 1
+      maxLength: 256
+      description: "Relative Wiki page path without extension, for example runbooks/deploy-guide. Must not start with / or contain .."
+      pattern: '^[A-Za-z0-9_][A-Za-z0-9_. -]*(/[A-Za-z0-9_][A-Za-z0-9_. -]*)*$'
+
+    CreateWikiPageRequest:
+      type: object
+      required:
+        - id
+        - content
+      description: "Request to create a new Wiki page"
+      properties:
+        id:
+          $ref: "#/components/schemas/WikiPagePath"
+        content:
+          type: string
+          description: "Full file content including optional YAML frontmatter"
+
+    UpdateWikiPageRequest:
+      type: object
+      required:
+        - content
+      description: "Request to update Wiki page content"
+      properties:
+        content:
+          type: string
+          description: "Full file content including optional YAML frontmatter"
+
+    RenameWikiPageRequest:
+      type: object
+      required:
+        - newPath
+      description: "Request to rename/move a Wiki page or directory"
+      properties:
+        newPath:
+          $ref: "#/components/schemas/WikiPagePath"
+
+    WikiPageDeleteBatchRequest:
+      type: object
+      required:
+        - paths
+      description: "Request to delete multiple Wiki pages or directories"
+      properties:
+        paths:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/WikiPagePath"
+          description: "Wiki page or directory paths to delete (max 100)"
+
+    WikiPageDeleteBatchResponse:
+      type: object
+      required:
+        - deleted
+        - failed
+        - message
+      properties:
+        deleted:
+          type: array
+          items:
+            type: string
+          description: "Successfully deleted paths"
+        failed:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiPageDeleteBatchFailedItem"
+          description: "Paths that failed to delete with error details"
+        message:
+          type: string
+          description: "Human-readable summary"
+
+    WikiPageDeleteBatchFailedItem:
+      type: object
+      required:
+        - path
+        - error
+      properties:
+        path:
+          type: string
+        error:
+          type: string
+
     Log:
       type: object
       description: "Log information for the execution"
@@ -13799,13 +14184,20 @@ components:
     Condition:
       type: object
       description: "Precondition that must be satisfied before running a step or DAG-run"
+      not:
+        required:
+          - condition
+          - eval
       properties:
         condition:
           type: string
-          description: "Expression or check to evaluate. When `expected` is omitted, the value runs as a command check using the same variable expansion rules as shell `command` steps."
+          description: "Value or command text to evaluate. When `expected` is omitted, this runs as a command check. When `expected` is set, this is value-resolved and compared as data."
+        eval:
+          type: string
+          description: "Dynamic value expression to evaluate and compare with `expected`. Valid only when `expected` is set and `condition` is omitted."
         expected:
           type: string
-          description: "Expected result of the condition evaluation. When set, Dagu compares the evaluated string output instead of using command exit status."
+          description: "Expected result for a value-match precondition. When set, Dagu compares the actual value from `condition` or `eval` instead of using command exit status."
         negate:
           type: boolean
           description: "If true, inverts the condition result (run when condition does NOT match)"
@@ -13815,9 +14207,6 @@ components:
         matched:
           type: boolean
           description: "Whether the condition was met"
-      required:
-        - condition
-
     RepeatMode:
       type: string
       description: "Repeat execution mode for steps"
@@ -14025,8 +14414,11 @@ components:
           minimum: 0
         queuedCount:
           type: integer
-          description: "Number of queued DAG-runs waiting to execute"
+          description: "Number of queued DAG-runs waiting to execute. When queuedCountCapped is true this is a lower bound, not an exact total."
           minimum: 0
+        queuedCountCapped:
+          type: boolean
+          description: "True when counting stopped at the server-side scan cap, so queuedCount is a lower bound rather than an exact total"
         running:
           type: array
           description: "List of currently running DAG-runs (bounded by maxConcurrency)"
@@ -14068,8 +14460,11 @@ components:
           minimum: 0
         totalQueued:
           type: integer
-          description: "Total DAG-runs waiting in queues"
+          description: "Total DAG-runs waiting in queues. When totalQueuedCapped is true this is a lower bound, not an exact total."
           minimum: 0
+        totalQueuedCapped:
+          type: boolean
+          description: "True when at least one queue's count reached the server-side scan cap, so totalQueued is a lower bound"
         totalCapacity:
           type: integer
           description: "Sum of all queue maxConcurrency values"
@@ -14146,6 +14541,14 @@ components:
         - developer
         - operator
         - viewer
+
+    UserAuthProvider:
+      type: string
+      description: "Authentication provider for a user account"
+      enum:
+        - builtin
+        - oidc
+        - proxy
 
     WorkspaceName:
       type: string
@@ -14237,6 +14640,54 @@ components:
         - expiresAt
         - user
 
+    LicenseStatusResponse:
+      type: object
+      description: "Public status of the current Dagu license"
+      properties:
+        valid:
+          type: boolean
+          description: "Whether the loaded license token has not expired"
+        plan:
+          type: string
+          description: "License plan name"
+        expiry:
+          type: string
+          description: "License expiration timestamp, or empty for a perpetual or absent license"
+        features:
+          type: array
+          items:
+            type: string
+          description: "Feature claims included in the license"
+        gracePeriod:
+          type: boolean
+          description: "Whether the license is expired but still inside its grace period"
+        graceEndsAt:
+          type: string
+          description: "Grace-period end timestamp, or empty when the license has no expiration"
+        community:
+          type: boolean
+          description: "Whether no license claims are loaded"
+        source:
+          type: string
+          description: "Public license source category"
+        warningCode:
+          type: string
+          description: "Warning code included in the license token"
+        error:
+          type: string
+          description: "User-facing explanation when a configured license is unusable"
+      required:
+        - valid
+        - plan
+        - expiry
+        - features
+        - gracePeriod
+        - graceEndsAt
+        - community
+        - source
+        - warningCode
+        - error
+
     ChangePasswordRequest:
       type: object
       description: "Request body for changing password"
@@ -14318,9 +14769,7 @@ components:
         workspaceAccess:
           $ref: "#/components/schemas/WorkspaceAccess"
         authProvider:
-          type: string
-          enum: [builtin, oidc]
-          description: "Authentication provider (builtin or oidc)"
+          $ref: "#/components/schemas/UserAuthProvider"
         isDisabled:
           type: boolean
           description: "Whether the user account is disabled"
@@ -14357,8 +14806,25 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/User"
+        oidcWorkspaceAccessSyncEnabled:
+          type: boolean
+          description: "Whether OIDC workspace access is synchronized by this node"
+        managedRoleProviders:
+          type: array
+          description: "Authentication providers that synchronize user roles at login on this node"
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/UserAuthProvider"
+        managedWorkspaceAccessProviders:
+          type: array
+          description: "Authentication providers that synchronize workspace access at login on this node"
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/UserAuthProvider"
       required:
         - users
+        - managedRoleProviders
+        - managedWorkspaceAccessProviders
 
     APIKey:
       type: object
@@ -14558,7 +15024,7 @@ components:
     # Git Sync schemas
     SyncStatus:
       type: string
-      description: "Sync status of a DAG"
+      description: "Sync status of an item"
       enum:
         - synced
         - modified
@@ -14581,11 +15047,9 @@ components:
       description: "Type of sync item"
       enum:
         - dag
-        - config
-        - memory
-        - skill
-        - soul
         - doc
+        - doc-asset
+        - file
 
     SyncItem:
       type: object
@@ -14593,7 +15057,7 @@ components:
       properties:
         itemId:
           type: string
-          description: "Stable item identifier (file path without extension)"
+          description: "Stable sync item identifier. Supporting file IDs include their extension."
         filePath:
           type: string
           description: "Relative file path with extension"
@@ -14613,11 +15077,11 @@ components:
         lastSyncedAt:
           type: string
           format: date-time
-          description: "When the DAG was last synced"
+          description: "When the item was last synced"
         modifiedAt:
           type: string
           format: date-time
-          description: "When the DAG was last modified locally"
+          description: "When the item was last modified locally"
         localHash:
           type: string
           description: "Current local content hash"
@@ -14650,7 +15114,7 @@ components:
 
     SyncStatusCounts:
       type: object
-      description: "Counts of DAGs in each sync status"
+      description: "Counts of items in each sync status"
       properties:
         synced:
           type: integer
@@ -14727,18 +15191,31 @@ components:
       properties:
         itemId:
           type: string
-          description: "The item identifier"
+          description: "The sync item identifier"
         filePath:
           type: string
           description: "Relative file path with extension"
         status:
           $ref: "#/components/schemas/SyncStatus"
+        kind:
+          $ref: "#/components/schemas/SyncItemKind"
+        binary:
+          type: boolean
+          description: "True for binary items; content fields are omitted and sizes are reported instead"
         localContent:
           type: string
-          description: "Current local file content"
+          description: "Current local file content. Omitted for binary items."
         remoteContent:
           type: string
-          description: "Content from remote repository"
+          description: "Content from remote repository. Omitted for binary items."
+        localSize:
+          type: integer
+          format: int64
+          description: "Local file size in bytes. Only set for binary items."
+        remoteSize:
+          type: integer
+          format: int64
+          description: "Remote file size in bytes. Only set for binary items."
         remoteCommit:
           type: string
           description: "Commit hash being compared against"
@@ -14748,11 +15225,19 @@ components:
         remoteMessage:
           type: string
           description: "Commit message of the remote version"
+        remoteDeleted:
+          type: boolean
+          description: "Whether the remote file was deleted"
+        localExecutable:
+          type: boolean
+          description: "Whether the local supporting file is executable"
+        remoteExecutable:
+          type: boolean
+          description: "Whether the remote supporting file is executable"
       required:
         - itemId
         - filePath
         - status
-        - localContent
 
     SyncResultResponse:
       type: object
@@ -14766,17 +15251,22 @@ components:
           type: array
           items:
             type: string
-          description: "DAG IDs that were synced"
+          description: "Sync item IDs that were synced"
+        deleted:
+          type: array
+          items:
+            type: string
+          description: "Sync item IDs deleted locally after remote deletion"
         modified:
           type: array
           items:
             type: string
-          description: "DAG IDs that were modified"
+          description: "Sync item IDs that were modified"
         conflicts:
           type: array
           items:
             type: string
-          description: "DAG IDs with conflicts"
+          description: "Sync item IDs with conflicts"
         errors:
           type: array
           items:
@@ -14790,7 +15280,7 @@ components:
 
     SyncPublishRequest:
       type: object
-      description: "Request to publish a DAG"
+      description: "Request to publish a sync item"
       properties:
         message:
           type: string
@@ -14802,7 +15292,7 @@ components:
 
     SyncPublishAllRequest:
       type: object
-      description: "Request to publish selected items"
+      description: "Request to publish selected sync items"
       properties:
         message:
           type: string
@@ -14811,11 +15301,11 @@ components:
           type: array
           items:
             type: string
-          description: "Item IDs to publish. If omitted, all modified or untracked items are published."
+          description: "Sync item IDs to publish. If omitted, all modified or untracked items are published."
 
     SyncDeleteBatchRequest:
       type: object
-      description: "Request to delete selected items"
+      description: "Request to delete selected sync items"
       properties:
         itemIds:
           type: array
@@ -14824,7 +15314,7 @@ components:
           items:
             type: string
             minLength: 1
-          description: "Item IDs to delete"
+          description: "Sync item IDs to delete"
         message:
           type: string
           description: "Commit message for the deletion"
@@ -14952,1177 +15442,6 @@ components:
           type: boolean
         commit:
           $ref: "#/components/schemas/SyncCommitConfig"
-
-    AgentConfigResponse:
-      type: object
-      description: "AI Agent configuration"
-      properties:
-        enabled:
-          type: boolean
-          description: "Whether the AI agent is enabled"
-        defaultModelId:
-          type: string
-          description: "ID of the default model"
-        toolPolicy:
-          $ref: "#/components/schemas/AgentToolPolicy"
-        selectedSoulId:
-          type: string
-          nullable: true
-          description: "ID of the currently selected soul"
-        webSearch:
-          $ref: "#/components/schemas/AgentWebSearchConfig"
-        webTools:
-          $ref: "#/components/schemas/AgentWebToolsConfig"
-
-    UpdateAgentConfigRequest:
-      type: object
-      description: "Request to update AI agent configuration"
-      properties:
-        enabled:
-          type: boolean
-          description: "Whether the AI agent is enabled"
-        defaultModelId:
-          type: string
-          description: "ID of the default model"
-        toolPolicy:
-          $ref: "#/components/schemas/AgentToolPolicy"
-        selectedSoulId:
-          type: string
-          nullable: true
-          description: "ID of the soul to select"
-        webSearch:
-          $ref: "#/components/schemas/AgentWebSearchConfig"
-        webTools:
-          $ref: "#/components/schemas/AgentWebToolsConfig"
-
-    AgentToolPolicy:
-      type: object
-      description: "Global tool permission policy for AI agent sessions"
-      properties:
-        tools:
-          type: object
-          description: "Per-tool enable/disable map"
-          additionalProperties:
-            type: boolean
-        bash:
-          $ref: "#/components/schemas/AgentBashPolicy"
-
-    AgentBashPolicy:
-      type: object
-      description: "Granular command policy for the bash tool"
-      properties:
-        rules:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentBashRule"
-        defaultBehavior:
-          type: string
-          enum: [allow, deny]
-          description: "Behavior when no rule matches a command segment"
-        denyBehavior:
-          type: string
-          enum: [ask_user, block]
-          description: "Behavior when a command segment is denied"
-
-    AgentBashRule:
-      type: object
-      required:
-        - pattern
-        - action
-      properties:
-        name:
-          type: string
-        pattern:
-          type: string
-          description: "Regex pattern matched against each shell command segment"
-        action:
-          type: string
-          enum: [allow, deny]
-        enabled:
-          type: boolean
-          description: "Rule enabled state (default: true when omitted)"
-
-    AgentWebSearchConfig:
-      type: object
-      description: "Provider-native web search configuration for agent sessions"
-      properties:
-        enabled:
-          type: boolean
-          description: "Whether provider-native web search is enabled"
-        maxUses:
-          type: integer
-          minimum: 1
-          description: "Maximum number of search invocations per request"
-
-    AgentWebToolsBackend:
-      type: string
-      enum: [tavily, firecrawl]
-      description: "Backend provider for agent web tools"
-
-    AgentWebToolsConfig:
-      type: object
-      description: "First-class web_search and web_extract tool configuration"
-      properties:
-        enabled:
-          type: boolean
-          description: "Whether provider-backed web tools are enabled"
-        backend:
-          $ref: "#/components/schemas/AgentWebToolsBackend"
-        tavily:
-          $ref: "#/components/schemas/AgentTavilyWebToolsConfig"
-        firecrawl:
-          $ref: "#/components/schemas/AgentFirecrawlWebToolsConfig"
-
-    AgentTavilyWebToolsConfig:
-      type: object
-      description: "Tavily web tool settings"
-      properties:
-        apiKey:
-          type: string
-          writeOnly: true
-          description: "Tavily API key. Write-only; omitted from responses."
-        clearApiKey:
-          type: boolean
-          writeOnly: true
-          description: "Clear the stored Tavily API key when true"
-        apiKeyConfigured:
-          type: boolean
-          readOnly: true
-          description: "Whether a Tavily API key is stored"
-        baseUrl:
-          type: string
-          format: uri
-          description: "Optional Tavily-compatible base URL"
-        maxResults:
-          type: integer
-          minimum: 1
-          maximum: 20
-          description: "Maximum search results allowed per web_search call"
-        searchDepth:
-          type: string
-          enum: [basic, advanced, fast, ultra-fast]
-          description: "Tavily search depth"
-
-    AgentFirecrawlWebToolsConfig:
-      type: object
-      description: "Firecrawl web tool settings"
-      properties:
-        apiKey:
-          type: string
-          writeOnly: true
-          description: "Firecrawl API key. Write-only; omitted from responses."
-        clearApiKey:
-          type: boolean
-          writeOnly: true
-          description: "Clear the stored Firecrawl API key when true"
-        apiKeyConfigured:
-          type: boolean
-          readOnly: true
-          description: "Whether a Firecrawl API key is stored"
-        baseUrl:
-          type: string
-          format: uri
-          description: "Optional Firecrawl-compatible base URL"
-        maxResults:
-          type: integer
-          minimum: 1
-          maximum: 100
-          description: "Maximum search results allowed per web_search call"
-
-    ModelConfigResponse:
-      type: object
-      required:
-        - id
-        - name
-        - provider
-        - model
-      description: "Model configuration"
-      properties:
-        id:
-          type: string
-        name:
-          type: string
-        provider:
-          type: string
-          enum: [anthropic, openai, openai-codex, gemini, openrouter, local, zai, opencode]
-        model:
-          type: string
-        apiKeyConfigured:
-          type: boolean
-        baseUrl:
-          type: string
-        contextWindow:
-          type: integer
-          minimum: 0
-        maxOutputTokens:
-          type: integer
-          minimum: 0
-        inputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        outputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        supportsThinking:
-          type: boolean
-        thinkingEffort:
-          type: string
-          enum: [low, medium, high, xhigh]
-        description:
-          type: string
-
-    CreateModelConfigRequest:
-      type: object
-      required:
-        - name
-        - provider
-        - model
-      description: "Request to create a new model configuration"
-      properties:
-        id:
-          type: string
-          description: "Optional custom ID (auto-generated from name if omitted)"
-        name:
-          type: string
-        provider:
-          type: string
-          enum: [anthropic, openai, openai-codex, gemini, openrouter, local, zai, opencode]
-        model:
-          type: string
-        apiKey:
-          type: string
-          writeOnly: true
-        baseUrl:
-          type: string
-        contextWindow:
-          type: integer
-          minimum: 0
-        maxOutputTokens:
-          type: integer
-          minimum: 0
-        inputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        outputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        supportsThinking:
-          type: boolean
-        thinkingEffort:
-          type: string
-          enum: [low, medium, high, xhigh]
-        description:
-          type: string
-
-    UpdateModelConfigRequest:
-      type: object
-      description: "Request to update a model configuration"
-      properties:
-        name:
-          type: string
-        provider:
-          type: string
-          enum: [anthropic, openai, openai-codex, gemini, openrouter, local, zai, opencode]
-        model:
-          type: string
-        apiKey:
-          type: string
-          writeOnly: true
-        baseUrl:
-          type: string
-        contextWindow:
-          type: integer
-          minimum: 0
-        maxOutputTokens:
-          type: integer
-          minimum: 0
-        inputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        outputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        supportsThinking:
-          type: boolean
-        thinkingEffort:
-          type: string
-          enum: [low, medium, high, xhigh]
-        description:
-          type: string
-
-    SetDefaultModelRequest:
-      type: object
-      required:
-        - modelId
-      description: "Request to set the default model"
-      properties:
-        modelId:
-          type: string
-          description: "Model ID to set as default"
-
-    SetDefaultModelResponse:
-      type: object
-      description: "Response after setting the default model"
-      properties:
-        defaultModelId:
-          type: string
-
-    ListModelsResponse:
-      type: object
-      required:
-        - models
-      description: "List of model configurations"
-      properties:
-        models:
-          type: array
-          items:
-            $ref: "#/components/schemas/ModelConfigResponse"
-        defaultModelId:
-          type: string
-
-    AgentAuthProviderStatus:
-      type: object
-      required:
-        - id
-        - name
-        - connected
-      description: "Connection status for one subscription-backed agent auth provider"
-      properties:
-        id:
-          type: string
-        name:
-          type: string
-        connected:
-          type: boolean
-        expiresAt:
-          type: string
-          format: date-time
-        canRefresh:
-          type: boolean
-        accountId:
-          type: string
-
-    ListAgentAuthProvidersResponse:
-      type: object
-      required:
-        - providers
-      description: "List of subscription-backed auth providers"
-      properties:
-        providers:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentAuthProviderStatus"
-
-    StartAgentAuthProviderLoginResponse:
-      type: object
-      required:
-        - flowId
-        - authUrl
-      description: "Manual OAuth login flow information"
-      properties:
-        flowId:
-          type: string
-        authUrl:
-          type: string
-        instructions:
-          type: string
-
-    CompleteAgentAuthProviderLoginRequest:
-      type: object
-      required:
-        - flowId
-      anyOf:
-        - required: [redirectUrl]
-        - required: [code]
-      description: "Complete a manual OAuth login flow"
-      properties:
-        flowId:
-          type: string
-          minLength: 1
-        redirectUrl:
-          type: string
-          format: uri
-          minLength: 1
-        code:
-          type: string
-          minLength: 1
-
-    CompleteAgentAuthProviderLoginResponse:
-      type: object
-      required:
-        - provider
-      description: "Updated provider status after login completion"
-      properties:
-        provider:
-          $ref: "#/components/schemas/AgentAuthProviderStatus"
-
-    SoulResponse:
-      type: object
-      required:
-        - id
-        - name
-      description: "Soul (agent personality) configuration"
-      properties:
-        id:
-          type: string
-        name:
-          type: string
-        description:
-          type: string
-        content:
-          type: string
-          description: "Markdown body content (identity definition)"
-
-    ListSoulsResponse:
-      type: object
-      required:
-        - souls
-        - pagination
-      description: "List of souls"
-      properties:
-        souls:
-          type: array
-          items:
-            $ref: "#/components/schemas/SoulResponse"
-        pagination:
-          $ref: "#/components/schemas/Pagination"
-
-    CreateSoulRequest:
-      type: object
-      required:
-        - name
-        - content
-      description: "Request to create a new soul"
-      properties:
-        id:
-          type: string
-          description: "Optional custom ID (auto-generated from name if omitted)"
-        name:
-          type: string
-        description:
-          type: string
-        content:
-          type: string
-          description: "Markdown body content (identity definition)"
-
-    UpdateSoulRequest:
-      type: object
-      description: "Request to update a soul (partial update)"
-      properties:
-        name:
-          type: string
-        description:
-          type: string
-        content:
-          type: string
-          description: "Markdown body content (identity definition)"
-
-    DocResponse:
-      type: object
-      description: "Full document with content"
-      required:
-        - id
-        - title
-        - description
-        - content
-      properties:
-        id:
-          type: string
-        title:
-          type: string
-        description:
-          type: string
-          description: "Short document description from YAML frontmatter"
-        workspace:
-          type: string
-          description: "Workspace that owns this document. Omitted for default documents."
-        content:
-          type: string
-          description: "Full file content including YAML frontmatter"
-        filePath:
-          type: string
-          description: "Absolute file path of the document on disk"
-        createdAt:
-          type: string
-          format: date-time
-          description: "RFC3339 timestamp when the document was created"
-        updatedAt:
-          type: string
-          format: date-time
-          description: "RFC3339 timestamp when the document was last updated"
-
-    DocMetadataResponse:
-      type: object
-      description: "Lightweight document metadata"
-      required:
-        - id
-        - title
-        - description
-      properties:
-        id:
-          type: string
-        title:
-          type: string
-        description:
-          type: string
-          description: "Short document description from YAML frontmatter"
-        workspace:
-          type: string
-          description: "Workspace that owns this document. Omitted for default documents."
-        modifiedAt:
-          type: string
-          format: date-time
-          description: "Last modification time of the document file"
-
-    DocTreeNodeResponse:
-      type: object
-      description: "A file or directory node in the doc tree"
-      required:
-        - id
-        - name
-        - type
-      properties:
-        id:
-          type: string
-        name:
-          type: string
-        title:
-          type: string
-        workspace:
-          type: string
-          description: "Workspace that owns this node. Omitted for default nodes."
-        type:
-          type: string
-          enum:
-            - file
-            - directory
-        children:
-          type: array
-          items:
-            $ref: "#/components/schemas/DocTreeNodeResponse"
-        modifiedAt:
-          type: string
-          format: date-time
-          description: "Last modification time. For files: file mtime. For directories: most recent descendant mtime."
-
-    DocListResponse:
-      type: object
-      description: "Paginated document list (tree or flat)"
-      required:
-        - pagination
-      properties:
-        tree:
-          type: array
-          items:
-            $ref: "#/components/schemas/DocTreeNodeResponse"
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/DocMetadataResponse"
-        pagination:
-          $ref: "#/components/schemas/Pagination"
-
-    DocSearchResultItem:
-      type: object
-      description: "A search result for a single document"
-      required:
-        - id
-        - title
-        - description
-      properties:
-        id:
-          type: string
-        title:
-          type: string
-        description:
-          type: string
-          description: "Short document description from YAML frontmatter"
-        workspace:
-          type: string
-          description: "Workspace that owns this document. Omitted for default documents."
-        matches:
-          type: array
-          items:
-            $ref: "#/components/schemas/SearchMatchItem"
-
-    DocSearchResponse:
-      type: object
-      description: "Search results"
-      required:
-        - results
-      properties:
-        results:
-          type: array
-          items:
-            $ref: "#/components/schemas/DocSearchResultItem"
-
-    DocPath:
-      type: string
-      minLength: 1
-      maxLength: 500
-      description: "Relative document path (without extension), e.g. runbooks/deploy-guide. Must not start with / or contain .."
-      pattern: '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
-
-    CreateDocRequest:
-      type: object
-      required:
-        - id
-        - content
-      description: "Request to create a new document"
-      properties:
-        id:
-          $ref: "#/components/schemas/DocPath"
-        content:
-          type: string
-          description: "Full file content including optional YAML frontmatter"
-
-    UpdateDocRequest:
-      type: object
-      required:
-        - content
-      description: "Request to update document content"
-      properties:
-        content:
-          type: string
-          description: "Full file content including optional YAML frontmatter"
-
-    RenameDocRequest:
-      type: object
-      required:
-        - newPath
-      description: "Request to rename/move a document or directory"
-      properties:
-        newPath:
-          $ref: "#/components/schemas/DocPath"
-
-    DocDeleteBatchRequest:
-      type: object
-      required:
-        - paths
-      description: "Request to delete multiple documents or directories"
-      properties:
-        paths:
-          type: array
-          minItems: 1
-          maxItems: 100
-          uniqueItems: true
-          items:
-            $ref: "#/components/schemas/DocPath"
-          description: "Document or directory paths to delete (max 100)"
-
-    DocDeleteBatchResponse:
-      type: object
-      required:
-        - deleted
-        - failed
-        - message
-      properties:
-        deleted:
-          type: array
-          items:
-            type: string
-          description: "Successfully deleted paths"
-        failed:
-          type: array
-          items:
-            $ref: "#/components/schemas/DocDeleteBatchFailedItem"
-          description: "Paths that failed to delete with error details"
-        message:
-          type: string
-          description: "Human-readable summary"
-
-    DocDeleteBatchFailedItem:
-      type: object
-      required:
-        - path
-        - error
-      properties:
-        path:
-          type: string
-        error:
-          type: string
-
-    ModelPreset:
-      type: object
-      required:
-        - name
-        - provider
-        - model
-      description: "Hardcoded model preset with metadata"
-      properties:
-        name:
-          type: string
-        provider:
-          type: string
-          enum: [anthropic, openai, openai-codex, gemini, openrouter, local, zai, opencode]
-        model:
-          type: string
-        contextWindow:
-          type: integer
-          minimum: 0
-        maxOutputTokens:
-          type: integer
-          minimum: 0
-        inputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        outputCostPer1M:
-          type: number
-          format: double
-          minimum: 0
-        supportsThinking:
-          type: boolean
-        thinkingEffort:
-          type: string
-          enum: [low, medium, high, xhigh]
-        description:
-          type: string
-
-    ListModelPresetsResponse:
-      type: object
-      required:
-        - presets
-      description: "List of model presets"
-      properties:
-        presets:
-          type: array
-          items:
-            $ref: "#/components/schemas/ModelPreset"
-
-    AgentMemoryResponse:
-      type: object
-      description: "Agent memory overview"
-      properties:
-        globalMemory:
-          type: string
-          description: "Content of global MEMORY.md"
-        dagMemories:
-          type: array
-          items:
-            $ref: "#/components/schemas/DAGName"
-          description: "List of DAG names that have memory files"
-        memoryDir:
-          type: string
-          description: "Root memory directory path"
-
-    AgentDAGMemoryResponse:
-      type: object
-      required:
-        - dagName
-        - content
-      description: "DAG-specific memory content"
-      properties:
-        dagName:
-          $ref: "#/components/schemas/DAGName"
-        content:
-          type: string
-
-    UpdateAgentMemoryRequest:
-      type: object
-      required:
-        - content
-      description: "Request to update memory content"
-      properties:
-        content:
-          type: string
-          description: "New memory content (markdown)"
-
-    AgentToolInfo:
-      type: object
-      description: "Metadata for a registered agent tool"
-      required:
-        - name
-        - label
-        - description
-      properties:
-        name:
-          type: string
-        label:
-          type: string
-        description:
-          type: string
-
-    ListAgentToolsResponse:
-      type: object
-      description: "List of agent tool metadata"
-      required:
-        - tools
-      properties:
-        tools:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentToolInfo"
-
-    AgentDAGContext:
-      type: object
-      description: "DAG reference for context-aware agent responses"
-      required:
-        - dagFile
-      properties:
-        dagFile:
-          type: string
-          description: "DAG file path or name"
-          minLength: 1
-        dagRunId:
-          type: string
-          description: "Specific run ID of the DAG"
-
-    AgentChatRequest:
-      type: object
-      description: "Request to send a chat message to the agent"
-      required:
-        - message
-      properties:
-        message:
-          type: string
-          description: "User's input text"
-          minLength: 1
-        model:
-          type: string
-          description: "LLM model ID to use"
-        dagContexts:
-          type: array
-          description: "DAG references for context"
-          items:
-            $ref: "#/components/schemas/AgentDAGContext"
-        safeMode:
-          type: boolean
-          description: "Enable approval prompts for dangerous commands"
-        soulId:
-          type: string
-          description: "Soul ID to use for this session (overrides default)"
-        sessionId:
-          type: string
-          description: "Optional client-provided session ID (UUID v4) for idempotent creation. Only used by the create-session endpoint; ignored by the chat endpoint."
-
-    CreateAgentSessionResponse:
-      type: object
-      description: "Response after creating a new agent session"
-      required:
-        - sessionId
-        - status
-      properties:
-        sessionId:
-          type: string
-        status:
-          type: string
-
-    AgentSession:
-      type: object
-      description: "Agent chat session metadata"
-      required:
-        - id
-        - createdAt
-        - updatedAt
-      properties:
-        id:
-          type: string
-        userId:
-          type: string
-        dagName:
-          type: string
-        title:
-          type: string
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-        parentSessionId:
-          type: string
-        delegateTask:
-          type: string
-
-    AgentSessionState:
-      type: object
-      description: "Current processing state of an agent session"
-      required:
-        - sessionId
-        - working
-        - totalCost
-      properties:
-        sessionId:
-          type: string
-        working:
-          type: boolean
-        hasPendingPrompt:
-          type: boolean
-          description: "Whether the agent is waiting for user input"
-        model:
-          type: string
-        totalCost:
-          type: number
-          format: double
-          minimum: 0
-          description: "Total accumulated cost in USD"
-
-    AgentSessionWithState:
-      type: object
-      description: "Agent session with its current state"
-      allOf:
-        - $ref: "#/components/schemas/AgentSessionState"
-        - type: object
-          required:
-            - session
-          properties:
-            session:
-              $ref: "#/components/schemas/AgentSession"
-
-    ListAgentSessionsResponse:
-      type: object
-      description: "Paginated list of agent sessions"
-      properties:
-        sessions:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentSessionWithState"
-        pagination:
-          $ref: "#/components/schemas/Pagination"
-        nextCursor:
-          type: string
-          description: "Opaque cursor for loading the next page of older sessions"
-      required:
-        - sessions
-        - pagination
-
-    AgentToolCallFunction:
-      type: object
-      description: "Function call details in a tool call"
-      required:
-        - name
-        - arguments
-      properties:
-        name:
-          type: string
-        arguments:
-          type: string
-
-    AgentToolCall:
-      type: object
-      description: "Tool call requested by the LLM"
-      required:
-        - id
-        - type
-        - function
-      properties:
-        id:
-          type: string
-        type:
-          type: string
-        function:
-          $ref: "#/components/schemas/AgentToolCallFunction"
-
-    AgentToolResult:
-      type: object
-      description: "Result from a tool execution"
-      required:
-        - toolCallId
-        - content
-      properties:
-        toolCallId:
-          type: string
-        content:
-          type: string
-        isError:
-          type: boolean
-
-    AgentTokenUsage:
-      type: object
-      description: "Token usage statistics from LLM"
-      properties:
-        promptTokens:
-          type: integer
-          minimum: 0
-        completionTokens:
-          type: integer
-          minimum: 0
-        totalTokens:
-          type: integer
-          minimum: 0
-
-    AgentUIAction:
-      type: object
-      description: "UI action to be performed"
-      required:
-        - type
-      properties:
-        type:
-          type: string
-        path:
-          type: string
-
-    AgentUserPromptOption:
-      type: object
-      description: "Single option in a user prompt"
-      required:
-        - id
-        - label
-      properties:
-        id:
-          type: string
-        label:
-          type: string
-        description:
-          type: string
-
-    AgentUserPrompt:
-      type: object
-      description: "Question from the agent requiring user response"
-      required:
-        - promptId
-        - question
-        - allowFreeText
-        - multiSelect
-      properties:
-        promptId:
-          type: string
-        question:
-          type: string
-        options:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentUserPromptOption"
-        allowFreeText:
-          type: boolean
-        freeTextPlaceholder:
-          type: string
-        multiSelect:
-          type: boolean
-        promptType:
-          type: string
-          enum:
-            - general
-            - command_approval
-        command:
-          type: string
-        workingDir:
-          type: string
-
-    AgentMessage:
-      type: object
-      description: "A message in an agent session"
-      required:
-        - id
-        - sessionId
-        - type
-        - sequenceId
-        - createdAt
-      properties:
-        id:
-          type: string
-        sessionId:
-          type: string
-        type:
-          type: string
-          enum:
-            - user
-            - assistant
-            - error
-            - ui_action
-            - user_prompt
-        sequenceId:
-          type: integer
-          format: int64
-        content:
-          type: string
-        toolCalls:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentToolCall"
-        toolResults:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentToolResult"
-        usage:
-          $ref: "#/components/schemas/AgentTokenUsage"
-        cost:
-          type: number
-          format: double
-        createdAt:
-          type: string
-          format: date-time
-        uiAction:
-          $ref: "#/components/schemas/AgentUIAction"
-        userPrompt:
-          $ref: "#/components/schemas/AgentUserPrompt"
-        delegateIds:
-          type: array
-          items:
-            type: string
-
-    AgentSessionDetailResponse:
-      type: object
-      description: "Session details including messages and current state"
-      required:
-        - messages
-        - session
-        - sessionState
-      properties:
-        messages:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentMessage"
-        session:
-          $ref: "#/components/schemas/AgentSession"
-        sessionState:
-          $ref: "#/components/schemas/AgentSessionState"
-        delegates:
-          type: array
-          items:
-            $ref: "#/components/schemas/AgentDelegateSnapshot"
-
-    AgentDelegateSnapshot:
-      type: object
-      description: "Snapshot of a delegate sub-agent's lifecycle state"
-      required:
-        - id
-        - task
-        - status
-      properties:
-        id:
-          type: string
-        task:
-          type: string
-        status:
-          type: string
-          enum: [running, completed]
-        cost:
-          type: number
-          format: double
-
-    AgentUserPromptResponse:
-      type: object
-      description: "User's response to an agent prompt"
-      required:
-        - promptId
-      properties:
-        promptId:
-          type: string
-        selectedOptionIds:
-          type: array
-          items:
-            type: string
-        freeTextResponse:
-          type: string
-        cancelled:
-          type: boolean
-
-    AgentStatusResponse:
-      type: object
-      description: "Simple status response"
-      required:
-        - status
-      properties:
-        status:
-          type: string
 
     CreateRemoteNodeRequest:
       type: object
@@ -16299,6 +15618,9 @@ components:
       properties:
         description:
           type: string
+        defaultProfile:
+          $ref: "#/components/schemas/RuntimeProfileOverride"
+          description: "Workspace default runtime profile. Only valid for workspace defaults. Empty string clears the setting; omit to leave it unchanged."
 
     SetRuntimeProfileVariableRequest:
       type: object
@@ -16403,6 +15725,9 @@ components:
           $ref: "#/components/schemas/InheritedRuntimeProfileScope"
         workspace:
           $ref: "#/components/schemas/WorkspaceName"
+        defaultProfile:
+          $ref: "#/components/schemas/RuntimeProfileName"
+          description: "Workspace default runtime profile used when a run and DAG do not select a profile."
         description:
           type: string
         status:
@@ -16436,9 +15761,10 @@ components:
         - dagu-managed
         - vault
         - kubernetes
-        - gcp-secret-manager
-        - aws-secrets-manager
-        - azure-key-vault
+        - gcp
+        - aws
+        - azure
+        - alibaba
 
     SecretStatus:
       type: string
@@ -16555,6 +15881,38 @@ components:
         total:
           type: integer
 
+    ViewColumn:
+      type: string
+      enum:
+        - queued
+        - running
+        - review
+        - done
+        - failed
+      description: "A status column available in a Kanban view."
+
+    ViewWorkspaceScope:
+      type: string
+      enum:
+        - all
+        - default
+        - workspace
+      description: "Workflows page workspace selection represented by the view."
+
+    ViewSortField:
+      type: string
+      enum:
+        - name
+        - nextRun
+      description: "Field used to sort workflows."
+
+    ViewSortOrder:
+      type: string
+      enum:
+        - asc
+        - desc
+      description: "Direction used to sort workflows."
+
     ViewSpec:
       type: object
       required:
@@ -16570,8 +15928,9 @@ components:
           type: string
           enum:
             - kanban
+            - workflow
           default: kanban
-          description: "Render type. Currently only kanban is supported."
+          description: "Saved view type."
         workspace:
           type: string
           maxLength: 64
@@ -16599,10 +15958,29 @@ components:
           minimum: 1
           maximum: 30
           description: "Required number of days each row (bucket) groups. Rows scroll back in time by this unit."
+        columns:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ViewColumn"
+          description: "Status columns to display, in left-to-right order. Omitted values use the default order with all columns visible."
         pinned:
           type: boolean
           default: false
           description: "Whether the view is pinned to the left sidebar."
+        workspaceScope:
+          $ref: "#/components/schemas/ViewWorkspaceScope"
+        sortField:
+          $ref: "#/components/schemas/ViewSortField"
+        sortOrder:
+          $ref: "#/components/schemas/ViewSortOrder"
+        activeOnly:
+          type: boolean
+          description: "Whether the view only includes scheduled, unsuspended workflows."
+        isDefault:
+          type: boolean
+          description: "Whether this is the default workflow view for its workspace scope."
 
     View:
       type: object
@@ -16630,7 +16008,23 @@ components:
           type: string
         intervalDays:
           type: integer
+        columns:
+          type: array
+          items:
+            $ref: "#/components/schemas/ViewColumn"
+          description: "Visible status columns in left-to-right display order."
         pinned:
+          type: boolean
+        workspaceScope:
+          $ref: "#/components/schemas/ViewWorkspaceScope"
+        sortField:
+          $ref: "#/components/schemas/ViewSortField"
+        sortOrder:
+          $ref: "#/components/schemas/ViewSortOrder"
+        activeOnly:
+          type: boolean
+          description: "Whether the view only includes scheduled, unsuspended workflows."
+        isDefault:
           type: boolean
         createdBy:
           type: string

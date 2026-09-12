@@ -153,9 +153,6 @@ steps:
 
 description: Render and read a file without external tools
 type: graph
-artifacts:
-  enabled: true
-
 steps:
   - id: render_report
     action: template.render
@@ -165,7 +162,7 @@ steps:
 
         status={{ .status }}
         source={{ .source }}
-      output: ${DAG_RUN_ARTIFACTS_DIR}/first-launch-report.md
+      output: ${context.paths.artifacts_dir}/first-launch-report.md
       data:
         status: ok
         source: Dagu
@@ -173,7 +170,7 @@ steps:
   - id: read_report
     action: file.read
     with:
-      path: ${DAG_RUN_ARTIFACTS_DIR}/first-launch-report.md
+      path: ${context.paths.artifacts_dir}/first-launch-report.md
     depends: [render_report]
 `,
 }

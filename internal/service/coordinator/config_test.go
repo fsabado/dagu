@@ -7,10 +7,43 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/service/coordinator"
+	appconfig "github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConfigFromPeer(t *testing.T) {
+	t.Parallel()
+
+	cfg := coordinator.ConfigFromPeer(appconfig.Peer{
+		Insecure:      false,
+		CertFile:      "client.crt",
+		KeyFile:       "client.key",
+		ClientCaFile:  "ca.crt",
+		SkipTLSVerify: true,
+		MaxRetries:    7,
+		RetryInterval: 3 * time.Second,
+	})
+
+	assert.False(t, cfg.Insecure)
+	assert.Equal(t, "client.crt", cfg.CertFile)
+	assert.Equal(t, "client.key", cfg.KeyFile)
+	assert.Equal(t, "ca.crt", cfg.CAFile)
+	assert.True(t, cfg.SkipTLSVerify)
+	assert.Equal(t, 7, cfg.MaxRetries)
+	assert.Equal(t, 3*time.Second, cfg.RetryInterval)
+}
+
+func TestConfigFromPeerKeepsRetryDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := coordinator.ConfigFromPeer(appconfig.Peer{})
+
+	assert.False(t, cfg.Insecure)
+	assert.Equal(t, 3, cfg.MaxRetries)
+	assert.Equal(t, time.Second, cfg.RetryInterval)
+}
 
 func TestDefaultConfig(t *testing.T) {
 	config := coordinator.DefaultConfig()
@@ -18,6 +51,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.True(t, config.Insecure)
 	assert.Equal(t, 10*time.Second, config.DialTimeout)
 	assert.Equal(t, 5*time.Minute, config.RequestTimeout)
+	assert.Equal(t, 10*time.Second, config.HeartbeatTimeout)
 	assert.Equal(t, 3, config.MaxRetries)
 	assert.Equal(t, time.Second, config.RetryInterval)
 	assert.Empty(t, config.CertFile)
@@ -120,12 +154,10 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "TLSWithSkipVerify",
+			name: "TLSWithSkipVerifyWithoutCerts",
 			config: &coordinator.Config{
 				Insecure:       false,
 				SkipTLSVerify:  true,
-				CertFile:       "/path/to/cert.pem",
-				KeyFile:        "/path/to/key.pem",
 				DialTimeout:    10 * time.Second,
 				RequestTimeout: 5 * time.Minute,
 				MaxRetries:     3,
@@ -179,6 +211,7 @@ func TestConfigValidateDefaults(t *testing.T) {
 
 	assert.Equal(t, 10*time.Second, config.DialTimeout)
 	assert.Equal(t, 5*time.Minute, config.RequestTimeout)
+	assert.Equal(t, 10*time.Second, config.HeartbeatTimeout)
 	assert.Equal(t, 0, config.MaxRetries)
 	assert.Equal(t, time.Second, config.RetryInterval)
 }

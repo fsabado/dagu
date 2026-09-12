@@ -10,11 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
-	"github.com/dagucloud/dagu/internal/test"
-	"github.com/dagucloud/dagu/internal/test/intgharness"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/test/intgharness"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,22 +34,23 @@ func TestIssue2042_EditedSuspendedScheduleDispatchesWithSkipIfSuccessful(t *test
 	h := intgharness.New(t, th.Helper)
 
 	dispatchedAt := make(chan time.Time, 4)
-	dispatchStub := func(ctx context.Context, dag *core.DAG, runID string, trigger core.TriggerType, scheduleTime time.Time) error {
-		attempt, err := th.DAGRunStore.CreateAttempt(ctx, dag, scheduleTime, runID, exec.NewDAGRunAttemptOptions{})
+	dispatchStub := func(ctx context.Context, entry scheduler.DAGEntry, runID string, trigger ir.TriggerType, scheduleTime time.Time) error {
+		dag := entry.DAG
+		attempt, err := th.DAGRunRepository.CreateAttempt(ctx, dag, scheduleTime, runID, persis.DAGRunCreateAttemptOptions{})
 		if err != nil {
 			return err
 		}
 
-		status := transform.NewStatusBuilder(dag).Create(
+		status := ir.NewStatusBuilder(dag).Create(
 			runID,
-			core.Succeeded,
+			ir.Succeeded,
 			0,
 			scheduleTime,
-			transform.WithAttemptID(attempt.ID()),
-			transform.WithHierarchyRefs(exec.NewDAGRunRef(dag.Name, runID), exec.DAGRunRef{}),
-			transform.WithFinishedAt(scheduleTime.Add(time.Second)),
-			transform.WithScheduleTime(exec.FormatTime(scheduleTime)),
-			transform.WithTriggerType(trigger),
+			ir.WithAttemptID(attempt.ID()),
+			ir.WithHierarchyRefs(ir.NewDAGRunRef(dag.Name, runID), ir.DAGRunRef{}),
+			ir.WithFinishedAt(scheduleTime.Add(time.Second)),
+			ir.WithScheduleTime(stringutil.FormatTime(scheduleTime)),
+			ir.WithTriggerType(trigger),
 		)
 
 		if err := attempt.Open(ctx); err != nil {
@@ -95,9 +97,9 @@ func TestIssue2042_EditedSuspendedScheduleDispatchesWithSkipIfSuccessful(t *test
 	firstDispatch := runScheduledTick(time.Date(2026, 2, 7, 12, 34, 0, 0, time.UTC))
 	require.Equal(t, time.Date(2026, 2, 7, 12, 34, 0, 0, time.UTC), firstDispatch)
 
-	require.NoError(t, th.DAGStore.ToggleSuspend(th.Context, dagName, true))
+	require.NoError(t, th.DAGRepository.SetSuspended(th.Context, dagName, true))
 	require.NoError(t, os.WriteFile(dagFile, []byte(issue2042DAGSpec(dagName, "43 * * * *")), 0o600))
-	require.NoError(t, th.DAGStore.ToggleSuspend(th.Context, dagName, false))
+	require.NoError(t, th.DAGRepository.SetSuspended(th.Context, dagName, false))
 
 	secondDispatch := runScheduledTick(time.Date(2026, 2, 7, 12, 43, 0, 0, time.UTC))
 	require.Equal(t, time.Date(2026, 2, 7, 12, 43, 0, 0, time.UTC), secondDispatch)

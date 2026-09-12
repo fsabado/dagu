@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core/spec"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -48,7 +48,7 @@ func TestExampleCommand(t *testing.T) {
 		out, err := runExampleCmd("example")
 		require.NoError(t, err)
 		assert.Contains(t, out, "parallel-steps")
-		assert.Contains(t, out, "agent-step")
+		assert.Contains(t, out, "custom-action")
 	})
 
 	t.Run("ShowByID", func(t *testing.T) {

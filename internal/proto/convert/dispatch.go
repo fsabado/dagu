@@ -7,14 +7,14 @@ import (
 	"fmt"
 	"maps"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
 const maxCoordinatorPort = 65535
 
 // DispatchTaskToProto converts a dispatch task to the coordinator wire shape.
-func DispatchTaskToProto(task *exec.DispatchTask) (*coordinatorv1.Task, error) {
+func DispatchTaskToProto(task *dispatch.DispatchTask) (*coordinatorv1.Task, error) {
 	if task == nil {
 		return nil, nil
 	}
@@ -36,15 +36,20 @@ func DispatchTaskToProto(task *exec.DispatchTask) (*coordinatorv1.Task, error) {
 		AttemptKey:                 task.AttemptKey,
 		Step:                       task.Step,
 		Params:                     task.Params,
+		ParallelItem:               task.ParallelItem,
 		QueueName:                  task.QueueName,
 		ProfileName:                task.ProfileName,
+		DefinitionId:               task.DefinitionID,
+		TriggerActor:               task.TriggerActor,
 		BaseConfig:                 task.BaseConfig,
 		Labels:                     task.Labels,
 		ScheduleTime:               task.ScheduleTime,
 		SourceFile:                 task.SourceFile,
 		WorkerSelector:             maps.Clone(task.WorkerSelector),
-		AgentSnapshot:              append([]byte(nil), task.AgentSnapshot...),
+		TargetWorkerId:             task.TargetWorkerID,
 		ExternalStepRetry:          task.ExternalStepRetry,
+		IncludeDownstream:          task.IncludeDownstream,
+		RetryPath:                  task.RetryPath,
 		WorkspaceBundleDigest:      task.WorkspaceBundleDigest,
 		WorkspaceBundleSize:        task.WorkspaceBundleSize,
 		WorkspaceBundleDagPath:     task.WorkspaceBundleDAGPath,
@@ -66,7 +71,7 @@ func DispatchTaskToProto(task *exec.DispatchTask) (*coordinatorv1.Task, error) {
 }
 
 // ProtoToDispatchTask converts a coordinator wire task to a dispatch task.
-func ProtoToDispatchTask(task *coordinatorv1.Task) (*exec.DispatchTask, error) {
+func ProtoToDispatchTask(task *coordinatorv1.Task) (*dispatch.DispatchTask, error) {
 	if task == nil {
 		return nil, nil
 	}
@@ -74,12 +79,12 @@ func ProtoToDispatchTask(task *coordinatorv1.Task) (*exec.DispatchTask, error) {
 		return nil, fmt.Errorf("owner coordinator port out of range: %d", task.OwnerCoordinatorPort)
 	}
 
-	dispatchTask := &exec.DispatchTask{
+	dispatchTask := &dispatch.DispatchTask{
 		RootDAGRunName:             task.RootDagRunName,
 		RootDAGRunID:               task.RootDagRunId,
 		ParentDAGRunName:           task.ParentDagRunName,
 		ParentDAGRunID:             task.ParentDagRunId,
-		Operation:                  exec.DispatchOperation(task.Operation),
+		Operation:                  dispatch.DispatchOperation(task.Operation),
 		DAGRunID:                   task.DagRunId,
 		Target:                     task.Target,
 		Definition:                 task.Definition,
@@ -88,21 +93,26 @@ func ProtoToDispatchTask(task *coordinatorv1.Task) (*exec.DispatchTask, error) {
 		AttemptKey:                 task.AttemptKey,
 		Step:                       task.Step,
 		Params:                     task.Params,
+		ParallelItem:               task.ParallelItem,
 		QueueName:                  task.QueueName,
 		ProfileName:                task.ProfileName,
+		DefinitionID:               task.DefinitionId,
+		TriggerActor:               task.TriggerActor,
 		BaseConfig:                 task.BaseConfig,
 		Labels:                     task.Labels,
 		ScheduleTime:               task.ScheduleTime,
 		SourceFile:                 task.SourceFile,
 		WorkerSelector:             maps.Clone(task.WorkerSelector),
-		AgentSnapshot:              append([]byte(nil), task.AgentSnapshot...),
+		TargetWorkerID:             task.TargetWorkerId,
 		ExternalStepRetry:          task.ExternalStepRetry,
+		IncludeDownstream:          task.IncludeDownstream,
+		RetryPath:                  task.RetryPath,
 		WorkspaceBundleDigest:      task.WorkspaceBundleDigest,
 		WorkspaceBundleSize:        task.WorkspaceBundleSize,
 		WorkspaceBundleDAGPath:     task.WorkspaceBundleDagPath,
 		WorkspaceBundleOriginalRef: task.WorkspaceBundleOriginalRef,
 		WorkspaceBundleResolvedRef: task.WorkspaceBundleResolvedRef,
-		Owner: exec.CoordinatorEndpoint{
+		Owner: dispatch.CoordinatorEndpoint{
 			ID:   task.OwnerCoordinatorId,
 			Host: task.OwnerCoordinatorHost,
 			Port: int(task.OwnerCoordinatorPort),
@@ -120,7 +130,7 @@ func ProtoToDispatchTask(task *coordinatorv1.Task) (*exec.DispatchTask, error) {
 }
 
 // WorkerStatsToProto converts worker stats to the coordinator wire shape.
-func WorkerStatsToProto(stats *exec.WorkerStats) *coordinatorv1.WorkerStats {
+func WorkerStatsToProto(stats *dispatch.WorkerStats) *coordinatorv1.WorkerStats {
 	if stats == nil {
 		return nil
 	}
@@ -136,15 +146,15 @@ func WorkerStatsToProto(stats *exec.WorkerStats) *coordinatorv1.WorkerStats {
 }
 
 // ProtoToWorkerStats converts coordinator worker stats to the domain shape.
-func ProtoToWorkerStats(stats *coordinatorv1.WorkerStats) *exec.WorkerStats {
+func ProtoToWorkerStats(stats *coordinatorv1.WorkerStats) *dispatch.WorkerStats {
 	if stats == nil {
 		return nil
 	}
-	runningTasks := make([]*exec.RunningTask, 0, len(stats.RunningTasks))
+	runningTasks := make([]*dispatch.RunningTask, 0, len(stats.RunningTasks))
 	for _, task := range stats.RunningTasks {
 		runningTasks = append(runningTasks, ProtoToRunningTask(task))
 	}
-	return &exec.WorkerStats{
+	return &dispatch.WorkerStats{
 		TotalPollers: stats.TotalPollers,
 		BusyPollers:  stats.BusyPollers,
 		RunningTasks: runningTasks,
@@ -152,7 +162,7 @@ func ProtoToWorkerStats(stats *coordinatorv1.WorkerStats) *exec.WorkerStats {
 }
 
 // RunningTaskToProto converts a running task to the coordinator wire shape.
-func RunningTaskToProto(task *exec.RunningTask) *coordinatorv1.RunningTask {
+func RunningTaskToProto(task *dispatch.RunningTask) *coordinatorv1.RunningTask {
 	if task == nil {
 		return nil
 	}
@@ -169,11 +179,11 @@ func RunningTaskToProto(task *exec.RunningTask) *coordinatorv1.RunningTask {
 }
 
 // ProtoToRunningTask converts a coordinator running task to the domain shape.
-func ProtoToRunningTask(task *coordinatorv1.RunningTask) *exec.RunningTask {
+func ProtoToRunningTask(task *coordinatorv1.RunningTask) *dispatch.RunningTask {
 	if task == nil {
 		return nil
 	}
-	return &exec.RunningTask{
+	return &dispatch.RunningTask{
 		DAGRunID:         task.DagRunId,
 		DAGName:          task.DagName,
 		StartedAt:        task.StartedAt,

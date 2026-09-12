@@ -7,18 +7,10 @@ import (
 	"context"
 	"os"
 
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
-func AgentConfigFromBuiltinHarnessConfigForTest(cfg map[string]any) (*core.AgentStepConfig, error) {
-	return agentConfigFromBuiltinHarnessConfig(cfg)
-}
-
-func BuiltinRunCanceledForTest(stopped bool, runCtxErr, parentCtxErr error) bool {
-	return builtinRunCanceled(stopped, runCtxErr, parentCtxErr)
-}
-
-func NewTestExecutorForTest(step core.Step, prompt string, script string, workDir string) *harnessExecutor {
+func NewTestExecutorForTest(step ir.Step, prompt string, script string, workDir string) *harnessExecutor {
 	return &harnessExecutor{
 		step:    step,
 		prompt:  prompt,
@@ -27,7 +19,7 @@ func NewTestExecutorForTest(step core.Step, prompt string, script string, workDi
 	}
 }
 
-func NewTestExecutorWithProviderConfigsForTest(step core.Step, prompt string, script string, workDir string, configs ...providerConfig) *harnessExecutor {
+func NewTestExecutorWithProviderConfigsForTest(step ir.Step, prompt string, script string, workDir string, configs ...providerConfig) *harnessExecutor {
 	return &harnessExecutor{
 		step:    step,
 		configs: configs,
@@ -37,11 +29,7 @@ func NewTestExecutorWithProviderConfigsForTest(step core.Step, prompt string, sc
 	}
 }
 
-func NewTestBuiltinProviderConfigForTest(name string) providerConfig {
-	return providerConfig{name: name, builtin: true}
-}
-
-func NewTestProviderConfigForTest(name string, definition core.HarnessDefinition, flags map[string]any) providerConfig {
+func NewTestProviderConfigForTest(name string, definition ir.HarnessDefinition, flags map[string]any) providerConfig {
 	return providerConfig{
 		name:       name,
 		definition: &definition,

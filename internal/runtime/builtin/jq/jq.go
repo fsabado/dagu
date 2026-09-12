@@ -12,11 +12,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/itchyny/gojq"
 )
@@ -36,7 +37,7 @@ type jqConfig struct {
 	Input string `mapstructure:"input"`
 }
 
-func newJQ(ctx context.Context, step core.Step) (executor.Executor, error) {
+func newJQ(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	var jqCfg jqConfig
 	if step.ExecutorConfig.Config != nil {
 		if err := decodeJqConfig(
@@ -184,5 +185,5 @@ func decodeJqConfig(dat map[string]any, cfg *jqConfig) error {
 }
 
 func init() {
-	executor.RegisterExecutor("jq", newJQ, nil, core.ExecutorCapabilities{Command: true, Script: true})
+	executor.RegisterExecutor("jq", newJQ, nil, registry.ExecutorCapabilities{Command: true, Script: true})
 }

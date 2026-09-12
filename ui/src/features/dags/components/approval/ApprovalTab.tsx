@@ -1,15 +1,18 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Button } from '@/components/ui/button';
-import { useRemoteNode } from '@/contexts/RemoteNodeContext';
-import { useClient } from '@/hooks/api';
 import { Check, RotateCcw } from 'lucide-react';
 import React, { useState } from 'react';
-import { components, NodeStatus, Stream } from '../../../../api/v1/schema';
+
+import { Button } from '@/components/ui/button';
+import { useRemoteNode } from '@/contexts/RemoteNodeContext';
+import { getManualActionState } from '@/features/dag-runs/lib/manualActionState';
+import { useClient } from '@/hooks/api';
+import { components, Stream } from '../../../../api/v1/schema';
 import { InlineLogViewer } from '../common/InlineLogViewer';
 import PushBackHistory from '../common/PushBackHistory';
 import { StepReviewModal } from '../dag-execution/StepReviewModal';
+import { I18nText } from '@/i18n/I18nText';
 
 type DAGRunDetails = components['schemas']['DAGRunDetails'];
 type NodeData = components['schemas']['Node'];
@@ -43,7 +46,7 @@ function ApprovalCard({
             <span className="text-sm font-semibold">{step.name}</span>
             {iteration > 0 && (
               <span className="text-xs font-normal text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                Iteration {iteration}
+                <I18nText text={"Iteration"} /> {iteration}
               </span>
             )}
           </div>
@@ -59,7 +62,7 @@ function ApprovalCard({
               onClick={() => onAction(node, 'retry')}
             >
               <RotateCcw className="h-4 w-4" />
-              Retry
+              <I18nText text={"Retry"} />
             </Button>
           )}
           <Button
@@ -68,7 +71,7 @@ function ApprovalCard({
             onClick={() => onAction(node, 'approve')}
           >
             <Check className="h-4 w-4" />
-            Approve
+            <I18nText text={"Approve"} />
           </Button>
         </div>
       </div>
@@ -80,7 +83,7 @@ function ApprovalCard({
       {/* Step Output */}
       <div>
         <div className="text-xs font-medium text-muted-foreground mb-1">
-          Step Output
+          <I18nText text={"Step Output"} />
         </div>
         <div className="max-h-[400px] overflow-y-auto rounded border border-border">
           <InlineLogViewer
@@ -105,8 +108,7 @@ export function ApprovalTab({ dagRun, dagName }: ApprovalTabProps) {
     action: 'approve' | 'retry';
   } | null>(null);
 
-  const waitingNodes =
-    dagRun.nodes?.filter((n) => n.status === NodeStatus.Waiting) || [];
+  const { waitingApprovalNodes: waitingNodes } = getManualActionState(dagRun);
 
   const isSubRun = !!(
     dagRun.rootDAGRunId &&
@@ -154,7 +156,7 @@ export function ApprovalTab({ dagRun, dagName }: ApprovalTabProps) {
   if (waitingNodes.length === 0) {
     return (
       <div className="text-center text-muted-foreground py-8 text-sm">
-        No steps awaiting approval.
+        <I18nText text={"No steps awaiting approval."} />
       </div>
     );
   }

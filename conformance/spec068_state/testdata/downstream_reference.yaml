@@ -1,0 +1,24 @@
+steps:
+  - id: set_val
+    action: state.set
+    with:
+      key: ref_key
+      value: 42
+
+  - id: get_val
+    depends: set_val
+    action: state.get
+    with:
+      key: ref_key
+
+  - id: get_named
+    depends: get_val
+    action: state.get
+    with:
+      key: ref_key
+    output: GET_RESULT
+
+  - id: print_named
+    depends: get_named
+    run: |
+      printf '%s\n' "${GET_RESULT}"

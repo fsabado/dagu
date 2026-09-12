@@ -6,10 +6,10 @@ package intg_test
 import (
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	exec1 "github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,11 +36,8 @@ steps:
     run: echo "region=$region count=$count debug=$debug"
     output: SHELL_VALUES
   - name: params-json
-    run: printenv DAGU_PARAMS_JSON
-    output: PARAMS_JSON
-  - name: params-json-compat
     run: printenv DAG_PARAMS_JSON
-    output: PARAMS_JSON_COMPAT
+    output: PARAMS_JSON
 `)
 
 	runID := uuid.Must(uuid.NewV7()).String()
@@ -50,15 +47,13 @@ steps:
 	})
 
 	status, outputs := readAttemptStatusAndOutputs(t, th, "inline-defaults", runID)
-	require.Equal(t, core.Succeeded, status.Status)
+	require.Equal(t, ir.Succeeded, status.Status)
 	assert.Equal(t, []string{"region=us-east-1", "count=3", "debug=false"}, status.ParamsList)
 
 	require.Contains(t, outputs.Outputs, "shellValues")
 	require.Contains(t, outputs.Outputs, "paramsJson")
-	require.Contains(t, outputs.Outputs, "paramsJsonCompat")
 	assert.Equal(t, "region=us-east-1 count=3 debug=false", outputs.Outputs["shellValues"])
 	assert.JSONEq(t, `{"region":"us-east-1","count":"3","debug":"false"}`, outputs.Outputs["paramsJson"])
-	assert.JSONEq(t, `{"region":"us-east-1","count":"3","debug":"false"}`, outputs.Outputs["paramsJsonCompat"])
 	assert.JSONEq(t, `["region=us-east-1","count=3","debug=false"]`, outputs.Metadata.Params)
 }
 
@@ -84,8 +79,8 @@ steps:
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "region")
 
-	_, err = th.DAGRunStore.FindAttempt(th.Context, exec1.NewDAGRunRef("inline-required", runID))
-	require.ErrorIs(t, err, exec1.ErrDAGRunIDNotFound)
+	_, err = th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef("inline-required", runID))
+	require.ErrorIs(t, err, dagrun.ErrDAGRunIDNotFound)
 }
 
 func TestInlineParams_StartFailsOnInvalidTypedValue(t *testing.T) {
@@ -119,8 +114,8 @@ steps:
 	require.Contains(t, err.Error(), "count")
 	require.Contains(t, err.Error(), "integer")
 
-	_, err = th.DAGRunStore.FindAttempt(th.Context, exec1.NewDAGRunRef("inline-invalid", runID))
-	require.ErrorIs(t, err, exec1.ErrDAGRunIDNotFound)
+	_, err = th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef("inline-invalid", runID))
+	require.ErrorIs(t, err, dagrun.ErrDAGRunIDNotFound)
 }
 
 func TestInlineParams_LocalSubDAGRuntimeCoercion(t *testing.T) {
@@ -156,7 +151,7 @@ steps:
     command: echo "region=$region count=$count debug=$debug"
     output: SHELL_VALUES
   - name: params-json
-    command: printenv DAGU_PARAMS_JSON
+    command: printenv DAG_PARAMS_JSON
     output: PARAMS_JSON
 `)
 
@@ -166,19 +161,19 @@ steps:
 		ExpectedOut: []string{"DAG run finished"},
 	})
 
-	rootRef := exec1.NewDAGRunRef("inline-subdag-parent", runID)
-	parentAttempt, err := th.DAGRunStore.FindAttempt(th.Context, rootRef)
+	rootRef := ir.NewDAGRunRef("inline-subdag-parent", runID)
+	parentAttempt, err := th.DAGRunRepository.FindAttempt(th.Context, rootRef)
 	require.NoError(t, err)
 
 	parentStatus, err := parentAttempt.ReadStatus(th.Context)
 	require.NoError(t, err)
-	require.Equal(t, core.Succeeded, parentStatus.Status)
+	require.Equal(t, ir.Succeeded, parentStatus.Status)
 	require.Len(t, parentStatus.Nodes, 1)
 	require.Len(t, parentStatus.Nodes[0].SubRuns, 1)
 
 	subRunID := parentStatus.Nodes[0].SubRuns[0].DAGRunID
 	subStatus, subOutputs := readSubAttemptStatusAndOutputs(t, th, rootRef, subRunID)
-	require.Equal(t, core.Succeeded, subStatus.Status)
+	require.Equal(t, ir.Succeeded, subStatus.Status)
 	assert.Equal(t, []string{"region=us-west-2", "count=5", "debug=true"}, subStatus.ParamsList)
 
 	require.Contains(t, subOutputs.Outputs, "shellValues")
@@ -188,10 +183,10 @@ steps:
 	assert.JSONEq(t, `["region=us-west-2","count=5","debug=true"]`, subOutputs.Metadata.Params)
 }
 
-func readAttemptStatusAndOutputs(t *testing.T, th test.Command, dagName, runID string) (*exec1.DAGRunStatus, *exec1.DAGRunOutputs) {
+func readAttemptStatusAndOutputs(t *testing.T, th test.Command, dagName, runID string) (*ir.DAGRunStatus, *ir.DAGRunOutputs) {
 	t.Helper()
 
-	attempt, err := th.DAGRunStore.FindAttempt(th.Context, exec1.NewDAGRunRef(dagName, runID))
+	attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dagName, runID))
 	require.NoError(t, err)
 
 	status, err := attempt.ReadStatus(th.Context)
@@ -203,10 +198,10 @@ func readAttemptStatusAndOutputs(t *testing.T, th test.Command, dagName, runID s
 	return status, outputs
 }
 
-func readSubAttemptStatusAndOutputs(t *testing.T, th test.Command, rootRef exec1.DAGRunRef, subRunID string) (*exec1.DAGRunStatus, *exec1.DAGRunOutputs) {
+func readSubAttemptStatusAndOutputs(t *testing.T, th test.Command, rootRef ir.DAGRunRef, subRunID string) (*ir.DAGRunStatus, *ir.DAGRunOutputs) {
 	t.Helper()
 
-	attempt, err := th.DAGRunStore.FindSubAttempt(th.Context, rootRef, subRunID)
+	attempt, err := th.DAGRunRepository.FindSubAttempt(th.Context, rootRef, subRunID)
 	require.NoError(t, err)
 
 	status, err := attempt.ReadStatus(th.Context)

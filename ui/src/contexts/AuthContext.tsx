@@ -18,12 +18,13 @@ import {
   TOKEN_KEY,
   addAuthSessionListener,
   clearAuthSession,
-  getAuthExpiresAt,
   getAuthToken,
+  scheduleAuthSessionExpiry,
   setAuthSession,
 } from '@/lib/authSession';
 import {
   effectiveWorkspaceRole,
+  normalizeAccess,
   roleAtLeast,
   workspaceRoleTarget,
 } from '@/lib/workspaceAccess';
@@ -181,19 +182,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!token) {
       return;
     }
-    const expiresAt = getAuthExpiresAt();
-    if (!expiresAt) {
-      return;
-    }
-    const delay = Date.parse(expiresAt) - Date.now();
-    if (delay <= 0) {
-      clearAuthSession('expired');
-      return;
-    }
-    const timeout = window.setTimeout(() => {
-      clearAuthSession('expired');
-    }, delay);
-    return () => window.clearTimeout(timeout);
+    return scheduleAuthSessionExpiry();
   }, [token]);
 
   useEffect(() => {
@@ -260,6 +249,24 @@ export function useCanWriteForWorkspace(workspace?: string | null): boolean {
   return roleAtLeast(
     effectiveWorkspaceRole(user, workspace ?? ''),
     UserRole.developer
+  );
+}
+
+export function useCanAccessGitSync(): boolean {
+  const { user } = useAuth();
+  const config = useConfig();
+  if (config.authMode !== 'builtin') return true;
+  return !!user && normalizeAccess(user.workspaceAccess).all;
+}
+
+export function useCanWriteGitSync(): boolean {
+  const { user } = useAuth();
+  const config = useConfig();
+  if (config.authMode !== 'builtin') return config.permissions.writeDags;
+  return (
+    !!user &&
+    normalizeAccess(user.workspaceAccess).all &&
+    roleAtLeast(user.role, UserRole.developer)
   );
 }
 

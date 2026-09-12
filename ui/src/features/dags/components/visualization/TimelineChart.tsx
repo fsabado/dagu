@@ -22,8 +22,17 @@ import { useQuery } from '@/hooks/api';
 import { whenEnabled } from '@/hooks/queryUtils';
 import dayjs from '@/lib/dayjs';
 import { isActiveNodeStatus } from '@/lib/status-utils';
-import { useEffect, useMemo } from 'react';
+import React, {
+  forwardRef,
+  useEffect,
+  useMemo,
+  type KeyboardEvent,
+} from 'react';
 import { components, NodeStatus, Status } from '../../../../api/v1/schema';
+import {
+  useOpenSubRun,
+  type SubRunStackEntry,
+} from '../common/SubRunStackModal';
 import {
   buildTimelineRows,
   getSubRunQueryContext,
@@ -31,6 +40,7 @@ import {
   hasTimelineSubRuns,
   TimelineRow,
 } from './timelineItems';
+import { I18nText } from '@/i18n/I18nText';
 
 /**
  * Props for the TimelineChart component
@@ -38,6 +48,11 @@ import {
 type Props = {
   /** DAG run details containing execution information */
   status: components['schemas']['DAGRunDetails'];
+  /**
+   * Optional opener for child DAG-run drill-down. Defaults to the
+   * SubRunOpenProvider context when rendered inside DAG status.
+   */
+  onOpenSubRun?: (entry: SubRunStackEntry) => void;
 };
 
 /** Format for displaying timestamps in tooltips */
@@ -221,16 +236,16 @@ function getStatusColor(row: TimelineRow): { bg: string; border: string } {
   if (row.statusSource === 'dagrun') {
     return (
       dagRunStatusColors[row.status as Status] || {
-        bg: '#6b7280',
-        border: '#6b7280',
+        bg: 'var(--status-neutral)',
+        border: 'var(--status-neutral)',
       }
     );
   }
 
   return (
     statusColors[row.status as NodeStatus] || {
-      bg: '#6b7280',
-      border: '#6b7280',
+      bg: 'var(--status-neutral)',
+      border: 'var(--status-neutral)',
     }
   );
 }
@@ -242,11 +257,105 @@ function isActiveTimelineStatus(row: TimelineRow): boolean {
   return isActiveNodeStatus(row.status as NodeStatus);
 }
 
+type TimelineBarProps = {
+  item: TimelineRow;
+  leftPercent: number;
+  widthPercent: number;
+  colors: { bg: string; border: string };
+  isActive: boolean;
+  openSubRun?: (entry: SubRunStackEntry) => void;
+} & React.ComponentPropsWithoutRef<'div'>;
+
+/**
+ * Colored execution bar. Openable sub-DAG bars use role="button"
+ * (same pattern as AgentTimeline) so positioning stays a div.
+ */
+const TimelineBar = forwardRef<HTMLDivElement, TimelineBarProps>(
+  function TimelineBar(
+    {
+      item,
+      leftPercent,
+      widthPercent,
+      colors,
+      isActive,
+      openSubRun,
+      className,
+      style,
+      onClick,
+      onKeyDown,
+      ...props
+    },
+    ref
+  ) {
+    const canOpen = item.kind === 'subdag' && !!openSubRun && !!item.dagRunId;
+    const openName = item.dagName || item.parentStepName || item.label;
+
+    function handleClick(event: React.MouseEvent<HTMLDivElement>) {
+      onClick?.(event);
+      if (!canOpen || !openSubRun || !item.dagRunId) {
+        return;
+      }
+      openSubRun({
+        name: openName,
+        dagRunId: item.dagRunId,
+      });
+    }
+
+    function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+      onKeyDown?.(event);
+      if (!canOpen || (event.key !== 'Enter' && event.key !== ' ')) {
+        return;
+      }
+      // Prevent Space from scrolling the page when activating the control.
+      event.preventDefault();
+      if (!openSubRun || !item.dagRunId) {
+        return;
+      }
+      openSubRun({
+        name: openName,
+        dagRunId: item.dagRunId,
+      });
+    }
+
+    return (
+      <div
+        ref={ref}
+        data-testid={`timeline-bar-${item.id}`}
+        {...props}
+        role={canOpen ? 'button' : undefined}
+        tabIndex={canOpen ? 0 : undefined}
+        aria-label={
+          canOpen && item.dagRunId
+            ? `Open ${openName} run ${item.dagRunId}`
+            : undefined
+        }
+        className={`absolute h-5 rounded transition-opacity hover:opacity-80 ${
+          canOpen
+            ? 'cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary'
+            : ''
+        } ${isActive ? 'animate-pulse' : ''} ${className ?? ''}`}
+        style={{
+          left: `calc(${leftPercent}% + 130px)`,
+          width: `calc(${Math.max(widthPercent, 0.5)}% - 130px)`,
+          minWidth: '4px',
+          backgroundColor: colors.bg,
+          borderLeft: `2px solid ${colors.border}`,
+          ...style,
+        }}
+        onClick={canOpen ? handleClick : onClick}
+        onKeyDown={canOpen ? handleKeyDown : onKeyDown}
+      />
+    );
+  }
+);
+
 /**
  * TimelineChart component renders a horizontal bar chart showing step execution
  */
-function TimelineChart({ status }: Props) {
+function TimelineChart({ status, onOpenSubRun }: Props) {
   const remoteNode = useRemoteNode();
+  const openSubRunFromContext = useOpenSubRun();
+  const openSubRun = onOpenSubRun ?? openSubRunFromContext;
   const shouldFetchSubRuns = hasTimelineSubRuns(status);
   const queryContext = getSubRunQueryContext(status);
   const eligibleSubRunIdsKey = useMemo(
@@ -331,7 +440,7 @@ function TimelineChart({ status }: Props) {
   if (items.length === 0) {
     return (
       <div className="text-sm text-muted-foreground p-4">
-        No step execution data available.
+        <I18nText text={'No step execution data available.'} />
       </div>
     );
   }
@@ -399,18 +508,13 @@ function TimelineChart({ status }: Props) {
               {/* Timeline bar */}
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <div
-                    data-testid={`timeline-bar-${item.id}`}
-                    className={`absolute h-5 rounded cursor-pointer transition-opacity hover:opacity-80 ${
-                      isActive ? 'animate-pulse' : ''
-                    }`}
-                    style={{
-                      left: `calc(${leftPercent}% + 130px)`,
-                      width: `calc(${Math.max(widthPercent, 0.5)}% - 130px)`,
-                      minWidth: '4px',
-                      backgroundColor: colors.bg,
-                      borderLeft: `2px solid ${colors.border}`,
-                    }}
+                  <TimelineBar
+                    item={item}
+                    leftPercent={leftPercent}
+                    widthPercent={widthPercent}
+                    colors={colors}
+                    isActive={isActive}
+                    openSubRun={openSubRun ?? undefined}
                   />
                 </TooltipTrigger>
                 <TooltipContent side="top" className="max-w-xs">
@@ -426,27 +530,33 @@ function TimelineChart({ status }: Props) {
                       </div>
                     )}
                     {item.dagName && (
-                      <div className="text-xs">DAG: {item.dagName}</div>
+                      <div className="text-xs">
+                        <I18nText text={'DAG:'} /> {item.dagName}
+                      </div>
                     )}
                     {item.dagRunId && (
-                      <div className="text-xs">Run ID: {item.dagRunId}</div>
+                      <div className="text-xs">
+                        <I18nText text={'Run ID:'} /> {item.dagRunId}
+                      </div>
                     )}
                     {item.params && (
-                      <div className="text-xs">Params: {item.params}</div>
+                      <div className="text-xs">
+                        <I18nText text={'Params:'} /> {item.params}
+                      </div>
                     )}
                     {item.parentStepName && (
                       <div className="text-xs text-muted-foreground">
-                        Parent: {item.parentStepName}
+                        <I18nText text={'Parent:'} /> {item.parentStepName}
                       </div>
                     )}
                     <div className="text-xs">
-                      Status:{' '}
+                      <I18nText text={'Status:'} />{' '}
                       <span className="font-medium">
-                        {getStatusLabel(item)}
+                        <I18nText text={getStatusLabel(item)} />
                       </span>
                     </div>
                     <div className="text-xs">
-                      Duration:{' '}
+                      <I18nText text={'Duration:'} />{' '}
                       <span className="font-mono">
                         {calculateDuration(item.startMs, item.endMs)}
                       </span>
@@ -457,7 +567,7 @@ function TimelineChart({ status }: Props) {
                     </div>
                     {item.error && (
                       <div className="text-xs text-destructive">
-                        Error: {item.error}
+                        <I18nText text={'Error:'} /> {item.error}
                       </div>
                     )}
                   </div>

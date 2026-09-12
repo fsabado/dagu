@@ -16,10 +16,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/mailer"
+	"github.com/dagucloud/dagu/v2/internal/cmn/mailer/oauthconfig"
 	"github.com/google/uuid"
 
-	"github.com/dagucloud/dagu/internal/service/eventstore"
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/eventstore"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 type ProviderType string
@@ -29,6 +31,7 @@ const (
 	ProviderWebhook  ProviderType = "webhook"
 	ProviderSlack    ProviderType = "slack"
 	ProviderTelegram ProviderType = "telegram"
+	ProviderTeams    ProviderType = "teams"
 )
 
 var defaultEvents = []eventstore.EventType{
@@ -41,6 +44,7 @@ var defaultEvents = []eventstore.EventType{
 var supportedEvents = []eventstore.EventType{
 	eventstore.TypeDAGRunWaiting,
 	eventstore.TypeDAGRunSucceeded,
+	eventstore.TypeDAGRunPartiallySucceeded,
 	eventstore.TypeDAGRunFailed,
 	eventstore.TypeDAGRunAborted,
 	eventstore.TypeDAGRunRejected,
@@ -87,6 +91,7 @@ type Channel struct {
 	Webhook  *WebhookTarget  `json:"webhook,omitempty"`
 	Slack    *SlackTarget    `json:"slack,omitempty"`
 	Telegram *TelegramTarget `json:"telegram,omitempty"`
+	Teams    *TeamsTarget    `json:"teams,omitempty"`
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
@@ -102,12 +107,13 @@ type WorkspaceSettings struct {
 }
 
 type SMTPConfig struct {
-	Host          string `json:"host,omitempty"`
-	Port          string `json:"port,omitempty"`
-	Username      string `json:"username,omitempty"`
-	Password      string `json:"password,omitempty"`
-	From          string `json:"from,omitempty"`
-	ClearPassword bool   `json:"-"`
+	Host          string              `json:"host,omitempty"`
+	Port          string              `json:"port,omitempty"`
+	Username      string              `json:"username,omitempty"`
+	Password      string              `json:"password,omitempty"`
+	OAuth         *oauthconfig.Config `json:"oauth,omitempty"`
+	From          string              `json:"from,omitempty"`
+	ClearPassword bool                `json:"-"`
 }
 
 type RouteSet struct {
@@ -147,6 +153,7 @@ type Target struct {
 	Webhook  *WebhookTarget  `json:"webhook,omitempty"`
 	Slack    *SlackTarget    `json:"slack,omitempty"`
 	Telegram *TelegramTarget `json:"telegram,omitempty"`
+	Teams    *TeamsTarget    `json:"teams,omitempty"`
 }
 
 type EmailTarget struct {
@@ -165,6 +172,7 @@ type WebhookTarget struct {
 	Headers             map[string]string `json:"headers,omitempty"`
 	HMACSecret          string            `json:"hmacSecret,omitempty"`
 	MessageTemplate     string            `json:"messageTemplate,omitempty"`
+	BodyTemplate        string            `json:"bodyTemplate,omitempty"`
 	AllowInsecureHTTP   bool              `json:"allowInsecureHttp,omitempty"`
 	AllowPrivateNetwork bool              `json:"allowPrivateNetwork,omitempty"`
 	ClearHeaders        bool              `json:"-"`
@@ -179,6 +187,12 @@ type SlackTarget struct {
 type TelegramTarget struct {
 	BotToken        string `json:"botToken,omitempty"`
 	ChatID          string `json:"chatId,omitempty"`
+	TopicID         string `json:"topicId,omitempty"`
+	MessageTemplate string `json:"messageTemplate,omitempty"`
+}
+
+type TeamsTarget struct {
+	WebhookURL      string `json:"webhookUrl,omitempty"`
 	MessageTemplate string `json:"messageTemplate,omitempty"`
 }
 
@@ -204,6 +218,7 @@ type PublicChannel struct {
 	Webhook  *PublicWebhookTarget  `json:"webhook,omitempty"`
 	Slack    *PublicSlackTarget    `json:"slack,omitempty"`
 	Telegram *PublicTelegramTarget `json:"telegram,omitempty"`
+	Teams    *PublicTeamsTarget    `json:"teams,omitempty"`
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
@@ -219,11 +234,21 @@ type PublicWorkspaceSettings struct {
 }
 
 type PublicSMTPConfig struct {
-	Host               string `json:"host,omitempty"`
-	Port               string `json:"port,omitempty"`
-	Username           string `json:"username,omitempty"`
-	From               string `json:"from,omitempty"`
-	PasswordConfigured bool   `json:"passwordConfigured"`
+	Host               string                 `json:"host,omitempty"`
+	Port               string                 `json:"port,omitempty"`
+	Username           string                 `json:"username,omitempty"`
+	OAuth              *PublicSMTPOAuthConfig `json:"oauth,omitempty"`
+	From               string                 `json:"from,omitempty"`
+	PasswordConfigured bool                   `json:"passwordConfigured"`
+}
+
+type PublicSMTPOAuthConfig struct {
+	Provider                     oauthconfig.Provider `json:"provider"`
+	TenantID                     string               `json:"tenantId,omitempty"`
+	ClientID                     string               `json:"clientId,omitempty"`
+	ClientSecretConfigured       bool                 `json:"clientSecretConfigured"`
+	RefreshTokenConfigured       bool                 `json:"refreshTokenConfigured"`
+	ServiceAccountJSONConfigured bool                 `json:"serviceAccountJsonConfigured"`
 }
 
 type PublicRouteSet struct {
@@ -263,6 +288,7 @@ type PublicTarget struct {
 	Webhook  *PublicWebhookTarget  `json:"webhook,omitempty"`
 	Slack    *PublicSlackTarget    `json:"slack,omitempty"`
 	Telegram *PublicTelegramTarget `json:"telegram,omitempty"`
+	Teams    *PublicTeamsTarget    `json:"teams,omitempty"`
 }
 
 type PublicWebhookTarget struct {
@@ -271,6 +297,7 @@ type PublicWebhookTarget struct {
 	Headers              map[string]string `json:"headers,omitempty"`
 	HMACSecretConfigured bool              `json:"hmacSecretConfigured"`
 	MessageTemplate      string            `json:"messageTemplate,omitempty"`
+	BodyTemplate         string            `json:"bodyTemplate,omitempty"`
 	AllowInsecureHTTP    bool              `json:"allowInsecureHttp"`
 	AllowPrivateNetwork  bool              `json:"allowPrivateNetwork"`
 }
@@ -281,10 +308,17 @@ type PublicSlackTarget struct {
 	MessageTemplate      string `json:"messageTemplate,omitempty"`
 }
 
+type PublicTeamsTarget struct {
+	WebhookURLConfigured bool   `json:"webhookUrlConfigured"`
+	WebhookURLPreview    string `json:"webhookUrlPreview,omitempty"`
+	MessageTemplate      string `json:"messageTemplate,omitempty"`
+}
+
 type PublicTelegramTarget struct {
 	BotTokenConfigured bool   `json:"botTokenConfigured"`
 	BotTokenPreview    string `json:"botTokenPreview,omitempty"`
 	ChatID             string `json:"chatId,omitempty"`
+	TopicID            string `json:"topicId,omitempty"`
 	MessageTemplate    string `json:"messageTemplate,omitempty"`
 }
 
@@ -488,8 +522,20 @@ func normalizeSMTPConfig(cfg *SMTPConfig) (*SMTPConfig, error) {
 	cfg.Port = strings.TrimSpace(cfg.Port)
 	cfg.Username = strings.TrimSpace(cfg.Username)
 	cfg.From = strings.TrimSpace(cfg.From)
-	if cfg.Host == "" && cfg.Port == "" && cfg.Username == "" && cfg.Password == "" && cfg.From == "" {
+	if cfg.Host == "" && cfg.Port == "" && cfg.Username == "" && cfg.Password == "" && cfg.OAuth == nil && cfg.From == "" {
 		return nil, nil
+	}
+	if cfg.OAuth != nil {
+		cfg.OAuth.Provider = strings.TrimSpace(cfg.OAuth.Provider)
+		cfg.OAuth.TenantID = strings.TrimSpace(cfg.OAuth.TenantID)
+		cfg.OAuth.ClientID = strings.TrimSpace(cfg.OAuth.ClientID)
+		mailerConfig, err := mailer.BuildConfig(cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.OAuth)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid smtp oauth config: %w", ErrInvalidSettings, err)
+		}
+		cfg.Host = mailerConfig.Host
+		cfg.Port = mailerConfig.Port
+		cfg.Username = mailerConfig.Username
 	}
 	if cfg.Host == "" {
 		return nil, fmt.Errorf("%w: smtp host is required", ErrInvalidSettings)
@@ -570,6 +616,7 @@ func normalizeTarget(target *Target) error {
 			return fmt.Errorf("%w: webhook target config is required", ErrInvalidSettings)
 		}
 		target.Webhook.MessageTemplate = normalizeTemplate(target.Webhook.MessageTemplate)
+		target.Webhook.BodyTemplate = normalizeTemplate(target.Webhook.BodyTemplate)
 		if target.Webhook.URL == "" {
 			return fmt.Errorf("%w: webhook target requires url", ErrInvalidSettings)
 		}
@@ -599,6 +646,24 @@ func normalizeTarget(target *Target) error {
 		target.Telegram.ChatID = strings.TrimSpace(target.Telegram.ChatID)
 		if target.Telegram.ChatID == "" {
 			return fmt.Errorf("%w: telegram target requires chatId", ErrInvalidSettings)
+		}
+		target.Telegram.TopicID = strings.TrimSpace(target.Telegram.TopicID)
+		if target.Telegram.TopicID != "" {
+			topicID, err := strconv.Atoi(target.Telegram.TopicID)
+			if err != nil || topicID <= 0 {
+				return fmt.Errorf("%w: telegram target topicId must be a positive integer", ErrInvalidSettings)
+			}
+		}
+	case ProviderTeams:
+		if target.Teams == nil {
+			return fmt.Errorf("%w: teams target config is required", ErrInvalidSettings)
+		}
+		target.Teams.MessageTemplate = normalizeTemplate(target.Teams.MessageTemplate)
+		if target.Teams.WebhookURL == "" {
+			return fmt.Errorf("%w: teams target requires webhookUrl", ErrInvalidSettings)
+		}
+		if err := validateHTTPSURL(target.Teams.WebhookURL); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedTarget, target.Type)
@@ -727,7 +792,7 @@ func IsEventEnabled(settings *Settings, event eventstore.EventType) bool {
 	if settings == nil || !settings.Enabled {
 		return false
 	}
-	return slices.Contains(settings.Events, event)
+	return matchesConfiguredEvent(settings.Events, event)
 }
 
 func IsTargetEventEnabled(settings *Settings, target Target, event eventstore.EventType) bool {
@@ -737,7 +802,7 @@ func IsTargetEventEnabled(settings *Settings, target Target, event eventstore.Ev
 	if len(target.Events) == 0 {
 		return true
 	}
-	return slices.Contains(target.Events, event)
+	return matchesConfiguredEvent(target.Events, event)
 }
 
 func IsSubscriptionEventEnabled(settings *Settings, subscription Subscription, event eventstore.EventType) bool {
@@ -747,7 +812,7 @@ func IsSubscriptionEventEnabled(settings *Settings, subscription Subscription, e
 	if len(subscription.Events) == 0 {
 		return true
 	}
-	return slices.Contains(subscription.Events, event)
+	return matchesConfiguredEvent(subscription.Events, event)
 }
 
 func IsRouteEventEnabled(routeSet *RouteSet, route Route, event eventstore.EventType) bool {
@@ -755,9 +820,17 @@ func IsRouteEventEnabled(routeSet *RouteSet, route Route, event eventstore.Event
 		return false
 	}
 	if len(route.Events) == 0 {
-		return slices.Contains(defaultEvents, event)
+		return matchesConfiguredEvent(defaultEvents, event)
 	}
-	return slices.Contains(route.Events, event)
+	return matchesConfiguredEvent(route.Events, event)
+}
+
+func matchesConfiguredEvent(events []eventstore.EventType, actual eventstore.EventType) bool {
+	if slices.Contains(events, actual) {
+		return true
+	}
+	return actual == eventstore.TypeDAGRunPartiallySucceeded &&
+		slices.Contains(events, eventstore.TypeDAGRunSucceeded)
 }
 
 func ToPublic(settings *Settings) *PublicSettings {
@@ -809,6 +882,7 @@ func (c Channel) ToPublic() PublicChannel {
 		Webhook:   target.Webhook,
 		Slack:     target.Slack,
 		Telegram:  target.Telegram,
+		Teams:     target.Teams,
 		CreatedAt: c.CreatedAt,
 		UpdatedAt: c.UpdatedAt,
 		UpdatedBy: c.UpdatedBy,
@@ -828,6 +902,16 @@ func (s WorkspaceSettings) ToPublic() PublicWorkspaceSettings {
 			Username:           s.SMTP.Username,
 			From:               s.SMTP.From,
 			PasswordConfigured: s.SMTP.Password != "",
+		}
+		if s.SMTP.OAuth != nil {
+			pub.SMTP.OAuth = &PublicSMTPOAuthConfig{
+				Provider:                     s.SMTP.OAuth.Provider,
+				TenantID:                     s.SMTP.OAuth.TenantID,
+				ClientID:                     s.SMTP.OAuth.ClientID,
+				ClientSecretConfigured:       s.SMTP.OAuth.ClientSecret != "",
+				RefreshTokenConfigured:       s.SMTP.OAuth.RefreshToken != "",
+				ServiceAccountJSONConfigured: s.SMTP.OAuth.ServiceAccountJSON != "",
+			}
 		}
 	}
 	return pub
@@ -887,6 +971,10 @@ func (c Channel) ToTarget() Target {
 		copy := *c.Telegram
 		target.Telegram = &copy
 	}
+	if c.Teams != nil {
+		copy := *c.Teams
+		target.Teams = &copy
+	}
 	return target
 }
 
@@ -899,6 +987,7 @@ func (c *Channel) applyTarget(target Target) {
 	c.Webhook = target.Webhook
 	c.Slack = target.Slack
 	c.Telegram = target.Telegram
+	c.Teams = target.Teams
 }
 
 func (t Target) ToPublic() PublicTarget {
@@ -923,6 +1012,7 @@ func (t Target) ToPublic() PublicTarget {
 				Headers:              previewHeaderValues(t.Webhook.Headers),
 				HMACSecretConfigured: t.Webhook.HMACSecret != "",
 				MessageTemplate:      t.Webhook.MessageTemplate,
+				BodyTemplate:         t.Webhook.BodyTemplate,
 				AllowInsecureHTTP:    t.Webhook.AllowInsecureHTTP,
 				AllowPrivateNetwork:  t.Webhook.AllowPrivateNetwork,
 			}
@@ -941,7 +1031,16 @@ func (t Target) ToPublic() PublicTarget {
 				BotTokenConfigured: t.Telegram.BotToken != "",
 				BotTokenPreview:    PreviewSecret(t.Telegram.BotToken),
 				ChatID:             t.Telegram.ChatID,
+				TopicID:            t.Telegram.TopicID,
 				MessageTemplate:    t.Telegram.MessageTemplate,
+			}
+		}
+	case ProviderTeams:
+		if t.Teams != nil {
+			pub.Teams = &PublicTeamsTarget{
+				WebhookURLConfigured: t.Teams.WebhookURL != "",
+				WebhookURLPreview:    PreviewSecret(t.Teams.WebhookURL),
+				MessageTemplate:      t.Teams.MessageTemplate,
 			}
 		}
 	}
@@ -1019,9 +1118,31 @@ func PreserveWorkspaceSecrets(next, existing *WorkspaceSettings) {
 	if next == nil || existing == nil || next.SMTP == nil || existing.SMTP == nil {
 		return
 	}
-	if next.SMTP.Password == "" && !next.SMTP.ClearPassword {
+	if next.SMTP.OAuth == nil && existing.SMTP.OAuth == nil && next.SMTP.Password == "" && !next.SMTP.ClearPassword {
 		next.SMTP.Password = existing.SMTP.Password
 	}
+	if !sameSMTPOAuthIdentity(next.SMTP, existing.SMTP) {
+		return
+	}
+	if next.SMTP.OAuth.ClientSecret == "" {
+		next.SMTP.OAuth.ClientSecret = existing.SMTP.OAuth.ClientSecret
+	}
+	if next.SMTP.OAuth.RefreshToken == "" {
+		next.SMTP.OAuth.RefreshToken = existing.SMTP.OAuth.RefreshToken
+	}
+	if next.SMTP.OAuth.ServiceAccountJSON == "" {
+		next.SMTP.OAuth.ServiceAccountJSON = existing.SMTP.OAuth.ServiceAccountJSON
+	}
+}
+
+func sameSMTPOAuthIdentity(next, existing *SMTPConfig) bool {
+	if next.OAuth == nil || existing.OAuth == nil {
+		return false
+	}
+	return strings.TrimSpace(string(next.OAuth.Provider)) == strings.TrimSpace(string(existing.OAuth.Provider)) &&
+		strings.TrimSpace(next.Username) == strings.TrimSpace(existing.Username) &&
+		strings.TrimSpace(next.OAuth.TenantID) == strings.TrimSpace(existing.OAuth.TenantID) &&
+		strings.TrimSpace(next.OAuth.ClientID) == strings.TrimSpace(existing.OAuth.ClientID)
 }
 
 func preserveTargetSecrets(next *Target, prev Target) {
@@ -1041,5 +1162,8 @@ func preserveTargetSecrets(next *Target, prev Target) {
 	}
 	if next.Telegram != nil && prev.Telegram != nil && next.Telegram.BotToken == "" {
 		next.Telegram.BotToken = prev.Telegram.BotToken
+	}
+	if next.Teams != nil && prev.Teams != nil && next.Teams.WebhookURL == "" {
+		next.Teams.WebhookURL = prev.Teams.WebhookURL
 	}
 }

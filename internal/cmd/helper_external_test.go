@@ -10,9 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	dagucmd "github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	dagucmd "github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,7 +23,7 @@ func TestRestoreDAGFromStatusIncludesDotenvFromResolvedWorkingDir(t *testing.T) 
 	require.NoError(t, os.MkdirAll(workDir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(workDir, ".env"), []byte("PYTHON_BIN=/usr/local/bin/python\nPROJECT_DIR=/work/quant-signal\n"), 0o600))
 
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:               "signal",
 		Location:           filepath.Join(root, "dags", "signal.yaml"),
 		WorkingDir:         "${QUANT_SIGNAL_DIR}",
@@ -39,7 +38,7 @@ steps:
     run: ${PYTHON_BIN} ${PROJECT_DIR}/signals/run_signals.py
 `),
 	}
-	status := &exec.DAGRunStatus{}
+	status := &ir.DAGRunStatus{}
 
 	restored, err := dagucmd.RestoreDAGFromStatusForTest(context.Background(), dag, status)
 	require.NoError(t, err)

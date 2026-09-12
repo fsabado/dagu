@@ -6,8 +6,8 @@ package intg_test
 import (
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/test"
 )
 
 func TestDataConvertAction(t *testing.T) {
@@ -41,7 +41,7 @@ steps:
 
 	agent.RunSuccess(t)
 
-	dag.AssertLatestStatus(t, core.Succeeded)
+	dag.AssertLatestStatus(t, ir.Succeeded)
 	dag.AssertOutputs(t, map[string]any{
 		"FIRST_NAME": "Alice",
 	})

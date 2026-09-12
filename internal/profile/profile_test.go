@@ -4,13 +4,14 @@
 package profile_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/profile"
+	"github.com/dagucloud/dagu/v2/internal/profile"
 )
 
 func TestNewValidatesProfile(t *testing.T) {
@@ -50,6 +51,8 @@ func TestValidateName(t *testing.T) {
 		{name: "Prod", want: false},
 		{name: "-prod", want: false},
 		{name: "prod/slash", want: false},
+		{name: strings.Repeat("a", 128), want: true},
+		{name: strings.Repeat("a", 129), want: false},
 	}
 
 	for _, tt := range tests {

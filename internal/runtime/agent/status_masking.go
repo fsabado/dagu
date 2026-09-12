@@ -6,13 +6,12 @@ package agent
 import (
 	"maps"
 
-	"github.com/dagucloud/dagu/internal/cmn/collections"
-	"github.com/dagucloud/dagu/internal/cmn/masking"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/collections"
+	"github.com/dagucloud/dagu/v2/internal/cmn/masking"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
-func (a *Agent) maskStatusSecrets(status *exec.DAGRunStatus) {
+func (a *Agent) maskStatusSecrets(status *ir.DAGRunStatus) {
 	if a.secretMasker == nil {
 		return
 	}
@@ -36,15 +35,27 @@ func newStatusSecretMasker(secretEnvs []string) *masking.Masker {
 	return masking.NewMasker(masking.SourcedEnvVars{Secrets: secretEnvs})
 }
 
-func maskNodeSecrets(masker *masking.Masker, node *exec.Node) {
+func maskNodeSecrets(masker *masking.Masker, node *ir.Node) {
 	if node == nil {
 		return
 	}
 	node.Step = maskStepSecrets(masker, node.Step)
 	node.Error = masker.MaskString(node.Error)
+	node.StatusDetails = maskNodeStatusDetails(masker, node.StatusDetails)
 	node.OutputVariables = maskOutputVariables(masker, node.OutputVariables)
 	node.OutputValue = maskStringPointer(masker, node.OutputValue)
 	node.OutputsValue = maskStringPointer(masker, node.OutputsValue)
+}
+
+func maskNodeStatusDetails(masker *masking.Masker, details []ir.NodeStatusDetail) []ir.NodeStatusDetail {
+	if len(details) == 0 {
+		return details
+	}
+	masked := append([]ir.NodeStatusDetail(nil), details...)
+	for i := range masked {
+		masked[i].Label = masker.MaskString(masked[i].Label)
+	}
+	return masked
 }
 
 func maskOutputVariables(masker *masking.Masker, values *collections.SyncMap) *collections.SyncMap {
@@ -64,7 +75,7 @@ func maskOutputVariables(masker *masking.Masker, values *collections.SyncMap) *c
 	return masked
 }
 
-func maskStepSecrets(masker *masking.Masker, step core.Step) core.Step {
+func maskStepSecrets(masker *masking.Masker, step ir.Step) ir.Step {
 	step.Command = masker.MaskString(step.Command)
 	step.CmdWithArgs = masker.MaskString(step.CmdWithArgs)
 	step.CmdArgsSys = masker.MaskString(step.CmdArgsSys)
@@ -72,9 +83,14 @@ func maskStepSecrets(masker *masking.Masker, step core.Step) core.Step {
 	step.Script = masker.MaskString(step.Script)
 	step.Args = maskStrings(masker, step.Args)
 	step.Env = maskStrings(masker, step.Env)
+	if step.HumanTask != nil {
+		humanTask := *step.HumanTask
+		humanTask.Prompt = masker.MaskString(humanTask.Prompt)
+		step.HumanTask = &humanTask
+	}
 
 	if len(step.Commands) > 0 {
-		commands := append([]core.CommandEntry(nil), step.Commands...)
+		commands := append([]ir.CommandEntry(nil), step.Commands...)
 		for i := range commands {
 			commands[i].Command = masker.MaskString(commands[i].Command)
 			commands[i].Args = maskStrings(masker, commands[i].Args)

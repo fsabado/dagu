@@ -7,21 +7,24 @@
  * @module features/dags/components/dag-execution
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Download } from 'lucide-react';
-import { components, NodeStatus, Stream } from '../../../../api/v1/schema';
+import { ChevronDown, ChevronUp, Download, Search, X } from 'lucide-react';
+import { components, Stream } from '../../../../api/v1/schema';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ReloadButton } from '@/components/ui/reload-button';
 import { Switch } from '@/components/ui/switch';
-import { TOKEN_KEY } from '../../../../contexts/AuthContext';
+import { downloadFromUrl } from '@/lib/download';
 import { useConfig } from '../../../../contexts/ConfigContext';
 import { useRemoteNode } from '../../../../contexts/RemoteNodeContext';
 import { useUserPreferences } from '../../../../contexts/UserPreference';
 import { useQuery } from '../../../../hooks/api';
 import { whenEnabled } from '../../../../hooks/queryUtils';
 import { useStepLogSSE } from '../../../../hooks/useStepLogSSE';
+import { AnsiLine, stripAnsi } from '@/lib/ansi';
 import { isActiveNodeStatus } from '../../../../lib/status-utils';
 import LoadingIndicator from '@/components/ui/loading-indicator';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 // Extended Log type with pagination fields
 interface LogWithPagination {
@@ -55,15 +58,6 @@ type Props = {
 };
 
 /**
- * Regular expression to match ANSI color codes for removal
- * Credit: https://github.com/chalk/ansi-regex/commit/02fa893d619d3da85411acc8fd4e2eea0e95a9d9 under MIT license
- */
-const ANSI_CODES_REGEX = [
-  '[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]+)*|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)',
-  '(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))',
-].join('|');
-
-/**
  * StepLog displays the log output for a specific step in a DAG run
  * Fetches log data from the API and refreshes every 30 seconds
  */
@@ -82,6 +76,8 @@ function StepLog({
   const [pageSize, setPageSize] = useState(1000);
   const [currentPage, setCurrentPage] = useState(1);
   const [jumpToLine, setJumpToLine] = useState<number | ''>('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [activeMatch, setActiveMatch] = useState(0);
   const isActive = isActiveNodeStatus(node?.status);
 
   const [isLiveMode, setIsLiveMode] = useState(isActive);
@@ -304,7 +300,6 @@ function StepLog({
   }
 
   const handleDownload = useCallback(async () => {
-    const token = localStorage.getItem(TOKEN_KEY);
     const endpoint = isSubDAGRun
       ? `${config.apiURL}/dag-runs/${dagRun?.rootDAGRunName}/${dagRun?.rootDAGRunId}/sub-dag-runs/${dagRun?.dagRunId}/steps/${stepName}/log/download`
       : `${config.apiURL}/dag-runs/${dagName}/${dagRunId}/steps/${stepName}/log/download`;
@@ -314,26 +309,10 @@ function StepLog({
     url.searchParams.set('stream', stream);
 
     try {
-      const response = await fetch(url.toString(), {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-
-      if (!response.ok) {
-        throw new Error(`Download failed: ${response.statusText}`);
-      }
-
-      const blob = await response.blob();
-      const filename =
-        response.headers
-          .get('Content-Disposition')
-          ?.match(/filename="(.+)"/)?.[1] ||
-        `${dagName}-${dagRunId}-${stepName}-${stream}.log`;
-
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = filename;
-      link.click();
-      URL.revokeObjectURL(link.href);
+      await downloadFromUrl(
+        url.toString(),
+        `${dagName}-${dagRunId}-${stepName}-${stream}.log`
+      );
     } catch (err) {
       console.error('Download failed:', err);
     }
@@ -348,12 +327,32 @@ function StepLog({
     remoteNode,
   ]);
 
+  // Prioritize SSE data, then REST data, then cached data
+  const logData = (sseLogData ||
+    data ||
+    cachedData) as LogWithPagination | null;
+  const content = logData?.content || '';
+
+  const lines = React.useMemo(() => {
+    const rawLines = content ? content.split('\n') : ['<No log output>'];
+    return rawLines[rawLines.length - 1] === ''
+      ? rawLines.slice(0, -1)
+      : rawLines;
+  }, [content]);
+
+  const trimmedSearch = searchTerm.trim();
+  const matchIndexes = React.useMemo(() => {
+    if (!trimmedSearch) return [];
+    const term = trimmedSearch.toLowerCase();
+    return lines.reduce<number[]>((acc, line, index) => {
+      if (stripAnsi(line).toLowerCase().includes(term)) acc.push(index);
+      return acc;
+    }, []);
+  }, [lines, trimmedSearch]);
+
   if (isLoading && !cachedData && isInitialLoad.current) {
     return <LoadingIndicator />;
   }
-
-  // Prioritize SSE data, then REST data, then cached data
-  const logData = (sseLogData || data || cachedData) as LogWithPagination;
 
   // Show error state (but not 404 since that means no log file exists yet)
   const isNotFoundError = error?.message?.includes('not found');
@@ -361,25 +360,40 @@ function StepLog({
     return (
       <div className="w-full h-full flex items-center justify-center">
         <div className="text-error">
-          Error loading log data: {error.message || 'Unknown error'}
+          <I18nText text={'Error loading log data:'} />{' '}
+          {error.message || <I18nText text={'Unknown error'} />}
         </div>
       </div>
     );
   }
 
-  const content =
-    logData?.content.replace(new RegExp(ANSI_CODES_REGEX, 'g'), '') || '';
   const totalLines = logData?.totalLines || 0;
   const hasMore = logData?.hasMore || false;
   const isEstimate = logData?.isEstimate || false;
-
-  const rawLines = content ? content.split('\n') : ['<No log output>'];
-  const lines =
-    rawLines[rawLines.length - 1] === '' ? rawLines.slice(0, -1) : rawLines;
   const effectiveTotalLines =
     totalLines - lines.length <= 1 ? lines.length : totalLines;
 
   const totalPages = calculateTotalPages(effectiveTotalLines, pageSize);
+
+  function scrollToMatch(matchPosition: number): void {
+    const lineIndex = matchIndexes[matchPosition];
+    if (lineIndex === undefined) return;
+    const element = logContainerRef.current?.querySelector(
+      `[data-log-index="${lineIndex}"]`
+    ) as HTMLElement | null;
+    if (!element) return;
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    element.classList.add('bg-primary/20');
+    setTimeout(() => element.classList.remove('bg-primary/20'), 1200);
+  }
+
+  function goToMatch(direction: 1 | -1): void {
+    if (matchIndexes.length === 0) return;
+    const next =
+      (activeMatch + direction + matchIndexes.length) % matchIndexes.length;
+    setActiveMatch(next);
+    scrollToMatch(next);
+  }
 
   function getLineNumber(index: number): number {
     switch (viewMode) {
@@ -405,7 +419,7 @@ function StepLog({
               onClick={() => handleViewModeChange('tail')}
               disabled={isNavigating}
             >
-              Show End
+              <I18nText text={'Show End'} />
             </Button>
             <Button
               size="sm"
@@ -413,7 +427,7 @@ function StepLog({
               onClick={() => handleViewModeChange('head')}
               disabled={isNavigating}
             >
-              Show Beginning
+              <I18nText text={'Show Beginning'} />
             </Button>
             <Button
               size="sm"
@@ -421,7 +435,7 @@ function StepLog({
               onClick={() => handleViewModeChange('page')}
               disabled={isNavigating}
             >
-              Page View
+              <I18nText text={'Page View'} />
             </Button>
           </div>
 
@@ -431,18 +445,30 @@ function StepLog({
             onChange={(e) => setPageSize(Number(e.target.value))}
             disabled={isNavigating}
           >
-            <option value="100">100 lines</option>
-            <option value="500">500 lines</option>
-            <option value="1000">1000 lines</option>
-            <option value="5000">5000 lines</option>
-            <option value="10000">10000 lines</option>
+            <option value="100">
+              <I18nText text={'100 lines'} />
+            </option>
+            <option value="500">
+              <I18nText text={'500 lines'} />
+            </option>
+            <option value="1000">
+              <I18nText text={'1000 lines'} />
+            </option>
+            <option value="5000">
+              <I18nText text={'5000 lines'} />
+            </option>
+            <option value="10000">
+              <I18nText text={'10000 lines'} />
+            </option>
           </select>
 
           {/* Wrap toggle, Live mode toggle and reload button */}
           <div className="flex items-center gap-2 ml-auto">
             {/* Wrap toggle */}
             <div className="flex items-center gap-1.5">
-              <span className="text-xs text-muted-foreground">Wrap</span>
+              <span className="text-xs text-muted-foreground">
+                <I18nText text={'Wrap'} />
+              </span>
               <Switch
                 checked={preferences.logWrap}
                 onCheckedChange={(checked) =>
@@ -452,26 +478,30 @@ function StepLog({
             </div>
 
             {/* Reload button */}
-            <ReloadButton
-              onReload={async () => {
-                if (mutate) {
-                  await mutate();
-                }
-              }}
-              isLoading={isNavigating || isLoading}
-              title="Reload logs"
-            />
+            <I18nProps>
+              <ReloadButton
+                onReload={async () => {
+                  if (mutate) {
+                    await mutate();
+                  }
+                }}
+                isLoading={isNavigating || isLoading}
+                title="Reload logs"
+              />
+            </I18nProps>
 
             {/* Download button */}
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleDownload}
-              disabled={isNavigating}
-              title="Download full log"
-            >
-              <Download className="h-4 w-4" />
-            </Button>
+            <I18nProps>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleDownload}
+                disabled={isNavigating}
+                title="Download full log"
+              >
+                <Download className="h-4 w-4" />
+              </Button>
+            </I18nProps>
 
             {/* Live mode toggle - only show when the node is active */}
             {isActive && (
@@ -483,7 +513,7 @@ function StepLog({
                 <span
                   className={`inline-block w-2 h-2 rounded-full ${isLiveMode ? 'bg-white animate-pulse' : 'bg-muted-foreground'}`}
                 />
-                LIVE
+                <I18nText text={'LIVE'} />
               </Button>
             )}
           </div>
@@ -491,8 +521,12 @@ function StepLog({
 
         {/* Stats line - full width on mobile */}
         <div className="text-xs text-muted-foreground flex items-center">
-          Showing {lines.length} of {effectiveTotalLines} lines{' '}
-          {isEstimate ? '(estimated)' : ''} {hasMore ? '(more available)' : ''}
+          <I18nText
+            text="Showing {visible} of {total} lines"
+            values={{ visible: lines.length, total: effectiveTotalLines }}
+          />{' '}
+          {isEstimate ? <I18nText text={'(estimated)'} /> : ''}{' '}
+          {hasMore ? <I18nText text={'(more available)'} /> : ''}
         </div>
 
         {/* Page navigation controls */}
@@ -503,10 +537,13 @@ function StepLog({
               onClick={() => handlePageChange(Math.max(1, currentPage - 1))}
               disabled={currentPage <= 1 || isNavigating}
             >
-              Previous
+              <I18nText text="Previous page" />
             </Button>
             <span className="text-xs">
-              Page {currentPage} of {totalPages}
+              <I18nText
+                text="Page {current} of {total}"
+                values={{ current: currentPage, total: totalPages }}
+              />
             </span>
             <Button
               size="sm"
@@ -515,14 +552,88 @@ function StepLog({
               }
               disabled={currentPage >= totalPages || isNavigating}
             >
-              Next
+              <I18nText text="Next page" />
             </Button>
           </div>
         )}
 
+        {/* Search within loaded lines */}
+        <div className="flex items-center gap-2 mt-2">
+          <Search className="h-3.5 w-3.5 text-muted-foreground" />
+          <I18nProps>
+            <Input
+              type="text"
+              placeholder="Search in loaded lines..."
+              value={searchTerm}
+              onChange={(e) => {
+                setSearchTerm(e.target.value);
+                setActiveMatch(0);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  goToMatch(e.shiftKey ? -1 : 1);
+                } else if (e.key === 'Escape') {
+                  setSearchTerm('');
+                  setActiveMatch(0);
+                }
+              }}
+              className="w-48 h-7 text-xs"
+            />
+          </I18nProps>
+          {trimmedSearch && (
+            <>
+              <span className="text-xs text-muted-foreground whitespace-nowrap">
+                {matchIndexes.length === 0 ? (
+                  <I18nText text={'No matches'} />
+                ) : (
+                  `${Math.min(activeMatch + 1, matchIndexes.length)}/${matchIndexes.length}`
+                )}
+              </span>
+              <I18nProps>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => goToMatch(-1)}
+                  disabled={matchIndexes.length === 0}
+                  title="Previous match (Shift+Enter)"
+                >
+                  <ChevronUp className="h-3.5 w-3.5" />
+                </Button>
+              </I18nProps>
+              <I18nProps>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => goToMatch(1)}
+                  disabled={matchIndexes.length === 0}
+                  title="Next match (Enter)"
+                >
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              </I18nProps>
+              <I18nProps>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setSearchTerm('');
+                    setActiveMatch(0);
+                  }}
+                  title="Clear search (Esc)"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              </I18nProps>
+            </>
+          )}
+        </div>
+
         {/* Jump to line controls */}
         <div className="flex items-center gap-2 mt-2">
-          <span className="text-xs text-muted-foreground">Jump to line:</span>
+          <span className="text-xs text-muted-foreground">
+            <I18nText text={'Jump to line:'} />
+          </span>
           <Input
             type="number"
             min={1}
@@ -556,7 +667,7 @@ function StepLog({
               (jumpToLine as number) > effectiveTotalLines
             }
           >
-            Go
+            <I18nText text={'Go'} />
           </Button>
         </div>
       </div>
@@ -567,7 +678,7 @@ function StepLog({
         className={`flex-1 rounded-lg bg-muted pt-4 pr-4 pb-4 relative ${preferences.logWrap ? 'overflow-auto' : 'overflow-x-auto overflow-y-auto'}`}
       >
         {isNavigating && (
-          <div className="absolute inset-0 bg-black bg-opacity-20 flex items-center justify-center z-10 pointer-events-none">
+          <div className="absolute inset-0 bg-black/20 flex items-center justify-center z-10 pointer-events-none">
             <div className="bg-card rounded-lg p-2">
               <div className="h-5 w-5 animate-spin rounded-full border-3 border-primary border-t-transparent"></div>
             </div>
@@ -577,7 +688,11 @@ function StepLog({
           className={`h-full font-mono text-sm text-foreground log-content ${preferences.logWrap ? '' : 'min-w-max'}`}
         >
           {lines.map((line, index) => (
-            <div key={index} className="flex pr-2 py-0.5">
+            <div
+              key={index}
+              className="flex pr-2 py-0.5"
+              data-log-index={index}
+            >
               <span
                 className="text-muted-foreground mr-4 select-none w-14 text-right flex-shrink-0 self-start sticky left-0 bg-muted pl-4 pr-2 z-10"
                 data-line-number={getLineNumber(index)}
@@ -587,7 +702,14 @@ function StepLog({
               <span
                 className={`flex-grow select-text cursor-text ${preferences.logWrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'}`}
               >
-                {line || ' '}
+                {line ? (
+                  <AnsiLine
+                    text={line}
+                    highlight={trimmedSearch || undefined}
+                  />
+                ) : (
+                  ' '
+                )}
               </span>
             </div>
           ))}

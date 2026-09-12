@@ -1,0 +1,7 @@
+working_dir: .
+steps:
+  - id: write
+    preconditions:
+      - condition: "$(printf hour-08)"
+        expected: "$(printf hour-08)"
+    run: printf '%s\n' dollar > step-dollar.txt

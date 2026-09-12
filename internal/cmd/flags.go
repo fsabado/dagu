@@ -4,7 +4,7 @@
 package cmd
 
 import (
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -46,6 +46,18 @@ var (
 	cpuProfileFlag = commandLineFlag{
 		name:   "cpu-profile",
 		usage:  "Enable CPU profiling (saves to cpu.pprof)",
+		isBool: true,
+	}
+
+	showUnresolvedFlag = commandLineFlag{
+		name:   "show-unresolved",
+		usage:  "Also report references whose value only exists during a run",
+		isBool: true,
+	}
+
+	noReuseFlag = commandLineFlag{
+		name:   "no-reuse",
+		usage:  "Recompute build steps instead of reusing prior materializations",
 		isBool: true,
 	}
 )
@@ -166,6 +178,18 @@ var (
 		name:  "step",
 		usage: "Retry only the specified step (optional)",
 	}
+
+	downstreamForRetry = commandLineFlag{
+		name:   "downstream",
+		usage:  "Also retry reachable downstream steps (requires --step)",
+		isBool: true,
+	}
+
+	retryPathFlag = commandLineFlag{
+		name:   "retry-path",
+		usage:  "Internal persisted child DAG retry path",
+		hidden: true,
+	}
 )
 
 // Sub DAG run flags
@@ -252,7 +276,7 @@ var (
 
 	workerCoordinatorsFlag = commandLineFlag{
 		name:      "worker.coordinators",
-		usage:     "Coordinator addresses for static discovery (format: host1:port1,host2:port2)",
+		usage:     "Required coordinator addresses (format: host1:port1,host2:port2)",
 		bindViper: true,
 	}
 )
@@ -315,6 +339,80 @@ var (
 		shorthand: "y",
 		usage:     "Skip confirmation prompt",
 		isBool:    true,
+	}
+
+	lsNextFlag = commandLineFlag{
+		name:      "next",
+		shorthand: "n",
+		usage:     "Show next scheduled run time",
+		isBool:    true,
+	}
+
+	lsLastFlag = commandLineFlag{
+		name:      "last",
+		shorthand: "l",
+		usage:     "Show last run status and time",
+		isBool:    true,
+	}
+
+	lsHistoryFlag = commandLineFlag{
+		name:      "history",
+		shorthand: "H",
+		usage:     "Show a compact recent-history summary",
+		isBool:    true,
+	}
+
+	lsSortLastFlag = commandLineFlag{
+		name:      "sort-last",
+		shorthand: "t",
+		usage:     "Sort by last run time, newest first",
+		isBool:    true,
+	}
+
+	lsReverseFlag = commandLineFlag{
+		name:      "reverse",
+		shorthand: "r",
+		usage:     "Reverse sort order",
+		isBool:    true,
+	}
+
+	rmHistoryFlag = commandLineFlag{
+		name:      "history",
+		shorthand: "H",
+		usage:     "Delete DAG run history",
+		isBool:    true,
+	}
+
+	rmDefinitionFlag = commandLineFlag{
+		name:      "definition",
+		shorthand: "d",
+		usage:     "Delete the DAG YAML definition",
+		isBool:    true,
+	}
+
+	rmOlderThanFlag = commandLineFlag{
+		name:      "older-than",
+		shorthand: "t",
+		usage:     "With --history: delete runs older than duration (e.g. 10d, 24h, 1w). Omitted = delete all history",
+	}
+
+	rmForceFlag = commandLineFlag{
+		name:      "force",
+		shorthand: "f",
+		usage:     "Skip confirmation prompt",
+		isBool:    true,
+	}
+
+	psDAGFlag = commandLineFlag{
+		name:      "dag",
+		shorthand: "d",
+		usage:     "Filter by DAG name",
+	}
+
+	psRunIDFlag = commandLineFlag{
+		name:      "run-id",
+		shorthand: "r",
+		usage:     "Filter by run ID (partial match supported)",
 	}
 )
 

@@ -13,10 +13,10 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 var (
@@ -60,7 +60,7 @@ func (w *Writer) Open() error {
 	}
 
 	dir := filepath.Dir(w.target)
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := fileutil.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
@@ -78,7 +78,7 @@ func (w *Writer) Open() error {
 
 // Write serializes the status to JSON and appends it to the file.
 // It automatically flushes data to ensure durability.
-func (w *Writer) Write(ctx context.Context, st exec.DAGRunStatus) error {
+func (w *Writer) Write(ctx context.Context, st ir.DAGRunStatus) error {
 	if err := w.write(st); err != nil {
 		logger.Error(ctx, "Failed to write status", tag.Error(err))
 		return err
@@ -88,7 +88,7 @@ func (w *Writer) Write(ctx context.Context, st exec.DAGRunStatus) error {
 }
 
 // write encodes a single status entry and persists it to disk.
-func (w *Writer) write(st exec.DAGRunStatus) error {
+func (w *Writer) write(st ir.DAGRunStatus) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

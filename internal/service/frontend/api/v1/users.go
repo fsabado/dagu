@@ -8,10 +8,12 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/auth"
-	"github.com/dagucloud/dagu/internal/service/audit"
-	authservice "github.com/dagucloud/dagu/internal/service/auth"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/license"
+	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 )
 
 // ListUsers returns a list of all users. Requires admin role.
@@ -27,10 +29,71 @@ func (a *API) ListUsers(ctx context.Context, _ api.ListUsersRequestObject) (api.
 	if err != nil {
 		return nil, err
 	}
+	mapping := a.currentOIDCMapping()
+	workspaceSync := a.oidcWorkspaceSync(mapping)
 
 	return api.ListUsers200JSONResponse{
-		Users: toAPIUsers(users),
+		Users:                           toAPIUsers(users),
+		OidcWorkspaceAccessSyncEnabled:  &workspaceSync,
+		ManagedRoleProviders:            a.managedProviders(a.oidcRoleSync(mapping)),
+		ManagedWorkspaceAccessProviders: a.managedProviders(workspaceSync),
 	}, nil
+}
+
+func (a *API) managedProviders(oidcSyncEnabled bool) []api.UserAuthProvider {
+	providers := make([]api.UserAuthProvider, 0, 2)
+	if oidcSyncEnabled {
+		providers = append(providers, api.UserAuthProviderOidc)
+	}
+	if a.config == nil {
+		return providers
+	}
+	if a.licenseManager != nil && !a.licenseManager.Checker().IsFeatureEnabled(license.FeatureSSO) {
+		return providers
+	}
+	authConfig := a.config.Server.Auth
+	if authConfig.Mode == config.AuthModeBuiltin &&
+		authConfig.Proxy.Enabled &&
+		!authConfig.Proxy.RoleMapping.SkipOrgRoleSync {
+		providers = append(providers, api.UserAuthProviderProxy)
+	}
+	return providers
+}
+
+func (a *API) currentOIDCMapping() config.OIDCRoleMapping {
+	if a.config == nil {
+		return config.OIDCRoleMapping{}
+	}
+	if a.oidcRoleMapping != nil {
+		return a.oidcRoleMapping()
+	}
+	return a.config.Server.Auth.OIDC.RoleMapping
+}
+
+func (a *API) oidcWorkspaceSync(mapping config.OIDCRoleMapping) bool {
+	return a.oidcSyncEnabled(mapping) && mapping.WorkspaceAccessPolicyActive()
+}
+
+func (a *API) oidcRoleSync(mapping config.OIDCRoleMapping) bool {
+	if !a.oidcSyncEnabled(mapping) {
+		return false
+	}
+	return len(mapping.GroupMappings) > 0 ||
+		mapping.RoleAttributePath != "" ||
+		mapping.WorkspaceAccessPolicyActive()
+}
+
+func (a *API) oidcSyncEnabled(mapping config.OIDCRoleMapping) bool {
+	if a.config == nil {
+		return false
+	}
+	if a.licenseManager != nil && !a.licenseManager.Checker().IsFeatureEnabled(license.FeatureSSO) {
+		return false
+	}
+	authConfig := a.config.Server.Auth
+	return authConfig.Mode == config.AuthModeBuiltin &&
+		authConfig.OIDC.IsConfigured() &&
+		!mapping.SkipOrgRoleSync
 }
 
 // CreateUser creates a new user. Requires admin role.
@@ -347,6 +410,13 @@ func (a *API) ResetUserPassword(ctx context.Context, request api.ResetUserPasswo
 				Code:       api.ErrorCodeBadRequest,
 				Message:    "Password does not meet security requirements",
 				HTTPStatus: http.StatusBadRequest,
+			}
+		}
+		if errors.Is(err, authservice.ErrExternalAuthPasswordManagement) {
+			return nil, &Error{
+				Code:       api.ErrorCodeForbidden,
+				Message:    "Password is managed by the authentication provider for this user",
+				HTTPStatus: http.StatusForbidden,
 			}
 		}
 		return nil, err

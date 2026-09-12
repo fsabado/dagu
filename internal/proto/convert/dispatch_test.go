@@ -6,9 +6,9 @@ package convert_test
 import (
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/proto/convert"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/proto/convert"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,7 +16,7 @@ import (
 func TestDispatchTaskToProtoClonesWorkerSelector(t *testing.T) {
 	t.Parallel()
 
-	task := &exec.DispatchTask{
+	task := &dispatch.DispatchTask{
 		WorkerSelector: map[string]string{"host": "server-a"},
 	}
 
@@ -30,20 +30,47 @@ func TestDispatchTaskToProtoClonesWorkerSelector(t *testing.T) {
 	assert.Equal(t, map[string]string{"host": "server-a"}, protoTask.WorkerSelector)
 }
 
-func TestDispatchTaskProfileNameRoundTrips(t *testing.T) {
+func TestDispatchTaskAttributionRoundTrips(t *testing.T) {
 	t.Parallel()
 
-	task := &exec.DispatchTask{ProfileName: "prod"}
+	task := &dispatch.DispatchTask{
+		ProfileName:       "prod",
+		DefinitionID:      "ops/daily",
+		TriggerActor:      "alice",
+		ParallelItem:      "item-1",
+		IncludeDownstream: true,
+	}
 
 	protoTask, err := convert.DispatchTaskToProto(task)
 	require.NoError(t, err)
 	require.NotNil(t, protoTask)
 	assert.Equal(t, "prod", protoTask.ProfileName)
+	assert.Equal(t, "ops/daily", protoTask.DefinitionId)
+	assert.Equal(t, "alice", protoTask.TriggerActor)
+	assert.Equal(t, "item-1", protoTask.ParallelItem)
+	assert.True(t, protoTask.IncludeDownstream)
 
 	got, err := convert.ProtoToDispatchTask(protoTask)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "prod", got.ProfileName)
+	assert.Equal(t, "ops/daily", got.DefinitionID)
+	assert.Equal(t, "alice", got.TriggerActor)
+	assert.Equal(t, "item-1", got.ParallelItem)
+	assert.True(t, got.IncludeDownstream)
+}
+
+func TestDispatchTaskTargetWorkerRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	task := &dispatch.DispatchTask{TargetWorkerID: "worker-a"}
+	protoTask, err := convert.DispatchTaskToProto(task)
+	require.NoError(t, err)
+	assert.Equal(t, "worker-a", protoTask.TargetWorkerId)
+
+	got, err := convert.ProtoToDispatchTask(protoTask)
+	require.NoError(t, err)
+	assert.Equal(t, "worker-a", got.TargetWorkerID)
 }
 
 func TestDispatchTaskToProtoValidatesOwnerPort(t *testing.T) {
@@ -64,8 +91,8 @@ func TestDispatchTaskToProtoValidatesOwnerPort(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := convert.DispatchTaskToProto(&exec.DispatchTask{
-				Owner: exec.CoordinatorEndpoint{Port: tt.port},
+			_, err := convert.DispatchTaskToProto(&dispatch.DispatchTask{
+				Owner: dispatch.CoordinatorEndpoint{Port: tt.port},
 			})
 			if tt.wantErr {
 				require.Error(t, err)

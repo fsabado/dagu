@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/service/audit"
-	frontendapi "github.com/dagucloud/dagu/internal/service/frontend/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	frontendapi "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
 	"github.com/google/uuid"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -150,8 +150,7 @@ func logMCPAudit(ctx context.Context, api *frontendapi.API, action string, detai
 }
 
 func isAuthorizationFailure(err error) bool {
-	var apiErr *frontendapi.Error
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*frontendapi.Error](err); ok {
 		return apiErr.HTTPStatus == http.StatusUnauthorized || apiErr.HTTPStatus == http.StatusForbidden
 	}
 	return false
@@ -208,6 +207,24 @@ func readAuditMetadata(input readInput) toolAuditMetadata {
 	if input.DAGRunID != "" {
 		attrs["dag_run_id"] = input.DAGRunID
 	}
+	if input.StepName != "" {
+		attrs["step_name"] = input.StepName
+	}
+	if input.Path != "" {
+		attrs["doc_path"] = input.Path
+	}
+	if input.Prefix != "" {
+		attrs["doc_prefix"] = input.Prefix
+	}
+	if input.Search != "" {
+		attrs["has_search"] = true
+	}
+	if input.Cursor != "" {
+		attrs["has_cursor"] = true
+	}
+	if input.Limit != 0 {
+		attrs["limit"] = input.Limit
+	}
 	if keys := queryKeys(input.Query); len(keys) > 0 {
 		attrs["query_keys"] = keys
 	}
@@ -215,6 +232,7 @@ func readAuditMetadata(input readInput) toolAuditMetadata {
 		Action:       "read",
 		ResourceType: target,
 		ResourceID:   resourceID,
+		Workspace:    input.Workspace,
 		Attributes:   attrs,
 	}
 }
@@ -226,18 +244,48 @@ func changeAuditMetadata(input changeInput) toolAuditMetadata {
 	}
 	changeType := strings.TrimSpace(input.Type)
 	if changeType == "" {
-		changeType = "upsert_dag"
+		changeType = changeTypeUpsertDAG
+	}
+	canonicalType := canonicalChangeType(changeType)
+	resourceType := "dag"
+	resourceID := input.Name
+	attributes := map[string]any{
+		"mode": mode,
+		"type": changeType,
+	}
+	workspace := ""
+	switch canonicalType {
+	case changeTypeUpsertDAG:
+		attributes["dag_name"] = input.Name
+		attributes["spec_bytes"] = len(input.Spec)
+	case changeTypeRenameDAG:
+		attributes["dag_name"] = input.Name
+		attributes["new_dag_name"] = input.NewName
+	case changeTypeDeleteDAG:
+		attributes["dag_name"] = input.Name
+	case changeTypeSetDAGProfile, changeTypeClearDAGProfile:
+		attributes["dag_name"] = input.Name
+		if input.Profile != "" {
+			attributes["profile"] = input.Profile
+		}
+	default:
+		resourceType = "doc"
+		resourceID = input.Path
+		workspace = input.Workspace
+		attributes["doc_path"] = input.Path
+		if input.NewPath != "" {
+			attributes["new_path"] = input.NewPath
+		}
+		if canonicalType == changeTypeUpsertWikiPage {
+			attributes["content_bytes"] = len(input.Content)
+		}
 	}
 	return toolAuditMetadata{
 		Action:       mode,
-		ResourceType: "dag",
-		ResourceID:   input.Name,
-		Attributes: map[string]any{
-			"mode":       mode,
-			"type":       changeType,
-			"dag_name":   input.Name,
-			"spec_bytes": len(input.Spec),
-		},
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Workspace:    workspace,
+		Attributes:   attributes,
 	}
 }
 
@@ -263,6 +311,7 @@ func executeAuditMetadata(input executeInput) toolAuditMetadata {
 		"target_type": targetType,
 		"dag_name":    input.Name,
 		"singleton":   input.Singleton,
+		"no_reuse":    input.NoReuse,
 		"label_count": len(input.Labels),
 	}
 	if input.DAGRunID != "" {
@@ -273,6 +322,12 @@ func executeAuditMetadata(input executeInput) toolAuditMetadata {
 	}
 	if input.StepName != "" {
 		attrs["step_name"] = input.StepName
+	}
+	if input.IncludeDownstream {
+		attrs["include_downstream"] = true
+	}
+	if input.Wait {
+		attrs["wait"] = true
 	}
 	if input.Spec != "" {
 		attrs["has_spec"] = true
@@ -362,13 +417,15 @@ func (svc *Service) readResource(ctx context.Context, req *mcpsdk.ReadResourceRe
 	successDetails["duration_ms"] = time.Since(start).Milliseconds()
 	successDetails["mime_type"] = mime
 	logMCPAudit(ctx, svc.api, "mcp.resource.read.succeeded", successDetails)
-	return &mcpsdk.ReadResourceResult{
-		Contents: []*mcpsdk.ResourceContents{{
-			URI:      req.Params.URI,
-			MIMEType: mime,
-			Text:     text,
-		}},
-	}, nil
+	content := &mcpsdk.ResourceContents{
+		URI:      req.Params.URI,
+		MIMEType: mime,
+		Text:     text,
+	}
+	if req.Params.URI == runInspectorURI {
+		content.Meta = runInspectorResourceMeta()
+	}
+	return &mcpsdk.ReadResourceResult{Contents: []*mcpsdk.ResourceContents{content}}, nil
 }
 
 func withMCPResourceSourceContext(ctx context.Context, req *mcpsdk.ReadResourceRequest) context.Context {
@@ -376,6 +433,14 @@ func withMCPResourceSourceContext(ctx context.Context, req *mcpsdk.ReadResourceR
 	source.MCPAction = "read_resource"
 	if req != nil {
 		applyMCPRequestMetadata(source, req.Session, req.Extra)
+		if parsed, err := url.Parse(req.Params.URI); err == nil && parsed.Scheme == "dagu" && (parsed.Host == "wiki" || parsed.Host == "docs") {
+			segments, _ := uriPathSegments(parsed)
+			if len(segments) > 0 {
+				source.ResolvedWorkspace = segments[0]
+			} else {
+				source.ResolvedWorkspace = "all"
+			}
+		}
 	}
 	return audit.WithSourceContext(ctx, source)
 }
@@ -401,7 +466,9 @@ func withMCPUnsubscribeSourceContext(ctx context.Context, req *mcpsdk.Unsubscrib
 func resourceAuditDetails(rawURI string) map[string]any {
 	resourceType := "resource"
 	resourceID := sanitizeAuditString(rawURI, 256)
-	if parsed, err := url.Parse(rawURI); err == nil && parsed.Scheme == "dagu" {
+	if parsed, err := url.Parse(rawURI); err == nil && parsed.Scheme == "ui" {
+		resourceType = "mcp_app"
+	} else if err == nil && parsed.Scheme == "dagu" {
 		segments, _ := uriPathSegments(parsed)
 		switch parsed.Host {
 		case "reference":
@@ -413,16 +480,31 @@ func resourceAuditDetails(rawURI string) map[string]any {
 			}
 		case "runs":
 			resourceType = "dag_run"
-			if len(segments) == 3 {
+			if isStepLogResourceSegments(segments) {
+				resourceType = "dag_run_step_log"
+				resourceID = segments[0] + "/" + segments[1] + "/" + segments[3]
+			} else if len(segments) == 3 {
 				resourceType = "dag_run_logs"
 			}
-			if len(segments) >= 2 {
+			if len(segments) >= 2 && !isStepLogResourceSegments(segments) {
+				resourceID = segments[0] + "/" + segments[1]
+			}
+		case "wiki", "docs":
+			switch len(segments) {
+			case 0:
+				resourceType = "documents"
+				resourceID = "all"
+			case 1:
+				resourceType = "documents"
+				resourceID = segments[0]
+			case 2:
+				resourceType = "document"
 				resourceID = segments[0] + "/" + segments[1]
 			}
 		}
 	}
 	return map[string]any{
 		"resource_type": resourceType,
-		"resource_id":   resourceID,
+		"resource_id":   sanitizeAuditString(resourceID, 256),
 	}
 }

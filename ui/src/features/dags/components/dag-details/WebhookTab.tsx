@@ -42,12 +42,20 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
-import { TOKEN_KEY } from '../../../../contexts/AuthContext';
+import { TOKEN_KEY, useIsAdmin } from '../../../../contexts/AuthContext';
 import { useConfig } from '../../../../contexts/ConfigContext';
 import { useRemoteNode } from '../../../../contexts/RemoteNodeContext';
 import { useClient } from '../../../../hooks/api';
 import dayjs from '../../../../lib/dayjs';
 import ConfirmModal from '@/components/ui/confirm-dialog';
+import WebhookProfileSelectionCard from './WebhookProfileSelectionCard';
+import {
+  buildWebhookExamples,
+  findActiveAllowedProfile,
+} from './webhookProfileSelection';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { I18nTemplate } from '@/i18n/I18nTemplate';
 
 type WebhookDetails = components['schemas']['WebhookDetails'];
 type WebhookAuthMode = components['schemas']['WebhookAuthMode'];
@@ -108,6 +116,7 @@ function WebhookTab({ fileName }: WebhookTabProps) {
   const config = useConfig();
   const remoteNode = useRemoteNode();
   const client = useClient();
+  const isAdmin = useIsAdmin();
 
   // State
   const [webhook, setWebhook] = useState<WebhookDetails | null>(null);
@@ -123,6 +132,7 @@ function WebhookTab({ fileName }: WebhookTabProps) {
   const [pendingToggleState, setPendingToggleState] = useState<boolean | null>(
     null
   );
+  const [activeProfileNames, setActiveProfileNames] = useState<string[]>([]);
 
   // Copy states
   const [copiedUrl, setCopiedUrl] = useState(false);
@@ -500,7 +510,9 @@ function WebhookTab({ fileName }: WebhookTabProps) {
         <CardHeader className="pb-2 px-4 pt-3">
           <div className="flex items-center gap-2">
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-            <CardTitle className="text-sm">Loading webhook...</CardTitle>
+            <CardTitle className="text-sm">
+              <I18nText text={'Loading webhook...'} />
+            </CardTitle>
           </div>
         </CardHeader>
       </Card>
@@ -514,7 +526,9 @@ function WebhookTab({ fileName }: WebhookTabProps) {
         <CardHeader className="pb-2 px-4 pt-3">
           <div className="flex items-center gap-2">
             <AlertTriangle className="h-4 w-4 text-destructive" />
-            <CardTitle className="text-sm text-destructive">Error</CardTitle>
+            <CardTitle className="text-sm text-destructive">
+              <I18nText text={'Error'} />
+            </CardTitle>
           </div>
           <CardDescription className="text-xs text-destructive">
             {error}
@@ -522,7 +536,7 @@ function WebhookTab({ fileName }: WebhookTabProps) {
         </CardHeader>
         <CardContent className="px-4 pb-3 pt-2">
           <Button variant="outline" size="sm" onClick={fetchWebhook}>
-            Retry
+            <I18nText text={'Retry'} />
           </Button>
         </CardContent>
       </Card>
@@ -548,7 +562,7 @@ function WebhookTab({ fileName }: WebhookTabProps) {
         </CardHeader>
         <CardContent className="px-4 pb-3 pt-3 space-y-3">
           <div className="p-3 bg-warning/10 border border-warning/20 rounded-md">
-            <p className="text-sm text-warning-foreground">{secretWarning}</p>
+            <p className="text-sm text-foreground">{secretWarning}</p>
           </div>
           <div className="flex items-center gap-2">
             <code className="flex-1 p-2 text-xs bg-muted rounded-md break-all font-mono">
@@ -567,7 +581,7 @@ function WebhookTab({ fileName }: WebhookTabProps) {
             </Button>
           </div>
           <Button variant="default" size="sm" onClick={handleDismissSecret}>
-            Done
+            <I18nText text={'Done'} />
           </Button>
         </CardContent>
       </Card>
@@ -581,10 +595,12 @@ function WebhookTab({ fileName }: WebhookTabProps) {
         <CardHeader className="pb-2 px-4 pt-3">
           <div className="flex items-center gap-2">
             <WebhookOff className="h-4 w-4 text-muted-foreground" />
-            <CardTitle className="text-sm">No Webhook Configured</CardTitle>
+            <CardTitle className="text-sm">
+              <I18nText text={'No Webhook Configured'} />
+            </CardTitle>
           </div>
           <CardDescription className="text-xs">
-            Create a webhook to trigger this DAG via HTTP
+            <I18nText text={'Create a webhook to trigger this DAG via HTTP'} />
           </CardDescription>
         </CardHeader>
         <CardContent className="px-4 pb-3 pt-3">
@@ -599,7 +615,7 @@ function WebhookTab({ fileName }: WebhookTabProps) {
             ) : (
               <Plus className="h-4 w-4 mr-1" />
             )}
-            Create Webhook
+            <I18nText text={'Create Webhook'} />
           </Button>
         </CardContent>
       </Card>
@@ -607,53 +623,20 @@ function WebhookTab({ fileName }: WebhookTabProps) {
   }
 
   const isHMACEnabled = webhook.authMode !== WebhookAuthModeValue.token_only;
-  const requestBody = `'{"dagRunId": "my-unique-id", "payload": {"key": "value"}}'`;
-  const curlExample =
-    webhook.authMode === WebhookAuthModeValue.hmac_only
-      ? `curl -X POST "${webhookUrl}" \\
-  -H "X-Dagu-Signature: sha256=<SIGNATURE>" \\
-  -H "Content-Type: application/json" \\
-  -d ${requestBody}`
-      : webhook.authMode === WebhookAuthModeValue.token_and_hmac
-        ? `curl -X POST "${webhookUrl}" \\
-  -H "Authorization: Bearer <YOUR_TOKEN>" \\
-  -H "X-Dagu-Signature: sha256=<SIGNATURE>" \\
-  -H "Content-Type: application/json" \\
-  -d ${requestBody}`
-        : `curl -X POST "${webhookUrl}" \\
-  -H "Authorization: Bearer <YOUR_TOKEN>" \\
-  -H "Content-Type: application/json" \\
-  -d ${requestBody}`;
-  const hmacShellExample = `body='{"dagRunId":"my-unique-id","payload":{"key":"value"}}'
-sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$DAGU_HMAC_SECRET" -hex | sed 's/^.* //')
-
-curl -X POST "${webhookUrl}" \\
-  ${webhook.authMode === WebhookAuthModeValue.token_and_hmac ? '-H "Authorization: Bearer <YOUR_TOKEN>" \\\n  ' : ''}-H "X-Dagu-Signature: sha256=$sig" \\
-  -H "Content-Type: application/json" \\
-  -d "$body"`;
-  const hmacNodeExample = `import crypto from 'node:crypto';
-
-const body = JSON.stringify({
-  dagRunId: 'my-unique-id',
-  payload: { key: 'value' },
-});
-
-const signature =
-  'sha256=' +
-  crypto.createHmac('sha256', process.env.DAGU_HMAC_SECRET!)
-    .update(body, 'utf8')
-    .digest('hex');
-
-const headers = {
-  'Content-Type': 'application/json',
-  'X-Dagu-Signature': signature,
-  ${webhook.authMode === WebhookAuthModeValue.token_and_hmac ? "'Authorization': 'Bearer <YOUR_TOKEN>',\n  " : ''}}
-
-await fetch('${webhookUrl}', {
-  method: 'POST',
-  headers,
-  body,
-});`;
+  const configuredAllowedProfiles = webhook.profileSelection.allowedProfiles;
+  const exampleProfile = findActiveAllowedProfile(
+    configuredAllowedProfiles,
+    activeProfileNames
+  );
+  const {
+    curl: curlExample,
+    hmacShell: hmacShellExample,
+    hmacNode: hmacNodeExample,
+  } = buildWebhookExamples({
+    authMode: webhook.authMode,
+    profileName: exampleProfile,
+    webhookUrl,
+  });
 
   // Webhook configured
   return (
@@ -664,11 +647,17 @@ await fetch('${webhookUrl}', {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Webhook className="h-4 w-4 text-muted-foreground" />
-              <CardTitle className="text-sm">Webhook</CardTitle>
+              <CardTitle className="text-sm">
+                <I18nText text={'Webhook'} />
+              </CardTitle>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-xs text-muted-foreground">
-                {webhook.enabled ? 'Enabled' : 'Disabled'}
+                {webhook.enabled ? (
+                  <I18nText text={'Enabled'} />
+                ) : (
+                  <I18nText text={'Disabled'} />
+                )}
               </span>
               <Switch
                 checked={webhook.enabled}
@@ -681,14 +670,18 @@ await fetch('${webhookUrl}', {
           {/* Endpoint */}
           <div>
             <div className="flex items-center justify-between mb-1">
-              <span className="text-xs text-muted-foreground">Endpoint</span>
+              <span className="text-xs text-muted-foreground">
+                <I18nText text={'Endpoint'} />
+              </span>
               <CopyButton
                 copied={copiedUrl}
                 onCopy={() => handleCopy(webhookUrl, setCopiedUrl)}
               />
             </div>
             <div className="px-3 py-2 bg-accent rounded-md text-xs font-mono border overflow-x-auto">
-              <span className="text-muted-foreground">POST</span>{' '}
+              <span className="text-muted-foreground">
+                <I18nText text={'POST'} />
+              </span>{' '}
               <span>{webhookUrl}</span>
             </div>
           </div>
@@ -696,7 +689,9 @@ await fetch('${webhookUrl}', {
           {/* Token prefix */}
           <div>
             <div className="flex items-center justify-between mb-1">
-              <span className="text-xs text-muted-foreground">Token</span>
+              <span className="text-xs text-muted-foreground">
+                <I18nText text={'Token'} />
+              </span>
             </div>
             <div className="px-3 py-2 bg-accent rounded-md text-xs font-mono border">
               <span>{webhook.tokenPrefix}</span>
@@ -706,17 +701,25 @@ await fetch('${webhookUrl}', {
 
           {/* Metadata */}
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            <div>Auth: {formatWebhookAuthMode(webhook.authMode)}</div>
             <div>
-              Created: {dayjs(webhook.createdAt).format('MMM D, YYYY HH:mm')}
+              <I18nText text={'Auth:'} />{' '}
+              {formatWebhookAuthMode(webhook.authMode)}
+            </div>
+            <div>
+              <I18nText text={'Created:'} />{' '}
+              {dayjs(webhook.createdAt).format('MMM D, YYYY HH:mm')}
             </div>
             {webhook.lastUsedAt && (
               <div>
-                Last triggered:{' '}
+                <I18nText text={'Last triggered:'} />{' '}
                 {dayjs(webhook.lastUsedAt).format('MMM D, YYYY HH:mm')}
               </div>
             )}
-            {webhook.createdBy && <div>By: {webhook.createdBy}</div>}
+            {webhook.createdBy && (
+              <div>
+                <I18nText text={'By:'} /> {webhook.createdBy}
+              </div>
+            )}
           </div>
 
           {/* Actions */}
@@ -732,7 +735,7 @@ await fetch('${webhookUrl}', {
               ) : (
                 <RefreshCw className="h-3.5 w-3.5 mr-1" />
               )}
-              Regenerate Token
+              <I18nText text={'Regenerate Token'} />
             </Button>
             <Button
               variant="outline"
@@ -742,7 +745,7 @@ await fetch('${webhookUrl}', {
               disabled={isActioning}
             >
               <Trash2 className="h-3.5 w-3.5 mr-1" />
-              Delete
+              <I18nText text={'Delete'} />
             </Button>
           </div>
         </CardContent>
@@ -752,15 +755,31 @@ await fetch('${webhookUrl}', {
       <Card className="gap-0 py-0">
         <CardHeader className="pb-3 px-4 pt-3">
           <div className="flex items-center gap-2">
-            <CardTitle className="text-sm">Authentication</CardTitle>
+            <CardTitle className="text-sm">
+              <I18nText text={'Authentication'} />
+            </CardTitle>
           </div>
           <CardDescription className="text-xs">
-            Choose how requests authenticate to this webhook. If you enable
-            HMAC, callers must send{' '}
-            <code className="bg-accent px-1 rounded-md border">
-              X-Dagu-Signature: sha256=&lt;hex&gt;
-            </code>{' '}
-            computed from the exact raw request body.
+            <I18nTemplate
+              text="Choose how requests authenticate to this webhook. If you enable HMAC, callers must send {signature} computed from the exact signature input shown below. Requests with {profile} sign {input}."
+              values={{
+                signature: (
+                  <code className="bg-accent px-1 rounded-md border">
+                    X-Dagu-Signature: sha256=&lt;hex&gt;
+                  </code>
+                ),
+                profile: (
+                  <code className="bg-accent px-1 rounded-md border">
+                    X-Dagu-Profile
+                  </code>
+                ),
+                input: (
+                  <code className="bg-accent px-1 rounded-md border">
+                    x-dagu-profile:&lt;profile&gt;\n&lt;body&gt;
+                  </code>
+                ),
+              }}
+            />
           </CardDescription>
         </CardHeader>
         <CardContent className="px-4 pb-3 pt-2 space-y-3">
@@ -769,7 +788,7 @@ await fetch('${webhookUrl}', {
               <div className="grid gap-3 md:grid-cols-2">
                 <div className="space-y-1">
                   <span className="text-xs text-muted-foreground">
-                    Auth mode
+                    <I18nText text={'Auth mode'} />
                   </span>
                   <Select
                     value={draftAuthMode}
@@ -782,17 +801,17 @@ await fetch('${webhookUrl}', {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value={WebhookAuthModeValue.token_and_hmac}>
-                        Token + HMAC
+                        <I18nText text={'Token + HMAC'} />
                       </SelectItem>
                       <SelectItem value={WebhookAuthModeValue.hmac_only}>
-                        HMAC only
+                        <I18nText text={'HMAC only'} />
                       </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 <div className="space-y-1">
                   <span className="text-xs text-muted-foreground">
-                    HMAC enforcement
+                    <I18nText text={'HMAC enforcement'} />
                   </span>
                   <Select
                     value={
@@ -814,12 +833,12 @@ await fetch('${webhookUrl}', {
                       <SelectItem
                         value={WebhookHMACEnforcementModeValue.strict}
                       >
-                        Strict
+                        <I18nText text={'Strict'} />
                       </SelectItem>
                       <SelectItem
                         value={WebhookHMACEnforcementModeValue.observe}
                       >
-                        Observe
+                        <I18nText text={'Observe'} />
                       </SelectItem>
                     </SelectContent>
                   </Select>
@@ -827,18 +846,26 @@ await fetch('${webhookUrl}', {
               </div>
 
               <div className="rounded-md border bg-accent/40 px-3 py-2 text-xs text-muted-foreground space-y-1">
-                <div>Algorithm: {webhook.hmac.algorithm || 'HMAC-SHA256'}</div>
                 <div>
-                  Header: {webhook.hmac.headerName || 'X-Dagu-Signature'}{' '}
-                  {webhook.hmac.format
-                    ? `(${webhook.hmac.format})`
-                    : '(sha256=<hex>)'}
+                  <I18nText text={'Algorithm:'} />{' '}
+                  {webhook.hmac.algorithm || 'HMAC-SHA256'}
                 </div>
                 <div>
-                  Last secret rotation:{' '}
-                  {webhook.hmac.updatedAt
-                    ? dayjs(webhook.hmac.updatedAt).format('MMM D, YYYY HH:mm')
-                    : 'Not available'}
+                  <I18nText text={'Header:'} />{' '}
+                  {webhook.hmac.headerName || 'X-Dagu-Signature'}{' '}
+                  {webhook.hmac.format ? (
+                    `(${webhook.hmac.format})`
+                  ) : (
+                    <I18nText text={'(sha256=<hex>)'} />
+                  )}
+                </div>
+                <div>
+                  <I18nText text={'Last secret rotation:'} />{' '}
+                  {webhook.hmac.updatedAt ? (
+                    dayjs(webhook.hmac.updatedAt).format('MMM D, YYYY HH:mm')
+                  ) : (
+                    <I18nText text={'Not available'} />
+                  )}
                 </div>
               </div>
 
@@ -849,7 +876,7 @@ await fetch('${webhookUrl}', {
                   onClick={handleSaveHMACSettings}
                   disabled={isActioning}
                 >
-                  Save HMAC Settings
+                  <I18nText text={'Save HMAC Settings'} />
                 </Button>
                 <Button
                   variant="outline"
@@ -857,7 +884,7 @@ await fetch('${webhookUrl}', {
                   onClick={handleRegenerateHMAC}
                   disabled={isActioning}
                 >
-                  Regenerate HMAC Secret
+                  <I18nText text={'Regenerate HMAC Secret'} />
                 </Button>
                 <Button
                   variant="outline"
@@ -865,15 +892,18 @@ await fetch('${webhookUrl}', {
                   onClick={handleDisableHMAC}
                   disabled={isActioning}
                 >
-                  Disable HMAC
+                  <I18nText text={'Disable HMAC'} />
                 </Button>
               </div>
             </>
           ) : (
             <>
               <div className="rounded-md border bg-accent/40 px-3 py-2 text-xs text-muted-foreground">
-                This webhook currently accepts the existing token only. HMAC
-                signing is off until you enable it.
+                <I18nText
+                  text={
+                    'This webhook currently accepts the existing token only. HMAC signing is off until you enable it.'
+                  }
+                />
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button
@@ -884,7 +914,7 @@ await fetch('${webhookUrl}', {
                   }
                   disabled={isActioning}
                 >
-                  Keep Token and Add HMAC
+                  <I18nText text={'Keep Token and Add HMAC'} />
                 </Button>
                 <Button
                   variant="outline"
@@ -894,7 +924,7 @@ await fetch('${webhookUrl}', {
                   }
                   disabled={isActioning}
                 >
-                  Use HMAC Only
+                  <I18nText text={'Use HMAC Only'} />
                 </Button>
               </div>
             </>
@@ -902,36 +932,57 @@ await fetch('${webhookUrl}', {
         </CardContent>
       </Card>
 
+      <WebhookProfileSelectionCard
+        fileName={fileName}
+        isAdmin={isAdmin}
+        remoteNode={remoteNode}
+        webhook={webhook}
+        onActiveProfileNamesChange={setActiveProfileNames}
+        onWebhookChange={setWebhook}
+      />
+
       {isHMACEnabled && (
         <Card className="gap-0 py-0">
           <CardHeader className="pb-3 px-4 pt-3">
-            <CardTitle className="text-sm">Generate HMAC</CardTitle>
+            <CardTitle className="text-sm">
+              <I18nText text={'Generate HMAC'} />
+            </CardTitle>
             <CardDescription className="text-xs">
-              Compute the HMAC from the exact raw request body you send. If the
-              body is reformatted before sending, verification will fail.
+              <I18nText
+                text={
+                  'Compute the HMAC from the exact signature input shown below. A selected profile is prefixed to the raw request body so the header cannot be changed without invalidating the signature.'
+                }
+              />
             </CardDescription>
           </CardHeader>
           <CardContent className="px-4 pb-3 pt-2 space-y-3">
             <div className="rounded-md border bg-accent/40 px-3 py-2 text-xs text-muted-foreground">
-              Use your webhook HMAC secret as{' '}
-              <code className="bg-accent px-1 rounded-md border">
-                DAGU_HMAC_SECRET
-              </code>
-              .
+              <I18nTemplate
+                text="Use your webhook HMAC secret as {variable}."
+                values={{
+                  variable: (
+                    <code className="bg-accent px-1 rounded-md border">
+                      DAGU_HMAC_SECRET
+                    </code>
+                  ),
+                }}
+              />
             </div>
 
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-xs font-medium text-muted-foreground">
-                  Shell (OpenSSL)
+                  <I18nText text={'Shell (OpenSSL)'} />
                 </span>
-                <CopyButton
-                  copied={copiedHMACShell}
-                  onCopy={() =>
-                    handleCopy(hmacShellExample, setCopiedHMACShell)
-                  }
-                  label="Copy"
-                />
+                <I18nProps>
+                  <CopyButton
+                    copied={copiedHMACShell}
+                    onCopy={() =>
+                      handleCopy(hmacShellExample, setCopiedHMACShell)
+                    }
+                    label="Copy"
+                  />
+                </I18nProps>
               </div>
               <pre className="px-3 py-2 bg-accent rounded-md text-xs font-mono border overflow-x-auto whitespace-pre-wrap">
                 {hmacShellExample}
@@ -941,13 +992,17 @@ await fetch('${webhookUrl}', {
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-xs font-medium text-muted-foreground">
-                  Node.js
+                  <I18nText text={'Node.js'} />
                 </span>
-                <CopyButton
-                  copied={copiedHMACNode}
-                  onCopy={() => handleCopy(hmacNodeExample, setCopiedHMACNode)}
-                  label="Copy"
-                />
+                <I18nProps>
+                  <CopyButton
+                    copied={copiedHMACNode}
+                    onCopy={() =>
+                      handleCopy(hmacNodeExample, setCopiedHMACNode)
+                    }
+                    label="Copy"
+                  />
+                </I18nProps>
               </div>
               <pre className="px-3 py-2 bg-accent rounded-md text-xs font-mono border overflow-x-auto whitespace-pre-wrap">
                 {hmacNodeExample}
@@ -963,13 +1018,17 @@ await fetch('${webhookUrl}', {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Terminal className="h-3.5 w-3.5 text-muted-foreground" />
-              <CardTitle className="text-sm">Example Request</CardTitle>
+              <CardTitle className="text-sm">
+                <I18nText text={'Example Request'} />
+              </CardTitle>
             </div>
-            <CopyButton
-              copied={copiedCurl}
-              onCopy={() => handleCopy(curlExample, setCopiedCurl)}
-              label="Copy"
-            />
+            <I18nProps>
+              <CopyButton
+                copied={copiedCurl}
+                onCopy={() => handleCopy(curlExample, setCopiedCurl)}
+                label="Copy"
+              />
+            </I18nProps>
           </div>
         </CardHeader>
         <CardContent className="px-4 pb-3 pt-2">
@@ -978,40 +1037,76 @@ await fetch('${webhookUrl}', {
           </pre>
           <ul className="mt-2 text-xs text-muted-foreground space-y-1">
             <li>
-              <code className="bg-accent px-1 rounded-md border">payload</code>{' '}
-              is available as{' '}
-              <code className="bg-accent px-1 rounded-md border">
-                WEBHOOK_PAYLOAD
-              </code>{' '}
-              env var.
+              <I18nTemplate
+                text="{payload} is available as the {variable} environment variable."
+                values={{
+                  payload: (
+                    <code className="bg-accent px-1 rounded-md border">
+                      payload
+                    </code>
+                  ),
+                  variable: (
+                    <code className="bg-accent px-1 rounded-md border">
+                      WEBHOOK_PAYLOAD
+                    </code>
+                  ),
+                }}
+              />
             </li>
             <li>
-              Configure{' '}
-              <code className="bg-accent px-1 rounded-md border">
-                webhook.forward_headers
-              </code>{' '}
-              in the DAG YAML. It can also be inherited from{' '}
-              <code className="bg-accent px-1 rounded-md border">
-                base.yaml
-              </code>{' '}
-              to expose selected request headers as{' '}
-              <code className="bg-accent px-1 rounded-md border">
-                WEBHOOK_HEADERS
-              </code>
-              .
+              <I18nTemplate
+                text="Configure {setting} in the DAG YAML. It can also be inherited from {base} to expose selected request headers as {variable}."
+                values={{
+                  setting: (
+                    <code className="bg-accent px-1 rounded-md border">
+                      webhook.forward_headers
+                    </code>
+                  ),
+                  base: (
+                    <code className="bg-accent px-1 rounded-md border">
+                      base.yaml
+                    </code>
+                  ),
+                  variable: (
+                    <code className="bg-accent px-1 rounded-md border">
+                      WEBHOOK_HEADERS
+                    </code>
+                  ),
+                }}
+              />
             </li>
             <li>
               <code className="bg-accent px-1 rounded-md border">dagRunId</code>{' '}
-              (optional) can be used as an idempotency key.
+              <I18nText
+                text={'(optional) can be used as an idempotency key.'}
+              />
+            </li>
+            <li>
+              <I18nTemplate
+                text={
+                  "{header} is accepted only for profiles approved in this webhook's profile-selection policy."
+                }
+                values={{
+                  header: (
+                    <code className="bg-accent px-1 rounded-md border">
+                      X-Dagu-Profile
+                    </code>
+                  ),
+                }}
+              />
             </li>
             {isHMACEnabled && (
               <li>
-                Sign the exact raw JSON request body bytes with your HMAC secret
-                and send the hex digest in{' '}
-                <code className="bg-accent px-1 rounded-md border">
-                  X-Dagu-Signature
-                </code>
-                .
+                <I18nTemplate
+                  text="Sign the exact input shown in the HMAC examples with your secret and send the hex digest in {header}."
+                  values={{
+                    header: (
+                      <code className="bg-accent px-1 rounded-md border">
+                        X-Dagu-Signature
+                      </code>
+                    ),
+                  }}
+                />
               </li>
             )}
           </ul>
@@ -1019,32 +1114,44 @@ await fetch('${webhookUrl}', {
       </Card>
 
       {/* Delete Confirmation Modal */}
-      <ConfirmModal
-        title="Delete Webhook"
-        buttonText="Delete"
-        visible={showDeleteConfirm}
-        dismissModal={() => setShowDeleteConfirm(false)}
-        onSubmit={handleDelete}
-      >
-        <p>
-          Are you sure you want to delete this webhook? Any applications using
-          this webhook token will immediately lose access.
-        </p>
-      </ConfirmModal>
+      <I18nProps>
+        <ConfirmModal
+          title="Delete Webhook"
+          buttonText="Delete"
+          visible={showDeleteConfirm}
+          dismissModal={() => setShowDeleteConfirm(false)}
+          onSubmit={handleDelete}
+        >
+          <p>
+            <I18nText
+              text={
+                'Are you sure you want to delete this webhook? Any applications using this webhook token will immediately lose access.'
+              }
+            />
+          </p>
+        </ConfirmModal>
+      </I18nProps>
 
       {/* Toggle Confirmation Modal */}
-      <ConfirmModal
-        title={pendingToggleState ? 'Enable Webhook' : 'Disable Webhook'}
-        buttonText={pendingToggleState ? 'Enable' : 'Disable'}
-        visible={showToggleConfirm}
-        dismissModal={handleToggleCancel}
-        onSubmit={handleToggleConfirm}
-      >
-        <p>
-          Are you sure you want to {pendingToggleState ? 'enable' : 'disable'}{' '}
-          this webhook?
-        </p>
-      </ConfirmModal>
+      <I18nProps>
+        <ConfirmModal
+          title={pendingToggleState ? 'Enable Webhook' : 'Disable Webhook'}
+          buttonText={pendingToggleState ? 'Enable' : 'Disable'}
+          visible={showToggleConfirm}
+          dismissModal={handleToggleCancel}
+          onSubmit={handleToggleConfirm}
+        >
+          <p>
+            <I18nText
+              text={
+                pendingToggleState
+                  ? 'Are you sure you want to enable this webhook?'
+                  : 'Are you sure you want to disable this webhook?'
+              }
+            />
+          </p>
+        </ConfirmModal>
+      </I18nProps>
     </div>
   );
 }

@@ -1,0 +1,7 @@
+working_dir: .
+steps:
+  - id: should_skip
+    preconditions:
+      - condition: "$(printf bad > step-substitution-ran.txt; exit 7)"
+        expected: ok
+    run: printf '%s\n' bad > failure-ran.txt

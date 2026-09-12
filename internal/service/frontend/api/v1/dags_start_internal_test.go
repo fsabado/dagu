@@ -7,21 +7,53 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	openapiv1 "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/procutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/launcher"
-	"github.com/dagucloud/dagu/internal/persis/file/dagrun"
-	"github.com/dagucloud/dagu/internal/persis/file/proc"
-	"github.com/dagucloud/dagu/internal/runtime"
+	openapiv1 "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/launcher"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	fileproc "github.com/dagucloud/dagu/v2/internal/persis/file/proc"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
+
+func TestExecuteDAGSyncWriteDeadlineStartsWithResponse(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 25 * time.Millisecond
+	handler := resetSyncWriteDeadline(timeout)(
+		func(context.Context, http.ResponseWriter, *http.Request, any) (any, error) {
+			time.Sleep(2 * timeout)
+			return nil, nil
+		},
+		"ExecuteDAGSync",
+	)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := handler(r.Context(), w, r, nil); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	server.Config.WriteTimeout = timeout
+	server.Start()
+	t.Cleanup(server.Close)
+
+	resp, err := server.Client().Get(server.URL)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, resp.Body.Close())
+	})
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+}
 
 func TestWaitForLocalDAGStartReturnsNilWhenStarterProcessStillAlive(t *testing.T) {
 	t.Parallel()
@@ -30,7 +62,7 @@ func TestWaitForLocalDAGStartReturnsNilWhenStarterProcessStillAlive(t *testing.T
 	done := make(chan error)
 	started := currentProcessStartResult(t, done)
 
-	err := api.waitForLocalDAGStart(context.Background(), &core.DAG{Name: "pending"}, "run-1", started, time.Nanosecond)
+	err := api.waitForLocalDAGStart(context.Background(), &ir.DAG{Name: "pending"}, "run-1", started, time.Nanosecond)
 	require.NoError(t, err)
 }
 
@@ -44,7 +76,7 @@ func TestWaitForLocalDAGStartReturnsCanceledWhenContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := api.waitForLocalDAGStart(ctx, &core.DAG{Name: "pending"}, "run-1", started, time.Second)
+	err := api.waitForLocalDAGStart(ctx, &ir.DAG{Name: "pending"}, "run-1", started, time.Second)
 	require.Error(t, err)
 
 	var apiErr *Error
@@ -62,7 +94,7 @@ func TestWaitForLocalDAGStartReturnsErrorWhenStarterExitedWithoutStatus(t *testi
 	done <- errors.New("exit status 1")
 	close(done)
 
-	err := api.waitForLocalDAGStart(context.Background(), &core.DAG{Name: "pending"}, "run-1", &launcher.StartResult{
+	err := api.waitForLocalDAGStart(context.Background(), &ir.DAG{Name: "pending"}, "run-1", &launcher.StartResult{
 		PID:  1,
 		Done: done,
 	}, time.Nanosecond)
@@ -80,15 +112,15 @@ func newLocalStartTestAPI(t *testing.T) *API {
 	t.Helper()
 
 	tmpDir := t.TempDir()
-	dagRunStore := dagrun.New(filepath.Join(tmpDir, "dag-runs"))
-	procStore := newTestProcStore(filepath.Join(tmpDir, "proc"))
+	dagRunRepository := testutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+	procRepository := newTestProcRepository(filepath.Join(tmpDir, "proc"))
 	return &API{
-		dagRunMgr: runtime.NewManager(dagRunStore, procStore, &config.Config{}),
+		dagRunMgr: runtime.NewManager(dagRunRepository, procRepository, &config.Config{}),
 	}
 }
 
-func newTestProcStore(procDir string) *proc.Store {
-	return proc.New(procDir)
+func newTestProcRepository(procDir string) *persis.ProcRepository {
+	return persis.NewProcRepository(fileproc.New(procDir))
 }
 
 func currentProcessStartResult(t *testing.T, done <-chan error) *launcher.StartResult {

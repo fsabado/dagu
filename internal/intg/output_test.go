@@ -13,10 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file/dagrun"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	filedagrun "github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -57,7 +56,7 @@ func TestLargeOutput_128KB(t *testing.T) {
 	require.NoError(t, err, "DAG should complete without hanging with large output")
 
 	// Verify successful completion
-	dag.AssertLatestStatus(t, core.Succeeded)
+	dag.AssertLatestStatus(t, ir.Succeeded)
 
 	// Get the latest status
 	dagRunStatus, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
@@ -66,14 +65,14 @@ func TestLargeOutput_128KB(t *testing.T) {
 
 	// Verify the step completed successfully
 	require.Len(t, dagRunStatus.Nodes, 1)
-	assert.Equal(t, core.NodeSucceeded, dagRunStatus.Nodes[0].Status)
+	assert.Equal(t, ir.NodeSucceeded, dagRunStatus.Nodes[0].Status)
 	assert.Equal(t, "read-128kb-file", dagRunStatus.Nodes[0].Step.Name)
 }
 
 type outputsCollectionCase struct {
 	dagYAML         string
 	runFunc         func(*testing.T, context.Context, *test.Agent)
-	validateFunc    func(*testing.T, exec.DAGRunStatus)
+	validateFunc    func(*testing.T, ir.DAGRunStatus)
 	validateOutputs func(*testing.T, map[string]string)
 }
 
@@ -95,10 +94,10 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 				require.Len(t, status.Nodes, 1)
-				require.Equal(t, core.NodeSucceeded, status.Nodes[0].Status)
+				require.Equal(t, ir.NodeSucceeded, status.Nodes[0].Status)
 			},
 			validateOutputs: func(t *testing.T, outputs map[string]string) {
 				require.NotNil(t, outputs)
@@ -118,8 +117,8 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 				require.Len(t, status.Nodes, 1)
 			},
 			validateOutputs: func(t *testing.T, outputs map[string]string) {
@@ -148,8 +147,8 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 				require.Len(t, status.Nodes, 3)
 			},
 			validateOutputs: func(t *testing.T, outputs map[string]string) {
@@ -179,8 +178,8 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 			},
 			validateOutputs: func(t *testing.T, outputs map[string]string) {
 				require.NotNil(t, outputs)
@@ -199,8 +198,8 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 			},
 			validateOutputs: func(t *testing.T, outputs map[string]string) {
 				assert.Nil(t, outputs)
@@ -219,8 +218,8 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 			},
 			validateOutputs: func(t *testing.T, outputs map[string]string) {
 				require.NotNil(t, outputs)
@@ -244,8 +243,8 @@ steps:
 			runFunc: func(t *testing.T, _ context.Context, agent *test.Agent) {
 				agent.RunSuccess(t)
 			},
-			validateFunc: func(t *testing.T, status exec.DAGRunStatus) {
-				require.Equal(t, core.Succeeded, status.Status)
+			validateFunc: func(t *testing.T, status ir.DAGRunStatus) {
+				require.Equal(t, ir.Succeeded, status.Status)
 			},
 			validateOutputs: func(t *testing.T, outputs map[string]string) {
 				require.NotNil(t, outputs)
@@ -309,7 +308,7 @@ steps:
 	require.Error(t, err)
 
 	status := agent.Status(agent.Context)
-	require.Equal(t, core.Failed, status.Status)
+	require.Equal(t, ir.Failed, status.Status)
 
 	// Outputs from successful steps should still be collected
 	outputs := readOutputsFile(t, th, dag.DAG)
@@ -353,6 +352,89 @@ func TestOutputsCollection_CamelCaseConversion_AlreadyCamelCase(t *testing.T) {
 	runOutputsCollectionCamelCaseConversion(t, "ALREADY_CAMEL_Case", "alreadyCamelCase", "ALREADY_CAMEL_Case=test_value")
 }
 
+func TestOutputsCollection_LifecycleHandlerReachesCaller(t *testing.T) {
+	outputsTestParallel(t)
+
+	th := test.Setup(t)
+	dag := th.DAG(t, `steps:
+  - action: dag.run
+    with:
+      dag: handler_outputs_child
+    output: CHILD
+  - run: echo "${CHILD.outputValues.from_step}|${CHILD.outputValues.from_handler}"
+    depends: dag_1
+    output: RESULT
+---
+name: handler_outputs_child
+handler_on:
+  exit:
+    run: echo '{"value":"from-handler"}'
+    stdout:
+      outputs:
+        fields:
+          from_handler:
+            decode: json
+            select: .value
+steps:
+  - name: emit-from-step
+    run: echo '{"value":"from-step"}'
+    stdout:
+      outputs:
+        fields:
+          from_step:
+            decode: json
+            select: .value
+`)
+	dag.Agent().RunSuccess(t)
+
+	dag.AssertOutputs(t, map[string]any{
+		"RESULT": "from-step|from-handler",
+	})
+}
+
+// The wait handler runs after the steps that already finished, so its value for
+// a key a step also published is the one that survives.
+func TestOutputsCollection_WaitHandlerOverridesEarlierStep(t *testing.T) {
+	outputsTestParallel(t)
+
+	th := test.Setup(t)
+	dag := th.DAG(t, `
+handler_on:
+  wait:
+    run: echo '{"value":"from-wait-handler"}'
+    stdout:
+      outputs:
+        fields:
+          shared:
+            decode: json
+            select: .value
+
+steps:
+  - name: emit
+    run: echo '{"value":"from-step"}'
+    stdout:
+      outputs:
+        fields:
+          shared:
+            decode: json
+            select: .value
+  - name: wait-step
+    run: "true"
+    depends: [emit]
+    approval: {}
+`)
+	agent := dag.Agent()
+	_ = agent.Run(agent.Context)
+
+	status := agent.Status(agent.Context)
+	require.Equal(t, ir.Waiting, status.Status)
+	require.NotNil(t, status.OnWait, "wait handler should have been executed")
+
+	outputs := readOutputsFile(t, th, dag.DAG)
+	require.NotNil(t, outputs)
+	assert.Equal(t, "from-wait-handler", outputs["shared"])
+}
+
 func TestOutputsCollection_SecretsMasked(t *testing.T) {
 	outputsTestParallel(t)
 
@@ -378,7 +460,7 @@ steps:
 
 	status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
 	require.NoError(t, err)
-	require.Equal(t, core.Succeeded, status.Status)
+	require.Equal(t, ir.Succeeded, status.Status)
 
 	// Read outputs.json
 	outputs := readOutputsFile(t, th, dag.DAG)
@@ -422,9 +504,68 @@ steps:
 	assert.Equal(t, "RESULT=42", fullOutputs.Outputs["result"])
 }
 
+func TestSubDAGPublishesDeclaredOutputsToCaller(t *testing.T) {
+	outputsTestParallel(t)
+
+	th := test.Setup(t)
+	dag := th.DAG(t, `
+steps:
+  - name: call
+    action: dag.run
+    with:
+      dag: declaring_child
+---
+name: declaring_child
+steps:
+  - id: load
+    run: echo scratch-value
+    output: SCRATCH
+  - id: publish
+    depends: [load]
+    action: outputs.write
+    with:
+      values:
+        verdict: clean
+`)
+	dag.Agent().RunSuccess(t)
+
+	status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+	require.NoError(t, err)
+	require.Len(t, status.Nodes, 1)
+	require.NotNil(t, status.Nodes[0].OutputsValue)
+	// The child declared one output, so that is the whole surface the caller
+	// sees. SCRATCH stays internal to the child run.
+	require.JSONEq(t, `{"verdict":"clean"}`, *status.Nodes[0].OutputsValue)
+}
+
+func TestSubDAGWithoutDeclaredOutputsPublishesNothing(t *testing.T) {
+	outputsTestParallel(t)
+
+	th := test.Setup(t)
+	dag := th.DAG(t, `
+steps:
+  - name: call
+    action: dag.run
+    with:
+      dag: plain_child
+---
+name: plain_child
+steps:
+  - id: load
+    run: echo scratch-value
+    output: SCRATCH
+`)
+	dag.Agent().RunSuccess(t)
+
+	status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+	require.NoError(t, err)
+	require.Len(t, status.Nodes, 1)
+	assert.Nil(t, status.Nodes[0].OutputsValue)
+}
+
 // readOutputsFile reads the outputs.json file for a given DAG run
 // Returns just the outputs map for backward compatibility with existing tests
-func readOutputsFile(t *testing.T, th test.Helper, dag *core.DAG) map[string]string {
+func readOutputsFile(t *testing.T, th test.Helper, dag *ir.DAG) map[string]string {
 	t.Helper()
 
 	fullOutputs := readFullOutputsFile(t, th, dag)
@@ -435,7 +576,7 @@ func readOutputsFile(t *testing.T, th test.Helper, dag *core.DAG) map[string]str
 }
 
 // readFullOutputsFile reads the full outputs.json file including metadata
-func readFullOutputsFile(t *testing.T, th test.Helper, dag *core.DAG) *exec.DAGRunOutputs {
+func readFullOutputsFile(t *testing.T, th test.Helper, dag *ir.DAG) *ir.DAGRunOutputs {
 	t.Helper()
 
 	// Find the attempt directory
@@ -446,7 +587,7 @@ func readFullOutputsFile(t *testing.T, th test.Helper, dag *core.DAG) *exec.DAGR
 	var outputsPath string
 	_ = filepath.Walk(dagRunDir, func(path string, info os.FileInfo, err error) error {
 		require.NoError(t, err)
-		if info.Name() == dagrun.OutputsFile {
+		if info.Name() == filedagrun.OutputsFile {
 			outputsPath = path
 			return filepath.SkipAll
 		}
@@ -460,7 +601,7 @@ func readFullOutputsFile(t *testing.T, th test.Helper, dag *core.DAG) *exec.DAGR
 	data, err := os.ReadFile(outputsPath)
 	require.NoError(t, err)
 
-	var outputs exec.DAGRunOutputs
+	var outputs ir.DAGRunOutputs
 	require.NoError(t, json.Unmarshal(data, &outputs))
 
 	// Return nil if old format (no metadata)

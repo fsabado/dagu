@@ -8,24 +8,30 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/worker/coordreport"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runctx"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/worker/coordreport"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // logStreamerMockClient implements coordinator.Client for testing log streamer
 type logStreamerMockClient struct {
 	coordinator.Client // Embed to satisfy interface (unused methods will panic)
 	streamLogsFunc     func(ctx context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error)
-	streamLogsToFunc   func(ctx context.Context, owner exec.HostInfo) (coordinatorv1.CoordinatorService_StreamLogsClient, error)
+	streamLogsToFunc   func(ctx context.Context, owner serviceregistry.HostInfo) (coordinatorv1.CoordinatorService_StreamLogsClient, error)
 }
 
 func (m *logStreamerMockClient) StreamLogs(ctx context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
@@ -35,7 +41,7 @@ func (m *logStreamerMockClient) StreamLogs(ctx context.Context) (coordinatorv1.C
 	return nil, errors.New("StreamLogs not configured")
 }
 
-func (m *logStreamerMockClient) StreamLogsTo(ctx context.Context, owner exec.HostInfo) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+func (m *logStreamerMockClient) StreamLogsTo(ctx context.Context, owner serviceregistry.HostInfo) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
 	if m.streamLogsToFunc != nil {
 		return m.streamLogsToFunc(ctx, owner)
 	}
@@ -78,6 +84,10 @@ func (m *mockStreamLogsClient) Send(chunk *coordinatorv1.LogChunk) error {
 		RootDagRunId:       chunk.RootDagRunId,
 		AttemptId:          chunk.AttemptId,
 		OwnerCoordinatorId: chunk.OwnerCoordinatorId,
+		AttemptKey:         chunk.AttemptKey,
+	}
+	if chunk.HasByteOffset() {
+		chunkCopy.SetByteOffset(chunk.GetByteOffset())
 	}
 	m.sentChunks = append(m.sentChunks, chunkCopy)
 	return nil
@@ -110,6 +120,28 @@ func (m *mockStreamLogsClient) getSentChunks() []*coordinatorv1.LogChunk {
 	return append([]*coordinatorv1.LogChunk(nil), m.sentChunks...)
 }
 
+func replayPositionedLog(chunks []*coordinatorv1.LogChunk, streamType coordinatorv1.LogStreamType) string {
+	var data []byte
+	for _, chunk := range chunks {
+		if chunk.StreamType != streamType || !chunk.HasByteOffset() {
+			continue
+		}
+		offset := int(chunk.GetByteOffset())
+		if chunk.IsFinal {
+			if offset < len(data) {
+				data = data[:offset]
+			}
+			continue
+		}
+		end := offset + len(chunk.Data)
+		if end > len(data) {
+			data = append(data, make([]byte, end-len(data))...)
+		}
+		copy(data[offset:end], chunk.Data)
+	}
+	return string(data)
+}
+
 func TestToProtoStreamType(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -117,8 +149,8 @@ func TestToProtoStreamType(t *testing.T) {
 		input    int
 		expected coordinatorv1.LogStreamType
 	}{
-		{"stdout", exec.StreamTypeStdout, coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT},
-		{"stderr", exec.StreamTypeStderr, coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDERR},
+		{"stdout", runctx.StreamTypeStdout, coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT},
+		{"stderr", runctx.StreamTypeStderr, coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDERR},
 		{"unknown", 999, coordinatorv1.LogStreamType_LOG_STREAM_TYPE_UNSPECIFIED},
 	}
 	for _, tt := range tests {
@@ -132,7 +164,7 @@ func TestToProtoStreamType(t *testing.T) {
 func TestNewLogStreamer(t *testing.T) {
 	t.Parallel()
 	client := &logStreamerMockClient{}
-	rootRef := exec.DAGRunRef{Name: "root-dag", ID: "root-id"}
+	rootRef := ir.DAGRunRef{Name: "root-dag", ID: "root-id"}
 
 	streamer := coordreport.NewLogStreamer(client, "worker-1", "run-123", "test-dag", "attempt-1", rootRef)
 
@@ -154,10 +186,10 @@ func TestLogStreamer_FinalChunksIncludeOwnerCoordinatorID(t *testing.T) {
 			return stepStream, nil
 		},
 	}
-	owner := exec.HostInfo{ID: "coord-1", Host: "127.0.0.1", Port: 4321}
-	streamer := coordreport.NewLogStreamer(stepClient, "worker-1", "run-123", "test-dag", "attempt-1", exec.DAGRunRef{}, owner)
+	owner := serviceregistry.HostInfo{ID: "coord-1", Host: "127.0.0.1", Port: 4321}
+	streamer := coordreport.NewLogStreamer(stepClient, "worker-1", "run-123", "test-dag", "attempt-1", ir.DAGRunRef{}, owner)
 
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 	_, err := stepWriter.Write([]byte("hello"))
 	require.NoError(t, err)
 	require.NoError(t, stepWriter.Close())
@@ -172,7 +204,7 @@ func TestLogStreamer_FinalChunksIncludeOwnerCoordinatorID(t *testing.T) {
 			return schedulerStream, nil
 		},
 	}
-	schedulerStreamer := coordreport.NewLogStreamer(schedulerClient, "worker-1", "run-123", "test-dag", "attempt-1", exec.DAGRunRef{}, owner)
+	schedulerStreamer := coordreport.NewLogStreamer(schedulerClient, "worker-1", "run-123", "test-dag", "attempt-1", ir.DAGRunRef{}, owner)
 	localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
 	require.NoError(t, err)
 	defer func() { _ = localFile.Close() }()
@@ -189,7 +221,7 @@ func TestLogStreamer_FinalChunksIncludeOwnerCoordinatorID(t *testing.T) {
 
 func TestSetAttemptID(t *testing.T) {
 	t.Parallel()
-	streamer := coordreport.NewLogStreamer(&logStreamerMockClient{}, "w", "r", "d", "initial", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(&logStreamerMockClient{}, "w", "r", "d", "initial", ir.DAGRunRef{})
 
 	assert.Equal(t, "initial", coordreport.LogStreamerAttemptID(streamer))
 
@@ -199,13 +231,13 @@ func TestSetAttemptID(t *testing.T) {
 
 func TestGetAttemptID(t *testing.T) {
 	t.Parallel()
-	streamer := coordreport.NewLogStreamer(&logStreamerMockClient{}, "w", "r", "d", "test-attempt", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(&logStreamerMockClient{}, "w", "r", "d", "test-attempt", ir.DAGRunRef{})
 	assert.Equal(t, "test-attempt", coordreport.LogStreamerAttemptID(streamer))
 }
 
 func TestSetAttemptID_Concurrent(t *testing.T) {
 	t.Parallel()
-	streamer := coordreport.NewLogStreamer(&logStreamerMockClient{}, "w", "r", "d", "initial", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(&logStreamerMockClient{}, "w", "r", "d", "initial", ir.DAGRunRef{})
 
 	var wg sync.WaitGroup
 	const goroutines = 100
@@ -240,16 +272,16 @@ func TestNewStepWriter(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "worker-1", "run-123", "test-dag", "attempt-1", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(client, "worker-1", "run-123", "test-dag", "attempt-1", ir.DAGRunRef{})
 
-	writer := streamer.NewStepWriter(context.Background(), "step1", exec.StreamTypeStdout)
+	writer := streamer.NewStepWriter(context.Background(), "step1", runctx.StreamTypeStdout)
 
 	require.NotNil(t, writer)
 	stepWriter, ok := writer.(*coordreport.StepLogWriter)
 	require.True(t, ok)
 	snapshot := coordreport.SnapshotStepLogWriter(stepWriter)
 	assert.Equal(t, "step1", snapshot.StepName)
-	assert.Equal(t, exec.StreamTypeStdout, snapshot.StreamType)
+	assert.Equal(t, runctx.StreamTypeStdout, snapshot.StreamType)
 	assert.Equal(t, streamer, snapshot.Streamer)
 	assert.False(t, snapshot.Closed)
 	assert.False(t, snapshot.StreamInitFailed)
@@ -263,8 +295,8 @@ func TestWrite_SmallData(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write small data (< 32KB)
 	data := []byte("small log message")
@@ -276,6 +308,67 @@ func TestWrite_SmallData(t *testing.T) {
 	assert.Empty(t, mockStream.getSentChunks())
 }
 
+func TestFlush_SmallDataBeforeClose(t *testing.T) {
+	t.Parallel()
+
+	mockStream := &mockStreamLogsClient{}
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			return mockStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
+
+	data := []byte("small log message")
+	_, err := writer.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, writer.Flush())
+
+	chunks := mockStream.getSentChunks()
+	require.Len(t, chunks, 1)
+	assert.Equal(t, data, chunks[0].Data)
+	assert.False(t, chunks[0].IsFinal)
+	assert.Equal(t, uint64(1), chunks[0].Sequence)
+
+	require.NoError(t, writer.Flush())
+	assert.Len(t, mockStream.getSentChunks(), 1)
+
+	require.NoError(t, writer.Close())
+	require.NoError(t, writer.Flush())
+	chunks = mockStream.getSentChunks()
+	require.Len(t, chunks, 2)
+	assert.True(t, chunks[1].IsFinal)
+}
+
+func TestFlushIfDue_SmallDataWhileOpen(t *testing.T) {
+	t.Parallel()
+
+	mockStream := &mockStreamLogsClient{}
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			return mockStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
+	defer func() { require.NoError(t, writer.Close()) }()
+
+	data := []byte("small log message")
+	_, err := writer.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, writer.FlushIfDue())
+	assert.Empty(t, mockStream.getSentChunks())
+
+	require.Eventually(t, func() bool {
+		if err := writer.FlushIfDue(); err != nil {
+			return false
+		}
+		chunks := mockStream.getSentChunks()
+		return len(chunks) == 1 && string(chunks[0].Data) == string(data)
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
 func TestWrite_ExactThreshold(t *testing.T) {
 	t.Parallel()
 	mockStream := &mockStreamLogsClient{}
@@ -284,8 +377,8 @@ func TestWrite_ExactThreshold(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write exactly the buffer threshold to trigger flush.
 	data := make([]byte, coordreport.LogBufferSize)
@@ -312,8 +405,8 @@ func TestWrite_LargeData(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write data larger than buffer (64KB)
 	data := make([]byte, 64*1024)
@@ -338,8 +431,8 @@ func TestWrite_MultipleSmallWrites(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Multiple small writes that accumulate to >= threshold
 	smallData := make([]byte, 8*1024) // 8KB each
@@ -367,8 +460,8 @@ func TestWrite_AfterClose(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Close the writer
 	err := writer.Close()
@@ -390,8 +483,8 @@ func TestWrite_FlushError_Continues(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write enough to trigger flush (which will fail)
 	data := make([]byte, coordreport.LogBufferSize)
@@ -402,7 +495,7 @@ func TestWrite_FlushError_Continues(t *testing.T) {
 	assert.Equal(t, len(data), n)
 }
 
-func TestWrite_FlushError_ClearsBuffer(t *testing.T) {
+func TestWrite_FlushError_RetainsBuffer(t *testing.T) {
 	t.Parallel()
 	mockStream := &mockStreamLogsClient{
 		sendErr: errors.New("send failed"),
@@ -412,17 +505,17 @@ func TestWrite_FlushError_ClearsBuffer(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 	stepWriter := writer.(*coordreport.StepLogWriter)
 
 	// Write enough to trigger flush
 	data := make([]byte, coordreport.LogBufferSize)
 	_, _ = writer.Write(data)
 
-	// Buffer should be cleared to prevent memory growth
+	// Unsent data remains available for the next stream.
 	snapshot := coordreport.SnapshotStepLogWriter(stepWriter)
-	assert.Equal(t, 0, snapshot.BufferLen)
+	assert.Equal(t, len(data), snapshot.BufferLen)
 }
 
 func TestFlush_EmptyBuffer(t *testing.T) {
@@ -433,8 +526,8 @@ func TestFlush_EmptyBuffer(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, nil)
 
@@ -452,8 +545,8 @@ func TestFlush_StreamInitSuccess(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, []byte("test data"))
 
@@ -470,37 +563,44 @@ func TestFlush_StreamInitFailure(t *testing.T) {
 			return nil, initErr
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, []byte("test data"))
 
 	assert.Equal(t, initErr, result.Err)
-	assert.True(t, result.StreamFailed, "streamInitFailed should be set")
-	assert.Equal(t, 0, result.BufferLen, "buffer should be cleared")
+	assert.False(t, result.StreamFailed)
+	assert.Equal(t, len("test data"), result.BufferLen)
 }
 
 func TestFlush_AfterInitFailure(t *testing.T) {
 	t.Parallel()
 	callCount := 0
+	mockStream := &mockStreamLogsClient{}
 	client := &logStreamerMockClient{
 		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
 			callCount++
-			return nil, errors.New("init failed")
+			if callCount == 1 {
+				return nil, errors.New("init failed")
+			}
+			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	// First flush triggers init failure.
 	_ = coordreport.FlushStepLogWriterWithBuffer(stepWriter, []byte("data1"))
 
-	// Second flush silently returns without retrying.
+	// The next flush opens a new stream and preserves output order.
 	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, []byte("data2"))
 
-	require.NoError(t, result.Err, "should silently succeed after init failure")
-	assert.Equal(t, 0, result.BufferLen, "buffer should be cleared")
-	assert.Equal(t, 1, callCount, "should not retry stream init")
+	require.NoError(t, result.Err)
+	assert.Equal(t, 0, result.BufferLen)
+	assert.Equal(t, 2, callCount)
+	chunks := mockStream.getSentChunks()
+	require.Len(t, chunks, 1)
+	assert.Equal(t, "data1data2", string(chunks[0].Data))
 }
 
 func TestFlush_SendSuccess(t *testing.T) {
@@ -511,32 +611,65 @@ func TestFlush_SendSuccess(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, []byte("test data"))
 
 	require.NoError(t, result.Err)
-	assert.Equal(t, result.InitialSequence+1, result.FinalSequence, "sequence should increment after success")
+	assert.Equal(t, result.InitialSequence, result.FinalSequence, "sequence remains pending until the stream is acknowledged")
 }
 
 func TestFlush_SendFailure(t *testing.T) {
 	t.Parallel()
-	mockStream := &mockStreamLogsClient{
+	failedStream := &mockStreamLogsClient{
 		sendErr: errors.New("send failed"),
 	}
+	recoveredStream := &mockStreamLogsClient{}
+	streamCount := 0
 	client := &logStreamerMockClient{
 		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
-			return mockStream, nil
+			streamCount++
+			if streamCount == 1 {
+				return failedStream, nil
+			}
+			return recoveredStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, []byte("test data"))
 
 	assert.Error(t, result.Err)
 	assert.Equal(t, result.InitialSequence, result.FinalSequence, "sequence should NOT increment on failure")
+	assert.Equal(t, len("test data"), result.BufferLen)
+
+	result = coordreport.FlushStepLogWriterWithBuffer(stepWriter, []byte(" after reconnect"))
+	require.NoError(t, result.Err)
+	chunks := recoveredStream.getSentChunks()
+	require.Len(t, chunks, 1)
+	assert.Equal(t, "test data after reconnect", string(chunks[0].Data))
+	assert.Equal(t, uint64(1), chunks[0].Sequence)
+}
+
+func TestFlush_SendFailureCapsRetainedData(t *testing.T) {
+	t.Parallel()
+
+	mockStream := &mockStreamLogsClient{sendErr: errors.New("send failed")}
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			return mockStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
+	data := make([]byte, coordreport.MaxRetainedStepLogSize+1)
+
+	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, data)
+
+	require.Error(t, result.Err)
+	assert.Equal(t, coordreport.MaxRetainedStepLogSize, result.BufferLen)
 }
 
 func TestFlush_SingleChunk(t *testing.T) {
@@ -547,8 +680,8 @@ func TestFlush_SingleChunk(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	// Buffer < 3MB - single chunk
 	data := make([]byte, 1*1024*1024) // 1MB
@@ -572,8 +705,8 @@ func TestFlush_ExactMaxChunkSize(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	// A max-size buffer stays in a single chunk.
 	data := make([]byte, coordreport.MaxChunkSize)
@@ -597,8 +730,8 @@ func TestFlush_TwoChunks(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	// 4MB buffer - should split into 3MB + 1MB
 	data := make([]byte, 4*1024*1024)
@@ -623,8 +756,8 @@ func TestFlush_MultipleChunks(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	// 10MB buffer - should split into 3MB + 3MB + 3MB + 1MB = 4 chunks
 	data := make([]byte, 10*1024*1024)
@@ -651,8 +784,8 @@ func TestFlush_ChunkSequences(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	// 6MB buffer - 2 chunks
 	data := make([]byte, 6*1024*1024)
@@ -682,8 +815,8 @@ func TestFlush_PartialFailure(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	// 6MB buffer - would be 2 chunks, but second fails
 	data := make([]byte, 6*1024*1024)
@@ -691,10 +824,11 @@ func TestFlush_PartialFailure(t *testing.T) {
 	result := coordreport.FlushStepLogWriterWithBuffer(stepWriter, data)
 
 	assert.Error(t, result.Err)
-	// Only first chunk sent and sequence incremented
+	// The whole batch remains pending because the stream was not acknowledged.
 	chunks := mockStream.getSentChunks()
 	require.Len(t, chunks, 1)
-	assert.Equal(t, result.InitialSequence+1, result.FinalSequence, "only first chunk's sequence incremented")
+	assert.Equal(t, result.InitialSequence, result.FinalSequence)
+	assert.Equal(t, len(data), result.BufferLen)
 }
 
 func TestFlush_DataCopied(t *testing.T) {
@@ -705,8 +839,8 @@ func TestFlush_DataCopied(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	data := []byte("original data")
 
@@ -731,8 +865,8 @@ func TestClose_NoData(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	err := writer.Close()
 
@@ -749,8 +883,8 @@ func TestClose_WithUnflushedData(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write small data (not flushed)
 	_, _ = writer.Write([]byte("unflushed data"))
@@ -765,6 +899,33 @@ func TestClose_WithUnflushedData(t *testing.T) {
 	assert.True(t, chunks[1].IsFinal)
 }
 
+func TestClose_RetriesBufferedDataAfterCoordinatorOutage(t *testing.T) {
+	t.Parallel()
+
+	failedStream := &mockStreamLogsClient{sendErr: status.Error(codes.Unavailable, "coordinator restarting")}
+	recoveredStream := &mockStreamLogsClient{}
+	var opens atomic.Int32
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			if opens.Add(1) == 1 {
+				return failedStream, nil
+			}
+			return recoveredStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(t.Context(), "step", runctx.StreamTypeStdout)
+	_, err := writer.Write([]byte("retained output"))
+	require.NoError(t, err)
+
+	require.NoError(t, writer.Close())
+	require.Equal(t, int32(2), opens.Load())
+	chunks := recoveredStream.getSentChunks()
+	require.Len(t, chunks, 2)
+	require.Equal(t, "retained output", string(chunks[0].Data))
+	require.True(t, chunks[1].IsFinal)
+}
+
 func TestClose_Idempotent(t *testing.T) {
 	t.Parallel()
 	mockStream := &mockStreamLogsClient{}
@@ -773,8 +934,8 @@ func TestClose_Idempotent(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write and close
 	_, _ = writer.Write([]byte("data"))
@@ -799,8 +960,8 @@ func TestClose_FinalChunkSequence(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write enough to flush, then close
 	data := make([]byte, coordreport.LogBufferSize)
@@ -828,8 +989,8 @@ func TestClose_FinalSendSuccess(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	stepWriter := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout).(*coordreport.StepLogWriter)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	stepWriter := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
 
 	_, _ = stepWriter.Write([]byte("data"))
 	err := stepWriter.Close()
@@ -857,8 +1018,8 @@ func TestClose_FinalSendFailure(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	_, _ = writer.Write([]byte("data"))
 	err := writer.Close()
@@ -877,14 +1038,220 @@ func TestClose_CloseAndRecvError(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	_, _ = writer.Write([]byte("data"))
 	err := writer.Close()
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "close failed")
+}
+
+func TestClose_ReplaysDataAfterAmbiguousCloseFailure(t *testing.T) {
+	t.Parallel()
+
+	failedStream := &mockStreamLogsClient{
+		closeErr: status.Error(codes.Unavailable, "coordinator replaced"),
+	}
+	recoveredStream := &mockStreamLogsClient{}
+	streamCount := 0
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			streamCount++
+			if streamCount == 1 {
+				return failedStream, nil
+			}
+			return recoveredStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+	payload := []byte("final output")
+
+	_, err := writer.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	assert.Equal(t, 2, streamCount)
+	chunks := recoveredStream.getSentChunks()
+	require.Len(t, chunks, 2)
+	assert.Equal(t, payload, chunks[0].Data)
+	assert.True(t, chunks[0].HasByteOffset())
+	assert.Equal(t, uint64(0), chunks[0].GetByteOffset())
+	assert.True(t, chunks[1].IsFinal)
+	assert.True(t, chunks[1].HasByteOffset())
+	assert.Equal(t, uint64(len(payload)), chunks[1].GetByteOffset())
+}
+
+func TestLogStreamer_LogStreamingDisabled(t *testing.T) {
+	t.Parallel()
+
+	t.Run("step close ignores disabled CloseAndRecv", func(t *testing.T) {
+		t.Parallel()
+
+		mockStream := &mockStreamLogsClient{
+			closeErr: status.Error(codes.FailedPrecondition, "log streaming not configured: logDir is empty"),
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+		writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+
+		_, err := writer.Write([]byte("data"))
+		require.NoError(t, err)
+
+		require.NoError(t, writer.Close())
+	})
+
+	t.Run("scheduler replay ignores disabled send", func(t *testing.T) {
+		t.Parallel()
+
+		mockStream := &mockStreamLogsClient{
+			sendErr: status.Error(codes.FailedPrecondition, "log streaming not configured: logDir is empty"),
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		logFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		_, err = logFile.WriteString("scheduler data")
+		require.NoError(t, err)
+		require.NoError(t, logFile.Close())
+
+		require.NoError(t, streamer.StreamSchedulerLog(context.Background(), logFile.Name()))
+	})
+
+	t.Run("scheduler replay ignores disabled CloseAndRecv", func(t *testing.T) {
+		t.Parallel()
+
+		mockStream := &mockStreamLogsClient{
+			closeErr: status.Error(codes.FailedPrecondition, "log streaming not configured: logDir is empty"),
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		logFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		_, err = logFile.WriteString("scheduler data")
+		require.NoError(t, err)
+		require.NoError(t, logFile.Close())
+
+		require.NoError(t, streamer.StreamSchedulerLog(context.Background(), logFile.Name()))
+	})
+
+	t.Run("step close skips final marker after disabled send", func(t *testing.T) {
+		t.Parallel()
+
+		var finalMarkerAttempted atomic.Bool
+		mockStream := &mockStreamLogsClient{
+			sendFunc: func(_ int, chunk *coordinatorv1.LogChunk) error {
+				if chunk.IsFinal {
+					finalMarkerAttempted.Store(true)
+					return errors.New("final marker should not be sent")
+				}
+				return status.Error(codes.FailedPrecondition, "log streaming not configured: logDir is empty")
+			},
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+		writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+
+		_, err := writer.Write([]byte("data"))
+		require.NoError(t, err)
+
+		require.NoError(t, writer.Close())
+		assert.False(t, finalMarkerAttempted.Load())
+	})
+}
+
+func TestLogStreamer_PreservesFailedPrecondition(t *testing.T) {
+	t.Parallel()
+
+	t.Run("step close returns non-owner error", func(t *testing.T) {
+		t.Parallel()
+
+		mockStream := &mockStreamLogsClient{
+			closeErr: status.Error(codes.FailedPrecondition, "log chunk sent to non-owner coordinator"),
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+		writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+
+		_, err := writer.Write([]byte("data"))
+		require.NoError(t, err)
+
+		err = writer.Close()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "log chunk sent to non-owner coordinator")
+	})
+
+	t.Run("scheduler replay returns non-owner error", func(t *testing.T) {
+		t.Parallel()
+
+		mockStream := &mockStreamLogsClient{
+			sendErr: status.Error(codes.FailedPrecondition, "log chunk sent to non-owner coordinator"),
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		logFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		_, err = logFile.WriteString("scheduler data")
+		require.NoError(t, err)
+		require.NoError(t, logFile.Close())
+
+		err = streamer.StreamSchedulerLog(context.Background(), logFile.Name())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "log chunk sent to non-owner coordinator")
+	})
+
+	t.Run("scheduler replay returns non-owner CloseAndRecv error", func(t *testing.T) {
+		t.Parallel()
+
+		mockStream := &mockStreamLogsClient{
+			closeErr: status.Error(codes.FailedPrecondition, "log chunk sent to non-owner coordinator"),
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		logFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		_, err = logFile.WriteString("scheduler data")
+		require.NoError(t, err)
+		require.NoError(t, logFile.Close())
+
+		err = streamer.StreamSchedulerLog(context.Background(), logFile.Name())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "log chunk sent to non-owner coordinator")
+	})
 }
 
 func TestClose_MultipleErrors(t *testing.T) {
@@ -903,8 +1270,8 @@ func TestClose_MultipleErrors(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	_, _ = writer.Write([]byte("data"))
 	err := writer.Close()
@@ -922,17 +1289,16 @@ func TestClose_NoStream(t *testing.T) {
 			return nil, errors.New("init failed")
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write triggers init failure
 	data := make([]byte, coordreport.LogBufferSize)
 	_, _ = writer.Write(data)
 
-	// Close should handle nil stream gracefully
+	// Close reports the final failed attempt without panicking on a nil stream.
 	err := writer.Close()
-	// No error because stream never initialized and streamInitFailed handles it
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "init failed")
 }
 
 func TestClose_FlushErrorThenSendSuccess(t *testing.T) {
@@ -953,8 +1319,8 @@ func TestClose_FlushErrorThenSendSuccess(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	_, _ = writer.Write([]byte("data"))
 	err := writer.Close()
@@ -972,8 +1338,8 @@ func TestConcurrentWrites(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	var wg sync.WaitGroup
 	const goroutines = 100
@@ -1000,8 +1366,8 @@ func TestConcurrentWriteAndClose(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	var wg sync.WaitGroup
 
@@ -1035,7 +1401,7 @@ func TestConcurrentSetAttemptID(t *testing.T) {
 			return &mockStreamLogsClient{}, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "initial", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "initial", ir.DAGRunRef{})
 
 	var wg sync.WaitGroup
 
@@ -1051,7 +1417,7 @@ func TestConcurrentSetAttemptID(t *testing.T) {
 	// Concurrent writes with separate writers (each gets its own stream)
 	for range 10 {
 		wg.Go(func() {
-			writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+			writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 			_, _ = writer.Write(make([]byte, coordreport.LogBufferSize)) // Triggers flush which reads attemptID
 			_ = writer.Close()
 		})
@@ -1068,10 +1434,11 @@ func TestLogStreamer_FullLifecycle(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	rootRef := exec.DAGRunRef{Name: "root", ID: "root-123"}
+	rootRef := ir.DAGRunRef{Name: "root", ID: "root-123"}
 	streamer := coordreport.NewLogStreamer(client, "worker-1", "run-456", "test-dag", "attempt-789", rootRef)
+	streamer.SetClaimKey("root-claim")
 
-	writer := streamer.NewStepWriter(context.Background(), "step1", exec.StreamTypeStdout)
+	writer := streamer.NewStepWriter(context.Background(), "step1", runctx.StreamTypeStdout)
 
 	// Multiple writes
 	for range 5 {
@@ -1097,6 +1464,7 @@ func TestLogStreamer_FullLifecycle(t *testing.T) {
 		assert.Equal(t, "root", chunk.RootDagRunName)
 		assert.Equal(t, "root-123", chunk.RootDagRunId)
 		assert.Equal(t, "attempt-789", chunk.AttemptId)
+		assert.Equal(t, "root-claim", chunk.AttemptKey)
 	}
 
 	// Verify final chunk
@@ -1117,11 +1485,11 @@ func TestLogStreamer_MultipleSteps(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
 
 	// Create multiple step writers
-	writer1 := streamer.NewStepWriter(context.Background(), "step1", exec.StreamTypeStdout)
-	writer2 := streamer.NewStepWriter(context.Background(), "step2", exec.StreamTypeStdout)
+	writer1 := streamer.NewStepWriter(context.Background(), "step1", runctx.StreamTypeStdout)
+	writer2 := streamer.NewStepWriter(context.Background(), "step2", runctx.StreamTypeStdout)
 
 	_, _ = writer1.Write([]byte("step1 data"))
 	_, _ = writer2.Write([]byte("step2 data"))
@@ -1147,10 +1515,10 @@ func TestLogStreamer_StdoutAndStderr(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
 
-	stdout := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
-	stderr := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStderr)
+	stdout := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+	stderr := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStderr)
 
 	_, _ = stdout.Write([]byte("stdout data"))
 	_, _ = stderr.Write([]byte("stderr data"))
@@ -1174,6 +1542,318 @@ func TestLogStreamer_StdoutAndStderr(t *testing.T) {
 	assert.True(t, hasStderr)
 }
 
+func TestLogStreamer_StepOutputMirrorsToSchedulerLog(t *testing.T) {
+	t.Parallel()
+
+	t.Run("successful step sends", func(t *testing.T) {
+		mockStream := &mockStreamLogsClient{}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		defer func() { _ = localFile.Close() }()
+
+		scheduler := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+		stdout := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+		stderr := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStderr)
+
+		const schedulerData = "scheduler live data\n"
+		const stdoutData = "stdout mirror data\n"
+		const stderrData = "stderr mirror data\n"
+		const afterData = "scheduler after step output\n"
+
+		_, err = scheduler.Write([]byte(schedulerData))
+		require.NoError(t, err)
+		_, err = stdout.Write([]byte(stdoutData))
+		require.NoError(t, err)
+		_, err = stderr.Write([]byte(stderrData))
+		require.NoError(t, err)
+
+		require.NoError(t, stdout.Close())
+		require.NoError(t, stderr.Close())
+		_, err = scheduler.Write([]byte(afterData))
+		require.NoError(t, err)
+		require.NoError(t, scheduler.Close())
+
+		logData, err := os.ReadFile(localFile.Name())
+		require.NoError(t, err)
+		logContent := string(logData)
+		assert.Equal(t, schedulerData+stdoutData+stderrData+afterData, logContent)
+
+		chunks := mockStream.getSentChunks()
+		var stdoutChunk, stderrChunk bool
+		for _, chunk := range chunks {
+			switch {
+			case chunk.StreamType == coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT &&
+				string(chunk.Data) == stdoutData:
+				stdoutChunk = true
+			case chunk.StreamType == coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDERR &&
+				string(chunk.Data) == stderrData:
+				stderrChunk = true
+			}
+		}
+		assert.True(t, stdoutChunk)
+		assert.True(t, stderrChunk)
+		assert.Equal(t, schedulerData+stdoutData+stderrData+afterData,
+			replayPositionedLog(chunks, coordinatorv1.LogStreamType_LOG_STREAM_TYPE_SCHEDULER))
+	})
+
+	t.Run("failed step send still mirrors to scheduler stream", func(t *testing.T) {
+		mockStream := &mockStreamLogsClient{
+			sendFunc: func(_ int, chunk *coordinatorv1.LogChunk) error {
+				if chunk.StreamType != coordinatorv1.LogStreamType_LOG_STREAM_TYPE_SCHEDULER {
+					return errors.New("step send failed")
+				}
+				return nil
+			},
+		}
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				return mockStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		defer func() { _ = localFile.Close() }()
+
+		scheduler := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+		stdout := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+
+		const schedulerData = "scheduler live data\n"
+		const marker = "failed step marker\n"
+		require.Less(t, len(marker), coordreport.LogBufferSize)
+		stepData := marker + strings.Repeat("x", coordreport.LogBufferSize-len(marker))
+
+		_, err = scheduler.Write([]byte(schedulerData))
+		require.NoError(t, err)
+		_, err = stdout.Write([]byte(stepData))
+		require.NoError(t, err)
+
+		_ = stdout.Close()
+		require.NoError(t, scheduler.Close())
+
+		logData, err := os.ReadFile(localFile.Name())
+		require.NoError(t, err)
+		assert.Equal(t, schedulerData+stepData, string(logData))
+
+		assert.Equal(t, schedulerData+stepData,
+			replayPositionedLog(mockStream.getSentChunks(), coordinatorv1.LogStreamType_LOG_STREAM_TYPE_SCHEDULER))
+	})
+
+	t.Run("scheduler send failure preserves tail order", func(t *testing.T) {
+		failedStream := &mockStreamLogsClient{sendErr: status.Error(codes.Unavailable, "scheduler send failed")}
+		retryStream := &mockStreamLogsClient{}
+		var streamCalls int
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				streamCalls++
+				if streamCalls == 1 {
+					return failedStream, nil
+				}
+				return retryStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		defer func() { _ = localFile.Close() }()
+
+		scheduler := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+		first := "first scheduler data\n" + strings.Repeat("a", coordreport.LogBufferSize)
+		second := "second scheduler data\n" + strings.Repeat("b", coordreport.LogBufferSize)
+
+		_, err = scheduler.Write([]byte(first))
+		require.NoError(t, err)
+		_, err = scheduler.Write([]byte(second))
+		require.NoError(t, err)
+		require.NoError(t, scheduler.Close())
+
+		assert.Equal(t, first+second,
+			replayPositionedLog(retryStream.getSentChunks(), coordinatorv1.LogStreamType_LOG_STREAM_TYPE_SCHEDULER))
+	})
+
+	t.Run("scheduler close failure replays unacknowledged data", func(t *testing.T) {
+		failedStream := &mockStreamLogsClient{
+			closeErr: status.Error(codes.Unavailable, "coordinator replaced"),
+		}
+		recoveredStream := &mockStreamLogsClient{}
+		var streamCalls int
+		client := &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				streamCalls++
+				if streamCalls == 1 {
+					return failedStream, nil
+				}
+				return recoveredStream, nil
+			},
+		}
+		streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+		localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		defer func() { _ = localFile.Close() }()
+
+		writer := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+		payload := []byte("final scheduler output")
+		_, err = writer.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+
+		assert.Equal(t, 2, streamCalls)
+		chunks := recoveredStream.getSentChunks()
+		require.Len(t, chunks, 2)
+		assert.Equal(t, payload, chunks[0].Data)
+		assert.Equal(t, uint64(0), chunks[0].GetByteOffset())
+		assert.True(t, chunks[1].IsFinal)
+		assert.Equal(t, uint64(len(payload)), chunks[1].GetByteOffset())
+	})
+}
+
+func TestSchedulerLogWriterFlushesSparseDataWhileOpen(t *testing.T) {
+	t.Parallel()
+
+	mockStream := &mockStreamLogsClient{}
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			return mockStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+	localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, localFile.Close()) }()
+
+	writer := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+	defer func() { require.NoError(t, writer.Close()) }()
+
+	data := []byte("sparse scheduler log\n")
+	_, err = writer.Write(data)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		chunks := mockStream.getSentChunks()
+		return len(chunks) == 1 &&
+			!chunks[0].IsFinal &&
+			chunks[0].StreamType == coordinatorv1.LogStreamType_LOG_STREAM_TYPE_SCHEDULER &&
+			string(chunks[0].Data) == string(data)
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestSchedulerLogWriterRetriesSparseDataAfterStreamOpenFailure(t *testing.T) {
+	t.Parallel()
+
+	mockStream := &mockStreamLogsClient{}
+	var openCount atomic.Int32
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			if openCount.Add(1) == 1 {
+				return nil, errors.New("temporary open failure")
+			}
+			return mockStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+	localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, localFile.Close()) }()
+
+	writer := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+	defer func() { require.NoError(t, writer.Close()) }()
+
+	data := []byte("sparse scheduler retry\n")
+	_, err = writer.Write(data)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		for _, chunk := range mockStream.getSentChunks() {
+			if !chunk.IsFinal && string(chunk.Data) == string(data) {
+				return true
+			}
+		}
+		return false
+	}, 8*time.Second, 10*time.Millisecond)
+	assert.GreaterOrEqual(t, openCount.Load(), int32(2))
+}
+
+func TestStepFlushDoesNotWaitForBlockedSchedulerStream(t *testing.T) {
+	sendStarted := make(chan struct{})
+	releaseSend := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseScheduler := func() {
+		releaseOnce.Do(func() { close(releaseSend) })
+	}
+	defer releaseScheduler()
+
+	var streamCount atomic.Int32
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(ctx context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			if streamCount.Add(1) != 1 {
+				return &mockStreamLogsClient{}, nil
+			}
+
+			var startedOnce sync.Once
+			return &mockStreamLogsClient{
+				sendFunc: func(_ int, _ *coordinatorv1.LogChunk) error {
+					startedOnce.Do(func() { close(sendStarted) })
+					select {
+					case <-releaseSend:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				},
+			}, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+
+	localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, localFile.Close()) }()
+
+	scheduler := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+	_, err = scheduler.Write([]byte("scheduler data\n"))
+	require.NoError(t, err)
+
+	select {
+	case <-sendStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scheduler stream did not begin sending")
+	}
+
+	step := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout).(*coordreport.StepLogWriter)
+	_, err = step.Write([]byte("step data\n"))
+	require.NoError(t, err)
+
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- step.Flush()
+	}()
+
+	select {
+	case err := <-flushDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		releaseScheduler()
+		<-flushDone
+		t.Fatal("step flush waited for the scheduler stream")
+	}
+
+	require.NoError(t, step.Close())
+	releaseScheduler()
+	require.NoError(t, scheduler.Close())
+}
+
 func TestLogStreamer_LargeOutput(t *testing.T) {
 	t.Parallel()
 	mockStream := &mockStreamLogsClient{}
@@ -1182,8 +1862,8 @@ func TestLogStreamer_LargeOutput(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Write 12MB of data
 	data := make([]byte, 12*1024*1024)
@@ -1222,8 +1902,8 @@ func TestLogStreamer_AttemptIDUpdatedDuringStream(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "initial-attempt", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "initial-attempt", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// First write with initial attempt ID
 	data := make([]byte, coordreport.LogBufferSize)
@@ -1257,8 +1937,8 @@ func TestLogStreamer_SequenceContinuity(t *testing.T) {
 			return mockStream, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
-	writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 
 	// Multiple flushes
 	for range 5 {
@@ -1284,7 +1964,7 @@ func TestLogStreamer_RaceDetector(t *testing.T) {
 			return &mockStreamLogsClient{}, nil
 		},
 	}
-	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", exec.DAGRunRef{})
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
 
 	var wg sync.WaitGroup
 	var ops int64
@@ -1292,7 +1972,7 @@ func TestLogStreamer_RaceDetector(t *testing.T) {
 	// Multiple writers on same streamer (each gets its own stream)
 	for range 5 {
 		wg.Go(func() {
-			writer := streamer.NewStepWriter(context.Background(), "step", exec.StreamTypeStdout)
+			writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
 			for range 20 {
 				_, _ = writer.Write([]byte("data"))
 				atomic.AddInt64(&ops, 1)

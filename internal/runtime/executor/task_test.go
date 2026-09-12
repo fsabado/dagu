@@ -4,13 +4,162 @@
 package executor_test
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestPrepareDAGWorkspace(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "scripts"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "config"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "root.txt"), []byte("root"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "scripts", "handler.sh"), []byte("handler"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "config", "foreach.yaml"), []byte("foreach"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "child.txt"), []byte("child"), 0o644))
+
+	dagData := []byte("name: root\nsteps:\n  - run: echo root\n")
+	dag := &ir.DAG{
+		Name:       "root",
+		SourceFile: filepath.Join(root, "dag.yaml"),
+		YamlData:   dagData,
+		Steps: []ir.Step{
+			{Dependencies: []string{"root.txt"}},
+			{Foreach: &ir.ForeachConfig{Steps: []ir.Step{{Dependencies: []string{"config/**"}}}}},
+		},
+		HandlerOn: ir.HandlerOn{
+			Failure: &ir.Step{Dependencies: []string{"scripts/handler.sh"}},
+		},
+		LocalDAGs: map[string]*ir.DAG{
+			"child": {Steps: []ir.Step{{Dependencies: []string{"child.txt"}}}},
+		},
+	}
+
+	seed, err := executor.PrepareDAGWorkspace(context.Background(), dag)
+	require.NoError(t, err)
+	require.NotNil(t, seed)
+	assert.Equal(t, "dag.yaml", seed.Descriptor.DAGPath)
+
+	dest := filepath.Join(t.TempDir(), "workspace")
+	require.NoError(t, workspacebundle.Extract(seed.Archive, dest, seed.Descriptor, workspacebundle.DefaultLimits()))
+	assert.FileExists(t, filepath.Join(dest, "root.txt"))
+	assert.FileExists(t, filepath.Join(dest, "scripts", "handler.sh"))
+	assert.FileExists(t, filepath.Join(dest, "config", "foreach.yaml"))
+	assert.FileExists(t, filepath.Join(dest, "child.txt"))
+	actualDAG, err := os.ReadFile(filepath.Join(dest, "dag.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, dagData, actualDAG)
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "root.txt"), []byte("updated"), 0o644))
+	updatedSeed, err := executor.PrepareDAGWorkspace(context.Background(), dag)
+	require.NoError(t, err)
+	require.NotNil(t, updatedSeed)
+	assert.NotEqual(t, seed.Descriptor.Digest, updatedSeed.Descriptor.Digest)
+}
+
+func TestPrepareDAGWorkspaceUsesDAGWorkingDirectory(t *testing.T) {
+	t.Parallel()
+
+	dagDir := t.TempDir()
+	workDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, "input.txt"), []byte("input"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, "dag.yaml"), []byte("dependency"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, ".dagu-workflow.yaml"), []byte("hidden dependency"), 0o644))
+
+	dagData := []byte("name: working-dir\nsteps:\n  - run: echo ok\n")
+	dag := &ir.DAG{
+		Name:               "working-dir",
+		SourceFile:         filepath.Join(dagDir, "dag.yaml"),
+		WorkingDir:         workDir,
+		WorkingDirExplicit: true,
+		YamlData:           dagData,
+		Steps:              []ir.Step{{Dependencies: []string{"input.txt", "dag.yaml", ".dagu-workflow.yaml"}}},
+	}
+
+	seed, err := executor.PrepareDAGWorkspace(context.Background(), dag)
+	require.NoError(t, err)
+	require.NotNil(t, seed)
+
+	dest := filepath.Join(t.TempDir(), "workspace")
+	require.NoError(t, workspacebundle.Extract(seed.Archive, dest, seed.Descriptor, workspacebundle.DefaultLimits()))
+	assert.FileExists(t, filepath.Join(dest, "input.txt"))
+	dependency, err := os.ReadFile(filepath.Join(dest, "dag.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("dependency"), dependency)
+	hiddenDependency, err := os.ReadFile(filepath.Join(dest, ".dagu-workflow.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("hidden dependency"), hiddenDependency)
+	transportedDAG, err := os.ReadFile(filepath.Join(dest, filepath.FromSlash(seed.Descriptor.DAGPath)))
+	require.NoError(t, err)
+	assert.Equal(t, dagData, transportedDAG)
+}
+
+func TestPrepareDAGWorkspaceSupportsInlineDAGWithWorkingDirectory(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, "input.txt"), []byte("input"), 0o644))
+	dagData := []byte("name: inline\nsteps:\n  - run: cat input.txt\n")
+	dag := &ir.DAG{
+		Name:               "inline",
+		WorkingDir:         workDir,
+		WorkingDirExplicit: true,
+		YamlData:           dagData,
+		Steps:              []ir.Step{{Dependencies: []string{"input.txt"}}},
+	}
+
+	seed, err := executor.PrepareDAGWorkspace(context.Background(), dag)
+	require.NoError(t, err)
+	require.NotNil(t, seed)
+
+	dest := filepath.Join(t.TempDir(), "workspace")
+	require.NoError(t, workspacebundle.Extract(seed.Archive, dest, seed.Descriptor, workspacebundle.DefaultLimits()))
+	assert.FileExists(t, filepath.Join(dest, "input.txt"))
+	transportedDAG, err := os.ReadFile(filepath.Join(dest, filepath.FromSlash(seed.Descriptor.DAGPath)))
+	require.NoError(t, err)
+	assert.Equal(t, dagData, transportedDAG)
+}
+
+func TestPrepareDAGWorkspaceRejectsEmptyResolvedWorkingDirectory(t *testing.T) {
+	t.Setenv("DAGU_TEST_EMPTY_WORKSPACE_ROOT", "")
+
+	dagDir := t.TempDir()
+	dag := &ir.DAG{
+		Name:               "empty-working-dir",
+		SourceFile:         filepath.Join(dagDir, "dag.yaml"),
+		WorkingDir:         "$DAGU_TEST_EMPTY_WORKSPACE_ROOT",
+		WorkingDirExplicit: true,
+		YamlData:           []byte("name: empty-working-dir\nsteps:\n  - run: echo ok\n"),
+		Steps:              []ir.Step{{Dependencies: []string{"input.txt"}}},
+	}
+
+	_, err := executor.PrepareDAGWorkspace(context.Background(), dag)
+	require.ErrorContains(t, err, "working_dir")
+	require.ErrorContains(t, err, "DAGU_TEST_EMPTY_WORKSPACE_ROOT")
+}
+
+func TestPrepareDAGWorkspaceReportsUnavailableSource(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{
+		Name:     "remote-child",
+		YamlData: []byte("name: remote-child\nsteps:\n  - run: cat input.txt\n"),
+		Steps:    []ir.Step{{Dependencies: []string{"input.txt"}}},
+	}
+
+	_, err := executor.PrepareDAGWorkspace(context.Background(), dag)
+	require.ErrorIs(t, err, executor.ErrDAGWorkspaceSourceUnavailable)
+}
 
 func TestDAG_CreateTask(t *testing.T) {
 	t.Parallel()
@@ -35,7 +184,7 @@ steps:
 		task := executor.CreateTask(
 			dagName,
 			yamlDefinition,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			runID,
 			executor.WithTaskParams(params),
 			executor.WithWorkerSelector(selector),
@@ -44,7 +193,7 @@ steps:
 		assert.NotNil(t, task)
 		assert.Equal(t, "test-dag", task.RootDAGRunName)
 		assert.Equal(t, runID, task.RootDAGRunID)
-		assert.Equal(t, exec.DispatchOperationStart, task.Operation)
+		assert.Equal(t, dispatch.DispatchOperationStart, task.Operation)
 		assert.Equal(t, runID, task.DAGRunID)
 		assert.Equal(t, "test-dag", task.Target)
 		assert.Equal(t, params, task.Params)
@@ -58,11 +207,11 @@ steps:
 	t.Run("WithRootDagRunOption", func(t *testing.T) {
 		t.Parallel()
 
-		dag := &core.DAG{
+		dag := &ir.DAG{
 			Name: "sub-dag",
 		}
 
-		rootRef := exec.DAGRunRef{
+		rootRef := ir.DAGRunRef{
 			Name: "root-dag",
 			ID:   "root-run-123",
 		}
@@ -70,7 +219,7 @@ steps:
 		task := executor.CreateTask(
 			dag.Name,
 			string(dag.YamlData),
-			exec.DispatchOperationRetry,
+			dispatch.DispatchOperationRetry,
 			"child-run-456",
 			executor.WithRootDagRun(rootRef),
 		)
@@ -84,7 +233,7 @@ steps:
 	t.Run("WithParentDagRunOption", func(t *testing.T) {
 		t.Parallel()
 
-		parentRef := exec.DAGRunRef{
+		parentRef := ir.DAGRunRef{
 			Name: "parent-dag",
 			ID:   "parent-run-789",
 		}
@@ -92,7 +241,7 @@ steps:
 		task := executor.CreateTask(
 			"sub-dag",
 			`name: sub-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"child-run-456",
 			executor.WithParentDagRun(parentRef),
 		)
@@ -106,11 +255,11 @@ steps:
 	t.Run("WithMultipleOptions", func(t *testing.T) {
 		t.Parallel()
 
-		rootRef := exec.DAGRunRef{
+		rootRef := ir.DAGRunRef{
 			Name: "root-dag",
 			ID:   "root-run-123",
 		}
-		parentRef := exec.DAGRunRef{
+		parentRef := ir.DAGRunRef{
 			Name: "parent-dag",
 			ID:   "parent-run-456",
 		}
@@ -118,7 +267,7 @@ steps:
 		task := executor.CreateTask(
 			"grandsub-dag",
 			`name: grandsub-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"grandchild-run-789",
 			executor.WithTaskParams("nested=true"),
 			executor.WithWorkerSelector(map[string]string{"env": "prod"}),
@@ -142,7 +291,7 @@ steps:
 		task := executor.CreateTask(
 			"test-dag",
 			`name: test-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"run-123",
 		)
 
@@ -153,13 +302,13 @@ steps:
 		t.Parallel()
 
 		// Test that empty refs don't modify the task
-		emptyRootRef := exec.DAGRunRef{}
-		emptyParentRef := exec.DAGRunRef{Name: "", ID: ""}
+		emptyRootRef := ir.DAGRunRef{}
+		emptyParentRef := ir.DAGRunRef{Name: "", ID: ""}
 
 		task := executor.CreateTask(
 			"test-dag",
 			`name: test-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"run-123",
 			executor.WithRootDagRun(emptyRootRef),
 			executor.WithParentDagRun(emptyParentRef),
@@ -177,13 +326,13 @@ steps:
 		t.Parallel()
 
 		// Test refs with only one field set
-		partialRootRef := exec.DAGRunRef{Name: "root-dag", ID: ""}
-		partialParentRef := exec.DAGRunRef{Name: "", ID: "parent-id"}
+		partialRootRef := ir.DAGRunRef{Name: "root-dag", ID: ""}
+		partialParentRef := ir.DAGRunRef{Name: "", ID: "parent-id"}
 
 		task := executor.CreateTask(
 			"test-dag",
 			`name: test-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"run-123",
 			executor.WithRootDagRun(partialRootRef),
 			executor.WithParentDagRun(partialParentRef),
@@ -201,7 +350,7 @@ steps:
 
 		// Create a custom task option
 		withStep := func(step string) executor.TaskOption {
-			return func(task *exec.DispatchTask) {
+			return func(task *dispatch.DispatchTask) {
 				task.Step = step
 			}
 		}
@@ -209,13 +358,13 @@ steps:
 		task := executor.CreateTask(
 			"test-dag",
 			`name: test-dag`,
-			exec.DispatchOperationRetry,
+			dispatch.DispatchOperationRetry,
 			"run-123",
 			withStep("step-2"),
 		)
 
 		assert.Equal(t, "step-2", task.Step)
-		assert.Equal(t, exec.DispatchOperationRetry, task.Operation)
+		assert.Equal(t, dispatch.DispatchOperationRetry, task.Operation)
 	})
 
 	t.Run("WithLabelsOption", func(t *testing.T) {
@@ -224,7 +373,7 @@ steps:
 		task := executor.CreateTask(
 			"test-dag",
 			`name: test-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"run-123",
 			executor.WithLabels("env=prod,region=us-east-1"),
 		)
@@ -238,7 +387,7 @@ steps:
 		task := executor.CreateTask(
 			"test-dag",
 			`name: test-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"run-123",
 			executor.WithScheduleTime("2026-03-13T10:00:00Z"),
 		)
@@ -252,7 +401,7 @@ steps:
 		task := executor.CreateTask(
 			"test-dag",
 			`name: test-dag`,
-			exec.DispatchOperationStart,
+			dispatch.DispatchOperationStart,
 			"run-123",
 			executor.WithExternalStepRetry(true),
 		)
@@ -263,10 +412,10 @@ steps:
 	t.Run("AllOperationTypes", func(t *testing.T) {
 		t.Parallel()
 
-		operations := []exec.DispatchOperation{
-			exec.DispatchOperationUnspecified,
-			exec.DispatchOperationStart,
-			exec.DispatchOperationRetry,
+		operations := []dispatch.DispatchOperation{
+			dispatch.DispatchOperationUnspecified,
+			dispatch.DispatchOperationStart,
+			dispatch.DispatchOperationRetry,
 		}
 
 		for _, op := range operations {
@@ -287,8 +436,8 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithRootDagRun", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
-		ref := exec.DAGRunRef{Name: "root", ID: "123"}
+		task := &dispatch.DispatchTask{}
+		ref := ir.DAGRunRef{Name: "root", ID: "123"}
 
 		executor.WithRootDagRun(ref)(task)
 
@@ -299,8 +448,8 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithParentDagRun", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
-		ref := exec.DAGRunRef{Name: "parent", ID: "456"}
+		task := &dispatch.DispatchTask{}
+		ref := ir.DAGRunRef{Name: "parent", ID: "456"}
 
 		executor.WithParentDagRun(ref)(task)
 
@@ -311,7 +460,7 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithTaskParams", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 
 		executor.WithTaskParams("key1=value1 key2=value2")(task)
 
@@ -321,7 +470,7 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithWorkerSelector", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 		selector := map[string]string{
 			"gpu":    "true",
 			"region": "us-west-2",
@@ -332,20 +481,39 @@ func TestTaskOption_Functions(t *testing.T) {
 		assert.Equal(t, selector, task.WorkerSelector)
 	})
 
+	t.Run("WithTargetWorkerID", func(t *testing.T) {
+		t.Parallel()
+
+		task := &dispatch.DispatchTask{}
+		executor.WithTargetWorkerID("worker-a")(task)
+
+		assert.Equal(t, "worker-a", task.TargetWorkerID)
+	})
+
 	t.Run("WithStep", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 
 		executor.WithStep("step-name")(task)
 
 		assert.Equal(t, "step-name", task.Step)
 	})
 
+	t.Run("WithIncludeDownstream", func(t *testing.T) {
+		t.Parallel()
+
+		task := &dispatch.DispatchTask{}
+
+		executor.WithIncludeDownstream(true)(task)
+
+		assert.True(t, task.IncludeDownstream)
+	})
+
 	t.Run("WithLabels", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 
 		executor.WithLabels("env=prod,team=backend")(task)
 
@@ -355,7 +523,7 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithLabelsEmpty", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 
 		executor.WithLabels("")(task)
 
@@ -365,7 +533,7 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithTags", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 
 		executor.WithTags("env=prod,team=backend")(task)
 
@@ -375,7 +543,7 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithTagsEmpty", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 
 		executor.WithTags("")(task)
 
@@ -385,15 +553,15 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithPreviousStatus", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
-		status := &exec.DAGRunStatus{
+		task := &dispatch.DispatchTask{}
+		status := &ir.DAGRunStatus{
 			Name:      "test-dag",
 			DAGRunID:  "run-123",
 			ProcGroup: "shared-queue",
-			Status:    core.Running,
-			Nodes: []*exec.Node{
-				{Step: core.Step{Name: "step1"}, Status: core.NodeSucceeded},
-				{Step: core.Step{Name: "step2"}, Status: core.NodeFailed},
+			Status:    ir.Running,
+			Nodes: []*ir.Node{
+				{Step: ir.Step{Name: "step1"}, Status: ir.NodeSucceeded},
+				{Step: ir.Step{Name: "step2"}, Status: ir.NodeFailed},
 			},
 		}
 
@@ -406,7 +574,7 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithPreviousStatusNil", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 
 		// Should not panic with nil status
 		executor.WithPreviousStatus(nil)(task)
@@ -417,7 +585,7 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithExternalStepRetry", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 		executor.WithExternalStepRetry(true)(task)
 
 		assert.True(t, task.ExternalStepRetry)
@@ -426,22 +594,10 @@ func TestTaskOption_Functions(t *testing.T) {
 	t.Run("WithSourceFile", func(t *testing.T) {
 		t.Parallel()
 
-		task := &exec.DispatchTask{}
+		task := &dispatch.DispatchTask{}
 		executor.WithSourceFile("/dags/test-dag.yaml")(task)
 
 		assert.Equal(t, "/dags/test-dag.yaml", task.SourceFile)
 	})
 
-	t.Run("WithAgentSnapshot", func(t *testing.T) {
-		t.Parallel()
-
-		task := &exec.DispatchTask{}
-		snapshot := []byte("agent-snapshot")
-		want := append([]byte(nil), snapshot...)
-		executor.WithAgentSnapshot(snapshot)(task)
-		snapshot[0] = 'X'
-
-		assert.Equal(t, want, task.AgentSnapshot)
-		assert.NotEqual(t, snapshot, task.AgentSnapshot)
-	})
 }

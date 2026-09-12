@@ -5,51 +5,55 @@ package dagrun_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	filedagrun "github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-type retryCandidateLister interface {
-	ListRetryCandidates(ctx context.Context, from exec.TimeInUTC) ([]*exec.DAGRunStatus, error)
-}
 
 func TestStoreListRetryCandidatesTracksFailedRunWrites(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store := dagrun.New(t.TempDir())
-	lister, ok := store.(retryCandidateLister)
-	require.True(t, ok)
+	repository := newFileRepository(t.TempDir(), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	dag := retryCandidateDAG()
 
-	successAttempt, _ := writeRetryCandidateStatus(t, ctx, store, dag, now, "success-run", core.Succeeded)
+	successAttempt, _ := writeRetryCandidateStatus(t, ctx, repository, dag, now, "success-run", ir.Succeeded)
 	defer func() { require.NoError(t, successAttempt.Close(ctx)) }()
-	failedAttempt, failedStatus := writeRetryCandidateStatus(t, ctx, store, dag, now.Add(time.Second), "failed-run", core.Failed)
+	failedAttempt, failedStatus := writeRetryCandidateStatus(t, ctx, repository, dag, now.Add(time.Second), "failed-run", ir.Failed)
 	defer func() { require.NoError(t, failedAttempt.Close(ctx)) }()
 
-	candidates, err := lister.ListRetryCandidates(ctx, exec.NewUTC(now.Add(-time.Hour)))
+	candidates, err := repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
 	require.NoError(t, err)
 	require.Len(t, candidates, 1)
 	assert.Equal(t, "failed-run", candidates[0].DAGRunID)
-	assert.Equal(t, core.Failed, candidates[0].Status)
+	assert.Equal(t, ir.Failed, candidates[0].Status)
 	assert.Equal(t, 2, candidates[0].AutoRetryLimit)
 	assert.NotEmpty(t, candidates[0].ProcGroup)
 
-	failedStatus.Status = core.Queued
+	failedStatus.AutoRetryCount = 1
+	require.NoError(t, failedAttempt.Write(ctx, *failedStatus))
+
+	candidates, err = repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, 1, candidates[0].AutoRetryCount)
+
+	failedStatus.Status = ir.Queued
 	failedStatus.QueuedAt = now.Add(2 * time.Second).Format(time.RFC3339)
 	require.NoError(t, failedAttempt.Write(ctx, *failedStatus))
 
-	candidates, err = lister.ListRetryCandidates(ctx, exec.NewUTC(now.Add(-time.Hour)))
+	candidates, err = repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
 	require.NoError(t, err)
 	assert.Empty(t, candidates)
 }
@@ -59,20 +63,18 @@ func TestStoreListRetryCandidatesRebuildsMissingCandidateDirectory(t *testing.T)
 
 	ctx := context.Background()
 	baseDir := t.TempDir()
-	store := dagrun.New(baseDir)
-	lister, ok := store.(retryCandidateLister)
-	require.True(t, ok)
+	repository := newFileRepository(baseDir, persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	dag := retryCandidateDAG()
 
-	attempt, _ := writeRetryCandidateStatus(t, ctx, store, dag, now, "failed-run", core.Failed)
+	attempt, _ := writeRetryCandidateStatus(t, ctx, repository, dag, now, "failed-run", ir.Failed)
 	defer func() { require.NoError(t, attempt.Close(ctx)) }()
 
 	candidateDir := filepath.Join(baseDir, dag.Name, "dag-runs", "2026", "06", "08", ".dagrun.retry-candidates")
 	require.NoError(t, os.RemoveAll(candidateDir))
 
-	candidates, err := lister.ListRetryCandidates(ctx, exec.NewUTC(now.Add(-time.Hour)))
+	candidates, err := repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
 	require.NoError(t, err)
 	require.Len(t, candidates, 1)
 	assert.Equal(t, "failed-run", candidates[0].DAGRunID)
@@ -84,9 +86,7 @@ func TestStoreListRetryCandidatesRebuildsDirtyCandidateDirectory(t *testing.T) {
 
 	ctx := context.Background()
 	baseDir := t.TempDir()
-	store := dagrun.New(baseDir)
-	lister, ok := store.(retryCandidateLister)
-	require.True(t, ok)
+	repository := newFileRepository(baseDir, persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	dag := retryCandidateDAG()
@@ -94,10 +94,10 @@ func TestStoreListRetryCandidatesRebuildsDirtyCandidateDirectory(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(candidateDir), 0750))
 	require.NoError(t, os.WriteFile(candidateDir, []byte("not a directory"), 0600))
 
-	attempt, _ := writeRetryCandidateStatus(t, ctx, store, dag, now, "failed-run", core.Failed)
+	attempt, _ := writeRetryCandidateStatus(t, ctx, repository, dag, now, "failed-run", ir.Failed)
 	defer func() { require.NoError(t, attempt.Close(ctx)) }()
 
-	candidates, err := lister.ListRetryCandidates(ctx, exec.NewUTC(now.Add(-time.Hour)))
+	candidates, err := repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
 	require.NoError(t, err)
 	require.Len(t, candidates, 1)
 	assert.Equal(t, "failed-run", candidates[0].DAGRunID)
@@ -109,23 +109,25 @@ func TestStoreListRetryCandidatesRebuildsCorruptedCandidateFile(t *testing.T) {
 
 	ctx := context.Background()
 	baseDir := t.TempDir()
-	store := dagrun.New(baseDir)
-	lister, ok := store.(retryCandidateLister)
-	require.True(t, ok)
+	repository := newFileRepository(baseDir, persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	dag := retryCandidateDAG()
 	candidateDir := filepath.Join(baseDir, dag.Name, "dag-runs", "2026", "06", "08", ".dagrun.retry-candidates")
 
-	attempt, _ := writeRetryCandidateStatus(t, ctx, store, dag, now, "failed-run", core.Failed)
+	attempt, _ := writeRetryCandidateStatus(t, ctx, repository, dag, now, "failed-run", ir.Failed)
 	defer func() { require.NoError(t, attempt.Close(ctx)) }()
+
+	candidates, err := repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
 
 	entries, err := os.ReadDir(candidateDir)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.NoError(t, os.WriteFile(filepath.Join(candidateDir, entries[0].Name()), []byte("{"), 0600))
 
-	candidates, err := lister.ListRetryCandidates(ctx, exec.NewUTC(now.Add(-time.Hour)))
+	candidates, err = repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
 	require.NoError(t, err)
 	require.Len(t, candidates, 1)
 	assert.Equal(t, "failed-run", candidates[0].DAGRunID)
@@ -136,20 +138,106 @@ func TestStoreListRetryCandidatesRemovesCandidateWhenRunIsGone(t *testing.T) {
 
 	ctx := context.Background()
 	baseDir := t.TempDir()
-	store := dagrun.New(baseDir)
-	lister, ok := store.(retryCandidateLister)
-	require.True(t, ok)
+	repository := newFileRepository(baseDir, persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	dag := retryCandidateDAG()
-	attempt, _ := writeRetryCandidateStatus(t, ctx, store, dag, now, "failed-run", core.Failed)
+	attempt, _ := writeRetryCandidateStatus(t, ctx, repository, dag, now, "failed-run", ir.Failed)
 	require.NoError(t, attempt.Close(ctx))
 
-	require.NoError(t, store.RemoveDAGRun(ctx, exec.NewDAGRunRef(dag.Name, "failed-run")))
+	candidates, err := repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
 
-	candidates, err := lister.ListRetryCandidates(ctx, exec.NewUTC(now.Add(-time.Hour)))
+	require.NoError(t, repository.RemoveDAGRun(ctx, ir.NewDAGRunRef(dag.Name, "failed-run"), persis.DAGRunRemoveOptions{}))
+
+	candidates, err = repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
 	require.NoError(t, err)
 	assert.Empty(t, candidates)
+}
+
+func TestStoreListRetryCandidatesCachesUnchangedFiles(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	repository := newFileRepository(baseDir, persis.DAGRunRepositoryOptions{LatestStatusToday: true})
+
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	dag := retryCandidateDAG()
+	for i := range 8 {
+		attempt, _ := writeRetryCandidateStatus(t, ctx, repository, dag, now.Add(time.Duration(i)*time.Second), fmt.Sprintf("failed-run-%d", i), ir.Failed)
+		require.NoError(t, attempt.Close(ctx))
+	}
+
+	candidateDir := filepath.Join(baseDir, dag.Name, "dag-runs", "2026", "06", "08", ".dagrun.retry-candidates")
+	entries, err := os.ReadDir(candidateDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 8)
+
+	var candidatePaths []string
+	for _, entry := range entries {
+		candidatePaths = append(candidatePaths, filepath.Join(candidateDir, entry.Name()))
+	}
+
+	from := persis.NewUTC(now.Add(-time.Hour))
+	var scanErr error
+	mtime := now
+	coldAllocs := testing.AllocsPerRun(5, func() {
+		mtime = mtime.Add(time.Second)
+		for _, path := range candidatePaths {
+			if err := os.Chtimes(path, mtime, mtime); err != nil {
+				scanErr = err
+				return
+			}
+		}
+		_, scanErr = repository.ListRetryCandidates(ctx, from)
+	})
+	require.NoError(t, scanErr)
+
+	warmAllocs := testing.AllocsPerRun(5, func() {
+		_, scanErr = repository.ListRetryCandidates(ctx, from)
+	})
+	require.NoError(t, scanErr)
+	assert.LessOrEqual(t, warmAllocs, coldAllocs*0.75)
+}
+
+func TestStoreListRetryCandidatesBoundsCache(t *testing.T) {
+	tests := []struct {
+		name           string
+		limit          int
+		candidateCount int
+		expectedCache  int
+	}{
+		{name: "bounded", limit: 2, candidateCount: 3, expectedCache: 2},
+		{name: "disabled", limit: 0, candidateCount: 1, expectedCache: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			baseDir := t.TempDir()
+			store := filedagrun.NewStore(baseDir, filedagrun.WithRetryCandidateCacheLimit(tt.limit))
+			repository := persis.NewDAGRunRepository(
+				store,
+				filedagrun.NewWorkDirStore(filepath.Join(baseDir, ".dag-run-work"), baseDir),
+				persis.DAGRunRepositoryOptions{LatestStatusToday: true},
+			)
+
+			now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+			dag := retryCandidateDAG()
+			for i := range tt.candidateCount {
+				attempt, _ := writeRetryCandidateStatus(t, ctx, repository, dag, now.Add(time.Duration(i)*time.Second), fmt.Sprintf("failed-run-%d", i), ir.Failed)
+				require.NoError(t, attempt.Close(ctx))
+			}
+
+			from := persis.NewUTC(now.Add(-time.Hour))
+			for range 2 {
+				candidates, err := repository.ListRetryCandidates(ctx, from)
+				require.NoError(t, err)
+				assert.Len(t, candidates, tt.candidateCount)
+				assert.Equal(t, tt.expectedCache, filedagrun.RetryCandidateCacheSizeForTest(store))
+			}
+		})
+	}
 }
 
 func TestStoreListRetryCandidatesIgnoresChildAttemptStatusFiles(t *testing.T) {
@@ -157,39 +245,37 @@ func TestStoreListRetryCandidatesIgnoresChildAttemptStatusFiles(t *testing.T) {
 
 	ctx := context.Background()
 	baseDir := t.TempDir()
-	store := dagrun.New(baseDir)
-	lister, ok := store.(retryCandidateLister)
-	require.True(t, ok)
+	repository := newFileRepository(baseDir, persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 	parentDAG := retryCandidateDAG()
-	parentAttempt, _ := writeRetryCandidateStatus(t, ctx, store, parentDAG, now, "parent-run", core.Running)
+	parentAttempt, _ := writeRetryCandidateStatus(t, ctx, repository, parentDAG, now, "parent-run", ir.Running)
 	defer func() { require.NoError(t, parentAttempt.Close(ctx)) }()
 
-	rootRef := exec.NewDAGRunRef(parentDAG.Name, "parent-run")
+	rootRef := ir.NewDAGRunRef(parentDAG.Name, "parent-run")
 	childDAG := retryCandidateDAG()
 	childDAG.Name = "child-retry-dag"
-	childAttempt, err := store.CreateAttempt(ctx, childDAG, now.Add(time.Second), "child-run", exec.NewDAGRunAttemptOptions{
-		RootDAGRun: &rootRef,
+	childAttempt, err := repository.CreateAttempt(ctx, childDAG, now.Add(time.Second), "child-run", persis.DAGRunCreateAttemptOptions{
+		RootDAGRun: rootRef,
 		AttemptID:  "child-attempt",
 	})
 	require.NoError(t, err)
 	require.NoError(t, childAttempt.Open(ctx))
 	defer func() { require.NoError(t, childAttempt.Close(ctx)) }()
 
-	childStatus := exec.InitialStatus(childDAG)
+	childStatus := ir.InitialStatus(childDAG)
 	childStatus.DAGRunID = "child-run"
 	childStatus.AttemptID = childAttempt.ID()
-	childStatus.Status = core.Failed
+	childStatus.Status = ir.Failed
 	childStatus.StartedAt = now.Add(time.Second).Format(time.RFC3339)
 	childStatus.FinishedAt = now.Add(2 * time.Second).Format(time.RFC3339)
 	require.NoError(t, childAttempt.Write(ctx, childStatus))
 
-	candidates, err := lister.ListRetryCandidates(ctx, exec.NewUTC(now.Add(-time.Hour)))
+	candidates, err := repository.ListRetryCandidates(ctx, persis.NewUTC(now.Add(-time.Hour)))
 	require.NoError(t, err)
 	assert.Empty(t, candidates)
 
-	childSidecarDir := filepath.Join(
+	runDir := filepath.Join(
 		baseDir,
 		parentDAG.Name,
 		"dag-runs",
@@ -197,17 +283,16 @@ func TestStoreListRetryCandidatesIgnoresChildAttemptStatusFiles(t *testing.T) {
 		"06",
 		"08",
 		"dag-run_20260608_120000Z_parent-run",
-		"children",
-		".dagrun.retry-candidates",
 	)
-	require.NoDirExists(t, childSidecarDir)
+	require.NoDirExists(t, filepath.Join(runDir, filedagrun.SubDAGRunsDir, ".dagrun.retry-candidates"))
+	require.NoDirExists(t, filepath.Join(runDir, filedagrun.LegacySubDAGRunsDir, ".dagrun.retry-candidates"))
 }
 
-func retryCandidateDAG() *core.DAG {
-	return &core.DAG{
+func retryCandidateDAG() *ir.DAG {
+	return &ir.DAG{
 		Name:     "retry-dag",
 		Location: "/tmp/retry-dag.yaml",
-		RetryPolicy: &core.DAGRetryPolicy{
+		RetryPolicy: &ir.DAGRetryPolicy{
 			Limit:       2,
 			Interval:    time.Minute,
 			Backoff:     0,
@@ -219,21 +304,21 @@ func retryCandidateDAG() *core.DAG {
 func writeRetryCandidateStatus(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	dag *core.DAG,
+	repository *persis.DAGRunRepository,
+	dag *ir.DAG,
 	ts time.Time,
 	runID string,
-	status core.Status,
-) (exec.DAGRunAttempt, *exec.DAGRunStatus) {
+	status ir.Status,
+) (dagrun.Attempt, *ir.DAGRunStatus) {
 	t.Helper()
 
-	attempt, err := store.CreateAttempt(ctx, dag, ts, runID, exec.NewDAGRunAttemptOptions{
+	attempt, err := repository.CreateAttempt(ctx, dag, ts, runID, persis.DAGRunCreateAttemptOptions{
 		AttemptID: runID + "-attempt",
 	})
 	require.NoError(t, err)
 	require.NoError(t, attempt.Open(ctx))
 
-	runStatus := exec.InitialStatus(dag)
+	runStatus := ir.InitialStatus(dag)
 	runStatus.DAGRunID = runID
 	runStatus.AttemptID = attempt.ID()
 	runStatus.Status = status

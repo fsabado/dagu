@@ -13,6 +13,7 @@ import {
 import { useConfig } from '@/contexts/ConfigContext';
 import { components, NodeStatus } from '../../../../api/v1/schema';
 import NodeStatusTableRow from './NodeStatusTableRow';
+import { I18nText } from '@/i18n/I18nText';
 
 /**
  * Props for the NodeStatusTable component
@@ -32,6 +33,8 @@ type Props = {
   ) => void;
   /** Function called after a row status update succeeds */
   onNodeStatusUpdated?: (stepName: string, status: NodeStatus) => void;
+  /** Hide per-row actions for nodes the step APIs cannot address */
+  hideActions?: boolean;
 };
 
 /**
@@ -43,16 +46,22 @@ function NodeStatusTable({
   fileName,
   onViewLog,
   onNodeStatusUpdated,
+  hideActions,
 }: Props) {
   const config = useConfig();
   const showActionsColumn = Boolean(
-    status?.dagRunId && config.permissions.runDags
+    !hideActions && status?.dagRunId && config.permissions.runDags
   );
 
   // Don't render if there are no nodes
   if (!nodes || !nodes.length) {
     return null;
   }
+
+  // Surface the first failed step's log without an extra click
+  const firstFailedStepName = nodes.find(
+    (n) => n.status === NodeStatus.Failed && (n.stdout || n.stderr)
+  )?.step.name;
 
   return (
     <div>
@@ -62,16 +71,16 @@ function NodeStatusTable({
           <Table className="w-full">
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[5%] text-center">No</TableHead>
-                <TableHead className="w-[20%]">Step Name</TableHead>
-                <TableHead className="w-[15%]">Execution</TableHead>
-                <TableHead className="w-[15%]">Last Run</TableHead>
-                <TableHead className="w-[10%] text-center">Status</TableHead>
+                <TableHead className="w-[5%] text-center"><I18nText text={"No"} /></TableHead>
+                <TableHead className="w-[20%]"><I18nText text={"Step Name"} /></TableHead>
+                <TableHead className="w-[15%]"><I18nText text={"Execution"} /></TableHead>
+                <TableHead className="w-[15%]"><I18nText text={"Last Run"} /></TableHead>
+                <TableHead className="w-[10%] text-center"><I18nText text={"Status"} /></TableHead>
                 <TableHead className="w-[35%] min-w-[150px]">
-                  Error / Logs
+                  <I18nText text={"Error / Logs"} />
                 </TableHead>
                 {showActionsColumn && (
-                  <TableHead className="w-[8%] text-center">Actions</TableHead>
+                  <TableHead className="w-[8%] text-center"><I18nText text={"Actions"} /></TableHead>
                 )}
               </TableRow>
             </TableHeader>
@@ -86,6 +95,8 @@ function NodeStatusTable({
                   onNodeStatusUpdated={onNodeStatusUpdated}
                   dagRun={status}
                   view="desktop"
+                  hideActions={hideActions}
+                  defaultLogExpanded={n.step.name === firstFailedStepName}
                 />
               ))}
             </TableBody>
@@ -105,6 +116,8 @@ function NodeStatusTable({
             onNodeStatusUpdated={onNodeStatusUpdated}
             dagRun={status}
             view="mobile"
+            hideActions={hideActions}
+            defaultLogExpanded={n.step.name === firstFailedStepName}
           />
         ))}
       </div>

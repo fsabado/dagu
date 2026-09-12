@@ -5,24 +5,24 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
-	apigen "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/crypto"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	persiststore "github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
-	"github.com/dagucloud/dagu/internal/profile"
-	"github.com/dagucloud/dagu/internal/runtime"
-	secretpkg "github.com/dagucloud/dagu/internal/secret"
-	apiv1 "github.com/dagucloud/dagu/internal/service/frontend/api/v1"
-	testhelper "github.com/dagucloud/dagu/internal/test"
-	workspacepkg "github.com/dagucloud/dagu/internal/workspace"
+	apigen "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/crypto"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	persiststore "github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/profile"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	secretpkg "github.com/dagucloud/dagu/v2/internal/secret"
+	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
+	testhelper "github.com/dagucloud/dagu/v2/internal/test"
+	workspacepkg "github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -242,6 +242,113 @@ func TestRuntimeProfilesAPI_WorkspaceDefaultsUseProfileStore(t *testing.T) {
 	assert.Empty(t, listed.Profiles)
 }
 
+func TestRuntimeProfilesAPI_WorkspaceDefaultProfileSetGetClear(t *testing.T) {
+	ctx := context.Background()
+	backend := testutil.NewMemoryBackend()
+	profileStore, err := persiststore.NewProfileStore(backend.Collection("profiles"))
+	require.NoError(t, err)
+	enc, err := crypto.NewEncryptor("test-key-for-workspace-default-profile")
+	require.NoError(t, err)
+	secretStore, err := persiststore.NewSecretStore(backend.Collection("secrets"), enc)
+	require.NoError(t, err)
+	workspaceStore, err := persiststore.NewWorkspaceStore(backend.Collection("workspaces"))
+	require.NoError(t, err)
+	require.NoError(t, workspaceStore.Create(ctx, workspacepkg.NewWorkspace("ops", "")))
+
+	local, err := profile.New(profile.CreateInput{Name: "local"}, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, profileStore.Create(ctx, local))
+	disabled, err := profile.New(profile.CreateInput{Name: "disabled"}, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, disabled.SetStatus(profile.StatusDisabled, "test", time.Now()))
+	require.NoError(t, profileStore.Create(ctx, disabled))
+
+	api := newRuntimeProfilesTestAPIWithStoresAndOptions(
+		t,
+		profileStore,
+		secretStore,
+		apiv1.WithWorkspaceStore(workspaceStore),
+	)
+
+	defaultProfile := "local"
+	workspaceName := apigen.WorkspaceName("ops")
+	resp, err := api.UpdateWorkspaceRuntimeProfileDefaults(ctx, apigen.UpdateWorkspaceRuntimeProfileDefaultsRequestObject{
+		WorkspaceName: workspaceName,
+		Body: &apigen.UpdateInheritedRuntimeProfileRequest{
+			DefaultProfile: &defaultProfile,
+		},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateWorkspaceRuntimeProfileDefaults200JSONResponse)
+	require.True(t, ok)
+	require.NotNil(t, updated.DefaultProfile)
+	assert.Equal(t, "local", *updated.DefaultProfile)
+
+	getResp, err := api.GetWorkspaceRuntimeProfileDefaults(ctx, apigen.GetWorkspaceRuntimeProfileDefaultsRequestObject{
+		WorkspaceName: workspaceName,
+	})
+	require.NoError(t, err)
+	got, ok := getResp.(apigen.GetWorkspaceRuntimeProfileDefaults200JSONResponse)
+	require.True(t, ok)
+	require.NotNil(t, got.DefaultProfile)
+	assert.Equal(t, "local", *got.DefaultProfile)
+
+	ref, err := profile.WorkspaceInheritedRef("ops")
+	require.NoError(t, err)
+	stored, err := profileStore.GetInherited(ctx, ref)
+	require.NoError(t, err)
+	assert.Equal(t, "local", stored.DefaultProfile)
+
+	emptyProfile := ""
+	clearResp, err := api.UpdateWorkspaceRuntimeProfileDefaults(ctx, apigen.UpdateWorkspaceRuntimeProfileDefaultsRequestObject{
+		WorkspaceName: workspaceName,
+		Body: &apigen.UpdateInheritedRuntimeProfileRequest{
+			DefaultProfile: &emptyProfile,
+		},
+	})
+	require.NoError(t, err)
+	cleared, ok := clearResp.(apigen.UpdateWorkspaceRuntimeProfileDefaults200JSONResponse)
+	require.True(t, ok)
+	assert.Nil(t, cleared.DefaultProfile)
+
+	stored, err = profileStore.GetInherited(ctx, ref)
+	require.NoError(t, err)
+	assert.Empty(t, stored.DefaultProfile)
+
+	globalResp, err := api.UpdateGlobalRuntimeProfileDefaults(ctx, apigen.UpdateGlobalRuntimeProfileDefaultsRequestObject{
+		Body: &apigen.UpdateInheritedRuntimeProfileRequest{
+			DefaultProfile: &defaultProfile,
+		},
+	})
+	require.NoError(t, err)
+	_, ok = globalResp.(apigen.UpdateGlobalRuntimeProfileDefaults400JSONResponse)
+	require.True(t, ok)
+	_, err = profileStore.GetInherited(ctx, profile.GlobalInheritedRef())
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	for _, tt := range []struct {
+		name       string
+		profile    string
+		httpStatus int
+	}{
+		{name: "missing", profile: "missing", httpStatus: http.StatusNotFound},
+		{name: "disabled", profile: "disabled", httpStatus: http.StatusBadRequest},
+		{name: "invalid", profile: "bad/name", httpStatus: http.StatusBadRequest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err = api.UpdateWorkspaceRuntimeProfileDefaults(ctx, apigen.UpdateWorkspaceRuntimeProfileDefaultsRequestObject{
+				WorkspaceName: workspaceName,
+				Body: &apigen.UpdateInheritedRuntimeProfileRequest{
+					DefaultProfile: &tt.profile,
+				},
+			})
+			var serviceErr *apiv1.Error
+			require.True(t, errors.As(err, &serviceErr))
+			assert.Equal(t, tt.httpStatus, serviceErr.HTTPStatus)
+		})
+	}
+}
+
 func TestRuntimeProfilesAPI_WorkspaceDefaultsAuthorizeBeforeWorkspaceLookup(t *testing.T) {
 	server := setupBuiltinAuthServer(t)
 	adminToken := getAdminToken(t, server)
@@ -340,9 +447,10 @@ steps:
 	server.Client().Post("/api/v1/profiles", apigen.CreateRuntimeProfileJSONRequestBody{
 		Name: "local",
 	}).WithBearerToken(managerToken).ExpectStatus(http.StatusCreated).Send(t)
+	protected := true
 	server.Client().Post("/api/v1/profiles", apigen.CreateRuntimeProfileJSONRequestBody{
 		Name:      "prod",
-		Protected: new(true),
+		Protected: &protected,
 	}).WithBearerToken(adminToken).ExpectStatus(http.StatusCreated).Send(t)
 
 	localProfile := apigen.RuntimeProfileName("local")
@@ -369,7 +477,7 @@ steps:
 	server.Client().Post(fmt.Sprintf("/api/v1/dags/%s/start", dagName), apigen.ExecuteDAGJSONRequestBody{
 		DagRunId: &defaultRunID,
 	}).WithBearerToken(operatorToken).ExpectStatus(http.StatusOK).Send(t)
-	defaultStatus := waitForStoredDAGRunStatus(t, server, dagName, defaultRunID, 10*time.Second, func(status *exec.DAGRunStatus) bool {
+	defaultStatus := waitForStoredDAGRunStatus(t, server, dagName, defaultRunID, 10*time.Second, func(status *ir.DAGRunStatus) bool {
 		return status.ProfileName == "prod"
 	})
 	assert.Equal(t, "prod", defaultStatus.ProfileName)
@@ -380,10 +488,66 @@ steps:
 		DagRunId: &noProfileRunID,
 		Profile:  &noProfile,
 	}).WithBearerToken(operatorToken).ExpectStatus(http.StatusOK).Send(t)
-	noProfileStatus := waitForStoredDAGRunStatus(t, server, dagName, noProfileRunID, 10*time.Second, func(status *exec.DAGRunStatus) bool {
+	noProfileStatus := waitForStoredDAGRunStatus(t, server, dagName, noProfileRunID, 10*time.Second, func(status *ir.DAGRunStatus) bool {
 		return status.DAGRunID == noProfileRunID
 	})
 	assert.Empty(t, noProfileStatus.ProfileName)
+}
+
+func TestRuntimeProfilesAPI_WorkspaceDefaultProfileRun(t *testing.T) {
+	server := setupBuiltinAuthServer(t)
+	adminToken := getAdminToken(t, server)
+	managerToken := createRuntimeProfileUserToken(
+		t, server, adminToken, "workspace-default-profile-manager", "managerpass1", apigen.UserRoleManager,
+	)
+	operatorToken := createRuntimeProfileUserToken(
+		t, server, adminToken, "workspace-default-profile-operator", "operatorpass1", apigen.UserRoleOperator,
+	)
+
+	server.Client().Post("/api/v1/workspaces", apigen.CreateWorkspaceRequest{
+		Name: "ops",
+	}).WithBearerToken(adminToken).ExpectStatus(http.StatusCreated).Send(t)
+
+	server.Client().Post("/api/v1/profiles", apigen.CreateRuntimeProfileJSONRequestBody{
+		Name: "local",
+	}).WithBearerToken(managerToken).ExpectStatus(http.StatusCreated).Send(t)
+	server.Client().Post("/api/v1/profiles", apigen.CreateRuntimeProfileJSONRequestBody{
+		Name:      "prod",
+		Protected: new(true),
+	}).WithBearerToken(adminToken).ExpectStatus(http.StatusCreated).Send(t)
+
+	protectedProfile := apigen.RuntimeProfileName("prod")
+	server.Client().Patch("/api/v1/profiles/_workspaces/ops", apigen.UpdateWorkspaceRuntimeProfileDefaultsJSONRequestBody{
+		DefaultProfile: &protectedProfile,
+	}).WithBearerToken(managerToken).ExpectStatus(http.StatusForbidden).Send(t)
+
+	localProfile := apigen.RuntimeProfileName("local")
+	server.Client().Patch("/api/v1/profiles/_workspaces/ops", apigen.UpdateWorkspaceRuntimeProfileDefaultsJSONRequestBody{
+		DefaultProfile: &localProfile,
+	}).WithBearerToken(managerToken).ExpectStatus(http.StatusOK).Send(t)
+
+	dagName := "workspace_default_profile_dag"
+	spec := `
+labels:
+  - workspace=ops
+steps:
+  - name: main
+    run: echo workspace default profile
+`
+	server.Client().Post("/api/v1/dags", apigen.CreateNewDAGJSONRequestBody{
+		Name: dagName,
+		Spec: &spec,
+	}).WithBearerToken(managerToken).ExpectStatus(http.StatusCreated).Send(t)
+
+	runID := "uses-workspace-default-profile"
+	server.Client().Post(fmt.Sprintf("/api/v1/dags/%s/start", dagName), apigen.ExecuteDAGJSONRequestBody{
+		DagRunId: &runID,
+	}).WithBearerToken(operatorToken).ExpectStatus(http.StatusOK).Send(t)
+
+	status := waitForStoredDAGRunStatus(t, server, dagName, runID, 10*time.Second, func(status *ir.DAGRunStatus) bool {
+		return status.ProfileName == "local"
+	})
+	assert.Equal(t, "local", status.ProfileName)
 }
 
 func TestRuntimeProfilesAPI_ProtectedProfileManagementRequiresAdmin(t *testing.T) {
@@ -476,10 +640,10 @@ steps:
 		Profile: &protectedProfile,
 	}).WithBearerToken(adminToken).ExpectStatus(http.StatusOK).Send(t)
 
-	dag, err := server.DAGStore.GetMetadata(server.Context, dagName)
+	dag, err := server.DAGRepository.GetMetadata(server.Context, dagName)
 	require.NoError(t, err)
 
-	seedLatestDAGRunStatus(t, server, dag, "protected-profile-source-run", core.Failed, seedDAGRunStatusOptions{
+	seedLatestDAGRunStatus(t, server, dag, "protected-profile-source-run", ir.Failed, seedDAGRunStatusOptions{
 		errorText:   "source run failed",
 		profileName: "prod",
 	})
@@ -489,12 +653,12 @@ steps:
 		apigen.RetryDAGRunJSONRequestBody{DagRunId: "protected-profile-source-run"},
 	).WithBearerToken(operatorToken).ExpectStatus(http.StatusOK).Send(t)
 
-	attempt, err := server.DAGRunStore.FindAttempt(server.Context, exec.NewDAGRunRef(dagName, "protected-profile-source-run"))
+	attempt, err := server.DAGRunRepository.FindAttempt(server.Context, ir.NewDAGRunRef(dagName, "protected-profile-source-run"))
 	require.NoError(t, err)
 
 	status, err := attempt.ReadStatus(server.Context)
 	require.NoError(t, err)
-	require.Equal(t, core.Queued, status.Status)
+	require.Equal(t, ir.Queued, status.Status)
 	assert.Equal(t, "prod", status.ProfileName)
 }
 

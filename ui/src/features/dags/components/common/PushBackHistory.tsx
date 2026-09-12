@@ -3,6 +3,8 @@
 
 import dayjs from '@/lib/dayjs';
 import { components } from '../../../../api/v1/schema';
+import { ManualActionSubject } from './ManualActionSubject';
+import { I18nText } from '@/i18n/I18nText';
 
 type PushBackHistoryEntry = components['schemas']['PushBackHistoryEntry'];
 
@@ -56,22 +58,27 @@ export default function PushBackHistory({
             >
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                 <span className="font-medium text-foreground/90">
-                  Iteration {entry.iteration}
+                  <I18nText text={"Iteration"} /> {entry.iteration}
                 </span>
-                {entry.by && (
+                {entry.by || entry.byId ? (
                   <span className="text-muted-foreground">
-                    by <span className="text-foreground/80">{entry.by}</span>
+                    <I18nText text={"by"} />{' '}
+                    <ManualActionSubject
+                      name={entry.by}
+                      id={entry.byId}
+                      className="text-foreground/80"
+                    />
                   </span>
-                )}
+                ) : null}
                 {entry.at && (
                   <span className="text-muted-foreground">
-                    at {formatTimestamp(entry.at)}
+                    <I18nText text={"at"} /> {formatTimestamp(entry.at)}
                   </span>
                 )}
               </div>
               {formattedInputs && (
                 <div className="mt-1 text-xs text-muted-foreground">
-                  <span className="font-medium">Inputs:</span>{' '}
+                  <span className="font-medium"><I18nText text={"Inputs:"} /></span>{' '}
                   <span className="font-mono text-foreground/80 break-all">
                     {formattedInputs}
                   </span>

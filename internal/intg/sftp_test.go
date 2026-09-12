@@ -4,15 +4,17 @@
 package intg_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/test"
 )
 
 // TestSFTPExecutorIntegration tests SFTP executor with a real SSH server in Docker
@@ -28,7 +30,7 @@ func TestSFTPExecutorIntegration(t *testing.T) {
 
 	// Start SSH server container (reuses helpers from ssh_test.go)
 	sshServer := startSSHServer(t, th, dockerClient)
-	defer stopSSHServer(t, th, dockerClient, sshServer)
+	defer stopSSHServer(t, dockerClient, sshServer)
 
 	// Wait for SSH server to be ready
 	waitForSSHReady(t, sshServer)
@@ -74,7 +76,7 @@ steps:
 
 		dag := th.DAG(t, dagConfig)
 		dag.Agent().RunSuccess(t)
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"UPLOAD_VERIFY": "sftp upload test content",
 		})
@@ -118,7 +120,7 @@ steps:
 
 		dag := th.DAG(t, dagConfig)
 		dag.Agent().RunSuccess(t)
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		// Verify downloaded file contents
 		content, err := os.ReadFile(downloadPath)
@@ -173,7 +175,7 @@ steps:
 
 		dag := th.DAG(t, dagConfig)
 		dag.Agent().RunSuccess(t)
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 		dag.AssertOutputs(t, map[string]any{
 			"DIR_UPLOAD_VERIFY": "content1\nnested content",
 		})
@@ -219,7 +221,7 @@ steps:
 
 		dag := th.DAG(t, dagConfig)
 		dag.Agent().RunSuccess(t)
-		dag.AssertLatestStatus(t, core.Succeeded)
+		dag.AssertLatestStatus(t, ir.Succeeded)
 
 		// Verify downloaded directory contents
 		content1, err := os.ReadFile(filepath.Join(downloadPath, "file1.txt"))
@@ -229,5 +231,51 @@ steps:
 		nested, err := os.ReadFile(filepath.Join(downloadPath, "subdir", "nested.txt"))
 		require.NoError(t, err, "failed to read downloaded nested.txt")
 		require.Equal(t, "remote nested\n", string(nested))
+	})
+
+	t.Run("StepTimeoutCancelsBlockedDownload", func(t *testing.T) {
+		th := test.Setup(t)
+		downloadPath := filepath.Join(t.TempDir(), "blocked-download.txt")
+		dagConfig := fmt.Sprintf(`
+type: graph
+retry_policy:
+  limit: 0
+  interval_sec: 1
+steps:
+  - name: create-blocking-source
+    action: ssh.run
+    with:
+      command: |
+        rm -f /tmp/dagu-sftp-timeout
+        mkfifo /tmp/dagu-sftp-timeout
+        nohup sh -c 'sleep 10; echo released > /tmp/dagu-sftp-timeout' >/dev/null 2>&1 </dev/null &
+      host: 127.0.0.1
+      port: "%s"
+      user: %s
+      key: "%s"
+      strict_host_key: false
+      shell: /bin/sh
+  - name: blocked-download
+    action: sftp.download
+    timeout_sec: 1
+    with:
+      host: 127.0.0.1
+      port: "%s"
+      user: %s
+      key: "%s"
+      strict_host_key: false
+      source: /tmp/dagu-sftp-timeout
+      destination: "%s"
+    depends:
+      - create-blocking-source
+`, sshServer.hostPort, sshTestUser, sshServer.keyPath,
+			sshServer.hostPort, sshTestUser, sshServer.keyPath, downloadPath)
+
+		dag := th.DAG(t, dagConfig)
+		startedAt := time.Now()
+		err := dag.Agent().Run(th.Context)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Less(t, time.Since(startedAt), 8*time.Second)
+		dag.AssertLatestStatus(t, ir.Failed)
 	})
 }

@@ -7,11 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/dagrun/intake"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/intake"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/spf13/cobra"
 )
 
@@ -32,7 +31,7 @@ Examples:
 	)
 }
 
-var enqueueFlags = []commandLineFlag{paramsFlag, nameFlag, dagRunIDFlag, queueFlag, labelsFlag, tagsFlag, defaultWorkingDirFlag, profileFlag, triggerTypeFlag, scheduleTimeFlag}
+var enqueueFlags = []commandLineFlag{paramsFlag, nameFlag, dagRunIDFlag, queueFlag, labelsFlag, tagsFlag, defaultWorkingDirFlag, profileFlag, triggerTypeFlag, triggerActorFlag, scheduleTimeFlag, noReuseFlag}
 
 func runEnqueue(ctx *Context, args []string) error {
 	if ctx.IsRemote() {
@@ -74,6 +73,10 @@ func runEnqueue(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	triggerActor, err := ctx.StringParam("trigger-actor")
+	if err != nil {
+		return fmt.Errorf("failed to get trigger actor: %w", err)
+	}
 
 	scheduleTime, err := parseScheduleTimeParam(ctx)
 	if err != nil {
@@ -83,36 +86,50 @@ func runEnqueue(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	noReuse, err := ctx.Command.Flags().GetBool("no-reuse")
+	if err != nil {
+		return fmt.Errorf("failed to read no-reuse: %w", err)
+	}
 
-	return enqueueDAGRun(ctx, dag, runID, triggerType, scheduleTime, profileName)
+	return enqueueDAGRun(ctx, dag, runID, runOptions{
+		triggerType:  triggerType,
+		triggerActor: triggerActor,
+		scheduleTime: scheduleTime,
+		profileName:  profileName,
+		definitionID: dagDefinitionIDFromEnv(),
+		noReuse:      noReuse,
+	})
 }
 
 // enqueueDAGRun enqueues a dag-run to the queue.
 // The DAG location is cleared to allow concurrent queued runs (location is used
 // for unix pipe generation which would prevent parallel execution).
-func enqueueDAGRun(ctx *Context, dag *core.DAG, dagRunID string, triggerType core.TriggerType, scheduleTime, profileName string) error {
+func enqueueDAGRun(ctx *Context, dag *ir.DAG, dagRunID string, opts runOptions) error {
 	dag.Location = ""
 
 	if !ctx.Config.Queues.Enabled {
 		return fmt.Errorf("queues are disabled in configuration")
 	}
 
-	dagRun := exec.NewDAGRunRef(dag.Name, dagRunID)
+	dagRun := ir.NewDAGRunRef(dag.Name, dagRunID)
 
-	if _, err := ctx.DAGRunStore.FindAttempt(ctx, dagRun); err == nil {
+	if _, err := ctx.Persistence.DAGRunRepository.FindAttempt(ctx, dagRun); err == nil {
 		return fmt.Errorf("DAG %q with ID %q already exists", dag.Name, dagRunID)
 	}
 
 	queued, err := intake.EnqueueRun(ctx.Context, intake.QueueRequest{
-		DAGRunStore:             ctx.DAGRunStore,
-		QueueStore:              ctx.QueueStore,
+		DAGRunRepository:        ctx.Persistence.DAGRunRepository,
+		QueueStore:              ctx.Persistence.QueueStore,
 		DAG:                     dag,
 		DAGRunID:                dagRunID,
 		LogBaseDir:              ctx.Config.Paths.LogDir,
 		ArtifactBaseDir:         ctx.Config.Paths.ArtifactDir,
-		TriggerType:             triggerType,
-		ScheduleTime:            scheduleTime,
-		ProfileName:             profileName,
+		TriggerType:             opts.triggerType,
+		TriggerActor:            opts.triggerActor,
+		ScheduleTime:            opts.scheduleTime,
+		ProfileName:             opts.profileName,
+		DefinitionID:            opts.definitionID,
+		NoReuse:                 opts.noReuse,
 		ProceedOnStatusCloseErr: true,
 	})
 	if err != nil {

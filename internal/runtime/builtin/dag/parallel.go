@@ -15,22 +15,25 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	exec1 "github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runctx"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
 var errParallelCancelled = errors.New("parallel execution cancelled")
 
 var _ executor.ParallelExecutor = (*parallelExecutor)(nil)
 var _ executor.NodeStatusDeterminer = (*parallelExecutor)(nil)
+var _ executor.StatusDetailsProvider = (*parallelExecutor)(nil)
 
 type parallelExecutor struct {
-	step          core.Step
+	step          ir.Step
 	lock          sync.Mutex
 	workDir       string
 	stdout        io.Writer
@@ -39,7 +42,7 @@ type parallelExecutor struct {
 	maxConcurrent int
 
 	// Runtime state
-	results  map[string]*exec1.RunStatus         // Maps DAG run ID to result
+	results  map[string]*ir.RunStatus            // Maps DAG run ID to result
 	errors   []error                             // Collects errors from failed executions
 	children map[string]*executor.SubDAGExecutor // Active child executors keyed by attempt
 
@@ -53,16 +56,18 @@ type scheduledAttempt struct {
 	runParams executor.RunParams
 	stepName  string
 	readyAt   time.Time
+	reuse     bool
+	retryPath dagrun.RetryPath
 }
 
 type attemptResult struct {
 	attempt scheduledAttempt
-	result  *exec1.RunStatus
+	result  *ir.RunStatus
 	err     error
 }
 
 func newParallelExecutor(
-	ctx context.Context, step core.Step,
+	ctx context.Context, step ir.Step,
 ) (executor.Executor, error) {
 	// The parallel executor doesn't use the params from the step directly
 	// as they are passed through SetParamsList
@@ -76,7 +81,7 @@ func newParallelExecutor(
 		return nil, ErrWorkingDirNotExist
 	}
 
-	maxConcurrent := core.DefaultMaxConcurrent
+	maxConcurrent := ir.DefaultMaxConcurrent
 	if step.Parallel != nil && step.Parallel.MaxConcurrent > 0 {
 		maxConcurrent = step.Parallel.MaxConcurrent
 	}
@@ -85,7 +90,7 @@ func newParallelExecutor(
 		step:          step,
 		workDir:       dir,
 		maxConcurrent: maxConcurrent,
-		results:       make(map[string]*exec1.RunStatus),
+		results:       make(map[string]*ir.RunStatus),
 		errors:        make([]error, 0),
 		children:      make(map[string]*executor.SubDAGExecutor),
 		cancel:        make(chan struct{}),
@@ -121,16 +126,32 @@ func (e *parallelExecutor) Run(ctx context.Context) error {
 	logger.Info(ctx, "Starting parallel execution",
 		slog.Int("total", len(e.runParamsList)),
 		slog.Int("max-concurrent", e.maxConcurrent),
-		tag.DAG(e.step.SubDAG.Name),
+		tag.SubDAG(e.step.SubDAG.Name),
 	)
 
 	pending := make([]scheduledAttempt, 0, len(e.runParamsList))
 	pendingSet := make(map[string]struct{}, len(e.runParamsList))
 	busyRuns := make(map[string]struct{}, len(e.runParamsList))
+	path := runctx.GetContext(ctx).RetryPath
+	hop, targeted := path.Current()
+	targeted = targeted && hop.Step == e.step.Name
+	targetFound := false
 	for _, params := range e.runParamsList {
 		attempt := scheduledAttempt{runParams: params}
+		if targeted {
+			if params.RunID == hop.RunID {
+				attempt.stepName = path.NextStep()
+				attempt.retryPath = path.Advance()
+				targetFound = true
+			} else {
+				attempt.reuse = true
+			}
+		}
 		pending = append(pending, attempt)
 		pendingSet[pendingAttemptKey(attempt)] = struct{}{}
+	}
+	if targeted && !targetFound {
+		return errTargetRunMissing(hop.RunID, e.step.Name)
 	}
 
 	resultCh := make(chan attemptResult, len(e.runParamsList))
@@ -160,7 +181,7 @@ func (e *parallelExecutor) Run(ctx context.Context) error {
 			inFlight++
 
 			go func(a scheduledAttempt) {
-				res, err := e.runAttempt(runCtx, a)
+				res, err := e.runAttempt(runCtx, &a)
 				select {
 				case resultCh <- attemptResult{attempt: a, result: res, err: err}:
 				case <-runCtx.Done():
@@ -194,7 +215,7 @@ func (e *parallelExecutor) Run(ctx context.Context) error {
 
 			if res.err != nil && !e.cancelled() {
 				logger.Error(ctx, "Sub DAG execution failed",
-					tag.RunID(res.attempt.runParams.RunID),
+					tag.SubRunID(res.attempt.runParams.RunID),
 					tag.Error(res.err),
 				)
 			}
@@ -210,6 +231,7 @@ func (e *parallelExecutor) Run(ctx context.Context) error {
 						runParams: res.attempt.runParams,
 						stepName:  retry.StepName,
 						readyAt:   scheduledAt.Add(retry.Interval),
+						retryPath: res.attempt.retryPath,
 					}
 					key := pendingAttemptKey(next)
 					if _, exists := pendingSet[key]; exists {
@@ -267,7 +289,7 @@ func (e *parallelExecutor) Run(ctx context.Context) error {
 	e.lock.Lock()
 	failedCount := 0
 	for _, result := range e.results {
-		if !result.Status.IsSuccess() && result.Status != core.Waiting {
+		if !result.Status.IsSuccess() && result.Status != ir.Waiting {
 			failedCount++
 		}
 	}
@@ -286,6 +308,84 @@ func (e *parallelExecutor) SetParamsList(paramsList []executor.RunParams) {
 	e.runParamsList = paramsList
 }
 
+func (e *parallelExecutor) GetStatusDetails() []ir.NodeStatusDetail {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+
+	nameCounts := make(map[string]int, len(e.runParamsList))
+	for _, params := range e.runParamsList {
+		name := parallelRunName(params, e.results[params.RunID])
+		if name != "" {
+			nameCounts[name]++
+		}
+	}
+
+	details := make([]ir.NodeStatusDetail, 0, len(e.runParamsList))
+	for _, params := range e.runParamsList {
+		result := e.results[params.RunID]
+		status := ir.NodeFailed
+		if e.cancelled() {
+			status = ir.NodeAborted
+		} else if result != nil {
+			status = parallelNodeStatus(result.Status)
+		}
+		details = append(details, ir.NodeStatusDetail{
+			Label:  parallelRunLabel(params, result, nameCounts[parallelRunName(params, result)] > 1),
+			Status: status,
+		})
+	}
+	return details
+}
+
+func parallelNodeStatus(status ir.Status) ir.NodeStatus {
+	switch status {
+	case ir.Succeeded:
+		return ir.NodeSucceeded
+	case ir.PartiallySucceeded:
+		return ir.NodePartiallySucceeded
+	case ir.Aborted:
+		return ir.NodeAborted
+	case ir.Failed:
+		return ir.NodeFailed
+	case ir.Waiting:
+		return ir.NodeWaiting
+	case ir.Rejected:
+		return ir.NodeRejected
+	case ir.Running:
+		return ir.NodeRunning
+	case ir.Queued, ir.NotStarted:
+		return ir.NodeNotStarted
+	default:
+		return ir.NodeNotStarted
+	}
+}
+
+func parallelRunName(params executor.RunParams, result *ir.RunStatus) string {
+	name := params.DAGName
+	if result != nil && result.Name != "" {
+		name = result.Name
+	}
+	return name
+}
+
+func parallelRunLabel(params executor.RunParams, result *ir.RunStatus, duplicateName bool) string {
+	name := parallelRunName(params, result)
+	values := params.Params
+	if result != nil && result.Params != "" {
+		values = result.Params
+	}
+	if duplicateName && values != "" {
+		return fmt.Sprintf("%s (%s)", name, values)
+	}
+	if name != "" {
+		return name
+	}
+	if values != "" {
+		return values
+	}
+	return params.RunID
+}
+
 func (e *parallelExecutor) SetStdout(out io.Writer) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
@@ -299,19 +399,19 @@ func (e *parallelExecutor) SetStderr(out io.Writer) {
 }
 
 // DetermineNodeStatus implements NodeStatusDeterminer.
-func (e *parallelExecutor) DetermineNodeStatus() (core.NodeStatus, error) {
+func (e *parallelExecutor) DetermineNodeStatus() (ir.NodeStatus, error) {
 	if e.cancelled() {
-		return core.NodeAborted, nil
+		return ir.NodeAborted, nil
 	}
 
 	if len(e.results) == 0 {
 		if len(e.errors) > 0 {
-			return core.NodeFailed, fmt.Errorf(
+			return ir.NodeFailed, fmt.Errorf(
 				"all %d sub DAG execution(s) failed; first error: %v",
 				len(e.runParamsList), e.errors[0],
 			)
 		}
-		return core.NodeFailed, fmt.Errorf("no results available for node status determination")
+		return ir.NodeFailed, fmt.Errorf("no results available for node status determination")
 	}
 
 	// Check if all sub DAGs succeeded or if any had partial success or waiting
@@ -322,22 +422,22 @@ func (e *parallelExecutor) DetermineNodeStatus() (core.NodeStatus, error) {
 	)
 	for _, result := range e.results {
 		switch result.Status {
-		case core.Succeeded:
+		case ir.Succeeded:
 			// continue checking other results
-		case core.PartiallySucceeded:
+		case ir.PartiallySucceeded:
 			partialSuccess = true
-		case core.Waiting:
+		case ir.Waiting:
 			// Sub-DAG is waiting for human approval
 			hasWaiting = true
 		default:
-			return core.NodeFailed, fmt.Errorf("sub DAG run %s is still in progress with status: %s", result.DAGRunID, result.Status)
+			return ir.NodeFailed, fmt.Errorf("sub DAG run %s is still in progress with status: %s", result.DAGRunID, result.Status)
 		}
 	}
 
 	// If any sub-DAG is waiting, propagate the waiting status to the parent
 	// This takes priority over partial success since we need human action
 	if hasWaiting {
-		return core.NodeWaiting, nil
+		return ir.NodeWaiting, nil
 	}
 
 	// Check count of items equal to count of succeeded items
@@ -346,26 +446,27 @@ func (e *parallelExecutor) DetermineNodeStatus() (core.NodeStatus, error) {
 	}
 
 	if partialSuccess {
-		return core.NodePartiallySucceeded, nil
+		return ir.NodePartiallySucceeded, nil
 	}
 
-	return core.NodeSucceeded, nil
+	return ir.NodeSucceeded, nil
 }
 
-func (e *parallelExecutor) runAttempt(ctx context.Context, attempt scheduledAttempt) (*exec1.RunStatus, error) {
+func (e *parallelExecutor) runAttempt(ctx context.Context, attempt *scheduledAttempt) (*ir.RunStatus, error) {
 	if e.cancelled() {
 		return nil, errParallelCancelled
 	}
 
-	child, err := e.newChildExecutor(ctx, attempt.runParams)
+	child, runParams, err := e.newChildExecutor(ctx, attempt.runParams)
 	if err != nil {
 		if e.cancelled() || errors.Is(ctx.Err(), context.Canceled) {
 			return nil, errParallelCancelled
 		}
 		return nil, err
 	}
+	attempt.runParams = runParams
 
-	key := pendingAttemptKey(attempt)
+	key := pendingAttemptKey(*attempt)
 	cleanupCtx := context.WithoutCancel(ctx)
 	e.lock.Lock()
 	if e.isCanceled.Load() {
@@ -391,8 +492,11 @@ func (e *parallelExecutor) runAttempt(ctx context.Context, attempt scheduledAtte
 		return nil, errParallelCancelled
 	}
 
+	if attempt.reuse {
+		return child.Reuse(ctx, attempt.runParams, e.workDir)
+	}
 	if attempt.stepName != "" {
-		return child.Retry(ctx, attempt.runParams, attempt.stepName, e.workDir)
+		return child.Retry(ctx, attempt.runParams, attempt.stepName, e.workDir, attempt.retryPath)
 	}
 	return child.Execute(ctx, attempt.runParams, e.workDir)
 }
@@ -461,12 +565,12 @@ func (e *parallelExecutor) outputResults() error {
 			Succeeded int `json:"succeeded"`
 			Failed    int `json:"failed"`
 		} `json:"summary"`
-		Results []exec1.RunStatus   `json:"results"`
+		Results []ir.RunStatus      `json:"results"`
 		Outputs []map[string]string `json:"outputs"`
 	}{}
 
 	output.Summary.Total = len(e.runParamsList)
-	output.Results = make([]exec1.RunStatus, 0, len(e.results))
+	output.Results = make([]ir.RunStatus, 0, len(e.results))
 	output.Outputs = make([]map[string]string, 0, len(e.results))
 
 	// Collect results in order of runParamsList for consistency
@@ -550,7 +654,7 @@ func (e *parallelExecutor) cancelExecution() []*executor.SubDAGExecutor {
 
 func (e *parallelExecutor) newChildExecutor(
 	ctx context.Context, runParams executor.RunParams,
-) (*executor.SubDAGExecutor, error) {
+) (*executor.SubDAGExecutor, executor.RunParams, error) {
 	target := runParams.DAGName
 	if target == "" && e.step.SubDAG != nil {
 		target = e.step.SubDAG.Name
@@ -558,23 +662,28 @@ func (e *parallelExecutor) newChildExecutor(
 
 	child, err := executor.NewSubDAGExecutor(ctx, target)
 	if err != nil {
-		return nil, err
+		return nil, runParams, err
 	}
 
-	if len(e.step.WorkerSelector) > 0 && child.DAG.HasApprovalSteps() {
-		_ = child.Cleanup(ctx)
-		return nil, fmt.Errorf("%w: %s", ErrApprovalStepsWithWorker, target)
+	runParams, err = resolveChildRunParams(ctx, child.DAG, runParams)
+	if err != nil {
+		_ = child.Cleanup(context.WithoutCancel(ctx))
+		return nil, runParams, err
+	}
+	if err := validateSubDAG(child.DAG, target, runParams.WorkerSelector); err != nil {
+		_ = child.Cleanup(context.WithoutCancel(ctx))
+		return nil, runParams, err
 	}
 
-	child.SetWorkerSelector(e.step.WorkerSelector)
+	child.SetWorkerSelector(runParams.WorkerSelector)
 	child.SetExternalStepRetry(true)
-	return child, nil
+	return child, runParams, nil
 }
 
 func init() {
-	caps := core.ExecutorCapabilities{
+	caps := registry.ExecutorCapabilities{
 		SubDAG:         true,
 		WorkerSelector: true,
 	}
-	executor.RegisterExecutor(core.ExecutorTypeParallel, newParallelExecutor, nil, caps)
+	executor.RegisterExecutor(ir.ExecutorTypeParallel, newParallelExecutor, nil, caps)
 }

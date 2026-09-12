@@ -8,8 +8,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 )
@@ -86,8 +86,8 @@ func TestRootCommand(t *testing.T) {
 			rootCmd.AddCommand(cmd.Scheduler())
 			rootCmd.AddCommand(cmd.Retry())
 			rootCmd.AddCommand(cmd.StartAll())
-			rootCmd.AddCommand(cmd.Migrate())
 			rootCmd.AddCommand(cmd.Profile())
+			rootCmd.AddCommand(cmd.HumanTask())
 
 			// Set args
 			rootCmd.SetArgs(tt.args[1:]) // Skip program name
@@ -176,8 +176,8 @@ func TestRootCommandStructure(t *testing.T) {
 		"scheduler",
 		"retry",
 		"start-all",
-		"migrate",
 		"profile",
+		"human-task",
 	}
 
 	// Get all commands
@@ -250,6 +250,6 @@ operations, or remote commands.
 	rootCmd.AddCommand(cmd.Scheduler())
 	rootCmd.AddCommand(cmd.Retry())
 	rootCmd.AddCommand(cmd.StartAll())
-	rootCmd.AddCommand(cmd.Migrate())
 	rootCmd.AddCommand(cmd.Profile())
+	rootCmd.AddCommand(cmd.HumanTask())
 }

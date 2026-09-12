@@ -6,7 +6,7 @@ package spec004_consts_test
 import (
 	"testing"
 
-	"github.com/dagucloud/dagu/conformance/harness"
+	"github.com/dagucloud/dagu/v2/conformance/harness"
 )
 
 func TestValidate(t *testing.T) {
@@ -79,7 +79,9 @@ func TestValidate(t *testing.T) {
 
 			dagu := harness.NewRunner(t)
 
-			result := dagu.Run("validate", tc.file)
+			// These references are well formed and only lack a value outside a
+			// run, so validation stays quiet about them by default.
+			result := dagu.Run("validate", "--show-unresolved", tc.file)
 			result.ExpectExitCode(0)
 			result.ExpectStdout("")
 			result.ExpectStderrContains(tc.stderrParts...)

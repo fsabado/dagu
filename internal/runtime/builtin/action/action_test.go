@@ -10,8 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	coreexec "github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -87,6 +86,13 @@ func TestResolveSourceBundleCachesByResolvedSHA(t *testing.T) {
 	assert.Equal(t, filepath.Join(toolsDir, "actions", "source", repoKey, sha), root)
 	assert.Equal(t, sha, resolved)
 	assert.FileExists(t, filepath.Join(root, manifestFileName))
+
+	// A pinned commit remains usable when the source repository is unavailable.
+	require.NoError(t, os.Rename(filepath.Join(repoDir, ".git"), filepath.Join(repoDir, ".git-offline")))
+	cached, cachedSHA, err := cloneGitSource(ctx, repoDir, sha, resolveOptions{ToolsDir: toolsDir})
+	require.NoError(t, err)
+	assert.Equal(t, root, cached)
+	assert.Equal(t, sha, cachedSHA)
 }
 
 func TestResolvePackagePrefixRejectsTraversal(t *testing.T) {
@@ -213,7 +219,7 @@ steps:
 func TestValidateActionDAGRejectsExplicitWorkingDir(t *testing.T) {
 	t.Parallel()
 
-	err := validateActionDAG(&core.DAG{
+	err := validateActionDAG(&ir.DAG{
 		Name:               "child",
 		WorkingDir:         "/tmp/source",
 		WorkingDirExplicit: true,
@@ -246,7 +252,7 @@ func TestWriteJSONOutputValidatesDeclaredOutputs(t *testing.T) {
 func TestActionOutputsFromRunStatusPrefersTypedOutputs(t *testing.T) {
 	t.Parallel()
 
-	outputs := actionOutputsFromRunStatus(&coreexec.RunStatus{
+	outputs := actionOutputsFromRunStatus(&ir.RunStatus{
 		Outputs: map[string]string{
 			"messageId": "legacy-msg",
 			"status":    "legacy",

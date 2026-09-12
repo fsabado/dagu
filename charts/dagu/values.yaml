@@ -1,16 +1,59 @@
-# Default values for dagu
-# Dagu requires a shared filesystem (ReadWriteMany) for state persistence
+# Default values for Dagu.
+
+# Override the chart-derived resource name when required by cluster conventions.
+nameOverride: ""
+fullnameOverride: ""
+
+# Standalone runs the web UI, scheduler, and workflow executor in one pod and
+# works with a regular ReadWriteOnce volume. Distributed runs separate server,
+# scheduler, coordinator, and worker Deployments and requires ReadWriteMany.
+deploymentMode: standalone
 
 # Image configuration
 image:
   repository: ghcr.io/dagucloud/dagu
-  tag: latest
+  # Empty uses Chart.appVersion.
+  tag: ""
   pullPolicy: IfNotPresent
+
+# Registry credentials applied to every Dagu pod.
+imagePullSecrets: []
+
+# Kubernetes ServiceAccount used by every Dagu pod. The chart creates a
+# release-scoped account by default. Set create=false to use an existing account;
+# an empty name then selects the namespace's default ServiceAccount.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod settings applied to every Dagu pod. Worker-pool scheduling values take
+# precedence when they are non-empty.
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# Additional Kubernetes volumes and mounts applied to every Dagu container.
+# Use these for file-backed configuration such as custom CA certificates,
+# kubeconfig files, and credentials stored in Secrets or ConfigMaps.
+extraVolumes: []
+extraVolumeMounts: []
 
 # Top-level Dagu config additions rendered into dagu.yaml
 config:
   # Absolute external URL of the Dagu UI. Used in notification links.
   publicUrl: ""
+  # Browser origins allowed to make cross-origin API requests.
+  # Empty disables CORS; same-origin UI access continues to work.
+  corsAllowedOrigins: []
+  # Restrict every UI/API HTTP route to these client IP addresses or CIDR ranges.
+  # Empty preserves unrestricted access.
+  ipAccess:
+    allowedIPs: []
+    # Forwarded client IP headers are honored only from these proxy addresses or ranges.
+    trustedProxies: []
   envPassthrough: []
   envPassthroughPrefixes: []
 
@@ -18,6 +61,14 @@ config:
 # Use this together with config.envPassthrough/config.envPassthroughPrefixes
 # when steps need access to runtime env such as proxies or custom CA paths.
 extraEnv: []
+
+# License activation key from an existing Kubernetes Secret.
+# The Secret must exist in the same namespace as the Helm release.
+# This is optional when another supported license env/file or persisted
+# activation source supplies the active license.
+license:
+  existingSecret: ""
+  secretKey: license-key
 
 # Pod security context applied to all Dagu pods.
 # The image entrypoint starts as root, prepares the runtime environment, then
@@ -27,7 +78,7 @@ extraEnv: []
 podSecurityContext:
   fsGroup: 1000
 
-# Scheduler configuration
+# Scheduler configuration for distributed mode.
 scheduler:
   replicas: 1
   resources:
@@ -38,7 +89,7 @@ scheduler:
       memory: "512Mi"
       cpu: "500m"
 
-# Coordinator configuration (gRPC server for distributed task execution)
+# Coordinator configuration for distributed mode.
 coordinator:
   replicas: 1
   healthPort: 8091
@@ -50,11 +101,13 @@ coordinator:
       memory: "256Mi"
       cpu: "200m"
 
-# Worker pool configuration
+# Worker configuration for distributed mode.
 # Each pool creates a separate Kubernetes Deployment.
 # Pool names become part of the Deployment name: <release>-dagu-worker-<poolName>
 worker:
   healthPort: 8092
+  # Maximum concurrent DAG runs handled by each worker process.
+  maxActiveRuns: 100
 
 workerPools:
   general:
@@ -74,36 +127,119 @@ workerPools:
     nodeSelector: {}
     tolerations: []
     affinity: {}
+    priorityClassName: ""
 
-# UI configuration
+# Server and UI configuration. In standalone mode this configures the combined
+# start-all pod and replicas must remain 1.
 ui:
   replicas: 1
+  # Port used by the Dagu process and pod probes. The Service can expose a
+  # different port without changing the container listener.
+  containerPort: 8080
   service:
+    # ClusterIP is recommended with ingress. LoadBalancer and NodePort are also supported.
+    type: ClusterIP
     port: 8080
+    # Use provider-specific annotations for an internal load balancer when needed.
+    annotations: {}
   resources:
     requests:
       memory: "256Mi"
       cpu: "250m"
-    limits:
-      memory: "512Mi"
-      cpu: "500m"
+    # Limits are intentionally unset because standalone workflow processes run
+    # inside this container. Set limits to match the workloads in the cluster.
+
+# Optional HTTP ingress for the Dagu UI and API. CORS is not required when
+# browsers load the UI and API through the same ingress host.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: dagu.local
+  tls:
+    enabled: false
+    # Leave empty to use the ingress controller's default certificate.
+    secretName: ""
 
 # Authentication configuration
 auth:
   mode: "builtin"  # Options: "none", "basic", "builtin" (default)
+  basic:
+    # Required when mode is basic. The Secret must contain both credential keys.
+    existingSecret: ""
+    usernameKey: username
+    passwordKey: password
   builtin:
     token:
       secret: ""               # optional: auto-generated at {data_dir}/auth/token_secret
       ttl: "24h"
+  oidc:
+    enabled: false
+    clientId: ""
+    clientUrl: ""
+    issuer: ""
+    scopes:
+      - openid
+      - profile
+      - email
+    whitelist: []
+    autoSignup: true
+    allowedDomains: []
+    buttonLabel: "Login with SSO"
+    clientSecret:
+      existingSecret: ""
+      secretKey: client-secret
+    roleMapping:
+      defaultRole: "viewer"
+      groupsClaim: "groups"
+      groupMappings: {}
+      workspaceMappings: {}
+      # The runtime-compatible "all" default gives every unmatched OIDC user
+      # viewer access to all named workspaces. Set this to "none" when named
+      # workspaces must be isolated by default.
+      defaultWorkspaceAccess: "all"
+      roleAttributePath: ""
+      roleAttributeStrict: false
+      skipOrgRoleSync: false
+  proxy:
+    enabled: false
+    # Optional identity namespace. Changing it makes the same header identity
+    # resolve to a distinct account.
+    source: ""
+    buttonLabel: "Continue with SSO"
+    headers:
+      user: "X-Auth-Request-User"
+      groups: "X-Auth-Request-Groups"
+    autoSignup: true
+    roleMapping:
+      defaultRole: "viewer"
+      defaultWorkspaceAccess: "none"
+      # Set to true to deny login unless at least one mapping matches.
+      requireMapping: false
+      # When true, preserve existing role and workspace access on subsequent logins.
+      skipOrgRoleSync: false
+      groupMappings: {}
+      workspaceMappings: {}
 
-# Persistence - REQUIRED: Dagu needs a shared filesystem (RWX)
-# Use NFS, EFS, CephFS, or similar storage that supports ReadWriteMany
+# Persistent Dagu state. Standalone mode uses ReadWriteOnce by default.
+# Distributed mode requires an RWX-capable volume such as NFS, EFS, or CephFS.
 persistence:
   enabled: true
-  accessMode: ReadWriteMany
+  # Keep the PVC and its data when the Helm release is uninstalled.
+  retain: true
+  # Use an existing PVC instead of creating one. It must be in the release
+  # namespace and its access mode must match this declaration.
+  existingClaim: ""
+  accessMode: ReadWriteOnce
   size: 10Gi
-  # Set this to your storage class that supports RWX
-  # Example: "nfs-client", "efs-sc", "cephfs"
+  # Empty uses the cluster's default StorageClass.
   storageClass: ""
-  # Skip RWX validation for local testing (Kind, Docker Desktop)
-  skipValidation: false
+  annotations: {}
+
+# Image used by `helm test`.
+test:
+  image:
+    repository: busybox
+    # Required because the Helm test image does not use Dagu's appVersion fallback.
+    tag: "1.36.1"
+    pullPolicy: IfNotPresent

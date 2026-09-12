@@ -5,8 +5,10 @@ import { components } from '@/api/v1/schema';
 import { Badge } from '@/components/ui/badge';
 import BorderedBox from '@/components/ui/bordered-box';
 import { getLogMessageFromConfig } from '@/lib/executor-utils';
+import { getHarnessStepSummary } from '@/lib/harness-step';
 import React from 'react';
 import { LogStepMessage } from '../dag-details/LogStepMessage';
+import { I18nText } from '@/i18n/I18nText';
 
 type Step = components['schemas']['Step'];
 
@@ -55,6 +57,7 @@ const STEP_FIELD_LABELS: Record<string, string> = {
 };
 
 export function StepDetails({ step }: { step: Step }) {
+  const harnessPrompt = getHarnessStepSummary(step)?.prompt ?? null;
   const fields = React.useMemo(() => {
     const entries = Object.entries(step)
       .filter(([key]) => key !== 'name')
@@ -75,21 +78,28 @@ export function StepDetails({ step }: { step: Step }) {
   if (fields.length === 0) {
     return (
       <div className="rounded-md border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
-        No additional step fields are defined.
+        <I18nText text={'No additional step fields are defined.'} />
       </div>
     );
   }
 
   return (
     <div className="space-y-4">
-      {fields.map(([key, value]) => (
-        <StepField
-          key={key}
-          label={STEP_FIELD_LABELS[key] || toTitleLabel(key)}
-          name={key}
-          value={value}
-        />
-      ))}
+      {fields.map(([key, value]) => {
+        const isHarnessPrompt = key === 'commands' && harnessPrompt !== null;
+        return (
+          <StepField
+            key={key}
+            label={
+              isHarnessPrompt
+                ? 'Prompt'
+                : STEP_FIELD_LABELS[key] || toTitleLabel(key)
+            }
+            name={isHarnessPrompt ? 'prompt' : key}
+            value={isHarnessPrompt ? harnessPrompt : value}
+          />
+        );
+      })}
     </div>
   );
 }
@@ -106,7 +116,7 @@ function StepField({
   return (
     <section className="space-y-2">
       <div className="text-xs font-medium uppercase text-muted-foreground">
-        {label}
+        <I18nText text={label} />
       </div>
       {renderStepFieldValue(name, value)}
     </section>
@@ -115,7 +125,11 @@ function StepField({
 
 function renderStepFieldValue(name: string, value: unknown): React.ReactNode {
   if (typeof value === 'boolean') {
-    return <Badge variant="outline">{value ? 'Enabled' : 'Disabled'}</Badge>;
+    return (
+      <Badge variant="outline">
+        {value ? <I18nText text={'Enabled'} /> : <I18nText text={'Disabled'} />}
+      </Badge>
+    );
   }
 
   if (typeof value === 'number') {
@@ -185,13 +199,15 @@ function ExecutorConfigField({ value }: { value: Record<string, unknown> }) {
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="min-w-0">
         <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">
-          Type
+          <I18nText text={'Type'} />
         </div>
-        <Badge variant="outline">log</Badge>
+        <Badge variant="outline">
+          <I18nText text={type} />
+        </Badge>
       </div>
       <div className="min-w-0">
         <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">
-          Message
+          <I18nText text={'Message'} />
         </div>
         <LogStepMessage message={logMessage} />
       </div>
@@ -240,7 +256,11 @@ function renderNestedFieldValue(name: string, value: unknown): React.ReactNode {
     return renderStepFieldValue(name, value);
   }
   if (typeof value === 'boolean') {
-    return <Badge variant="outline">{value ? 'Enabled' : 'Disabled'}</Badge>;
+    return (
+      <Badge variant="outline">
+        {value ? <I18nText text={'Enabled'} /> : <I18nText text={'Disabled'} />}
+      </Badge>
+    );
   }
   return (
     <div className="whitespace-pre-wrap break-words text-sm text-foreground">
@@ -261,7 +281,7 @@ function CodeBlock({
   }
 
   return (
-    <BorderedBox className="max-h-72 overflow-auto bg-muted/20 p-3">
+    <BorderedBox className="bg-muted/20 p-3">
       <pre className="whitespace-pre-wrap break-words text-xs leading-5 text-foreground">
         {value}
       </pre>
@@ -273,8 +293,8 @@ function ShellCodeBlock({ value }: { value: string }) {
   const lines = value.split('\n');
 
   return (
-    <BorderedBox className="max-h-72 overflow-auto bg-muted/30 p-0 dark:border-slate-700 dark:bg-slate-950">
-      <pre className="m-0 min-w-max text-xs leading-5 text-foreground selection:bg-primary/20 dark:text-slate-100 dark:selection:bg-sky-500/40 dark:selection:text-white">
+    <BorderedBox className="overflow-x-auto bg-muted/30 p-0 dark:border-slate-700 dark:bg-slate-950">
+      <pre className="m-0 min-w-max text-xs leading-5 text-foreground selection:bg-primary/20 dark:text-slate-100 dark:selection:bg-violet-500/40 dark:selection:text-white">
         {lines.map((line, index) => (
           <div
             key={`${index}-${line}`}
@@ -283,7 +303,7 @@ function ShellCodeBlock({ value }: { value: string }) {
             <span className="select-none bg-muted px-2 py-0.5 text-right text-muted-foreground dark:bg-slate-900 dark:text-slate-500">
               {index + 1}
             </span>
-            <code className="whitespace-pre px-3 py-0.5 font-mono text-foreground selection:bg-primary/20 dark:text-slate-100 dark:selection:bg-sky-500/40 dark:selection:text-white">
+            <code className="whitespace-pre px-3 py-0.5 font-mono text-foreground selection:bg-primary/20 dark:text-slate-100 dark:selection:bg-violet-500/40 dark:selection:text-white">
               {line ? highlightShellLine(line) : '\u00a0'}
             </code>
           </div>
@@ -425,10 +445,10 @@ function highlightShellPlainSegment(
 }
 
 function getShellTokenClassName(token: string): string {
-  if (token.startsWith('$')) return 'text-cyan-700 dark:text-cyan-300';
+  if (token.startsWith('$')) return 'text-violet-700 dark:text-violet-300';
   if (SHELL_KEYWORDS.has(token))
     return 'font-medium text-purple-700 dark:text-purple-300';
-  if (/^--?/.test(token)) return 'text-sky-700 dark:text-sky-300';
+  if (/^--?/.test(token)) return 'text-amber-700 dark:text-amber-300';
   if (/^[|&;()<>]/.test(token)) return 'text-orange-700 dark:text-orange-300';
   if (/^\d+$/.test(token)) return 'text-amber-700 dark:text-amber-300';
   return 'text-foreground dark:text-slate-100';

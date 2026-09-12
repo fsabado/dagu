@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis/file/dagrun/dagrunindex"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file/dagrun/dagrunindex"
 )
 
 type dagRunListKey struct {
@@ -28,7 +28,7 @@ type dagRunListKey struct {
 
 type dagRunListItem struct {
 	Key    dagRunListKey
-	Status *exec.DAGRunStatus
+	Status *ir.DAGRunStatus
 }
 
 func compareDagRunListKeys(a, b dagRunListKey) int {
@@ -50,18 +50,14 @@ func compareDagRunListKeys(a, b dagRunListKey) int {
 	}
 }
 
-func (store *Store) ListStatusesPage(ctx context.Context, opts ...exec.ListDAGRunStatusesOption) (exec.DAGRunStatusPage, error) {
-	options, err := prepareListOptions(opts)
+// QueryStatuses executes a normalized status query.
+func (store *Store) QueryStatuses(ctx context.Context, query persis.DAGRunStatusQuery) (persis.DAGRunStatusPage, error) {
+	items, nextCursor, err := store.listStatusesOrdered(ctx, query)
 	if err != nil {
-		return exec.DAGRunStatusPage{}, fmt.Errorf("failed to prepare options: %w", err)
+		return persis.DAGRunStatusPage{}, err
 	}
 
-	items, nextCursor, err := store.listStatusesOrdered(ctx, options, options.Limit, true)
-	if err != nil {
-		return exec.DAGRunStatusPage{}, err
-	}
-
-	return exec.DAGRunStatusPage{
+	return persis.DAGRunStatusPage{
 		Items:      items,
 		NextCursor: nextCursor,
 	}, nil
@@ -69,10 +65,8 @@ func (store *Store) ListStatusesPage(ctx context.Context, opts ...exec.ListDAGRu
 
 func (store *Store) listStatusesOrdered(
 	ctx context.Context,
-	opts exec.ListDAGRunStatusesOptions,
-	limit int,
-	returnCursor bool,
-) ([]*exec.DAGRunStatus, string, error) {
+	opts persis.DAGRunStatusQuery,
+) ([]*ir.DAGRunStatus, string, error) {
 	cursorKey, err := decodeQueryCursor(opts.Cursor, opts)
 	if err != nil {
 		return nil, "", err
@@ -83,18 +77,12 @@ func (store *Store) listStatusesOrdered(
 		return nil, "", err
 	}
 
+	limit := opts.Limit
 	target := limit
-	if target <= 0 {
-		if opts.Unlimited {
-			target = math.MaxInt
-		} else {
-			target = opts.Limit
-		}
+	if target == 0 {
+		target = math.MaxInt
 	}
-	if target <= 0 {
-		target = 1
-	}
-	if returnCursor && target < math.MaxInt {
+	if target < math.MaxInt {
 		target++
 	}
 
@@ -114,7 +102,7 @@ func (store *Store) listStatusesOrdered(
 	}
 	heap.Init(&pq)
 
-	statuses := make([]*exec.DAGRunStatus, 0, min(target, len(iterators)))
+	statuses := make([]*ir.DAGRunStatus, 0, min(target, len(iterators)))
 	keys := make([]dagRunListKey, 0, cap(statuses))
 
 	for pq.Len() > 0 && len(statuses) < target {
@@ -134,7 +122,7 @@ func (store *Store) listStatusesOrdered(
 		}
 	}
 
-	if !returnCursor || limit <= 0 || len(statuses) <= limit {
+	if limit <= 0 || len(statuses) <= limit {
 		return statuses, "", nil
 	}
 
@@ -145,7 +133,7 @@ func (store *Store) listStatusesOrdered(
 	return statuses[:limit], nextCursor, nil
 }
 
-func (store *Store) newStatusIterators(ctx context.Context, opts exec.ListDAGRunStatusesOptions) ([]*dagRunStatusIterator, error) {
+func (store *Store) newStatusIterators(ctx context.Context, opts persis.DAGRunStatusQuery) ([]*dagRunStatusIterator, error) {
 	var roots []DataRoot
 	if opts.ExactName == "" {
 		listed, err := store.listRoot(ctx, "")
@@ -172,31 +160,31 @@ func (store *Store) newStatusIterators(ctx context.Context, opts exec.ListDAGRun
 type dagRunStatusIterator struct {
 	store           *Store
 	root            DataRoot
-	opts            exec.ListDAGRunStatusesOptions
+	opts            persis.DAGRunStatusQuery
 	dayPaths        []string
 	dayIndex        int
 	dayItems        []dagRunListItem
 	dayItemIndex    int
-	labelFilters    []core.LabelFilter
-	statusesFilter  map[core.Status]struct{}
+	labelFilters    []ir.LabelFilter
+	statusesFilter  map[ir.Status]struct{}
 	hasStatusFilter bool
 }
 
-func newDAGRunStatusIterator(store *Store, root DataRoot, opts exec.ListDAGRunStatusesOptions) (*dagRunStatusIterator, error) {
+func newDAGRunStatusIterator(store *Store, root DataRoot, opts persis.DAGRunStatusQuery) (*dagRunStatusIterator, error) {
 	dayPaths, err := listDayPathsInRange(root, opts.From, opts.To)
 	if err != nil {
 		return nil, err
 	}
 
-	statusesFilter := make(map[core.Status]struct{}, len(opts.Statuses))
+	statusesFilter := make(map[ir.Status]struct{}, len(opts.Statuses))
 	for _, status := range opts.Statuses {
 		statusesFilter[status] = struct{}{}
 	}
 
-	labelFilters := make([]core.LabelFilter, 0, len(opts.Labels))
+	labelFilters := make([]ir.LabelFilter, 0, len(opts.Labels))
 	for _, label := range opts.Labels {
 		if trimmed := strings.TrimSpace(label); trimmed != "" {
-			labelFilters = append(labelFilters, core.ParseLabelFilter(trimmed))
+			labelFilters = append(labelFilters, ir.ParseLabelFilter(trimmed))
 		}
 	}
 
@@ -250,7 +238,7 @@ func (it *dagRunStatusIterator) loadDay(ctx context.Context, dayPath string) ([]
 		return nil, fmt.Errorf("read day directory %s: %w", dayPath, err)
 	}
 
-	runs, err := loadDayRuns(dayPath, entries, it.statusesFilter, it.hasStatusFilter)
+	runs, err := loadDayRuns(ctx, dayPath, entries, it.statusesFilter, it.hasStatusFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +279,7 @@ func containsFold(value, query string) bool {
 	return strings.Contains(strings.ToLower(value), strings.ToLower(query))
 }
 
-func effectiveTimeRange(from, to exec.TimeInUTC) (time.Time, time.Time) {
+func effectiveTimeRange(from, to persis.TimeInUTC) (time.Time, time.Time) {
 	start := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	end := time.Now().UTC()
 	if !from.IsZero() {
@@ -303,7 +291,7 @@ func effectiveTimeRange(from, to exec.TimeInUTC) (time.Time, time.Time) {
 	return start, end
 }
 
-func listDayPathsInRange(root DataRoot, from, to exec.TimeInUTC) ([]string, error) {
+func listDayPathsInRange(root DataRoot, from, to persis.TimeInUTC) ([]string, error) {
 	startDate, endDate := effectiveTimeRange(from, to)
 
 	years, err := listDirsSorted(root.dagRunsDir, true, reYear)
@@ -352,8 +340,8 @@ func listDayPathsInRange(root DataRoot, from, to exec.TimeInUTC) ([]string, erro
 	return dayPaths, nil
 }
 
-func loadDayRuns(dayPath string, dayEntries []os.DirEntry, statusesFilter map[core.Status]struct{}, hasStatusFilter bool) ([]*DAGRun, error) {
-	indexEntries, _, indexErr := dagrunindex.TryLoadForDay(dayPath, dayEntries)
+func loadDayRuns(ctx context.Context, dayPath string, dayEntries []os.DirEntry, statusesFilter map[ir.Status]struct{}, hasStatusFilter bool) ([]*DAGRun, error) {
+	indexEntries, _, indexErr := dagrunindex.TryLoadForDay(ctx, dayPath, dayEntries)
 	if indexErr == nil && indexEntries != nil && len(indexEntries) == countDAGRunDirs(dayEntries) {
 		runs := make([]*DAGRun, 0, len(indexEntries))
 		for _, indexEntry := range indexEntries {

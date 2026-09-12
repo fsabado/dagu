@@ -5,25 +5,41 @@ package scheduler
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"log/slog"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
 )
 
 const queueAgeWarningThreshold = 2 * time.Minute
 const queueProcessMinInterval = 3 * time.Second
+const queueProcessFallbackInterval = 30 * time.Second
+const queueScanItemLimit = 100
+const queueHeadItemLimit = 1
+const maxConcurrentQueueScans = 8
+const maxConcurrentDispatchHandoffs = 8
 
 var (
 	errProcessorClosed              = errors.New("processor closed")
 	errNotStarted                   = errors.New("execution not started")
 	errExecutionExitedBeforeStartup = errors.New("execution exited before startup")
+	errRunLivenessUnavailable       = errors.New("run liveness unavailable")
 )
 
 const suspendedQueueDropReason = "dag schedule suspended before dispatch"
@@ -64,18 +80,40 @@ func (s startupWaitState) executionDone() (bool, error) {
 	return s.execDone()
 }
 
+type startupExecutionError struct {
+	err error
+}
+
+func newStartupExecutionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return startupExecutionError{err: err}
+}
+
+func (e startupExecutionError) Error() string {
+	return e.err.Error()
+}
+
+func (e startupExecutionError) Unwrap() error {
+	return e.err
+}
+
 // QueueProcessor is responsible for processing queued DAG runs.
 type QueueProcessor struct {
-	queueStore             exec.QueueStore
-	dagRunStore            exec.DAGRunStore
-	procStore              exec.ProcStore
-	dagRunLeaseStore       exec.DAGRunLeaseStore
-	dispatchTaskStore      exec.DispatchTaskStore
-	dispatchAdmissionStore exec.DispatchAdmissionStore
+	queueStore             queuedomain.QueueStore
+	dagRunRepository       *persis.DAGRunRepository
+	procRepository         queueProcessRepository
+	dagRunLeaseStore       dispatch.DAGRunLeaseStore
+	dispatchTaskStore      dispatch.DispatchTaskStore
+	dispatchAdmissionStore dispatch.DispatchAdmissionStore
+	workerHeartbeatStore   dispatch.WorkerHeartbeatStore
+	workerStaleAfter       time.Duration
 	dagExecutor            *DAGExecutor
 	isSuspended            IsSuspendedFunc
 	queues                 sync.Map // map[string]*queue
 	wakeUpCh               chan struct{}
+	dispatchHandoffs       chan struct{}
 	quit                   chan struct{}
 	wg                     sync.WaitGroup
 	stopOnce               sync.Once
@@ -86,10 +124,28 @@ type QueueProcessor struct {
 }
 
 type queue struct {
-	maxConcurrency int
-	isGlobal       bool // true if this queue is defined in config (global queue)
-	inflight       atomic.Int32
-	mu             sync.Mutex
+	maxConcurrency  int
+	isGlobal        bool // true if this queue is defined in config (global queue)
+	scanCursor      string
+	scanGeneration  queueScanGeneration
+	scanRetryAt     time.Time
+	scanRetryNeeded bool
+	generationSet   bool
+	parked          bool
+	inflight        atomic.Int32
+	mu              sync.Mutex
+}
+
+type workerEligibilityGeneration struct {
+	fingerprint [sha256.Size]byte
+	enabled     bool
+	available   bool
+}
+
+type queueScanGeneration struct {
+	queueRevision int64
+	workers       workerEligibilityGeneration
+	capacity      queueCapacityGeneration
 }
 
 func (q *queue) getMaxConcurrency() int {
@@ -106,6 +162,77 @@ func (q *queue) isGlobalQueue() bool {
 
 func (q *queue) getInflight() int {
 	return int(q.inflight.Load())
+}
+
+func (q *queue) scanPosition(generation queueScanGeneration, now time.Time) (string, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.generationSet || q.scanGeneration != generation {
+		q.scanCursor = ""
+		q.scanGeneration = generation
+		q.scanRetryAt = time.Time{}
+		q.scanRetryNeeded = false
+		q.generationSet = true
+		q.parked = false
+	} else if q.parked && !q.scanRetryAt.IsZero() && !now.Before(q.scanRetryAt) {
+		q.scanRetryAt = time.Time{}
+		q.scanRetryNeeded = false
+		q.parked = false
+	}
+	return q.scanCursor, q.parked
+}
+
+func (q *queue) advanceScan(generation queueScanGeneration, cursor string, retryNeeded bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.generationSet || q.scanGeneration != generation {
+		q.scanRetryNeeded = false
+	}
+	q.scanGeneration = generation
+	q.scanRetryAt = time.Time{}
+	q.scanRetryNeeded = q.scanRetryNeeded || retryNeeded
+	q.generationSet = true
+	q.scanCursor = cursor
+	q.parked = false
+}
+
+func (q *queue) parkScan(generation queueScanGeneration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.scanGeneration = generation
+	q.scanRetryAt = time.Time{}
+	q.scanRetryNeeded = false
+	q.generationSet = true
+	q.scanCursor = ""
+	q.parked = true
+}
+
+func (q *queue) deferScan(generation queueScanGeneration, retryAt time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.scanGeneration = generation
+	q.scanRetryAt = retryAt
+	q.scanRetryNeeded = false
+	q.generationSet = true
+	q.scanCursor = ""
+	q.parked = true
+}
+
+func (q *queue) finishScan(generation queueScanGeneration, retryNeeded bool, retryAt time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.generationSet && q.scanGeneration == generation {
+		retryNeeded = retryNeeded || q.scanRetryNeeded
+	}
+	q.scanGeneration = generation
+	q.scanRetryNeeded = false
+	q.generationSet = true
+	q.scanCursor = ""
+	q.parked = true
+	q.scanRetryAt = time.Time{}
+	if retryNeeded {
+		q.scanRetryAt = retryAt
+	}
 }
 
 func (q *queue) incInflight() { q.inflight.Add(1) }
@@ -130,28 +257,42 @@ func WithLeaseStaleThreshold(threshold time.Duration) QueueProcessorOption {
 }
 
 // WithDAGRunLeaseStore sets the shared distributed run lease store.
-func WithDAGRunLeaseStore(store exec.DAGRunLeaseStore) QueueProcessorOption {
+func WithDAGRunLeaseStore(store dispatch.DAGRunLeaseStore) QueueProcessorOption {
 	return func(p *QueueProcessor) {
 		p.dagRunLeaseStore = store
 	}
 }
 
+// WithWorkerHeartbeatStore sets the shared worker heartbeat store.
+func WithWorkerHeartbeatStore(store dispatch.WorkerHeartbeatStore) QueueProcessorOption {
+	return func(p *QueueProcessor) {
+		p.workerHeartbeatStore = store
+	}
+}
+
+// WithWorkerHeartbeatStaleThreshold sets the worker heartbeat freshness threshold.
+func WithWorkerHeartbeatStaleThreshold(threshold time.Duration) QueueProcessorOption {
+	return func(p *QueueProcessor) {
+		p.workerStaleAfter = threshold
+	}
+}
+
 // WithDispatchTaskStore sets the shared distributed dispatch reservation store.
-func WithDispatchTaskStore(store exec.DispatchTaskStore) QueueProcessorOption {
+func WithDispatchTaskStore(store dispatch.DispatchTaskStore) QueueProcessorOption {
 	return func(p *QueueProcessor) {
 		p.dispatchTaskStore = store
 		p.dispatchAdmissionStore = dispatchAdmissionStoreFromTaskStore(store)
 	}
 }
 
-func WithDispatchAdmissionStore(store exec.DispatchAdmissionStore) QueueProcessorOption {
+func WithDispatchAdmissionStore(store dispatch.DispatchAdmissionStore) QueueProcessorOption {
 	return func(p *QueueProcessor) {
 		p.dispatchAdmissionStore = store
 	}
 }
 
-func dispatchAdmissionStoreFromTaskStore(store exec.DispatchTaskStore) exec.DispatchAdmissionStore {
-	admissionStore, _ := store.(exec.DispatchAdmissionStore)
+func dispatchAdmissionStoreFromTaskStore(store dispatch.DispatchTaskStore) dispatch.DispatchAdmissionStore {
+	admissionStore, _ := store.(dispatch.DispatchAdmissionStore)
 	return admissionStore
 }
 
@@ -164,26 +305,28 @@ func WithIsSuspended(isSuspended IsSuspendedFunc) QueueProcessorOption {
 
 // NewQueueProcessor creates a new QueueProcessor.
 func NewQueueProcessor(
-	queueStore exec.QueueStore,
-	dagRunStore exec.DAGRunStore,
-	procStore exec.ProcStore,
+	queueStore queuedomain.QueueStore,
+	dagRunRepository *persis.DAGRunRepository,
+	procRepository queueProcessRepository,
 	dagExecutor *DAGExecutor,
 	queuesConfig config.Queues,
 	opts ...QueueProcessorOption,
 ) *QueueProcessor {
 	p := &QueueProcessor{
-		queueStore:  queueStore,
-		dagRunStore: dagRunStore,
-		procStore:   procStore,
-		dagExecutor: dagExecutor,
-		wakeUpCh:    make(chan struct{}, 1),
-		quit:        make(chan struct{}),
+		queueStore:       queueStore,
+		dagRunRepository: dagRunRepository,
+		procRepository:   procRepository,
+		dagExecutor:      dagExecutor,
+		wakeUpCh:         make(chan struct{}, 1),
+		dispatchHandoffs: make(chan struct{}, maxConcurrentDispatchHandoffs),
+		quit:             make(chan struct{}),
 		// Seed prevTime in the past so Start()'s initial wake-up is not
 		// throttled by the minimum processing interval.
 		prevTime:            time.Now().Add(-queueProcessMinInterval),
 		backoffConfig:       DefaultBackoffConfig(),
-		leaseStaleThreshold: exec.DefaultStaleLeaseThreshold,
-		isSuspended:         func(context.Context, string) bool { return false },
+		leaseStaleThreshold: dagrun.DefaultStaleLeaseThreshold,
+		workerStaleAfter:    dispatch.DefaultStaleWorkerHeartbeatThreshold,
+		isSuspended:         func(context.Context, string) (bool, error) { return false, nil },
 	}
 
 	for _, opt := range opts {
@@ -246,7 +389,7 @@ func (p *QueueProcessor) loop(ctx context.Context) {
 		case <-p.quit:
 			return
 		case <-p.wakeUpCh:
-		case <-time.After(30 * time.Second):
+		case <-time.After(queueProcessFallbackInterval):
 			// wake up the queue processor on interval in case event is missed
 		}
 
@@ -282,26 +425,51 @@ func (p *QueueProcessor) loop(ctx context.Context) {
 		// Remove inactive non-global queues
 		p.removeInactiveQueues(activeQueues)
 
-		// Process each queue concurrently
-		var wg sync.WaitGroup
-		for name := range activeQueues {
-			wg.Add(1)
-			go func(queueName string) {
-				defer wg.Done()
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Error(ctx, "Queue processing panicked",
-							tag.Queue(queueName),
-							tag.Error(panicToError(r)),
-						)
-					}
-				}()
-				queueCtx := logger.WithValues(ctx, tag.Queue(queueName))
-				p.ProcessQueueItems(queueCtx, queueName)
-			}(name)
-		}
-		wg.Wait()
+		p.processActiveQueues(ctx, activeQueues)
 	}
+}
+
+func (p *QueueProcessor) processActiveQueues(ctx context.Context, activeQueues map[string]struct{}) {
+	workerCount := min(len(activeQueues), maxConcurrentQueueScans)
+	if workerCount == 0 {
+		return
+	}
+	workerSnapshot := p.loadWorkerHeartbeatSnapshot(ctx)
+	workerGeneration := workerSnapshot.generation(p.workerHeartbeatStore != nil, p.workerStaleAfter)
+
+	queueNames := make(chan string)
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Go(func() {
+			for queueName := range queueNames {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Error(ctx, "Queue processing panicked",
+								tag.Queue(queueName),
+								tag.Error(panicToError(r)),
+							)
+						}
+					}()
+					queueCtx := logger.WithValues(ctx, tag.Queue(queueName))
+					p.processQueueItems(queueCtx, queueName, workerSnapshot, workerGeneration)
+				}()
+			}
+		})
+	}
+
+sendQueues:
+	for queueName := range activeQueues {
+		select {
+		case queueNames <- queueName:
+		case <-ctx.Done():
+			break sendQueues
+		case <-p.quit:
+			break sendQueues
+		}
+	}
+	close(queueNames)
+	wg.Wait()
 }
 
 func (p *QueueProcessor) isClosed() bool {
@@ -316,22 +484,51 @@ func (p *QueueProcessor) isClosed() bool {
 func (p *QueueProcessor) newQueueDispatcher() *queueDispatcher {
 	return newQueueDispatcher(queueDispatchDeps{
 		queueStore:             p.queueStore,
-		dagRunStore:            p.dagRunStore,
-		procStore:              p.procStore,
+		dagRunRepository:       p.dagRunRepository,
+		procRepository:         p.procRepository,
 		dagRunLeaseStore:       p.dagRunLeaseStore,
 		dispatchTaskStore:      p.dispatchTaskStore,
 		dispatchAdmissionStore: p.dispatchAdmissionStore,
+		workerHeartbeatStore:   p.workerHeartbeatStore,
+		workerStaleAfter:       p.workerStaleAfter,
 		dagExecutor:            p.dagExecutor,
 		isSuspended:            p.isSuspended,
 		backoffConfig:          p.backoffConfig,
 		leaseStaleThreshold:    p.leaseStaleThreshold,
 		isClosed:               p.isClosed,
 		wakeUp:                 p.wakeUp,
+		acquireDispatchHandoff: p.acquireDispatchHandoff,
 	})
+}
+
+func (p *QueueProcessor) acquireDispatchHandoff(ctx context.Context) (func(), bool) {
+	select {
+	case p.dispatchHandoffs <- struct{}{}:
+		return func() { <-p.dispatchHandoffs }, true
+	case <-ctx.Done():
+		return nil, false
+	case <-p.quit:
+		return nil, false
+	}
 }
 
 // ProcessQueueItems processes items in the specified queue.
 func (p *QueueProcessor) ProcessQueueItems(ctx context.Context, queueName string) {
+	workerSnapshot := p.loadWorkerHeartbeatSnapshot(ctx)
+	p.processQueueItems(
+		ctx,
+		queueName,
+		workerSnapshot,
+		workerSnapshot.generation(p.workerHeartbeatStore != nil, p.workerStaleAfter),
+	)
+}
+
+func (p *QueueProcessor) processQueueItems(
+	ctx context.Context,
+	queueName string,
+	workerSnapshot *workerHeartbeatSnapshot,
+	workerGeneration workerEligibilityGeneration,
+) {
 	if p.isClosed() {
 		return
 	}
@@ -343,27 +540,57 @@ func (p *QueueProcessor) ProcessQueueItems(ctx context.Context, queueName string
 	}
 	q := v.(*queue)
 	logger.Debug(ctx, "Processing queue", tag.MaxConcurrency(q.getMaxConcurrency()))
+	dispatcher := p.newQueueDispatcher()
 
-	items, err := p.queueStore.List(ctx, queueName)
+	revision, err := p.queueStore.Revision(ctx, queueName)
+	if err != nil {
+		logger.Error(ctx, "Failed to read queue revision", tag.Error(err))
+		return
+	}
+	capacity := dispatcher.queueCapacity(ctx, queueName, q.getMaxConcurrency(), q.getInflight())
+	generation := queueScanGeneration{
+		queueRevision: revision,
+		workers:       workerGeneration,
+		capacity:      capacity.queueCapacityGeneration,
+	}
+	cursor, parked := q.scanPosition(generation, time.Now())
+	if parked {
+		p.wakeUp()
+		logger.Debug(ctx, "Queue scan parked until relevant state changes")
+		return
+	}
+
+	page, err := p.listQueueScanPage(ctx, queueName, cursor)
 	if err != nil {
 		logger.Error(ctx, "Failed to get queued items", tag.Error(err))
 		return
 	}
+	items := page.Items
+	logger.Debug(ctx, "Loaded bounded queue scan",
+		slog.Int("scanned_count", len(items)),
+		slog.Bool("has_more", page.HasMore),
+	)
 
 	if len(items) == 0 {
+		p.finishQueueScan(q, generation, false)
 		logger.Debug(ctx, "No item found")
 		return
 	}
 
-	defer p.wakeUp()
-	dispatcher := p.newQueueDispatcher()
-
-	maxConcurrency := q.getMaxConcurrency()
-	batch, err := dispatcher.selectDispatchBatch(ctx, queueName, items, maxConcurrency, q.getInflight())
+	batch, err := dispatcher.selectDispatchBatch(ctx, queueName, items, capacity, workerSnapshot)
 	if err != nil {
+		if capacity.err != nil {
+			p.parkQueueScan(q, generation)
+		}
 		return
 	}
 	if len(batch.items) == 0 {
+		if page.HasMore && page.NextCursor != "" {
+			q.advanceScan(generation, page.NextCursor, batch.retryScan)
+			p.wakeUp()
+		} else {
+			p.finishQueueScan(q, generation, batch.retryScan)
+		}
 		return
 	}
 	logger.Info(ctx, "Processing batch of items",
@@ -375,7 +602,7 @@ func (p *QueueProcessor) ProcessQueueItems(ctx context.Context, queueName string
 	var wg sync.WaitGroup
 	for _, item := range batch.items {
 		wg.Add(1)
-		go func(queuedItem exec.QueuedItemData) {
+		go func(queuedItem queuedomain.QueuedItemData) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
@@ -385,23 +612,119 @@ func (p *QueueProcessor) ProcessQueueItems(ctx context.Context, queueName string
 			if !dispatcher.dispatchQueuedItem(ctx, queuedItem, queueName, batch, q.incInflight, q.decInflight) {
 				return
 			}
-			data, err := queuedItem.Data()
-			if err != nil {
-				logger.Error(ctx, "Failed to get item data", tag.Error(err))
-				return
-			}
-			if _, err := p.queueStore.DequeueByDAGRunID(ctx, queueName, *data); err != nil {
-				if errors.Is(err, exec.ErrQueueItemNotFound) {
-					return
-				}
-				logger.Error(ctx, "Failed to dequeue item", tag.Error(err))
+			if _, err := p.queueStore.DeleteByItemIDs(ctx, queueName, []string{queuedItem.ID()}); err != nil {
+				logger.Error(ctx, "Failed to delete processed queue item", tag.Error(err))
 			}
 		}(item)
 	}
 	wg.Wait()
+	q.deferScan(generation, time.Now().Add(queueProcessFallbackInterval))
+	p.wakeUp()
 }
 
-func currentStatusString(status *exec.DAGRunStatus) string {
+func (p *QueueProcessor) parkQueueScan(q *queue, generation queueScanGeneration) {
+	q.parkScan(generation)
+	p.wakeUp()
+}
+
+func (p *QueueProcessor) finishQueueScan(q *queue, generation queueScanGeneration, retryNeeded bool) {
+	q.finishScan(generation, retryNeeded, time.Now().Add(queueProcessFallbackInterval))
+	p.wakeUp()
+}
+
+func (p *QueueProcessor) listQueueScanPage(
+	ctx context.Context,
+	queueName string,
+	cursor string,
+) (pagination.CursorResult[queuedomain.QueuedItemData], error) {
+	for attempt := range 2 {
+		head, err := p.queueStore.ListCursor(ctx, queueName, "", queueHeadItemLimit)
+		if err != nil || !head.HasMore || len(head.Items) == 0 {
+			return head, err
+		}
+
+		rotatingCursor := cursor
+		if rotatingCursor == "" {
+			rotatingCursor = head.NextCursor
+		}
+		rotating, err := p.queueStore.ListCursor(
+			ctx,
+			queueName,
+			rotatingCursor,
+			queueScanItemLimit-queueHeadItemLimit,
+		)
+		if errors.Is(err, pagination.ErrInvalidCursor) && attempt == 0 {
+			logger.Debug(ctx, "Queue scan cursor invalidated; restarting from head")
+			cursor = ""
+			continue
+		}
+		if err != nil {
+			return pagination.CursorResult[queuedomain.QueuedItemData]{}, err
+		}
+
+		items := make([]queuedomain.QueuedItemData, 0, queueScanItemLimit)
+		items = append(items, head.Items...)
+		seen := map[string]struct{}{head.Items[0].ID(): {}}
+		for _, item := range rotating.Items {
+			if _, ok := seen[item.ID()]; ok {
+				continue
+			}
+			seen[item.ID()] = struct{}{}
+			items = append(items, item)
+		}
+		return pagination.CursorResult[queuedomain.QueuedItemData]{
+			Items:      items,
+			HasMore:    rotating.HasMore,
+			NextCursor: rotating.NextCursor,
+		}, nil
+	}
+
+	return pagination.CursorResult[queuedomain.QueuedItemData]{}, pagination.ErrInvalidCursor
+}
+
+func (p *QueueProcessor) loadWorkerHeartbeatSnapshot(ctx context.Context) *workerHeartbeatSnapshot {
+	snapshot := &workerHeartbeatSnapshot{observedAt: time.Now().UTC()}
+	if p.workerHeartbeatStore != nil {
+		_, _ = snapshot.load(ctx, p.workerHeartbeatStore)
+	}
+	return snapshot
+}
+
+func (s *workerHeartbeatSnapshot) generation(
+	enabled bool,
+	staleThreshold time.Duration,
+) workerEligibilityGeneration {
+	generation := workerEligibilityGeneration{enabled: enabled, available: s.err == nil}
+	if !enabled || s.err != nil {
+		return generation
+	}
+
+	entries := make([]string, 0, len(s.records))
+	for _, record := range s.records {
+		if !dispatch.WorkerHeartbeatFresh(record, s.observedAt, staleThreshold) {
+			continue
+		}
+		keys := make([]string, 0, len(record.Labels))
+		for key := range record.Labels {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		var entry strings.Builder
+		entry.WriteString(strconv.Quote(record.WorkerID))
+		for _, key := range keys {
+			entry.WriteByte(':')
+			entry.WriteString(strconv.Quote(key))
+			entry.WriteByte('=')
+			entry.WriteString(strconv.Quote(record.Labels[key]))
+		}
+		entries = append(entries, entry.String())
+	}
+	sort.Strings(entries)
+	generation.fingerprint = sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return generation
+}
+
+func currentStatusString(status *ir.DAGRunStatus) string {
 	if status == nil {
 		return "unknown"
 	}
@@ -443,13 +766,13 @@ func readStartupExecutionError(execErrCh <-chan error) error {
 	}
 	select {
 	case err := <-execErrCh:
-		return err
+		return newStartupExecutionError(err)
 	default:
 		return nil
 	}
 }
 
-func queueAttemptKey(runRef exec.DAGRunRef, attempt exec.DAGRunAttempt, status *exec.DAGRunStatus) string {
+func queueAttemptKey(runRef ir.DAGRunRef, attempt dagrun.Attempt, status *ir.DAGRunStatus) string {
 	if status == nil {
 		return ""
 	}
@@ -464,12 +787,12 @@ func queueAttemptKey(runRef exec.DAGRunRef, attempt exec.DAGRunAttempt, status *
 	if attemptID == "" {
 		return ""
 	}
-	return exec.GenerateAttemptKey(runRef.Name, runRef.ID, runRef.Name, runRef.ID, attemptID)
+	return ir.GenerateAttemptKey(runRef.Name, runRef.ID, runRef.Name, runRef.ID, attemptID)
 }
 
 func (p *QueueProcessor) leaseStaleThresholdOrDefault() time.Duration {
 	if p.leaseStaleThreshold <= 0 {
-		return exec.DefaultStaleLeaseThreshold
+		return dagrun.DefaultStaleLeaseThreshold
 	}
 	return p.leaseStaleThreshold
 }

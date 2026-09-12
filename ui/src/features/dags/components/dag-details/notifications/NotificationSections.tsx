@@ -11,7 +11,7 @@ import {
   Trash2,
   XCircle,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { Badge } from '@/components/ui/badge';
@@ -19,6 +19,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import {
   Select,
   SelectContent,
@@ -48,8 +49,13 @@ import {
   PROVIDER_OPTIONS,
   replaceDeliveryProvider,
   TestResult,
+  WEBHOOK_BODY_TEMPLATE_PLACEHOLDER,
 } from './notificationDrafts';
 import type { EffectiveNotificationRoute } from './useNotificationSettings';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { useI18n } from '@/i18n/I18nProvider';
+import { I18nTemplate } from '@/i18n/I18nTemplate';
 
 type ProviderFieldsProps = {
   draft: DeliveryDraft;
@@ -57,71 +63,87 @@ type ProviderFieldsProps = {
 };
 
 function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
+  const { ts } = useI18n();
+  const fieldId = useId();
   const update = (patch: Partial<DeliveryDraft>) =>
     onChange({ ...draft, ...patch });
 
   if (draft.type === NotificationProviderType.email) {
     return (
       <div className="grid gap-3 md:grid-cols-2">
-        <Input
-          value={draft.email.to}
-          placeholder="To"
-          onChange={(event) =>
-            update({ email: { ...draft.email, to: event.target.value } })
-          }
-        />
-        <Input
-          value={draft.email.from}
-          placeholder="From"
-          onChange={(event) =>
-            update({ email: { ...draft.email, from: event.target.value } })
-          }
-        />
-        <Input
-          value={draft.email.cc}
-          placeholder="Cc"
-          onChange={(event) =>
-            update({ email: { ...draft.email, cc: event.target.value } })
-          }
-        />
-        <Input
-          value={draft.email.bcc}
-          placeholder="Bcc"
-          onChange={(event) =>
-            update({ email: { ...draft.email, bcc: event.target.value } })
-          }
-        />
-        <Input
-          value={draft.email.subjectPrefix}
-          placeholder="Subject prefix"
-          onChange={(event) =>
-            update({
-              email: { ...draft.email, subjectPrefix: event.target.value },
-            })
-          }
-        />
-        <Textarea
-          className="md:col-span-2"
-          aria-label="Email subject template"
-          value={draft.email.subjectTemplate}
-          placeholder={DEFAULT_SUBJECT_TEMPLATE}
-          onChange={(event) =>
-            update({
-              email: { ...draft.email, subjectTemplate: event.target.value },
-            })
-          }
-        />
-        <Textarea
-          className="min-h-24 md:col-span-2"
-          aria-label="Email body template"
-          value={draft.email.bodyTemplate}
-          placeholder={DEFAULT_MESSAGE_TEMPLATE}
-          onChange={(event) =>
-            update({
-              email: { ...draft.email, bodyTemplate: event.target.value },
-            })
-          }
-        />
+        <I18nProps>
+          <Input
+            value={draft.email.to}
+            placeholder="To"
+            onChange={(event) =>
+              update({ email: { ...draft.email, to: event.target.value } })
+            }
+          />
+        </I18nProps>
+        <I18nProps>
+          <Input
+            value={draft.email.from}
+            placeholder="From"
+            onChange={(event) =>
+              update({ email: { ...draft.email, from: event.target.value } })
+            }
+          />
+        </I18nProps>
+        <I18nProps>
+          <Input
+            value={draft.email.cc}
+            placeholder="Cc"
+            onChange={(event) =>
+              update({ email: { ...draft.email, cc: event.target.value } })
+            }
+          />
+        </I18nProps>
+        <I18nProps>
+          <Input
+            value={draft.email.bcc}
+            placeholder="Bcc"
+            onChange={(event) =>
+              update({ email: { ...draft.email, bcc: event.target.value } })
+            }
+          />
+        </I18nProps>
+        <I18nProps>
+          <Input
+            value={draft.email.subjectPrefix}
+            placeholder="Subject prefix"
+            onChange={(event) =>
+              update({
+                email: { ...draft.email, subjectPrefix: event.target.value },
+              })
+            }
+          />
+        </I18nProps>
+        <I18nProps>
+          <Textarea
+            className="md:col-span-2"
+            aria-label="Email subject template"
+            value={draft.email.subjectTemplate}
+            placeholder={DEFAULT_SUBJECT_TEMPLATE}
+            onChange={(event) =>
+              update({
+                email: { ...draft.email, subjectTemplate: event.target.value },
+              })
+            }
+          />
+        </I18nProps>
+        <I18nProps>
+          <Textarea
+            className="min-h-24 py-1 md:col-span-2"
+            aria-label="Email body template"
+            value={draft.email.bodyTemplate}
+            placeholder={DEFAULT_MESSAGE_TEMPLATE}
+            onChange={(event) =>
+              update({
+                email: { ...draft.email, bodyTemplate: event.target.value },
+              })
+            }
+          />
+        </I18nProps>
         <label className="flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm">
           <Checkbox
             checked={draft.email.attachLogs}
@@ -131,7 +153,7 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
               })
             }
           />
-          Attach logs
+          <I18nText text={'Attach logs'} />
         </label>
       </div>
     );
@@ -143,22 +165,34 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
       isSlackIncomingWebhookURL(draft.webhook.urlPreview || '');
     return (
       <div className="space-y-3">
-        <Input
-          value={draft.webhook.url}
-          placeholder={
-            draft.webhook.urlConfigured
-              ? `URL configured (${draft.webhook.urlPreview || 'saved'})`
-              : 'Webhook endpoint URL'
-          }
-          onChange={(event) =>
-            update({
-              webhook: { ...draft.webhook, url: event.target.value },
-            })
-          }
-        />
+        <div className="space-y-2">
+          <Label htmlFor={`${fieldId}-webhook-url`}>
+            <I18nText text={'Webhook endpoint URL'} />
+          </Label>
+          <Input
+            id={`${fieldId}-webhook-url`}
+            value={draft.webhook.url}
+            placeholder={
+              draft.webhook.urlConfigured
+                ? ts('URL configured ({preview})', {
+                    preview: draft.webhook.urlPreview || ts('saved'),
+                  })
+                : 'https://example.com/webhook'
+            }
+            onChange={(event) =>
+              update({
+                webhook: { ...draft.webhook, url: event.target.value },
+              })
+            }
+          />
+        </div>
         {hasSlackURL && (
           <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
-            This is a Slack Incoming Webhook URL. Select Slack as the provider.
+            <I18nText
+              text={
+                'This is a Slack Incoming Webhook URL. Select Slack as the provider.'
+              }
+            />
           </div>
         )}
         {draft.webhook.headerPreviews &&
@@ -173,22 +207,24 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
               )}
             </div>
           )}
-        <Textarea
-          value={draft.webhook.headers}
-          placeholder="Header-Name: value"
-          onChange={(event) =>
-            update({
-              webhook: { ...draft.webhook, headers: event.target.value },
-            })
-          }
-        />
+        <I18nProps>
+          <Textarea
+            value={draft.webhook.headers}
+            placeholder="Header-Name: value"
+            onChange={(event) =>
+              update({
+                webhook: { ...draft.webhook, headers: event.target.value },
+              })
+            }
+          />
+        </I18nProps>
         <Input
           type="password"
           value={draft.webhook.hmacSecret}
           placeholder={
             draft.webhook.hmacSecretConfigured
-              ? 'HMAC secret configured'
-              : 'HMAC secret'
+              ? ts('HMAC secret configured')
+              : ts('HMAC secret')
           }
           onChange={(event) =>
             update({
@@ -196,20 +232,72 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
             })
           }
         />
-        <Textarea
-          className="min-h-24"
-          aria-label="Webhook message template"
-          value={draft.webhook.messageTemplate}
-          placeholder={DEFAULT_MESSAGE_TEMPLATE}
-          onChange={(event) =>
-            update({
-              webhook: {
-                ...draft.webhook,
-                messageTemplate: event.target.value,
-              },
-            })
-          }
-        />
+        <div className="space-y-2">
+          <Label htmlFor={`${fieldId}-webhook-message-template`}>
+            <I18nText text={'Webhook message template'} />
+          </Label>
+          <Textarea
+            id={`${fieldId}-webhook-message-template`}
+            className="min-h-24 py-1"
+            value={draft.webhook.messageTemplate}
+            placeholder={DEFAULT_MESSAGE_TEMPLATE}
+            onChange={(event) =>
+              update({
+                webhook: {
+                  ...draft.webhook,
+                  messageTemplate: event.target.value,
+                },
+              })
+            }
+          />
+          <p className="text-xs text-muted-foreground">
+            <I18nTemplate
+              text="Supports tokens such as {dag}, {status}, {error}, and {link}."
+              values={{
+                dag: <code>{'{{dag.name}}'}</code>,
+                status: <code>{'{{run.status}}'}</code>,
+                error: <code>{'{{run.error}}'}</code>,
+                link: <code>{'{{run.link}}'}</code>,
+              }}
+            />
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor={`${fieldId}-webhook-body-template`}>
+            <I18nText text={'Webhook JSON body template'} />
+          </Label>
+          <Textarea
+            id={`${fieldId}-webhook-body-template`}
+            className="min-h-24 py-1 font-mono"
+            value={draft.webhook.bodyTemplate}
+            placeholder={WEBHOOK_BODY_TEMPLATE_PLACEHOLDER}
+            onChange={(event) =>
+              update({
+                webhook: {
+                  ...draft.webhook,
+                  bodyTemplate: event.target.value,
+                },
+              })
+            }
+          />
+          <p className="text-xs text-muted-foreground">
+            <I18nText
+              text={
+                'Optional. Replaces the default webhook payload and must render as valid JSON. Supports the message-template tokens plus'
+              }
+            />{' '}
+            <code>{'{{message}}'}</code>
+            <I18nText
+              text={'. Leave blank to keep the default Dagu payload.'}
+            />
+          </p>
+          <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs">
+            <div className="mb-1 text-muted-foreground">
+              <I18nText text={'Example'} />
+            </div>
+            <code>{'{"text": "{{message}}"}'}</code>
+          </div>
+        </div>
         <div className="grid gap-2 md:grid-cols-2">
           <label className="flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm">
             <Checkbox
@@ -220,7 +308,7 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
                 })
               }
             />
-            Clear headers
+            <I18nText text={'Clear headers'} />
           </label>
           <label className="flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm">
             <Checkbox
@@ -231,7 +319,7 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
                 })
               }
             />
-            Clear HMAC
+            <I18nText text={'Clear HMAC'} />
           </label>
           <label className="flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm">
             <Checkbox
@@ -242,7 +330,7 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
                 })
               }
             />
-            Allow HTTP
+            <I18nText text={'Allow HTTP'} />
           </label>
           <label className="flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm">
             <Checkbox
@@ -253,7 +341,7 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
                 })
               }
             />
-            Allow private network
+            <I18nText text={'Allow private network'} />
           </label>
         </div>
       </div>
@@ -268,8 +356,10 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
           value={draft.slack.webhookUrl}
           placeholder={
             draft.slack.webhookUrlConfigured
-              ? `Webhook URL configured (${draft.slack.webhookUrlPreview || 'saved'})`
-              : 'Slack webhook URL'
+              ? ts('Webhook URL configured ({preview})', {
+                  preview: draft.slack.webhookUrlPreview || ts('saved'),
+                })
+              : ts('Slack webhook URL')
           }
           onChange={(event) =>
             update({
@@ -277,20 +367,104 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
             })
           }
         />
-        <Textarea
-          className="min-h-24"
-          aria-label="Slack message template"
-          value={draft.slack.messageTemplate}
-          placeholder={DEFAULT_MESSAGE_TEMPLATE}
-          onChange={(event) =>
-            update({
-              slack: {
-                ...draft.slack,
-                messageTemplate: event.target.value,
-              },
-            })
-          }
-        />
+        <I18nProps>
+          <Textarea
+            className="min-h-24 py-1"
+            aria-label="Slack message template"
+            value={draft.slack.messageTemplate}
+            placeholder={DEFAULT_MESSAGE_TEMPLATE}
+            onChange={(event) =>
+              update({
+                slack: {
+                  ...draft.slack,
+                  messageTemplate: event.target.value,
+                },
+              })
+            }
+          />
+        </I18nProps>
+      </div>
+    );
+  }
+
+  if (draft.type === NotificationProviderType.teams) {
+    return (
+      <div className="space-y-3">
+        <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+          <I18nText
+            text={
+              'Create an incoming-webhook Workflow in Teams, select its destination, save it, and copy the generated URL. Dagu sends the compatible MessageCard format automatically.'
+            }
+          />{' '}
+          <a
+            className="font-medium text-primary underline-offset-4 hover:underline"
+            href="https://support.microsoft.com/en-US/Workflows/send-messages-in-teams-using-incoming-webhooks"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <I18nText text={'Open Microsoft setup guide'} />
+          </a>
+          .
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor={`${fieldId}-teams-webhook-url`}>
+            <I18nText text={'Teams webhook URL'} />
+          </Label>
+          <Input
+            id={`${fieldId}-teams-webhook-url`}
+            type="password"
+            value={draft.teams.webhookUrl}
+            placeholder={
+              draft.teams.webhookUrlConfigured
+                ? ts('Webhook URL configured ({preview})', {
+                    preview: draft.teams.webhookUrlPreview || ts('saved'),
+                  })
+                : 'https://...'
+            }
+            onChange={(event) =>
+              update({
+                teams: { ...draft.teams, webhookUrl: event.target.value },
+              })
+            }
+          />
+          <p className="text-xs text-muted-foreground">
+            <I18nText
+              text={
+                'Only HTTPS URLs are accepted. A saved URL remains configured unless it is replaced.'
+              }
+            />
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor={`${fieldId}-teams-message-template`}>
+            <I18nText text={'Teams message template'} />
+          </Label>
+          <Textarea
+            id={`${fieldId}-teams-message-template`}
+            className="min-h-24 py-1"
+            value={draft.teams.messageTemplate}
+            placeholder={DEFAULT_MESSAGE_TEMPLATE}
+            onChange={(event) =>
+              update({
+                teams: {
+                  ...draft.teams,
+                  messageTemplate: event.target.value,
+                },
+              })
+            }
+          />
+          <p className="text-xs text-muted-foreground">
+            <I18nTemplate
+              text="Supports tokens such as {dag}, {status}, {error}, and {link}."
+              values={{
+                dag: <code>{'{{dag.name}}'}</code>,
+                status: <code>{'{{run.status}}'}</code>,
+                error: <code>{'{{run.error}}'}</code>,
+                link: <code>{'{{run.link}}'}</code>,
+              }}
+            />
+          </p>
+        </div>
       </div>
     );
   }
@@ -303,8 +477,10 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
           value={draft.telegram.botToken}
           placeholder={
             draft.telegram.botTokenConfigured
-              ? `Bot token configured (${draft.telegram.botTokenPreview || 'saved'})`
-              : 'Bot token'
+              ? ts('Bot token configured ({preview})', {
+                  preview: draft.telegram.botTokenPreview || ts('saved'),
+                })
+              : ts('Bot token')
           }
           onChange={(event) =>
             update({
@@ -312,30 +488,46 @@ function ProviderFields({ draft, onChange }: ProviderFieldsProps) {
             })
           }
         />
+        <I18nProps>
+          <Input
+            value={draft.telegram.chatId}
+            placeholder="Chat ID"
+            onChange={(event) =>
+              update({
+                telegram: { ...draft.telegram, chatId: event.target.value },
+              })
+            }
+          />
+        </I18nProps>
+      </div>
+      <I18nProps>
         <Input
-          value={draft.telegram.chatId}
-          placeholder="Chat ID"
+          aria-label="Telegram topic ID"
+          value={draft.telegram.topicId}
+          placeholder="Topic ID (optional, for forum groups)"
           onChange={(event) =>
             update({
-              telegram: { ...draft.telegram, chatId: event.target.value },
+              telegram: { ...draft.telegram, topicId: event.target.value },
             })
           }
         />
-      </div>
-      <Textarea
-        className="min-h-24"
-        aria-label="Telegram message template"
-        value={draft.telegram.messageTemplate}
-        placeholder={DEFAULT_MESSAGE_TEMPLATE}
-        onChange={(event) =>
-          update({
-            telegram: {
-              ...draft.telegram,
-              messageTemplate: event.target.value,
-            },
-          })
-        }
-      />
+      </I18nProps>
+      <I18nProps>
+        <Textarea
+          className="min-h-24 py-1"
+          aria-label="Telegram message template"
+          value={draft.telegram.messageTemplate}
+          placeholder={DEFAULT_MESSAGE_TEMPLATE}
+          onChange={(event) =>
+            update({
+              telegram: {
+                ...draft.telegram,
+                messageTemplate: event.target.value,
+              },
+            })
+          }
+        />
+      </I18nProps>
     </div>
   );
 }
@@ -365,27 +557,40 @@ function EventFilterEditor({ events, onChange }: EventFilterEditorProps) {
                 )
               }
             />
-            {event.label}
+            <I18nText text={event.label} />
           </label>
         );
       })}
       {events.length > 0 && (
         <Button variant="ghost" size="sm" onClick={() => onChange([])}>
-          Use DAG events
+          <I18nText text={'Use DAG events'} />
         </Button>
       )}
     </div>
   );
 }
 
-function eventSummary(events: NotificationEventType[]): string {
-  if (events.length === 0) {
-    return 'Same as DAG events';
-  }
+function EventSummary({
+  events,
+  fallback,
+}: {
+  events: NotificationEventType[];
+  fallback: string;
+}) {
   const labels = EVENT_OPTIONS.filter((event) =>
     events.includes(event.value)
   ).map((event) => event.label);
-  return labels.length > 0 ? labels.join(', ') : 'Custom events';
+
+  if (labels.length === 0) {
+    return <I18nText text={fallback} />;
+  }
+
+  return labels.map((label, index) => (
+    <span key={label}>
+      {index > 0 ? ', ' : ''}
+      <I18nText text={label} />
+    </span>
+  ));
 }
 
 type NotificationOverviewCardProps = {
@@ -418,26 +623,40 @@ export function NotificationOverviewCard({
       <CardHeader className="grid-cols-[1fr_auto]">
         <div className="flex items-center gap-2">
           <Bell className="h-4 w-4 text-muted-foreground" />
-          <CardTitle className="text-sm">Notification Source</CardTitle>
+          <CardTitle className="text-sm">
+            <I18nText text={'Notification Source'} />
+          </CardTitle>
           <Badge variant={isDAGConfigured ? 'success' : 'default'}>
-            {isDAGConfigured ? 'DAG override' : 'Inherited'}
+            {isDAGConfigured ? (
+              <I18nText text={'DAG override'} />
+            ) : (
+              <I18nText text={'Inherited'} />
+            )}
           </Badge>
           {isDAGConfigured && (
             <Badge variant={draft.enabled ? 'success' : 'default'}>
-              {draft.enabled ? 'Override on' : 'Override off'}
+              {draft.enabled ? (
+                <I18nText text={'Override on'} />
+              ) : (
+                <I18nText text={'Override off'} />
+              )}
             </Badge>
           )}
           {hasUnsavedChanges && (
-            <Badge variant="warning">Unsaved changes</Badge>
+            <Badge variant="warning">
+              <I18nText text={'Unsaved changes'} />
+            </Badge>
           )}
         </div>
         <div className="flex items-center justify-end">
           {isDAGConfigured && (
-            <Switch
-              checked={draft.enabled}
-              onCheckedChange={onEnabledChange}
-              aria-label="Toggle notifications"
-            />
+            <I18nProps>
+              <Switch
+                checked={draft.enabled}
+                onCheckedChange={onEnabledChange}
+                aria-label="Toggle notifications"
+              />
+            </I18nProps>
           )}
         </div>
       </CardHeader>
@@ -458,7 +677,7 @@ export function NotificationOverviewCard({
         {isDAGConfigured ? (
           <div className="space-y-2">
             <div className="text-sm font-medium text-foreground">
-              Send notifications when this DAG is
+              <I18nText text={'Send notifications when this DAG is'} />
             </div>
             <div className="flex flex-wrap gap-2">
               {EVENT_OPTIONS.map((event) => {
@@ -486,30 +705,45 @@ export function NotificationOverviewCard({
               })}
             </div>
             <div className="text-xs text-muted-foreground">
-              This DAG override replaces workspace and Global rules for future
-              runs. Send test verifies delivery now.
+              <I18nText
+                text={
+                  'This DAG override replaces workspace and Global rules for future runs. Send test verifies delivery now.'
+                }
+              />
             </div>
             {!hasDAGDestinations && (
-              <div className="rounded-md border border-warning/20 bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
-                This DAG override has no destinations. Inherited rules are not
-                used while the override exists.
+              <div className="rounded-md border border-warning/20 bg-warning/10 px-3 py-2 text-sm text-foreground">
+                <I18nText
+                  text={
+                    'This DAG override has no destinations. Inherited rules are not used while the override exists.'
+                  }
+                />
               </div>
             )}
             {hasUnsavedChanges && (
               <div className="text-xs text-muted-foreground">
-                Save changes before leaving this page or sending a test.
+                <I18nText
+                  text={
+                    'Save changes before leaving this page or sending a test.'
+                  }
+                />
               </div>
             )}
           </div>
         ) : (
           <div className="rounded-md border border-border bg-muted/30 px-3 py-4">
             <div className="text-sm font-medium text-foreground">
-              This DAG inherits {inheritedSourceLabel}.
+              <I18nText
+                text="This DAG inherits {source}."
+                values={{ source: inheritedSourceLabel }}
+              />
             </div>
             <div className="mt-1 text-sm text-muted-foreground">
-              Create a DAG override only when this DAG needs different events or
-              destinations. The effective order is DAG, then workspace, then
-              Global.
+              <I18nText
+                text={
+                  'Create a DAG override only when this DAG needs different events or destinations. The effective order is DAG, then workspace, then Global.'
+                }
+              />
             </div>
           </div>
         )}
@@ -537,7 +771,11 @@ export function NotificationOverviewCard({
                   )}
                 </div>
                 <Badge variant={result.delivered ? 'success' : 'error'}>
-                  {result.delivered ? 'Delivered' : 'Failed'}
+                  {result.delivered ? (
+                    <I18nText text={'Delivered'} />
+                  ) : (
+                    <I18nText text={'Failed'} />
+                  )}
                 </Badge>
               </div>
             ))}
@@ -546,13 +784,6 @@ export function NotificationOverviewCard({
       </CardContent>
     </Card>
   );
-}
-
-function inheritedRouteEventSummary(events: NotificationEventType[]): string {
-  const labels = EVENT_OPTIONS.filter((event) =>
-    events.includes(event.value)
-  ).map((event) => event.label);
-  return labels.length > 0 ? labels.join(', ') : 'No events';
 }
 
 type InheritedNotificationRoutesCardProps = {
@@ -576,7 +807,7 @@ export function InheritedNotificationRoutesCard({
         <div className="flex min-w-0 items-center gap-2">
           <Link2 className="h-4 w-4 shrink-0 text-muted-foreground" />
           <CardTitle className="truncate text-sm">
-            Effective Inherited Routes
+            <I18nText text={'Effective Inherited Routes'} />
           </CardTitle>
           <Badge variant={enabledRoutes.length > 0 ? 'success' : 'default'}>
             {sourceLabel}
@@ -585,14 +816,14 @@ export function InheritedNotificationRoutesCard({
         <Button asChild variant="outline" size="sm">
           <Link to={manageRulesHref}>
             <Settings className="h-4 w-4" />
-            Manage rules
+            <I18nText text={'Manage rules'} />
           </Link>
         </Button>
       </CardHeader>
       <CardContent>
         {routes.length === 0 ? (
           <div className="text-sm text-muted-foreground">
-            No inherited route is configured for this DAG.
+            <I18nText text={'No inherited route is configured for this DAG.'} />
           </div>
         ) : (
           <div className="divide-y divide-border rounded-md border border-border">
@@ -610,11 +841,15 @@ export function InheritedNotificationRoutesCard({
                       {route.channelName}
                     </span>
                     <Badge variant={active ? 'success' : 'default'}>
-                      {active ? 'Active' : 'Inactive'}
+                      {active ? (
+                        <I18nText text={'Active'} />
+                      ) : (
+                        <I18nText text={'Inactive'} />
+                      )}
                     </Badge>
                   </div>
                   <div className="text-xs text-muted-foreground">
-                    {inheritedRouteEventSummary(route.events)}
+                    <EventSummary events={route.events} fallback="No events" />
                   </div>
                 </div>
               );
@@ -650,18 +885,18 @@ export function NotificationChannelsSection({
     <>
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-foreground">
-          Notification Channels
+          <I18nText text={'Notification Channels'} />
         </h3>
         <Button variant="outline" size="sm" onClick={onAdd}>
           <Plus className="h-4 w-4" />
-          Add
+          <I18nText text={'Add'} />
         </Button>
       </div>
 
       {channels.length === 0 ? (
         <Card>
           <CardContent className="py-8 text-sm text-muted-foreground">
-            No channels configured.
+            <I18nText text={'No channels configured.'} />
           </CardContent>
         </Card>
       ) : (
@@ -677,9 +912,17 @@ export function NotificationChannelsSection({
                       {deliveryLabel(channel)}
                     </CardTitle>
                     <Badge variant={channel.enabled ? 'success' : 'default'}>
-                      {channel.enabled ? 'Enabled' : 'Disabled'}
+                      {channel.enabled ? (
+                        <I18nText text={'Enabled'} />
+                      ) : (
+                        <I18nText text={'Disabled'} />
+                      )}
                     </Badge>
-                    {!channel.id && <Badge variant="warning">New</Badge>}
+                    {!channel.id && (
+                      <Badge variant="warning">
+                        <I18nText text={'New'} />
+                      </Badge>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <Switch
@@ -703,7 +946,7 @@ export function NotificationChannelsSection({
                       ) : (
                         <Save className="h-4 w-4" />
                       )}
-                      Save
+                      <I18nText text={'Save'} />
                     </Button>
                     <Button
                       variant="ghost"
@@ -717,16 +960,18 @@ export function NotificationChannelsSection({
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px]">
-                    <Input
-                      value={channel.name}
-                      placeholder="Channel name"
-                      onChange={(event) =>
-                        onUpdate(index, (current) => ({
-                          ...current,
-                          name: event.target.value,
-                        }))
-                      }
-                    />
+                    <I18nProps>
+                      <Input
+                        value={channel.name}
+                        placeholder="Channel name"
+                        onChange={(event) =>
+                          onUpdate(index, (current) => ({
+                            ...current,
+                            name: event.target.value,
+                          }))
+                        }
+                      />
+                    </I18nProps>
                     <Select
                       value={channel.type}
                       onValueChange={(value) =>
@@ -828,13 +1073,15 @@ export function DAGSubscriptionsSection({
   return (
     <>
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-foreground">Send to</h3>
+        <h3 className="text-sm font-medium text-foreground">
+          <I18nText text={'Send to'} />
+        </h3>
         <div className="flex items-center gap-2">
           {manageChannelsHref && (
             <Button asChild variant="ghost" size="sm">
               <Link to={manageChannelsHref}>
                 <Settings className="h-4 w-4" />
-                Manage channels
+                <I18nText text={'Manage channels'} />
               </Link>
             </Button>
           )}
@@ -845,7 +1092,7 @@ export function DAGSubscriptionsSection({
             disabled={channels.filter((channel) => channel.id).length === 0}
           >
             <Plus className="h-4 w-4" />
-            Add channel
+            <I18nText text={'Add channel'} />
           </Button>
         </div>
       </div>
@@ -853,10 +1100,15 @@ export function DAGSubscriptionsSection({
       {draft.subscriptions.length === 0 ? (
         <Card>
           <CardContent className="space-y-2 py-8 text-sm text-muted-foreground">
-            <div>No DAG override channels selected.</div>
             <div>
-              Inherited rules are not used while this DAG override exists. Add a
-              channel or reset to inherit.
+              <I18nText text={'No DAG override channels selected.'} />
+            </div>
+            <div>
+              <I18nText
+                text={
+                  'Inherited rules are not used while this DAG override exists. Add a channel or reset to inherit.'
+                }
+              />
             </div>
           </CardContent>
         </Card>
@@ -894,14 +1146,22 @@ export function DAGSubscriptionsSection({
                             : 'default'
                         }
                       >
-                        {subscription.enabled && channel?.enabled
-                          ? 'Enabled'
-                          : 'Disabled'}
+                        {subscription.enabled && channel?.enabled ? (
+                          <I18nText text={'Enabled'} />
+                        ) : (
+                          <I18nText text={'Disabled'} />
+                        )}
                       </Badge>
                       {!subscription.id && (
-                        <Badge variant="warning">Unsaved</Badge>
+                        <Badge variant="warning">
+                          <I18nText text={'Unsaved'} />
+                        </Badge>
                       )}
-                      {!channel && <Badge variant="error">Missing</Badge>}
+                      {!channel && (
+                        <Badge variant="error">
+                          <I18nText text={'Missing'} />
+                        </Badge>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       <Switch
@@ -928,7 +1188,7 @@ export function DAGSubscriptionsSection({
                         ) : (
                           <FlaskConical className="h-4 w-4" />
                         )}
-                        Send test
+                        <I18nText text={'Send test'} />
                       </Button>
                       <Button
                         variant="ghost"
@@ -973,7 +1233,15 @@ export function DAGSubscriptionsSection({
 
                     <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-sm">
                       <span className="text-muted-foreground">
-                        Events: {eventSummary(subscription.events)}
+                        <I18nText text={'Events:'} />{' '}
+                        <EventSummary
+                          events={subscription.events}
+                          fallback={
+                            subscription.events.length === 0
+                              ? 'Same as DAG events'
+                              : 'Custom events'
+                          }
+                        />
                       </span>
                       <div className="flex items-center gap-2">
                         {hasCustomEvents && (
@@ -987,7 +1255,7 @@ export function DAGSubscriptionsSection({
                               }))
                             }
                           >
-                            Use DAG events
+                            <I18nText text={'Use DAG events'} />
                           </Button>
                         )}
                         <Button
@@ -995,7 +1263,11 @@ export function DAGSubscriptionsSection({
                           size="sm"
                           onClick={() => toggleEventRow(rowKey)}
                         >
-                          {eventsExpanded ? 'Hide events' : 'Customize events'}
+                          {eventsExpanded ? (
+                            <I18nText text={'Hide events'} />
+                          ) : (
+                            <I18nText text={'Customize events'} />
+                          )}
                         </Button>
                       </div>
                     </div>
@@ -1047,7 +1319,7 @@ export function DAGLocalTargetsSection({
       <div className="flex flex-wrap justify-end gap-2">
         <Button variant="ghost" size="sm" onClick={onAdd}>
           <Link2 className="h-4 w-4" />
-          Add custom destination
+          <I18nText text={'Add custom destination'} />
         </Button>
       </div>
     );
@@ -1057,12 +1329,12 @@ export function DAGLocalTargetsSection({
     <>
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-foreground">
-          Custom Destinations
+          <I18nText text={'Custom Destinations'} />
         </h3>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={onAdd}>
             <Plus className="h-4 w-4" />
-            Add custom
+            <I18nText text={'Add custom'} />
           </Button>
         </div>
       </div>
@@ -1078,9 +1350,17 @@ export function DAGLocalTargetsSection({
                     {deliveryLabel(target)}
                   </CardTitle>
                   <Badge variant={target.enabled ? 'success' : 'default'}>
-                    {target.enabled ? 'Enabled' : 'Disabled'}
+                    {target.enabled ? (
+                      <I18nText text={'Enabled'} />
+                    ) : (
+                      <I18nText text={'Disabled'} />
+                    )}
                   </Badge>
-                  {!target.id && <Badge variant="warning">Unsaved</Badge>}
+                  {!target.id && (
+                    <Badge variant="warning">
+                      <I18nText text={'Unsaved'} />
+                    </Badge>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   <Switch
@@ -1106,7 +1386,7 @@ export function DAGLocalTargetsSection({
                     ) : (
                       <FlaskConical className="h-4 w-4" />
                     )}
-                    Send test
+                    <I18nText text={'Send test'} />
                   </Button>
                   <Button
                     variant="ghost"
@@ -1120,25 +1400,24 @@ export function DAGLocalTargetsSection({
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px]">
-                  <Input
-                    value={target.name}
-                    placeholder="Target name"
-                    onChange={(event) =>
-                      onUpdate(index, (current) => ({
-                        ...current,
-                        name: event.target.value,
-                      }))
-                    }
-                  />
+                  <I18nProps>
+                    <Input
+                      value={target.name}
+                      placeholder="Target name"
+                      onChange={(event) =>
+                        onUpdate(index, (current) => ({
+                          ...current,
+                          name: event.target.value,
+                        }))
+                      }
+                    />
+                  </I18nProps>
                   <Select
                     value={target.type}
                     onValueChange={(value) =>
                       onUpdate(index, (current) => {
                         const nextType = value as NotificationProviderType;
-                        const next = replaceDeliveryProvider(
-                          current,
-                          nextType
-                        );
+                        const next = replaceDeliveryProvider(current, nextType);
                         return {
                           ...next,
                           id: current.id,

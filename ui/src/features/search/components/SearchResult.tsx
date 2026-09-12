@@ -4,18 +4,20 @@
 import { Button } from '@/components/ui/button';
 import { useClient } from '@/hooks/api';
 import { cn } from '@/lib/utils';
+import { encodeWikiPagePathForURL } from '@/pages/wiki/lib/wiki-page-path';
 import {
-  visibleDocumentPathForWorkspace,
-  workspaceDocumentQueryForWorkspace,
+  visibleWikiPagePathForWorkspace,
+  workspaceWikiQueryForWorkspace,
 } from '@/lib/workspace';
 import React from 'react';
 import { Link } from 'react-router-dom';
 import { components } from '../../../api/v1/schema';
 import { AppBarContext } from '../../../contexts/AppBarContext';
+import { I18nText } from '@/i18n/I18nText';
 
 type SearchMatch = components['schemas']['SearchMatchItem'];
 type DagResult = components['schemas']['DAGSearchPageItem'];
-type DocResult = components['schemas']['DocSearchPageItem'];
+type WikiPageResult = components['schemas']['WikiPageSearchPageItem'];
 type DAGWorkspaceQuery = {
   workspace?: string;
 };
@@ -27,6 +29,12 @@ type LoadMoreResponse = {
   nextCursor?: string;
 };
 
+type SearchMatchesResponse = components['schemas']['SearchMatchesResponse'];
+type SearchMatchesRequest = () => Promise<{
+  data?: SearchMatchesResponse;
+  error?: { message?: string };
+}>;
+
 type Props =
   | {
       type: 'dag';
@@ -34,10 +42,10 @@ type Props =
       results: DagResult[];
       workspaceQuery?: DAGWorkspaceQuery;
     }
-  | { type: 'doc'; query: string; results: DocResult[] };
+  | { type: 'wiki'; query: string; results: WikiPageResult[] };
 
 type SearchResultItemProps = {
-  kind: 'DAG' | 'Doc';
+  kind: 'DAG' | 'Wiki';
   title: string;
   link: string;
   query: string;
@@ -46,6 +54,27 @@ type SearchResultItemProps = {
   initialNextCursor?: string;
   loadMore: (cursor?: string) => Promise<LoadMoreResponse>;
 };
+
+async function fetchSearchMatches(
+  request: SearchMatchesRequest
+): Promise<LoadMoreResponse> {
+  try {
+    const response = await request();
+    return {
+      error: response.error?.message || undefined,
+      matches: response.data?.matches ?? [],
+      hasMore: response.data?.hasMore ?? false,
+      nextCursor: response.data?.nextCursor,
+    };
+  } catch (error) {
+    return {
+      error:
+        error instanceof Error ? error.message : 'Failed to load more matches',
+      matches: [],
+      hasMore: false,
+    };
+  }
+}
 
 function SearchSnippet({ match }: { match: SearchMatch }) {
   const lines = match.line.split('\n');
@@ -141,7 +170,7 @@ function SearchResultItem({
             </h3>
           </Link>
           <span className="shrink-0 text-xs text-muted-foreground">
-            {matches.length} shown
+            {matches.length} <I18nText text={"shown"} />
           </span>
         </div>
 
@@ -166,7 +195,7 @@ function SearchResultItem({
                 void loadMoreMatches();
               }}
             >
-              {isLoadingMore ? 'Loading...' : 'Show more matches'}
+              {isLoadingMore ? <I18nText text={"Loading..."} /> : <I18nText text={"Show more matches"} />}
             </Button>
           </div>
         )}
@@ -196,10 +225,9 @@ function SearchResult(props: Props) {
             initialMatches: result.matches ?? [],
             initialHasMoreMatches: result.hasMoreMatches,
             initialNextCursor: result.nextMatchesCursor,
-            loadMore: async (cursor?: string): Promise<LoadMoreResponse> => {
-              const response = await client.GET(
-                '/search/dags/{fileName}/matches',
-                {
+            loadMore: (cursor?: string) =>
+              fetchSearchMatches(() =>
+                client.GET('/search/dags/{fileName}/matches', {
                   params: {
                     path: { fileName: result.fileName },
                     query: {
@@ -209,57 +237,43 @@ function SearchResult(props: Props) {
                       ...dagWorkspaceQuery,
                     },
                   },
-                }
-              );
-
-              return {
-                error: response.error?.message || undefined,
-                matches: response.data?.matches ?? [],
-                hasMore: response.data?.hasMore ?? false,
-                nextCursor: response.data?.nextCursor,
-              };
-            },
+                })
+              ),
           };
         })
       : results.map((result) => {
-          const docPath = visibleDocumentPathForWorkspace(
+          const wikiPagePath = visibleWikiPagePathForWorkspace(
             result.id,
             result.workspace
           );
-          const docWorkspaceQuery = workspaceDocumentQueryForWorkspace(
+          const wikiWorkspaceQuery = workspaceWikiQueryForWorkspace(
             result.workspace
           );
           const linkSearch = result.workspace
             ? `?workspace=${encodeURIComponent(result.workspace)}`
             : '';
           return {
-            key: `doc-${result.id}-${result.workspace ?? ''}-${query}`,
-            kind: 'Doc' as const,
+            key: `wiki-${result.id}-${result.workspace ?? ''}-${query}`,
+            kind: 'Wiki' as const,
             title: result.title,
-            link: `/docs/${encodeURI(docPath)}${linkSearch}`,
+            link: `/wiki/${encodeWikiPagePathForURL(wikiPagePath)}${linkSearch}`,
             initialMatches: result.matches ?? [],
             initialHasMoreMatches: result.hasMoreMatches,
             initialNextCursor: result.nextMatchesCursor,
-            loadMore: async (cursor?: string): Promise<LoadMoreResponse> => {
-              const response = await client.GET('/search/docs/matches', {
-                params: {
-                  query: {
-                    remoteNode,
-                    path: docPath,
-                    q: query,
-                    cursor,
-                    ...docWorkspaceQuery,
+            loadMore: (cursor?: string) =>
+              fetchSearchMatches(() =>
+                client.GET('/search/wiki/matches', {
+                  params: {
+                    query: {
+                      remoteNode,
+                      path: wikiPagePath,
+                      q: query,
+                      cursor,
+                      ...wikiWorkspaceQuery,
+                    },
                   },
-                },
-              });
-
-              return {
-                error: response.error?.message || undefined,
-                matches: response.data?.matches ?? [],
-                hasMore: response.data?.hasMore ?? false,
-                nextCursor: response.data?.nextCursor,
-              };
-            },
+                })
+              ),
           };
         });
 

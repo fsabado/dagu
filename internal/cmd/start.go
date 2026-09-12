@@ -14,18 +14,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/buildenv"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/dispatch"
-	"github.com/dagucloud/dagu/internal/runtime/agent"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/cmn/buildenv"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/runtime/agent"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/spf13/cobra"
 )
 
@@ -61,7 +64,7 @@ This command parses the DAG definition, resolves parameters, and initiates the D
 }
 
 // Command line flags for the start command
-var startFlags = []commandLineFlag{paramsFlag, nameFlag, dagRunIDFlag, fromRunIDFlag, parentDAGRunFlag, rootDAGRunFlag, labelsFlag, tagsFlag, defaultWorkingDirFlag, profileFlag, startWorkerIDFlag, attemptIDFlag, triggerTypeFlag, scheduleTimeFlag, sourceFileFlag}
+var startFlags = []commandLineFlag{paramsFlag, nameFlag, dagRunIDFlag, fromRunIDFlag, parentDAGRunFlag, rootDAGRunFlag, labelsFlag, tagsFlag, defaultWorkingDirFlag, profileFlag, startWorkerIDFlag, attemptIDFlag, triggerTypeFlag, triggerActorFlag, scheduleTimeFlag, sourceFileFlag, noReuseFlag}
 
 var fromRunIDFlag = commandLineFlag{
 	name:  "from-run-id",
@@ -79,6 +82,12 @@ var triggerTypeFlag = commandLineFlag{
 	name:         "trigger-type",
 	usage:        "How this DAG run was initiated (scheduler, manual, webhook, subdag, retry, catchup)",
 	defaultValue: "manual",
+}
+
+var triggerActorFlag = commandLineFlag{
+	name:   "trigger-actor",
+	usage:  "Attributable actor that initiated this DAG run",
+	hidden: true,
 }
 
 // scheduleTimeFlag records the cron fire time for scheduler-triggered runs
@@ -112,6 +121,10 @@ func runStart(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	triggerActor, err := ctx.StringParam("trigger-actor")
+	if err != nil {
+		return fmt.Errorf("failed to get trigger actor: %w", err)
+	}
 
 	scheduleTime, err := parseScheduleTimeParam(ctx)
 	if err != nil {
@@ -132,8 +145,9 @@ func runStart(ctx *Context, args []string) error {
 	}
 
 	var (
-		dag    *core.DAG
-		params string
+		dag             *ir.DAG
+		params          string
+		historicNoReuse bool
 	)
 
 	if fromRunID != "" {
@@ -149,7 +163,7 @@ func runStart(ctx *Context, args []string) error {
 			return fmt.Errorf("failed to resolve DAG name: %w", err)
 		}
 
-		attempt, err := ctx.DAGRunStore.FindAttempt(ctx, exec.NewDAGRunRef(dagName, fromRunID))
+		attempt, err := ctx.Persistence.DAGRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dagName, fromRunID))
 		if err != nil {
 			return fmt.Errorf("failed to find historic dag-run %s for DAG %s: %w", fromRunID, dagName, err)
 		}
@@ -161,6 +175,7 @@ func runStart(ctx *Context, args []string) error {
 		if profileName == "" {
 			profileName = status.ProfileName
 		}
+		historicNoReuse = status.NoReuse
 
 		snapshot, err := attempt.ReadDAG(ctx)
 		if err != nil {
@@ -178,7 +193,7 @@ func runStart(ctx *Context, args []string) error {
 			return fmt.Errorf("failed to read name override: %w", err)
 		}
 		if nameOverride != "" {
-			if err := core.ValidateDAGName(nameOverride); err != nil {
+			if err := ir.ValidateDAGName(nameOverride); err != nil {
 				return fmt.Errorf("invalid DAG name override: %w", err)
 			}
 			dag.Name = nameOverride
@@ -207,15 +222,36 @@ func runStart(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	noReuse, err := ctx.Command.Flags().GetBool("no-reuse")
+	if err != nil {
+		return fmt.Errorf("failed to read no-reuse: %w", err)
+	}
+	if fromRunID != "" && !ctx.Command.Flags().Changed("no-reuse") {
+		noReuse = historicNoReuse
+	}
+
+	opts := runOptions{
+		root:         root,
+		workerID:     workerID,
+		attemptID:    attemptID,
+		triggerType:  triggerType,
+		triggerActor: triggerActor,
+		parallelItem: parallelItemFromEnv(dag.Env),
+		scheduleTime: scheduleTime,
+		profileName:  profileName,
+		definitionID: dagDefinitionIDFromEnv(),
+		noReuse:      noReuse,
+	}
 
 	ctx.Context = logger.WithValues(ctx.Context, tag.DAG(dag.Name), tag.RunID(dagRunID))
 
 	if isSubDAGRun {
-		parent, err := exec.ParseDAGRunRef(parentRef)
+		parent, err := ir.ParseDAGRunRef(parentRef)
 		if err != nil {
 			return fmt.Errorf("failed to parse parent dag-run reference: %w", err)
 		}
-		return handleSubDAGRun(ctx, dag, dagRunID, params, root, parent, workerID, attemptID, triggerType, scheduleTime, profileName)
+		opts.parent = parent
+		return handleSubDAGRun(ctx, dag, dagRunID, params, opts)
 	}
 
 	if fromRunID != "" {
@@ -227,45 +263,52 @@ func runStart(ctx *Context, args []string) error {
 		logger.Info(ctx, "Executing root dag-run", slog.String("params", params))
 	}
 
-	return tryExecuteDAG(ctx, dag, dagRunID, root, workerID, attemptID, triggerType, scheduleTime, profileName)
+	return tryExecuteDAG(ctx, dag, dagRunID, opts)
 }
 
 // tryExecuteDAG acquires a process handle and executes the DAG.
-func tryExecuteDAG(ctx *Context, dag *core.DAG, dagRunID string, root exec.DAGRunRef, workerID, attemptID string, triggerType core.TriggerType, scheduleTime, profileName string) error {
+func tryExecuteDAG(ctx *Context, dag *ir.DAG, dagRunID string, opts runOptions) error {
+	if dag.Type == ir.TypeBuild && opts.workerID != "local" {
+		return dispatch.ErrBuildRequiresLocal
+	}
 	// Check for dispatch to coordinator for distributed execution.
 	// Skip if already running on a worker (workerID != "local").
-	if workerID == "local" {
-		coordinatorCli := ctx.NewCoordinatorClient()
+	if opts.workerID == "local" {
+		coordinatorCli, err := ctx.NewCoordinatorClient()
+		if err != nil {
+			return err
+		}
 		if dispatch.ShouldDispatchToCoordinator(dag, coordinatorCli != nil, ctx.Config.DefaultExecMode) {
-			return dispatchToCoordinatorAndWait(ctx, dag, dagRunID, scheduleTime, profileName, coordinatorCli)
+			if dag.Type == ir.TypeBuild {
+				return dispatch.ErrBuildRequiresLocal
+			}
+			return dispatchToCoordinatorAndWait(ctx, dag, dagRunID, opts, coordinatorCli)
 		}
 	}
 
-	if workerID != "local" && ctx.DAGRunStore == nil {
-		return executeDAGRun(ctx, dag, exec.DAGRunRef{}, dagRunID, root, workerID, attemptID, triggerType, scheduleTime, profileName, nil)
+	if opts.workerID != "local" && ctx.Persistence.DAGRunRepository == nil {
+		return executeDAGRun(ctx, dag, dagRunID, opts)
 	}
 
 	return withPreparedLocalExecution(
 		ctx,
 		dag,
 		dagRunID,
-		root,
-		exec.DAGRunRef{},
-		triggerType,
-		scheduleTime,
-		profileName,
-		func(execCtx context.Context) (exec.DAGRunAttempt, error) {
-			if workerID != "local" {
-				attempt, _, err := resolveWorkerPreparedAttempt(execCtx, ctx.DAGRunStore, dag.Name, dagRunID, root, attemptID)
+		opts,
+		func(execCtx context.Context) (dagrun.Attempt, error) {
+			if opts.workerID != "local" {
+				attempt, _, err := resolveWorkerPreparedAttempt(execCtx, ctx.Persistence.DAGRunRepository, dag.Name, dagRunID, opts.root, opts.attemptID)
 				if err != nil {
 					return nil, err
 				}
 				return attempt, nil
 			}
-			return ctx.DAGRunStore.CreateAttempt(execCtx, dag, time.Now(), dagRunID, exec.NewDAGRunAttemptOptions{})
+			return ctx.Persistence.DAGRunRepository.CreateAttempt(execCtx, dag, time.Now(), dagRunID, persis.DAGRunCreateAttemptOptions{})
 		},
-		func(preparedAttempt exec.DAGRunAttempt) error {
-			return executeDAGRun(ctx, dag, exec.DAGRunRef{}, dagRunID, root, workerID, attemptID, triggerType, scheduleTime, profileName, preparedAttempt)
+		func(preparedAttempt dagrun.Attempt) error {
+			run := opts
+			run.preparedAttempt = preparedAttempt
+			return executeDAGRun(ctx, dag, dagRunID, run)
 		},
 	)
 }
@@ -301,13 +344,18 @@ func getDAGRunInfo(ctx *Context) (dagRunID, rootDAGRun, parentDAGRun string, isS
 }
 
 // loadDAGWithParams loads the DAG and its parameters from command arguments.
-func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*core.DAG, string, error) {
+func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*ir.DAG, string, error) {
 	dagPath := args[0]
 
 	loadOpts := []spec.LoadOption{
 		spec.WithBaseConfig(ctx.Config.Paths.BaseConfig),
 		spec.WithWorkspaceBaseConfigDir(workspace.BaseConfigDir(ctx.Config.Paths.DAGsDir)),
 		spec.WithDAGsDir(ctx.Config.Paths.DAGsDir),
+	}
+	if definitionID := dagDefinitionIDFromEnv(); definitionID != "" {
+		loadOpts = append(loadOpts, spec.WithDefaultName(
+			fileutil.TrimYAMLFileExtension(filepath.Base(definitionID)),
+		))
 	}
 
 	if isSubDAGRun {
@@ -333,8 +381,8 @@ func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*core.DAG
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to load presolved build env: %w", err)
 	}
-	if len(presolvedBuildEnv) > 0 {
-		loadOpts = append(loadOpts, spec.WithBuildEnv(presolvedBuildEnv))
+	if len(presolvedBuildEnv.Env) > 0 || presolvedBuildEnv.RuntimeResolved {
+		loadOpts = append(loadOpts, spec.WithBuildEnvSnapshot(presolvedBuildEnv))
 	}
 
 	var params string
@@ -355,7 +403,11 @@ func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*core.DAG
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to load DAG from %s: %w", dagPath, err)
 	}
-	if sourceFile, err := ctx.StringParam("source-file"); err == nil && sourceFile != "" {
+	if ctx.Command.Flags().Changed(sourceFileFlag.name) {
+		sourceFile, err := ctx.StringParam(sourceFileFlag.name)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to get source file override: %w", err)
+		}
 		dag.SourceFile = sourceFile
 	}
 
@@ -363,14 +415,14 @@ func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*core.DAG
 }
 
 // parseAndAppendLabels parses the --labels flag and appends validated labels to the DAG.
-func parseAndAppendLabels(ctx *Context, dag *core.DAG) error {
+func parseAndAppendLabels(ctx *Context, dag *ir.DAG) error {
 	labelsStr, err := labelsParam(ctx)
 	if err != nil {
 		return err
 	}
 	if labelsStr != "" {
-		extraLabels := core.NewLabels(strings.Split(labelsStr, ","))
-		if err := core.ValidateLabels(extraLabels); err != nil {
+		extraLabels := ir.NewLabels(strings.Split(labelsStr, ","))
+		if err := ir.ValidateLabels(extraLabels); err != nil {
 			return fmt.Errorf("invalid labels: %w", err)
 		}
 		dag.Labels = append(dag.Labels, extraLabels...)
@@ -379,24 +431,24 @@ func parseAndAppendLabels(ctx *Context, dag *core.DAG) error {
 }
 
 // determineRootDAGRun creates or parses the root execution reference.
-func determineRootDAGRun(isSubDAGRun bool, rootDAGRun string, dag *core.DAG, dagRunID string) (exec.DAGRunRef, error) {
+func determineRootDAGRun(isSubDAGRun bool, rootDAGRun string, dag *ir.DAG, dagRunID string) (ir.DAGRunRef, error) {
 	if isSubDAGRun {
-		ref, err := exec.ParseDAGRunRef(rootDAGRun)
+		ref, err := ir.ParseDAGRunRef(rootDAGRun)
 		if err != nil {
-			return exec.DAGRunRef{}, fmt.Errorf("failed to parse root exec ref: %w", err)
+			return ir.DAGRunRef{}, fmt.Errorf("failed to parse root exec ref: %w", err)
 		}
 		return ref, nil
 	}
-	return exec.NewDAGRunRef(dag.Name, dagRunID), nil
+	return ir.NewDAGRunRef(dag.Name, dagRunID), nil
 }
 
 // handleSubDAGRun processes a sub dag-run, checking for previous runs.
-func handleSubDAGRun(ctx *Context, dag *core.DAG, dagRunID string, params string, root exec.DAGRunRef, parent exec.DAGRunRef, workerID, attemptID string, triggerType core.TriggerType, scheduleTime, profileName string) error {
+func handleSubDAGRun(ctx *Context, dag *ir.DAG, dagRunID string, params string, opts runOptions) error {
 	logger.Info(ctx, "Executing sub dag-run",
 		slog.String("params", params),
-		slog.Any("root", root),
-		slog.Any("parent", parent),
-		slog.String("workerID", workerID),
+		slog.Any("root", opts.root),
+		slog.Any("parent", opts.parent),
+		slog.String("workerID", opts.workerID),
 	)
 
 	if dagRunID == "" {
@@ -404,52 +456,48 @@ func handleSubDAGRun(ctx *Context, dag *core.DAG, dagRunID string, params string
 	}
 
 	// For distributed execution, the coordinator already created the sub-attempt record.
-	if workerID != "local" {
-		if ctx.DAGRunStore == nil {
-			return executeDAGRun(ctx, dag, parent, dagRunID, root, workerID, attemptID, triggerType, scheduleTime, profileName, nil)
+	if opts.workerID != "local" {
+		if ctx.Persistence.DAGRunRepository == nil {
+			return executeDAGRun(ctx, dag, dagRunID, opts)
 		}
 		return withPreparedLocalExecution(
 			ctx,
 			dag,
 			dagRunID,
-			root,
-			parent,
-			triggerType,
-			scheduleTime,
-			profileName,
-			func(execCtx context.Context) (exec.DAGRunAttempt, error) {
-				attempt, _, err := resolveWorkerPreparedAttempt(execCtx, ctx.DAGRunStore, dag.Name, dagRunID, root, attemptID)
+			opts,
+			func(execCtx context.Context) (dagrun.Attempt, error) {
+				attempt, _, err := resolveWorkerPreparedAttempt(execCtx, ctx.Persistence.DAGRunRepository, dag.Name, dagRunID, opts.root, opts.attemptID)
 				if err != nil {
 					return nil, err
 				}
 				return attempt, nil
 			},
-			func(preparedAttempt exec.DAGRunAttempt) error {
-				return executeDAGRun(ctx, dag, parent, dagRunID, root, workerID, attemptID, triggerType, scheduleTime, profileName, preparedAttempt)
+			func(preparedAttempt dagrun.Attempt) error {
+				run := opts
+				run.preparedAttempt = preparedAttempt
+				return executeDAGRun(ctx, dag, dagRunID, run)
 			},
 		)
 	}
 
 	logger.Debug(ctx, "Checking for previous sub dag-run with the dag-run ID")
 
-	subAttempt, err := ctx.DAGRunStore.FindSubAttempt(ctx, root, dagRunID)
-	if errors.Is(err, exec.ErrDAGRunIDNotFound) {
+	subAttempt, err := ctx.Persistence.DAGRunRepository.FindSubAttempt(ctx, opts.root, dagRunID)
+	if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 		return withPreparedLocalExecution(
 			ctx,
 			dag,
 			dagRunID,
-			root,
-			parent,
-			triggerType,
-			scheduleTime,
-			profileName,
-			func(execCtx context.Context) (exec.DAGRunAttempt, error) {
-				return ctx.DAGRunStore.CreateAttempt(execCtx, dag, time.Now(), dagRunID, exec.NewDAGRunAttemptOptions{
-					RootDAGRun: &root,
+			opts,
+			func(execCtx context.Context) (dagrun.Attempt, error) {
+				return ctx.Persistence.DAGRunRepository.CreateAttempt(execCtx, dag, time.Now(), dagRunID, persis.DAGRunCreateAttemptOptions{
+					RootDAGRun: opts.root,
 				})
 			},
-			func(preparedAttempt exec.DAGRunAttempt) error {
-				return executeDAGRun(ctx, dag, parent, dagRunID, root, workerID, attemptID, triggerType, scheduleTime, profileName, preparedAttempt)
+			func(preparedAttempt dagrun.Attempt) error {
+				run := opts
+				run.preparedAttempt = preparedAttempt
+				return executeDAGRun(ctx, dag, dagRunID, run)
 			},
 		)
 	}
@@ -462,33 +510,38 @@ func handleSubDAGRun(ctx *Context, dag *core.DAG, dagRunID string, params string
 		return fmt.Errorf("failed to read previous run status for dag-run ID %s: %w", dagRunID, err)
 	}
 
+	retry := opts
+	retry.parent = status.Parent
+	retry.triggerType = queue.PreservedQueueTriggerType(status)
+	retry.triggerActor = status.TriggerActor
+	retry.parallelItem = status.ParallelItem
+	retry.scheduleTime = status.ScheduleTime
+
 	return withPreparedLocalExecution(
 		ctx,
 		dag,
 		dagRunID,
-		root,
-		status.Parent,
-		exec.PreservedQueueTriggerType(status),
-		status.ScheduleTime,
-		profileName,
-		func(execCtx context.Context) (exec.DAGRunAttempt, error) {
-			if status.Status == core.Queued {
+		retry,
+		func(execCtx context.Context) (dagrun.Attempt, error) {
+			if status.Status == ir.Queued {
 				subAttempt.SetDAG(dag)
 				return subAttempt, nil
 			}
-			return ctx.DAGRunStore.CreateAttempt(execCtx, dag, time.Now(), dagRunID, exec.NewDAGRunAttemptOptions{
+			return ctx.Persistence.DAGRunRepository.CreateAttempt(execCtx, dag, time.Now(), dagRunID, persis.DAGRunCreateAttemptOptions{
 				Retry:      true,
-				RootDAGRun: &root,
+				RootDAGRun: opts.root,
 			})
 		},
-		func(preparedAttempt exec.DAGRunAttempt) error {
-			return executeRetry(ctx, dag, status, root, "", workerID, attemptID, profileName, preparedAttempt)
+		func(preparedAttempt dagrun.Attempt) error {
+			prepared := retry
+			prepared.preparedAttempt = preparedAttempt
+			return executeRetry(ctx, dag, status, prepared)
 		},
 	)
 }
 
 // executeDAGRun initializes execution state for a DAG run and invokes the shared agent executor.
-func executeDAGRun(ctx *Context, d *core.DAG, parent exec.DAGRunRef, dagRunID string, root exec.DAGRunRef, workerID, attemptID string, triggerType core.TriggerType, scheduleTime, profileName string, preparedAttempt exec.DAGRunAttempt) error {
+func executeDAGRun(ctx *Context, d *ir.DAG, dagRunID string, opts runOptions) error {
 	logFile, err := ctx.OpenLogFile(d, dagRunID)
 	if err != nil {
 		return fmt.Errorf("failed to initialize log file for DAG %s: %w", d.Name, err)
@@ -504,18 +557,18 @@ func executeDAGRun(ctx *Context, d *core.DAG, parent exec.DAGRunRef, dagRunID st
 		return fmt.Errorf("failed to initialize artifact directory for DAG %s: %w", d.Name, err)
 	}
 
-	dr, err := ctx.dagStore(dagStoreConfig{
+	dr, err := ctx.dagRepository(dagRepositoryConfig{
 		SearchPaths:           []string{filepath.Dir(d.Location)},
-		SkipDirectoryCreation: workerID != "local",
+		SkipDirectoryCreation: opts.workerID != "local",
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize DAG store: %w", err)
 	}
 
 	// When running on a worker, the dag-run was already created by the coordinator.
-	queuedRun := workerID != "local"
+	queuedRun := opts.workerID != "local"
 
-	as := ctx.agentStores()
+	as := ctx.runtimeStores()
 	extraEnvs, err := prepareDAGTools(ctx, d)
 	if err != nil {
 		return err
@@ -529,35 +582,32 @@ func executeDAGRun(ctx *Context, d *core.DAG, parent exec.DAGRunRef, dagRunID st
 		ctx.DAGRunMgr,
 		dr,
 		agent.Options{
-			ParentDAGRun:               parent,
-			ProgressDisplay:            shouldEnableProgress(ctx),
-			ExtraEnvs:                  extraEnvs,
-			WorkerID:                   workerID,
-			AttemptID:                  attemptID,
-			QueuedRun:                  queuedRun,
-			PreparedAttempt:            preparedAttempt,
-			DAGRunStore:                ctx.DAGRunStore,
-			QueueStore:                 ctx.QueueStore,
-			StateStore:                 ctx.StateStore,
-			SecretStore:                as.SecretStore,
-			ProfileStore:               as.ProfileStore,
-			ProfileName:                profileName,
-			ServiceRegistry:            ctx.ServiceRegistry,
-			SubWorkflowRunnerFactory:   ctx.SubWorkflowRunnerFactory(),
-			RootDAGRun:                 root,
-			PeerConfig:                 ctx.Config.Core.Peer,
-			TriggerType:                triggerType,
-			DefaultExecMode:            ctx.Config.DefaultExecMode,
-			AgentConfigStore:           as.ConfigStore,
-			AgentModelStore:            as.ModelStore,
-			AgentMemoryStore:           as.MemoryStore,
-			AgentSoulStore:             as.SoulStore,
-			AgentOAuthManager:          as.OAuthManager,
-			AgentRemoteContextResolver: as.ContextResolver,
-			ScheduleTime:               scheduleTime,
-			ArtifactDir:                artifactDir,
-			DAGRunLogDir:               ctx.Config.Paths.LogDir,
-			DAGRunArtifactDir:          ctx.Config.Paths.ArtifactDir,
+			ParentDAGRun:             opts.parent,
+			ProgressDisplay:          shouldEnableProgress(ctx),
+			ExtraEnvs:                extraEnvs,
+			WorkerID:                 opts.workerID,
+			AttemptID:                agentAttemptID(opts.attemptID, opts.preparedAttempt),
+			QueuedRun:                queuedRun,
+			RunStateStore:            persis.NewRunStateStore(ctx.Persistence.DAGRunRepository, opts.preparedAttempt),
+			StateStore:               ctx.Persistence.StateStore,
+			MaterializationStore:     as.MaterializationStore,
+			NoReuse:                  opts.noReuse,
+			SecretStore:              as.SecretStore,
+			ProfileStore:             as.ProfileStore,
+			ProfileName:              opts.profileName,
+			DAGDefinitionID:          opts.definitionID,
+			ServiceRegistry:          ctx.Persistence.ServiceRegistry,
+			SubWorkflowRunnerFactory: ctx.SubWorkflowRunnerFactory(),
+			RootDAGRun:               opts.root,
+			PeerConfig:               ctx.Config.Core.Peer,
+			TriggerType:              opts.triggerType,
+			TriggerActor:             opts.triggerActor,
+			ParallelItem:             opts.parallelItem,
+			DefaultExecMode:          ctx.Config.DefaultExecMode,
+			ScheduleTime:             opts.scheduleTime,
+			ArtifactDir:              artifactDir,
+			DAGRunLogDir:             ctx.Config.Paths.LogDir,
+			DAGRunArtifactDir:        ctx.Config.Paths.ArtifactDir,
 		},
 	)
 
@@ -565,7 +615,7 @@ func executeDAGRun(ctx *Context, d *core.DAG, parent exec.DAGRunRef, dagRunID st
 }
 
 // dispatchToCoordinatorAndWait dispatches a DAG to coordinator and waits for completion.
-func dispatchToCoordinatorAndWait(ctx *Context, d *core.DAG, dagRunID string, scheduleTime, profileName string, coordinatorCli coordinator.Client) error {
+func dispatchToCoordinatorAndWait(ctx *Context, d *ir.DAG, dagRunID string, opts runOptions, coordinatorCli coordinator.Client) error {
 	signalCtx, stop := signal.NotifyContext(ctx.Context, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	signalAwareCtx := ctx.WithContext(signalCtx)
@@ -600,22 +650,25 @@ func dispatchToCoordinatorAndWait(ctx *Context, d *core.DAG, dagRunID string, sc
 	if d.SourceFile != "" {
 		taskOpts = append(taskOpts, executor.WithSourceFile(d.SourceFile))
 	}
-	if scheduleTime != "" {
-		taskOpts = append(taskOpts, executor.WithScheduleTime(scheduleTime))
+	if opts.scheduleTime != "" {
+		taskOpts = append(taskOpts, executor.WithScheduleTime(opts.scheduleTime))
 	}
-	if profileName != "" {
-		taskOpts = append(taskOpts, executor.WithProfileName(profileName))
+	if opts.profileName != "" {
+		taskOpts = append(taskOpts, executor.WithProfileName(opts.profileName))
+	}
+	if opts.triggerActor != "" {
+		taskOpts = append(taskOpts, executor.WithTriggerActor(opts.triggerActor))
 	}
 
 	task := executor.CreateTask(
 		d.Name,
 		string(d.YamlData),
-		exec.DispatchOperationStart,
+		dispatch.DispatchOperationStart,
 		dagRunID,
 		taskOpts...,
 	)
 
-	if err := coordinatorCli.Dispatch(signalAwareCtx, exec.DispatchRequest{Task: task}); err != nil {
+	if err := coordinatorCli.Dispatch(signalAwareCtx, dispatch.DispatchRequest{Task: task}); err != nil {
 		return fmt.Errorf("failed to dispatch task: %w", err)
 	}
 
@@ -632,7 +685,7 @@ func dispatchToCoordinatorAndWait(ctx *Context, d *core.DAG, dagRunID string, sc
 
 // handleDistributedCancellation handles the cancellation of a distributed DAG run when a signal is received.
 // It requests cancellation from the coordinator and polls for status updates until the DAG is no longer active.
-func handleDistributedCancellation(ctx context.Context, dag *core.DAG, dagRunID string, coordinatorCli coordinator.Client, progress *RemoteProgressDisplay, originalErr error) error {
+func handleDistributedCancellation(ctx context.Context, dag *ir.DAG, dagRunID string, coordinatorCli coordinator.Client, progress *RemoteProgressDisplay, originalErr error) error {
 	logger.Info(ctx, "Requesting cancellation of distributed DAG run", tag.RunID(dagRunID))
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -669,7 +722,7 @@ func handleDistributedCancellation(ctx context.Context, dag *core.DAG, dagRunID 
 
 // waitForDAGCompletionWithProgress polls the coordinator until the DAG run completes.
 // Progress display is managed by the caller.
-func waitForDAGCompletionWithProgress(ctx *Context, d *core.DAG, dagRunID string, coordinatorCli coordinator.Client, progress *RemoteProgressDisplay) error {
+func waitForDAGCompletionWithProgress(ctx *Context, d *ir.DAG, dagRunID string, coordinatorCli coordinator.Client, progress *RemoteProgressDisplay) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 

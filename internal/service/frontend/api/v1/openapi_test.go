@@ -6,10 +6,11 @@ package api_test
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,6 +35,21 @@ func TestOpenapiJSON_StrictValidation(t *testing.T) {
 	doc := decodeOpenAPIDocument(t, resp.Body)
 	require.Equal(t, "/api/v1", openAPIServerURL(t, doc))
 	require.Contains(t, doc.Paths, "/openapi.json")
+}
+
+func TestHumanTaskCompletionBodyLimit(t *testing.T) {
+	server := test.SetupServer(t)
+
+	response := server.Client().Post(
+		"/api/v1/dag-runs/test/run-1/human-tasks/review/complete",
+		strings.Repeat("x", (16<<20)+1),
+	).ExpectStatus(http.StatusRequestEntityTooLarge).Send(t)
+
+	var apiError struct {
+		Code string `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(response.Body), &apiError))
+	require.Equal(t, "payload_too_large", apiError.Code)
 }
 
 func TestOpenapiJSON_BuiltinAuth(t *testing.T) {

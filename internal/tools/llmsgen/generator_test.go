@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/tools/llmsgen"
+	"github.com/dagucloud/dagu/v2/internal/tools/llmsgen"
 )
 
 func TestGenerateBuildsLLMsTextFromBundledSkillSources(t *testing.T) {
@@ -30,12 +30,15 @@ func TestGenerateBuildsLLMsTextFromBundledSkillSources(t *testing.T) {
 		"# Dagu",
 		"Dagu is a self-contained workflow orchestration engine for running DAGs defined in YAML.",
 		"It runs as a single binary without requiring an external database or message broker.",
+		"operating Dagu through its CLI",
+		"repository-local workflow and CLI references",
 		"# DAG Authoring",
 		"# Actions",
 		"# Remote Action Packages",
 		"# Dagu CLI Reference",
 		"# Context References, Scoped Values, And Step Outputs",
-		"# Coding Agent Integration",
+		"# Build Workflows",
+		"# External CLI Harnesses",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("generated output missing %q\n%s", want, output)
@@ -63,7 +66,8 @@ func TestGenerateBuildsLLMsTextFromBundledSkillSources(t *testing.T) {
 		"# Remote Action Packages",
 		"# Dagu CLI Reference",
 		"# Context References, Scoped Values, And Step Outputs",
-		"# Coding Agent Integration",
+		"# Build Workflows",
+		"# External CLI Harnesses",
 	)
 }
 
@@ -122,7 +126,11 @@ Use dagu validate.
 
 Use scoped references.
 `,
-		filepath.Join("references", "codingagent.md"): `# Coding Agent Integration
+		filepath.Join("references", "build.md"): `# Build Workflows
+
+Reuse stable file transformations.
+`,
+		filepath.Join("references", "harnesses.md"): `# External CLI Harnesses
 
 Use harness.run.
 `,

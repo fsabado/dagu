@@ -19,7 +19,8 @@ It covers:
 This spec does not define:
 
 - user-authored `env` declarations
-- parameter declaration, validation, or individual `${params.name}` references
+- parameter declaration, validation, individual `${params.name}` references,
+  or root `${params}` payload references
 - step output declaration or `${steps.step_id.outputs.name}` references
 - secret provider lookup or secret masking
 - lifecycle handler execution order
@@ -38,8 +39,8 @@ Workflow authors can read stable DAG-run metadata without depending on ambient
 host environment, storage layout, UI state, or scheduler internals.
 
 Shell-oriented steps can continue to use small environment variables.
-Object-valued payloads stay on their existing compatibility environment
-variables or owning specs instead of becoming structured string references.
+Object-valued payloads stay on their owning specs or compatibility
+environment variables instead of becoming `context.*` string references.
 
 ## Motivation
 
@@ -109,7 +110,6 @@ ${context.trigger.actor}
 ${context.paths.log_file}
 ${context.paths.work_dir}
 ${context.paths.artifacts_dir}
-${context.paths.docs_dir}
 ${context.paths.step_stdout_file}
 ${context.paths.step_stderr_file}
 ${context.paths.step_output_file}
@@ -243,7 +243,6 @@ Rules:
 | `context.paths.log_file` | All run, step, and handler scopes | Absolute path to the aggregated DAG-run log file. |
 | `context.paths.work_dir` | When a per-run work directory is available | Absolute path to the per-run work directory. |
 | `context.paths.artifacts_dir` | When artifact storage is active | Absolute path to the per-run artifacts directory or staging directory. |
-| `context.paths.docs_dir` | When a per-DAG docs directory is configured | Absolute path to the per-DAG docs directory. |
 | `context.paths.step_stdout_file` | Current executable step after stream files are assigned | Absolute path to the current step stdout file. |
 | `context.paths.step_stderr_file` | Current executable step after stream files are assigned | Absolute path to the current step stderr file. |
 | `context.paths.step_output_file` | Current step attempt after output publication is prepared | Absolute path to the current step output file used by Spec 012. |
@@ -255,6 +254,8 @@ Rules:
   where final storage is remote or coordinator-owned.
 - Workflow authors must not infer storage retention, public URL shape, or UI
   availability from a path value.
+- A reference to `context.paths.artifacts_dir` in the DAG definition enables
+  artifact storage unless artifact storage is explicitly disabled.
 
 `context.profile` fields:
 
@@ -309,9 +310,7 @@ Run-level projection:
 | `DAG_RUN_LOG_FILE` | `context.paths.log_file` | All steps and handlers. |
 | `DAG_RUN_WORK_DIR` | `context.paths.work_dir` | When a per-run work directory is available. |
 | `DAG_RUN_ARTIFACTS_DIR` | `context.paths.artifacts_dir` | When artifact storage is active. |
-| `DAG_DOCS_DIR` | `context.paths.docs_dir` | When a per-DAG docs directory is configured. |
-| `DAG_PARAMS_JSON` | Parameter payload JSON | When resolved parameters exist. |
-| `DAGU_PARAMS_JSON` | Same value as `DAG_PARAMS_JSON` | Compatibility alias when resolved parameters exist. |
+| `DAG_PARAMS_JSON` | Resolved parameter payload JSON; same payload as `${params}` from Spec 005 | When resolved parameters exist. |
 
 Step and handler projection:
 
@@ -381,8 +380,9 @@ Availability rules:
   assigned for the current executable step.
 - Step output file path is available only after step output publication is
   prepared for the current step attempt.
-- Artifact directory is available only when artifact storage is active.
-- Docs directory is available only when a docs directory is configured.
+- Artifact directory is available when artifact storage is active. A DAG
+  definition reference to `context.paths.artifacts_dir` activates artifact
+  storage unless artifact storage is explicitly disabled.
 - Profile context is available only when a runtime profile was selected.
 - Webhook context is available only for webhook-triggered runs.
 - Push-back context is available only for step executions caused by an
@@ -394,6 +394,13 @@ Validation rules:
   unavailable during validation.
 - Explicit inspection surfaces must report passive notices for unresolved
   supported structured context references.
+- A supported structured context reference carries a value only during a run, so
+  its notice is runtime-only. `dagu validate` must keep it out of the default
+  output and print it under `--show-unresolved`.
+- A reference to an unsupported field under `context.` remains a defect and is
+  reported by default, which is what separates a typo such as
+  `${context.paths.artifact_dir}` from the supported
+  `${context.paths.artifacts_dir}`.
 - Explicit inspection surfaces must report passive notices with reason
   `unknown_context_field` for unknown fields under reserved context namespaces.
 - Normal run execution must not emit passive value-reference notices as run
@@ -425,9 +432,7 @@ Rules:
 Rules:
 
 - Existing environment variable names listed in this spec remain supported.
-- `DAG_PARAMS_JSON` is the canonical parameter payload environment variable.
-- `DAGU_PARAMS_JSON` remains a compatibility alias with the same value whenever
-  `DAG_PARAMS_JSON` is set.
+- `DAG_PARAMS_JSON` is the parameter payload environment variable.
 - New structured context fields must be additive.
 - New structured context fields must be added under `context.*`.
 - Short top-level aliases are frozen. They remain supported for the exact fields
@@ -458,7 +463,6 @@ Frozen structured-reference aliases:
 | `paths.log_file` | `context.paths.log_file` |
 | `paths.work_dir` | `context.paths.work_dir` |
 | `paths.artifacts_dir` | `context.paths.artifacts_dir` |
-| `paths.docs_dir` | `context.paths.docs_dir` |
 | `paths.step_stdout_file` | `context.paths.step_stdout_file` |
 | `paths.step_stderr_file` | `context.paths.step_stderr_file` |
 | `paths.step_output_file` | `context.paths.step_output_file` |

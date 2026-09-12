@@ -16,19 +16,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/agentsnapshot"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/cmn/logpath"
-	"github.com/dagucloud/dagu/internal/core"
-	coreexec "github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	rtagent "github.com/dagucloud/dagu/internal/runtime/agent"
-	runtimeexec "github.com/dagucloud/dagu/internal/runtime/executor"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logpath"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	filematerialization "github.com/dagucloud/dagu/v2/internal/persis/file/materialization"
+	"github.com/dagucloud/dagu/v2/internal/proc"
+	rtagent "github.com/dagucloud/dagu/v2/internal/runtime/agent"
+	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 func (e *Engine) RunFile(ctx context.Context, path string, opts RunOptions) (*Run, error) {
@@ -54,7 +56,7 @@ func (e *Engine) Status(ctx context.Context, ref RunRef) (*Status, error) {
 	if ref.Name == "" || ref.ID == "" {
 		return nil, fmt.Errorf("run name and ID are required")
 	}
-	status, err := e.readStatus(ctx, coreexec.NewDAGRunRef(ref.Name, ref.ID))
+	status, err := e.readStatus(ctx, ir.NewDAGRunRef(ref.Name, ref.ID))
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +68,7 @@ func (e *Engine) Outputs(ctx context.Context, ref RunRef) (map[string]string, er
 	if ref.Name == "" || ref.ID == "" {
 		return nil, fmt.Errorf("run name and ID are required")
 	}
-	outputs, err := e.readOutputs(ctx, coreexec.NewDAGRunRef(ref.Name, ref.ID))
+	outputs, err := e.readOutputs(ctx, ir.NewDAGRunRef(ref.Name, ref.ID))
 	if err != nil {
 		return nil, err
 	}
@@ -81,40 +83,40 @@ func (e *Engine) Stop(ctx context.Context, ref RunRef) error {
 	if ref.Name == "" || ref.ID == "" {
 		return fmt.Errorf("run name and ID are required")
 	}
-	runRef := coreexec.NewDAGRunRef(ref.Name, ref.ID)
+	runRef := ir.NewDAGRunRef(ref.Name, ref.ID)
 	if e.runStateStore != nil {
 		attempt, err := e.runStateStore.OpenAttempt(ctx, runRef)
 		if err == nil {
 			return attempt.RequestCancel(ctx)
 		}
-		if !e.shouldFallbackToDAGRunStore(err) {
+		if !e.shouldFallbackToDAGRunRepository(err) {
 			return err
 		}
 	}
-	if e.dagRunStore == nil {
-		return fmt.Errorf("DAG-run store is not configured")
+	if e.dagRunRepository == nil {
+		return fmt.Errorf("DAG-run repository is not configured")
 	}
-	return e.stopDAGRunStore(ctx, ref.ID, runRef)
+	return e.stopDAGRunRepository(ctx, ref.ID, runRef)
 }
 
-func (e *Engine) readStatus(ctx context.Context, ref coreexec.DAGRunRef) (*coreexec.DAGRunStatus, error) {
+func (e *Engine) readStatus(ctx context.Context, ref ir.DAGRunRef) (*ir.DAGRunStatus, error) {
 	if e.runStateStore != nil {
 		status, err := e.readRunStateStatus(ctx, ref)
 		if err == nil {
 			return status, nil
 		}
-		if !e.shouldFallbackToDAGRunStore(err) {
+		if !e.shouldFallbackToDAGRunRepository(err) {
 			return nil, err
 		}
 	}
-	if e.dagRunStore != nil {
+	if e.dagRunRepository != nil {
 		return e.dagRunMgr.GetSavedStatus(ctx, ref)
 	}
-	return nil, fmt.Errorf("neither run-state store nor DAG-run store is configured")
+	return nil, fmt.Errorf("neither run-state store nor DAG-run repository is configured")
 }
 
-func (e *Engine) stopDAGRunStore(ctx context.Context, dagRunID string, ref coreexec.DAGRunRef) error {
-	attempt, err := e.dagRunStore.FindAttempt(ctx, ref)
+func (e *Engine) stopDAGRunRepository(ctx context.Context, dagRunID string, ref ir.DAGRunRef) error {
+	attempt, err := e.dagRunRepository.FindAttempt(ctx, ref)
 	if err != nil {
 		return err
 	}
@@ -190,7 +192,7 @@ func (r *Run) Stop(ctx context.Context) error {
 	return r.engine.Stop(ctx, r.ref)
 }
 
-func (e *Engine) readRunStateStatus(ctx context.Context, ref coreexec.DAGRunRef) (*coreexec.DAGRunStatus, error) {
+func (e *Engine) readRunStateStatus(ctx context.Context, ref ir.DAGRunRef) (*ir.DAGRunStatus, error) {
 	attempt, err := e.runStateStore.OpenAttempt(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -202,23 +204,23 @@ func (e *Engine) readRunStateStatus(ctx context.Context, ref coreexec.DAGRunRef)
 	return status, nil
 }
 
-func (e *Engine) readOutputs(ctx context.Context, ref coreexec.DAGRunRef) (*coreexec.DAGRunOutputs, error) {
+func (e *Engine) readOutputs(ctx context.Context, ref ir.DAGRunRef) (*ir.DAGRunOutputs, error) {
 	if e.runStateStore != nil {
 		outputs, err := e.readRunStateOutputs(ctx, ref)
 		if err == nil {
 			return outputs, nil
 		}
-		if !e.shouldFallbackToDAGRunStore(err) {
+		if !e.shouldFallbackToDAGRunRepository(err) {
 			return nil, err
 		}
 	}
-	if e.dagRunStore != nil {
+	if e.dagRunRepository != nil {
 		return e.readDAGRunOutputs(ctx, ref)
 	}
-	return nil, fmt.Errorf("neither run-state store nor DAG-run store is configured")
+	return nil, fmt.Errorf("neither run-state store nor DAG-run repository is configured")
 }
 
-func (e *Engine) readRunStateOutputs(ctx context.Context, ref coreexec.DAGRunRef) (*coreexec.DAGRunOutputs, error) {
+func (e *Engine) readRunStateOutputs(ctx context.Context, ref ir.DAGRunRef) (*ir.DAGRunOutputs, error) {
 	attempt, err := e.runStateStore.OpenAttempt(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -226,16 +228,16 @@ func (e *Engine) readRunStateOutputs(ctx context.Context, ref coreexec.DAGRunRef
 	return attempt.ReadOutputs(ctx)
 }
 
-func (e *Engine) readDAGRunOutputs(ctx context.Context, ref coreexec.DAGRunRef) (*coreexec.DAGRunOutputs, error) {
-	attempt, err := e.dagRunStore.FindAttempt(ctx, ref)
+func (e *Engine) readDAGRunOutputs(ctx context.Context, ref ir.DAGRunRef) (*ir.DAGRunOutputs, error) {
+	attempt, err := e.dagRunRepository.FindAttempt(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
 	return attempt.ReadOutputs(ctx)
 }
 
-func (e *Engine) shouldFallbackToDAGRunStore(err error) bool {
-	return e.dagRunStore != nil && errors.Is(err, coreexec.ErrDAGRunIDNotFound)
+func (e *Engine) shouldFallbackToDAGRunRepository(err error) bool {
+	return e.dagRunRepository != nil && errors.Is(err, dagrun.ErrDAGRunIDNotFound)
 }
 
 func (r *Run) waitLocal(ctx context.Context) (*Status, error) {
@@ -316,7 +318,7 @@ func (r *Run) statusWithFinalTimeout() (*Status, error) {
 	return r.Status(ctx)
 }
 
-func (e *Engine) loadFile(ctx context.Context, path string, opts RunOptions) (*core.DAG, error) {
+func (e *Engine) loadFile(ctx context.Context, path string, opts RunOptions) (*ir.DAG, error) {
 	loadOpts := e.loadOptions(opts)
 	dag, err := spec.Load(ctx, path, loadOpts...)
 	if err != nil {
@@ -329,7 +331,7 @@ func (e *Engine) loadFile(ctx context.Context, path string, opts RunOptions) (*c
 	return dag, nil
 }
 
-func (e *Engine) loadYAML(ctx context.Context, data []byte, opts RunOptions) (*core.DAG, error) {
+func (e *Engine) loadYAML(ctx context.Context, data []byte, opts RunOptions) (*ir.DAG, error) {
 	loadOpts := e.loadOptions(opts)
 	dag, err := spec.LoadYAML(ctx, data, loadOpts...)
 	if err != nil {
@@ -359,7 +361,7 @@ func (e *Engine) loadOptions(opts RunOptions) []spec.LoadOption {
 	return loadOpts
 }
 
-func applyRunOverrides(dag *core.DAG, opts RunOptions) {
+func applyRunOverrides(dag *ir.DAG, opts RunOptions) {
 	// Name, DefaultWorkingDir, and params are handled during loading; only
 	// overrides that must mutate the loaded DAG belong here.
 	if len(opts.WorkerSelector) > 0 {
@@ -370,7 +372,7 @@ func applyRunOverrides(dag *core.DAG, opts RunOptions) {
 		for _, existing := range dag.Labels {
 			seen[existing.String()] = struct{}{}
 		}
-		for _, candidate := range core.NewLabels(opts.Labels) {
+		for _, candidate := range ir.NewLabels(opts.Labels) {
 			key := candidate.String()
 			if _, ok := seen[key]; ok {
 				continue
@@ -381,18 +383,18 @@ func applyRunOverrides(dag *core.DAG, opts RunOptions) {
 	}
 }
 
-func (e *Engine) runLoaded(ctx context.Context, dag *core.DAG, opts RunOptions) (*Run, error) {
+func (e *Engine) runLoaded(ctx context.Context, dag *ir.DAG, opts RunOptions) (*Run, error) {
 	if err := dag.Validate(); err != nil {
 		return nil, err
 	}
 	runID := opts.RunID
 	if runID == "" {
-		id, err := e.dagRunMgr.GenDAGRunID(ctx)
+		id, err := ir.NewDAGRunID()
 		if err != nil {
 			return nil, err
 		}
 		runID = id
-	} else if err := coreexec.ValidateDAGRunID(runID); err != nil {
+	} else if err := ir.ValidateDAGRunID(runID); err != nil {
 		return nil, err
 	}
 	mode := opts.Mode
@@ -412,7 +414,7 @@ func (e *Engine) runLoaded(ctx context.Context, dag *core.DAG, opts RunOptions) 
 	}
 }
 
-func (e *Engine) runLocal(ctx context.Context, dag *core.DAG, runID string, opts RunOptions) (*Run, error) {
+func (e *Engine) runLocal(ctx context.Context, dag *ir.DAG, runID string, opts RunOptions) (*Run, error) {
 	logFile, err := e.openLogFile(ctx, dag, runID)
 	if err != nil {
 		return nil, err
@@ -422,14 +424,14 @@ func (e *Engine) runLocal(ctx context.Context, dag *core.DAG, runID string, opts
 		_ = logFile.Close()
 		return nil, err
 	}
-	dagStore, err := e.dagStoreFactory(ctx, e.cfg, DAGStoreFactoryOptions{
+	dagRepository, err := e.dagRepositoryFactory(ctx, e.cfg, DAGRepositoryFactoryOptions{
 		SearchPaths: []string{filepath.Dir(dag.Location)},
 	})
 	if err != nil {
 		_ = logFile.Close()
 		return nil, err
 	}
-	root := coreexec.NewDAGRunRef(dag.Name, runID)
+	root := ir.NewDAGRunRef(dag.Name, runID)
 	var prepared *localPreparation
 	if !opts.DryRun {
 		prepared, err = e.prepareLocal(ctx, dag, runID, root)
@@ -439,36 +441,40 @@ func (e *Engine) runLocal(ctx context.Context, dag *core.DAG, runID string, opts
 		}
 	}
 
-	stores := e.agentStores(ctx)
+	stores := e.runtimeStores(ctx)
+	attempt := preparedAttempt(prepared)
+	runStateStore := e.runStateStore
+	if runStateStore == nil {
+		runStateStore = persis.NewRunStateStore(e.dagRunRepository, attempt)
+	}
+	attemptID := ""
+	if attempt != nil {
+		attemptID = attempt.ID()
+	}
 	agentInstance := rtagent.New(
 		runID,
 		dag,
 		filepath.Dir(logFile.Name()),
 		logFile.Name(),
 		e.dagRunMgr,
-		dagStore,
+		dagRepository,
 		rtagent.Options{
-			Dry:                        opts.DryRun,
-			WorkerID:                   "local",
-			PreparedAttempt:            preparedAttempt(prepared),
-			RunStateStore:              e.runStateStore,
-			DAGRunStore:                e.dagRunStore,
-			StateStore:                 e.stateStore,
-			SecretStore:                stores.SecretStore,
-			ProfileStore:               stores.ProfileStore,
-			ServiceRegistry:            e.serviceRegistry,
-			SubWorkflowRunnerFactory:   e.subWorkflowRunnerFactory(stores),
-			RootDAGRun:                 root,
-			PeerConfig:                 e.cfg.Core.Peer,
-			TriggerType:                core.TriggerTypeManual,
-			DefaultExecMode:            configExecutionMode(e.defaultMode),
-			AgentConfigStore:           stores.ConfigStore,
-			AgentModelStore:            stores.ModelStore,
-			AgentMemoryStore:           stores.MemoryStore,
-			AgentSoulStore:             stores.SoulStore,
-			AgentOAuthManager:          stores.OAuthManager,
-			AgentRemoteContextResolver: stores.ContextResolver,
-			ArtifactDir:                artifactDir,
+			Dry:                      opts.DryRun,
+			WorkerID:                 "local",
+			AttemptID:                attemptID,
+			RunStateStore:            runStateStore,
+			StateStore:               e.stateStore,
+			MaterializationStore:     stores.MaterializationStore,
+			NoReuse:                  opts.NoReuse,
+			SecretStore:              stores.SecretStore,
+			ProfileStore:             stores.ProfileStore,
+			ServiceRegistry:          e.serviceRegistry,
+			SubWorkflowRunnerFactory: e.subWorkflowRunnerFactory(stores),
+			RootDAGRun:               root,
+			PeerConfig:               e.cfg.Core.Peer,
+			TriggerType:              ir.TriggerTypeManual,
+			DefaultExecMode:          configExecutionMode(e.defaultMode),
+			ArtifactDir:              artifactDir,
 		},
 	)
 
@@ -507,7 +513,10 @@ func (e *Engine) runLocal(ctx context.Context, dag *core.DAG, runID string, opts
 	return run, nil
 }
 
-func (e *Engine) runDistributed(ctx context.Context, dag *core.DAG, runID string, opts RunOptions) (*Run, error) {
+func (e *Engine) runDistributed(ctx context.Context, dag *ir.DAG, runID string, opts RunOptions) (*Run, error) {
+	if dag.Type == ir.TypeBuild {
+		return nil, dispatch.ErrBuildRequiresLocal
+	}
 	dist := e.distributed
 	if len(opts.WorkerSelector) > 0 {
 		dist.WorkerSelector = cloneStringMap(opts.WorkerSelector)
@@ -527,24 +536,20 @@ func (e *Engine) runDistributed(ctx context.Context, dag *core.DAG, runID string
 	}
 	if dag.SourceFile != "" {
 		taskOpts = append(taskOpts, runtimeexec.WithSourceFile(dag.SourceFile))
-	}
-	if snapshot, snapErr := agentsnapshot.BuildFromPaths(ctx, dag, e.cfg.Paths, e.dagStore, e.snapshotStoreFactory); snapErr != nil {
-		_ = client.Cleanup(ctx)
-		return nil, fmt.Errorf("build agent snapshot: %w", snapErr)
-	} else if len(snapshot) > 0 {
-		taskOpts = append(taskOpts, runtimeexec.WithAgentSnapshot(snapshot))
+	} else if dag.WorkingDir != "" {
+		taskOpts = append(taskOpts, runtimeexec.WithSourceWorkDir(dag.WorkingDir))
 	}
 	task := runtimeexec.CreateTask(
 		dag.Name,
 		string(dag.YamlData),
-		coreexec.DispatchOperationStart,
+		dispatch.DispatchOperationStart,
 		runID,
 		taskOpts...,
 	)
 	if len(dag.Params) > 0 {
 		task.Params = strings.Join(dag.Params, " ")
 	}
-	if err := client.Dispatch(ctx, coreexec.DispatchRequest{Task: task}); err != nil {
+	if err := client.Dispatch(ctx, dispatch.DispatchRequest{Task: task}); err != nil {
 		_ = client.Cleanup(ctx)
 		return nil, fmt.Errorf("dispatch DAG run: %w", err)
 	}
@@ -593,33 +598,43 @@ func (r *Run) doneError() error {
 	return r.doneErr
 }
 
-func (e *Engine) prepareLocal(ctx context.Context, dag *core.DAG, runID string, root coreexec.DAGRunRef) (*localPreparation, error) {
-	if err := e.procStore.Lock(ctx, dag.ProcGroup()); err != nil {
-		return nil, fmt.Errorf("lock process group: %w", err)
+func (e *Engine) prepareLocal(ctx context.Context, dag *ir.DAG, runID string, root ir.DAGRunRef) (*localPreparation, error) {
+	var preparation *localPreparation
+	err := e.procRepository.WithLock(ctx, dag.ProcGroup(), func() error {
+		var err error
+		preparation, err = e.prepareLocalLocked(ctx, dag, runID, root)
+		return err
+	})
+	if err != nil {
+		if persis.IsProcLockError(err) {
+			return nil, fmt.Errorf("lock process group: %w", err)
+		}
+		return nil, err
 	}
-	defer e.procStore.Unlock(ctx, dag.ProcGroup())
+	return preparation, nil
+}
 
-	var attempt coreexec.DAGRunAttempt
+func (e *Engine) prepareLocalLocked(ctx context.Context, dag *ir.DAG, runID string, root ir.DAGRunRef) (*localPreparation, error) {
+	var attempt dagrun.Attempt
 	attemptID := runID
-	if e.dagRunStore != nil {
-		created, err := e.dagRunStore.CreateAttempt(ctx, dag, time.Now(), runID, coreexec.NewDAGRunAttemptOptions{})
+	if e.dagRunRepository != nil {
+		created, err := e.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 		if err != nil {
-			if errors.Is(err, coreexec.ErrDAGRunAlreadyExists) {
+			if errors.Is(err, dagrun.ErrDAGRunAlreadyExists) {
 				return nil, fmt.Errorf("dag-run ID %s already exists for DAG %s: %w", runID, dag.Name, err)
 			}
 			return nil, fmt.Errorf("create DAG run attempt: %w", err)
 		}
-		created.SetDAG(dag)
 		attempt = created
 		attemptID = created.ID()
 	} else if e.runStateStore != nil {
 		if _, err := e.runStateStore.OpenAttempt(ctx, root); err == nil {
-			return nil, fmt.Errorf("%w: %s", coreexec.ErrDAGRunAlreadyExists, runID)
-		} else if !errors.Is(err, coreexec.ErrDAGRunIDNotFound) {
+			return nil, fmt.Errorf("%w: %s", dagrun.ErrDAGRunAlreadyExists, runID)
+		} else if !errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 			return nil, fmt.Errorf("check existing run-state attempt: %w", err)
 		}
 	}
-	proc, err := e.procStore.Acquire(ctx, dag.ProcGroup(), coreexec.ProcMeta{
+	handle, err := e.procRepository.Acquire(ctx, dag.ProcGroup(), proc.ProcMeta{
 		StartedAt:    time.Now().Unix(),
 		Name:         dag.Name,
 		DAGRunID:     runID,
@@ -633,15 +648,15 @@ func (e *Engine) prepareLocal(ctx context.Context, dag *core.DAG, runID string, 
 		}
 		return nil, fmt.Errorf("acquire process handle: %w", err)
 	}
-	return &localPreparation{attempt: attempt, proc: proc}, nil
+	return &localPreparation{attempt: attempt, proc: handle}, nil
 }
 
 func (e *Engine) recordPreparedFailure(
 	ctx context.Context,
-	attempt coreexec.DAGRunAttempt,
-	dag *core.DAG,
+	attempt dagrun.Attempt,
+	dag *ir.DAG,
 	runID string,
-	root coreexec.DAGRunRef,
+	root ir.DAGRunRef,
 	runErr error,
 ) error {
 	logFile, logErr := logpath.Generate(ctx, e.cfg.Paths.LogDir, dag.LogDir, dag.Name, runID)
@@ -652,19 +667,19 @@ func (e *Engine) recordPreparedFailure(
 	if artifactErr != nil {
 		logger.Warn(ctx, "Failed to generate artifact path for prepared local execution failure", tag.Error(artifactErr))
 	}
-	status := transform.NewStatusBuilder(dag).Create(
+	status := ir.NewStatusBuilder(dag).Create(
 		runID,
-		core.Failed,
+		ir.Failed,
 		0,
 		time.Now(),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithHierarchyRefs(root, coreexec.DAGRunRef{}),
-		transform.WithLogFilePath(logFile),
-		transform.WithArchiveDir(artifactDir),
-		transform.WithFinishedAt(time.Now()),
-		transform.WithError(runErr.Error()),
-		transform.WithWorkerID("local"),
-		transform.WithTriggerType(core.TriggerTypeManual),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithHierarchyRefs(root, ir.DAGRunRef{}),
+		ir.WithLogFilePath(logFile),
+		ir.WithArchiveDir(artifactDir),
+		ir.WithFinishedAt(time.Now()),
+		ir.WithError(runErr.Error()),
+		ir.WithWorkerID("local"),
+		ir.WithTriggerType(ir.TriggerTypeManual),
 	)
 	if err := attempt.Open(ctx); err != nil {
 		return err
@@ -675,7 +690,7 @@ func (e *Engine) recordPreparedFailure(
 	return attempt.Write(ctx, status)
 }
 
-func (e *Engine) openLogFile(ctx context.Context, dag *core.DAG, runID string) (*os.File, error) {
+func (e *Engine) openLogFile(ctx context.Context, dag *ir.DAG, runID string) (*os.File, error) {
 	path, err := logpath.Generate(ctx, e.cfg.Paths.LogDir, dag.LogDir, dag.Name, runID)
 	if err != nil {
 		return nil, err
@@ -683,7 +698,7 @@ func (e *Engine) openLogFile(ctx context.Context, dag *core.DAG, runID string) (
 	return fileutil.OpenOrCreateFile(path)
 }
 
-func (e *Engine) artifactDir(ctx context.Context, dag *core.DAG, runID string) (string, error) {
+func (e *Engine) artifactDir(ctx context.Context, dag *ir.DAG, runID string) (string, error) {
 	if dag == nil || !dag.ArtifactsEnabled() {
 		return "", nil
 	}
@@ -694,14 +709,18 @@ func (e *Engine) artifactDir(ctx context.Context, dag *core.DAG, runID string) (
 	return logpath.GenerateDir(ctx, e.cfg.Paths.ArtifactDir, dagArtifactDir, dag.Name, runID)
 }
 
-func (e *Engine) agentStores(ctx context.Context) AgentStores {
-	if e.agentStoresFactory == nil {
-		return AgentStores{}
+func (e *Engine) runtimeStores(ctx context.Context) RuntimeStores {
+	var stores RuntimeStores
+	if e.runtimeStoresFactory != nil {
+		stores = e.runtimeStoresFactory(ctx, e.cfg)
 	}
-	return e.agentStoresFactory(ctx, e.cfg)
+	if stores.MaterializationStore == nil {
+		stores.MaterializationStore = filematerialization.New(filepath.Join(e.cfg.Paths.DataDir, "materializations"))
+	}
+	return stores
 }
 
-func preparedAttempt(prepared *localPreparation) coreexec.DAGRunAttempt {
+func preparedAttempt(prepared *localPreparation) dagrun.Attempt {
 	if prepared == nil {
 		return nil
 	}
@@ -742,7 +761,7 @@ func configExecutionMode(mode ExecutionMode) config.ExecutionMode {
 
 func isActiveStatus(status string) bool {
 	switch status {
-	case core.Running.String(), core.Queued.String(), core.Waiting.String(), core.NotStarted.String():
+	case ir.Running.String(), ir.Queued.String(), ir.Waiting.String(), ir.NotStarted.String():
 		return true
 	default:
 		return false

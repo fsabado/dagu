@@ -4,20 +4,26 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"time"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/humantask"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/runtime/agentloop"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 const maxIntValue = int(^uint(0) >> 1)
 
-func toSchedule(s core.Schedule) api.Schedule {
+func toSchedule(s ir.Schedule) api.Schedule {
 	schedule := api.Schedule{}
 	if kind := s.GetKind(); kind != "" {
 		schedule.Kind = ptrOf(api.ScheduleKind(kind))
@@ -28,11 +34,12 @@ func toSchedule(s core.Schedule) api.Schedule {
 	if at, ok := s.OneOffTime(); ok {
 		schedule.At = &at
 	}
+	schedule.Profile = toRuntimeProfileName(s.Profile)
 	return schedule
 }
 
-func workspaceResponseNameFromLabels(labels core.Labels) *string {
-	workspaceName, ok := exec.WorkspaceNameFromLabels(labels)
+func workspaceResponseNameFromLabels(labels ir.Labels) *string {
+	workspaceName, ok := workspace.WorkspaceNameFromLabels(labels)
 	if !ok {
 		return nil
 	}
@@ -40,10 +47,10 @@ func workspaceResponseNameFromLabels(labels core.Labels) *string {
 }
 
 func workspaceResponseNameFromLabelStrings(labels []string) *string {
-	return workspaceResponseNameFromLabels(core.NewLabels(labels))
+	return workspaceResponseNameFromLabels(ir.NewLabels(labels))
 }
 
-func toDAG(dag *core.DAG) api.DAG {
+func toDAG(dag *ir.DAG) api.DAG {
 	schedules := make([]api.Schedule, len(dag.Schedule))
 	for i, s := range dag.Schedule {
 		schedules[i] = toSchedule(s)
@@ -63,7 +70,7 @@ func toDAG(dag *core.DAG) api.DAG {
 	}
 }
 
-func toDAGResources(resources *core.Resources) *api.DAGResources {
+func toDAGResources(resources *ir.Resources) *api.DAGResources {
 	if resources == nil || resources.Limits == nil {
 		return nil
 	}
@@ -75,7 +82,7 @@ func toDAGResources(resources *core.Resources) *api.DAGResources {
 	}
 }
 
-func toStep(obj core.Step) api.Step {
+func toStep(obj ir.Step) api.Step {
 	conditions := make([]api.Condition, len(obj.Preconditions))
 	for i := range obj.Preconditions {
 		conditions[i] = toPrecondition(obj.Preconditions[i])
@@ -99,10 +106,16 @@ func toStep(obj core.Step) api.Step {
 
 	commands := make([]api.CommandEntry, len(obj.Commands))
 	for i, cmd := range obj.Commands {
-		commands[i] = api.CommandEntry{
+		entry := api.CommandEntry{
 			Command: cmd.Command,
 			Args:    ptrOf(cmd.Args),
 		}
+		// Harness prompts live in CmdWithArgs to preserve multiline text.
+		if obj.ExecutorConfig.Type == "harness" && cmd.CmdWithArgs != "" {
+			entry.Command = cmd.CmdWithArgs
+			entry.Args = nil
+		}
+		commands[i] = entry
 	}
 
 	step := api.Step{
@@ -117,6 +130,22 @@ func toStep(obj core.Step) api.Step {
 		Preconditions: ptrOf(conditions),
 		RepeatPolicy:  ptrOf(repeatPolicy),
 		Script:        ptrOf(obj.Script),
+	}
+	if len(obj.Inputs) > 0 {
+		inputs := make([]api.StepInputDeclaration, len(obj.Inputs))
+		for i, input := range obj.Inputs {
+			inputs[i] = api.StepInputDeclaration{Name: input.Name, Path: input.Path}
+		}
+		step.Inputs = &inputs
+	}
+	if len(obj.Dependencies) > 0 {
+		step.Dependencies = ptrOf(obj.Dependencies)
+	}
+	// Only authored declarations belong here. Names derived from a step's
+	// capture configuration are not published through DAGU_OUTPUT_FILE and are
+	// already visible in the field that configures them.
+	if outputs := authoredOutputDeclarations(obj.Outputs); len(outputs) > 0 {
+		step.Outputs = &outputs
 	}
 
 	if obj.Timeout > 0 {
@@ -173,6 +202,22 @@ func toStep(obj core.Step) api.Step {
 		}
 	}
 
+	if obj.HumanTask != nil {
+		humanTask := &api.HumanTaskConfig{Prompt: obj.HumanTask.Prompt}
+		if len(obj.HumanTask.Form) > 0 {
+			var form map[string]any
+			decoder := json.NewDecoder(bytes.NewReader(obj.HumanTask.Form))
+			decoder.UseNumber()
+			if err := decoder.Decode(&form); err == nil && form != nil {
+				var extra any
+				if err := decoder.Decode(&extra); err == io.EOF {
+					humanTask.Form = &form
+				}
+			}
+		}
+		step.HumanTask = humanTask
+	}
+
 	if obj.Router != nil {
 		routes := make([]struct {
 			Pattern string   `json:"pattern"`
@@ -202,20 +247,75 @@ func toStep(obj core.Step) api.Step {
 	return step
 }
 
-func toPrecondition(obj *core.Condition) api.Condition {
-	return api.Condition{
-		Condition: obj.Condition,
-		Expected:  ptrOf(obj.Expected),
-		Negate:    ptrOf(obj.Negate),
-		Error:     ptrOf(obj.GetErrorMessage()),
+func toPrecondition(obj *ir.Condition) api.Condition {
+	condition := api.Condition{
+		Expected: ptrOf(obj.Expected),
+		Negate:   ptrOf(obj.Negate),
+		Error:    ptrOf(""),
 	}
+	if obj.Condition != "" {
+		condition.Condition = ptrOf(obj.Condition)
+	}
+	if obj.Eval != "" {
+		condition.Eval = ptrOf(obj.Eval)
+	}
+	return condition
 }
 
-func toTriggerType(t core.TriggerType) *api.TriggerType {
-	if t == core.TriggerTypeUnknown {
+func toPreconditionResult(result ir.ConditionResult) api.Condition {
+	condition := toPrecondition(&result.Condition)
+	condition.Error = ptrOf(result.Error)
+	return condition
+}
+
+func toTriggerType(t ir.TriggerType) *api.TriggerType {
+	if t == ir.TriggerTypeUnknown {
 		return nil
 	}
 	return new(api.TriggerType(t.String()))
+}
+
+func toDAGRunConditions(status ir.Status, conditions []ir.DAGRunCondition) *[]api.DAGRunCondition {
+	if status != ir.Queued || len(conditions) == 0 {
+		return nil
+	}
+
+	result := make([]api.DAGRunCondition, 0, len(conditions))
+	for _, condition := range conditions {
+		checkedAt, err := time.Parse(time.RFC3339, condition.CheckedAt)
+		if err != nil {
+			continue
+		}
+		conditionStatus, ok := toDAGRunConditionStatus(condition.Status)
+		if !ok {
+			continue
+		}
+		result = append(result, api.DAGRunCondition{
+			Type:      condition.Type,
+			Status:    conditionStatus,
+			Reason:    condition.Reason,
+			Message:   condition.Message,
+			CheckedAt: checkedAt,
+		})
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return &result
+}
+
+func toDAGRunConditionStatus(status string) (api.DAGRunConditionStatus, bool) {
+	switch status {
+	case string(api.DAGRunConditionStatusFalse):
+		return api.DAGRunConditionStatusFalse, true
+	case string(api.DAGRunConditionStatusTrue):
+		return api.DAGRunConditionStatusTrue, true
+	case string(api.DAGRunConditionStatusUnknown):
+		return api.DAGRunConditionStatusUnknown, true
+	default:
+		var zero api.DAGRunConditionStatus
+		return zero, false
+	}
 }
 
 func toRuntimeProfileName(name string) *api.RuntimeProfileName {
@@ -226,7 +326,7 @@ func toRuntimeProfileName(name string) *api.RuntimeProfileName {
 	return &profileName
 }
 
-func toDAGRunSummary(s exec.DAGRunStatus) api.DAGRunSummary {
+func toDAGRunSummary(s ir.DAGRunStatus) api.DAGRunSummary {
 	var autoRetryLimit *int
 	if s.AutoRetryLimit > 0 {
 		autoRetryLimit = ptrOf(s.AutoRetryLimit)
@@ -242,20 +342,23 @@ func toDAGRunSummary(s exec.DAGRunStatus) api.DAGRunSummary {
 		QueuedAt:           ptrOf(s.QueuedAt),
 		AutoRetryCount:     s.AutoRetryCount,
 		AutoRetryLimit:     autoRetryLimit,
+		Conditions:         toDAGRunConditions(s.Status, s.Conditions),
 		ScheduleTime:       ptrOf(s.ScheduleTime),
 		StartedAt:          s.StartedAt,
 		FinishedAt:         s.FinishedAt,
 		ArtifactsAvailable: artifactsAvailable,
+		NoReuse:            ptrOf(s.NoReuse),
 		Status:             api.Status(s.Status),
 		StatusLabel:        api.StatusLabel(s.Status.String()),
 		WorkerId:           ptrOf(s.WorkerID),
 		TriggerType:        toTriggerType(s.TriggerType),
+		TriggerActor:       ptrOf(s.TriggerActor),
 		Labels:             &s.Labels,
 		Tags:               &s.Labels,
 	}
 }
 
-func toDAGRunsPageResponse(page exec.DAGRunStatusPage) api.DAGRunsPageResponse {
+func toDAGRunsPageResponse(page persis.DAGRunStatusPage) api.DAGRunsPageResponse {
 	dagRuns := make([]api.DAGRunSummary, 0, len(page.Items))
 	for _, item := range page.Items {
 		if item == nil {
@@ -275,10 +378,10 @@ func toDAGRunsPageResponse(page exec.DAGRunStatusPage) api.DAGRunsPageResponse {
 
 // ToDAGRunDetails converts a DAGRunStatus to its API representation.
 // This function is exported for use by the SSE package.
-func ToDAGRunDetails(s exec.DAGRunStatus) api.DAGRunDetails {
+func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 	preconditions := make([]api.Condition, len(s.Preconditions))
 	for i, p := range s.Preconditions {
-		preconditions[i] = toPrecondition(p)
+		preconditions[i] = toPreconditionResult(p)
 	}
 	nodes := make([]api.Node, len(s.Nodes))
 	for i, n := range s.Nodes {
@@ -290,37 +393,49 @@ func ToDAGRunDetails(s exec.DAGRunStatus) api.DAGRunDetails {
 		autoRetryLimit = ptrOf(s.AutoRetryLimit)
 	}
 	artifactsAvailable := hasArtifactEntries(s.ArchiveDir)
+	var humanTaskResumePending *bool
+	if humantask.ResumePending(&s) {
+		humanTaskResumePending = ptrOf(true)
+	}
 
 	return api.DAGRunDetails{
-		RootDAGRunName:     s.Root.Name,
-		RootDAGRunId:       s.Root.ID,
-		ParentDAGRunName:   ptrOf(s.Parent.Name),
-		ParentDAGRunId:     ptrOf(s.Parent.ID),
-		ArtifactsAvailable: artifactsAvailable,
-		Log:                s.Log,
-		Name:               s.Name,
-		Params:             ptrOf(s.Params),
-		DagRunId:           s.DAGRunID,
-		Workspace:          workspaceResponseNameFromLabelStrings(s.Labels),
-		ProfileName:        toRuntimeProfileName(s.ProfileName),
-		QueuedAt:           ptrOf(s.QueuedAt),
-		AutoRetryCount:     s.AutoRetryCount,
-		AutoRetryLimit:     autoRetryLimit,
-		ScheduleTime:       ptrOf(s.ScheduleTime),
-		StartedAt:          s.StartedAt,
-		FinishedAt:         s.FinishedAt,
-		Status:             api.Status(s.Status),
-		StatusLabel:        api.StatusLabel(s.Status.String()),
-		WorkerId:           ptrOf(s.WorkerID),
-		TriggerType:        toTriggerType(s.TriggerType),
-		Preconditions:      ptrOf(preconditions),
-		Nodes:              nodes,
-		OnSuccess:          ptrOf(toNode(s.OnSuccess)),
-		OnFailure:          ptrOf(toNode(s.OnFailure)),
-		OnAbort:            ptrOf(toNode(s.OnAbort)),
-		OnExit:             ptrOf(toNode(s.OnExit)),
-		Labels:             &s.Labels,
-		Tags:               &s.Labels,
+		AgentTasks:             agentTaskProgress(s.Nodes),
+		AgentEvents:            agentTimeline(s.Nodes),
+		RootDAGRunName:         s.Root.Name,
+		RootDAGRunId:           s.Root.ID,
+		ParentDAGRunName:       ptrOf(s.Parent.Name),
+		ParentDAGRunId:         ptrOf(s.Parent.ID),
+		ArtifactsAvailable:     artifactsAvailable,
+		NoReuse:                ptrOf(s.NoReuse),
+		Log:                    s.Log,
+		Name:                   s.Name,
+		Params:                 ptrOf(s.Params),
+		DagRunId:               s.DAGRunID,
+		Workspace:              workspaceResponseNameFromLabelStrings(s.Labels),
+		ProfileName:            toRuntimeProfileName(s.ProfileName),
+		QueuedAt:               ptrOf(s.QueuedAt),
+		AutoRetryCount:         s.AutoRetryCount,
+		AutoRetryLimit:         autoRetryLimit,
+		Conditions:             toDAGRunConditions(s.Status, s.Conditions),
+		ScheduleTime:           ptrOf(s.ScheduleTime),
+		StartedAt:              s.StartedAt,
+		FinishedAt:             s.FinishedAt,
+		Status:                 api.Status(s.Status),
+		StatusLabel:            api.StatusLabel(s.Status.String()),
+		WorkerId:               ptrOf(s.WorkerID),
+		HumanTaskResumePending: humanTaskResumePending,
+		TriggerType:            toTriggerType(s.TriggerType),
+		TriggerActor:           ptrOf(s.TriggerActor),
+		Preconditions:          ptrOf(preconditions),
+		Nodes:                  nodes,
+		OnInit:                 ptrOf(toNode(s.OnInit)),
+		OnSuccess:              ptrOf(toNode(s.OnSuccess)),
+		OnFailure:              ptrOf(toNode(s.OnFailure)),
+		OnAbort:                ptrOf(toNode(s.OnAbort)),
+		OnExit:                 ptrOf(toNode(s.OnExit)),
+		OnWait:                 ptrOf(toNode(s.OnWait)),
+		Labels:                 &s.Labels,
+		Tags:                   &s.Labels,
 	}
 }
 
@@ -347,36 +462,120 @@ func hasArtifactEntries(archiveDir string) bool {
 	return false
 }
 
-func toNode(node *exec.Node) api.Node {
+func toNode(node *ir.Node) api.Node {
 	if node == nil {
 		return api.Node{}
 	}
-	return api.Node{
-		DoneCount:         node.DoneCount,
-		FinishedAt:        node.FinishedAt,
-		Stdout:            node.Stdout,
-		Stderr:            node.Stderr,
-		RetryCount:        node.RetryCount,
-		StartedAt:         node.StartedAt,
-		Status:            api.NodeStatus(node.Status),
-		StatusLabel:       api.NodeStatusLabel(node.Status.String()),
-		Step:              toStep(node.Step),
-		Error:             ptrOf(node.Error),
-		SubRuns:           ptrOf(toSubDAGRuns(node.SubRuns)),
-		SubRunsRepeated:   ptrOf(toSubDAGRuns(node.SubRunsRepeated)),
-		ApprovedAt:        ptrOf(node.ApprovedAt),
-		ApprovedBy:        ptrOf(node.ApprovedBy),
-		ApprovalInputs:    ptrOf(node.ApprovalInputs),
-		PushBackInputs:    ptrOf(node.PushBackInputs),
-		PushBackHistory:   ptrOf(toPushBackHistory(node)),
-		RejectedAt:        ptrOf(node.RejectedAt),
-		RejectedBy:        ptrOf(node.RejectedBy),
-		RejectionReason:   ptrOf(node.RejectionReason),
-		ApprovalIteration: ptrOf(node.ApprovalIteration),
+	step := toStep(node.Step)
+	if node.PreconditionResults != nil {
+		preconditions := make([]api.Condition, len(node.PreconditionResults))
+		for i, condition := range node.PreconditionResults {
+			preconditions[i] = toPreconditionResult(condition)
+		}
+		step.Preconditions = ptrOf(preconditions)
+	}
+	result := api.Node{
+		DoneCount:              node.DoneCount,
+		FinishedAt:             node.FinishedAt,
+		Stdout:                 node.Stdout,
+		Stderr:                 node.Stderr,
+		RetryCount:             node.RetryCount,
+		StartedAt:              node.StartedAt,
+		Status:                 api.NodeStatus(node.Status),
+		StatusLabel:            api.NodeStatusLabel(node.Status.String()),
+		Step:                   step,
+		Error:                  ptrOf(node.Error),
+		SubRuns:                ptrOf(toSubDAGRuns(node.SubRuns)),
+		SubRunsRepeated:        ptrOf(toSubDAGRuns(node.SubRunsRepeated)),
+		HumanTaskCompletedBy:   ptrOf(node.HumanTaskCompletedBy),
+		HumanTaskCompletedById: ptrOf(node.HumanTaskCompletedByID),
+		ApprovedAt:             ptrOf(node.ApprovedAt),
+		ApprovedBy:             ptrOf(node.ApprovedBy),
+		ApprovedById:           ptrOf(node.ApprovedByID),
+		ApprovalInputs:         ptrOf(node.ApprovalInputs),
+		PushBackInputs:         ptrOf(node.PushBackInputs),
+		PushBackHistory:        ptrOf(toPushBackHistory(node)),
+		RejectedAt:             ptrOf(node.RejectedAt),
+		RejectedBy:             ptrOf(node.RejectedBy),
+		RejectedById:           ptrOf(node.RejectedByID),
+		RejectionReason:        ptrOf(node.RejectionReason),
+		ApprovalIteration:      ptrOf(node.ApprovalIteration),
+	}
+	if node.AgentSession != nil {
+		result.AgentSession = toAgentSession(node.AgentSession)
+	}
+	if node.Build != nil {
+		result.Build = &api.BuildExecution{
+			Decision:           api.BuildExecutionDecision(node.Build.Decision),
+			Phase:              api.BuildExecutionPhase(node.Build.Phase),
+			Reason:             string(node.Build.Reason),
+			Detail:             ptrOf(node.Build.Detail),
+			Fingerprint:        ptrOf(node.Build.Fingerprint),
+			MaterializationKey: ptrOf(node.Build.MaterializationKey),
+			ProducerAttemptId:  ptrOf(node.Build.ProducerAttemptID),
+		}
+		if !node.Build.ProducerRun.Zero() {
+			result.Build.ProducerRun = &api.BuildProducer{
+				Name: ptrOf(node.Build.ProducerRun.Name),
+				Id:   ptrOf(node.Build.ProducerRun.ID),
+			}
+		}
+	}
+	return result
+}
+
+func toAgentSession(session *ir.AgentSession) *api.AgentSession {
+	if session == nil {
+		return nil
+	}
+	interactions := make([]api.AgentInteraction, 0, len(session.Interactions))
+	for _, interaction := range session.Interactions {
+		questions := make([]api.AgentQuestion, 0, len(interaction.Questions))
+		for _, question := range interaction.Questions {
+			options := make([]api.AgentQuestionOption, 0, len(question.Options))
+			for _, option := range question.Options {
+				options = append(options, api.AgentQuestionOption{
+					Label: option.Label, Description: ptrOf(option.Description),
+				})
+			}
+			questions = append(questions, api.AgentQuestion{
+				Header: question.Header, Question: question.Question,
+				Options: ptrOf(options), Multiple: ptrOf(question.Multiple), Custom: ptrOf(question.Custom),
+			})
+		}
+		interactions = append(interactions, api.AgentInteraction{
+			Id: interaction.ID, Kind: api.AgentInteractionKind(interaction.Kind), Status: api.AgentInteractionStatus(interaction.Status),
+			Permission: ptrOf(interaction.Permission), Patterns: ptrOf(interaction.Patterns), AllowForSessionPatterns: ptrOf(interaction.AllowForSessionPatterns),
+			Questions: ptrOf(questions), Decision: ptrOf(interaction.Decision), Answers: ptrOf(interaction.Answers),
+			CreatedAt: ptrOf(interaction.CreatedAt), RespondedAt: ptrOf(interaction.RespondedAt),
+			RespondedBy: ptrOf(interaction.RespondedBy), RespondedById: ptrOf(interaction.RespondedByID),
+		})
+	}
+	events := make([]api.AgentSessionEvent, 0, len(session.Events))
+	for _, event := range session.Events {
+		events = append(events, toAgentSessionEvent(event))
+	}
+	return &api.AgentSession{
+		Provider: session.Provider, ProviderVersion: ptrOf(session.ProviderVersion), SessionId: ptrOf(session.SessionID), Generation: ptrOf(session.Generation),
+		Agent: ptrOf(session.Agent), Model: ptrOf(session.Model), Variant: ptrOf(session.Variant),
+		State:     api.AgentSessionState(session.State),
+		LastError: ptrOf(session.LastError), Interactions: ptrOf(interactions), Events: ptrOf(events),
+		Usage: &api.AgentUsage{
+			InputTokens: ptrOf(session.Usage.InputTokens), OutputTokens: ptrOf(session.Usage.OutputTokens),
+			ReasoningTokens: ptrOf(session.Usage.ReasoningTokens), TotalTokens: ptrOf(session.Usage.TotalTokens), Cost: ptrOf(session.Usage.Cost),
+		},
 	}
 }
 
-func toPushBackHistory(node *exec.Node) []api.PushBackHistoryEntry {
+func toAgentSessionEvent(event ir.AgentSessionEvent) api.AgentSessionEvent {
+	return api.AgentSessionEvent{
+		Sequence: event.Sequence, Id: event.ID, Type: event.Type,
+		Timestamp: ptrOf(event.Timestamp), Role: ptrOf(event.Role), Content: ptrOf(event.Content),
+		Name: ptrOf(event.Name), Status: ptrOf(event.Status), Files: ptrOf(event.Files),
+	}
+}
+
+func toPushBackHistory(node *ir.Node) []api.PushBackHistoryEntry {
 	if node == nil {
 		return nil
 	}
@@ -385,7 +584,7 @@ func toPushBackHistory(node *exec.Node) []api.PushBackHistoryEntry {
 	if node.Step.Approval != nil {
 		allowedInputs = node.Step.Approval.Input
 	}
-	history := exec.NormalizePushBackHistory(
+	history := dagrun.NormalizePushBackHistory(
 		allowedInputs,
 		node.ApprovalIteration,
 		node.PushBackInputs,
@@ -400,6 +599,7 @@ func toPushBackHistory(node *exec.Node) []api.PushBackHistoryEntry {
 		items[i] = api.PushBackHistoryEntry{
 			Iteration: entry.Iteration,
 			By:        ptrOf(entry.By),
+			ById:      ptrOf(entry.ByID),
 			Inputs:    ptrOf(entry.Inputs),
 		}
 		if entry.At != "" {
@@ -411,7 +611,7 @@ func toPushBackHistory(node *exec.Node) []api.PushBackHistoryEntry {
 	return items
 }
 
-func toSubDAGRuns(subDAGRuns []exec.SubDAGRun) []api.SubDAGRun {
+func toSubDAGRuns(subDAGRuns []ir.SubDAGRun) []api.SubDAGRun {
 	result := make([]api.SubDAGRun, len(subDAGRuns))
 	for i, w := range subDAGRuns {
 		result[i] = api.SubDAGRun{
@@ -423,7 +623,7 @@ func toSubDAGRuns(subDAGRuns []exec.SubDAGRun) []api.SubDAGRun {
 	return result
 }
 
-func toLocalDAG(dag *core.DAG) api.LocalDag {
+func toLocalDAG(dag *ir.DAG) api.LocalDag {
 	return api.LocalDag{
 		Name:   dag.Name,
 		Dag:    toDAGDetails(dag),
@@ -431,7 +631,7 @@ func toLocalDAG(dag *core.DAG) api.LocalDag {
 	}
 }
 
-func toDAGDetails(dag *core.DAG) *api.DAGDetails {
+func toDAGDetails(dag *ir.DAG) *api.DAGDetails {
 	if dag == nil {
 		return nil
 	}
@@ -478,6 +678,8 @@ func toDAGDetails(dag *core.DAG) *api.DAGDetails {
 	}
 
 	return &api.DAGDetails{
+		Type:              agentDAGType(dag.Type),
+		Tasks:             declaredAgentTasks(dag),
 		Artifacts:         artifacts,
 		Name:              dag.Name,
 		Description:       ptrOf(dag.Description),
@@ -504,6 +706,91 @@ func toDAGDetails(dag *core.DAG) *api.DAGDetails {
 	}
 }
 
+// agentDAGType exposes the DAG execution type, which the UI uses to decide
+// whether agent-specific views apply.
+func agentDAGType(dagType string) *api.DAGDetailsType {
+	if dagType == "" {
+		return nil
+	}
+	return ptrOf(api.DAGDetailsType(dagType))
+}
+
+// declaredAgentTasks lists the goals an agent DAG declares, before any
+// run has made progress against them.
+func declaredAgentTasks(dag *ir.DAG) *[]api.AgentTask {
+	if len(dag.Tasks) == 0 {
+		return nil
+	}
+	tasks := make([]api.AgentTask, 0, len(dag.Tasks))
+	for _, task := range dag.Tasks {
+		tasks = append(tasks, api.AgentTask{
+			Name:        task.Name,
+			Description: ptrOf(task.Description),
+			Status:      api.AgentTaskStatusOpen,
+		})
+	}
+	return &tasks
+}
+
+// agentTimeline reports the ordered decisions an agent DAG-run made.
+func agentTimeline(nodes []*ir.Node) *[]api.AgentEvent {
+	for _, node := range nodes {
+		if node == nil || !ir.IsPersistedAgentStepName(node.Step.Name) {
+			continue
+		}
+		recorded := agentloop.EventsFromState(node.AgentState)
+		if len(recorded) == 0 {
+			return nil
+		}
+		events := make([]api.AgentEvent, 0, len(recorded))
+		for _, e := range recorded {
+			events = append(events, api.AgentEvent{
+				Turn:          e.Turn,
+				Kind:          api.AgentEventKind(e.Kind),
+				Name:          ptrOf(e.Name),
+				Status:        ptrOf(e.Status),
+				Attempt:       ptrOf(e.Attempt),
+				Reason:        ptrOf(e.Reason),
+				StartedAt:     ptrOf(e.StartedAt),
+				FinishedAt:    ptrOf(e.FinishedAt),
+				ChildDagRunId: ptrOf(e.ChildDAGRunID),
+				ChildDagName:  ptrOf(e.ChildDAGName),
+			})
+		}
+		return &events
+	}
+	return nil
+}
+
+// agentTaskProgress reports goal progress recorded by the agent step
+// of an agent DAG-run.
+func agentTaskProgress(nodes []*ir.Node) *[]api.AgentTask {
+	for _, node := range nodes {
+		if node == nil || !ir.IsPersistedAgentStepName(node.Step.Name) {
+			continue
+		}
+		states := agentloop.TasksFromState(node.AgentState)
+		if len(states) == 0 {
+			return nil
+		}
+		tasks := make([]api.AgentTask, 0, len(states))
+		for _, state := range states {
+			status := state.Status
+			if status == "" {
+				status = agentloop.TaskOpen
+			}
+			tasks = append(tasks, api.AgentTask{
+				Name:        state.Name,
+				Description: ptrOf(state.Description),
+				Status:      api.AgentTaskStatus(status),
+				Reason:      ptrOf(state.Reason),
+			})
+		}
+		return &tasks
+	}
+	return nil
+}
+
 func toJSONObject(raw json.RawMessage) *map[string]any {
 	if len(raw) == 0 {
 		return nil
@@ -523,7 +810,7 @@ func toJSONObject(raw json.RawMessage) *map[string]any {
 	return &value
 }
 
-func toParamDefs(defs []core.ParamDef) []api.ParamDef {
+func toParamDefs(defs []ir.ParamDef) []api.ParamDef {
 	result := make([]api.ParamDef, 0, len(defs))
 	for _, def := range defs {
 		paramDef := api.ParamDef{
@@ -628,7 +915,7 @@ func toParamScalarUint64(value uint64) (api.ParamScalar, bool) {
 	return scalar, scalar.FromParamScalar1(int(value)) == nil
 }
 
-func toHandlerOn(handlers core.HandlerOn) api.HandlerOn {
+func toHandlerOn(handlers ir.HandlerOn) api.HandlerOn {
 	handlerOn := api.HandlerOn{}
 	if handlers.Failure != nil {
 		handlerOn.Failure = ptrOf(toStep(*handlers.Failure))
@@ -645,7 +932,7 @@ func toHandlerOn(handlers core.HandlerOn) api.HandlerOn {
 	return handlerOn
 }
 
-func toChatMessages(messages []exec.LLMMessage) []api.ChatMessage {
+func toChatMessages(messages []ir.LLMMessage) []api.ChatMessage {
 	if messages == nil {
 		return []api.ChatMessage{}
 	}
@@ -657,7 +944,7 @@ func toChatMessages(messages []exec.LLMMessage) []api.ChatMessage {
 	return result
 }
 
-func toChatMessage(msg exec.LLMMessage) api.ChatMessage {
+func toChatMessage(msg ir.LLMMessage) api.ChatMessage {
 	apiMsg := api.ChatMessage{
 		Role:    api.ChatMessageRole(msg.Role),
 		Content: msg.Content,
@@ -688,7 +975,7 @@ func toChatMessage(msg exec.LLMMessage) api.ChatMessage {
 	return apiMsg
 }
 
-func toToolDefinitions(defs []exec.ToolDefinition) *[]api.ToolDefinition {
+func toToolDefinitions(defs []ir.ToolDefinition) *[]api.ToolDefinition {
 	if len(defs) == 0 {
 		return nil
 	}
@@ -703,4 +990,25 @@ func toToolDefinitions(defs []exec.ToolDefinition) *[]api.ToolDefinition {
 	}
 
 	return &result
+}
+
+// authoredOutputDeclarations converts the declarations a workflow author wrote,
+// dropping names the build derived from a step's capture configuration.
+func authoredOutputDeclarations(declarations []ir.StepOutputDeclaration) []api.StepOutputDeclaration {
+	outputs := make([]api.StepOutputDeclaration, 0, len(declarations))
+	for _, declaration := range declarations {
+		if declaration.Source == ir.StepDeclaredOutputSourceCapture {
+			continue
+		}
+		output := api.StepOutputDeclaration{Name: declaration.Name}
+		if declaration.Type != "" {
+			outputType := api.StepOutputDeclarationType(declaration.Type)
+			output.Type = &outputType
+		}
+		if declaration.Path != "" {
+			output.Path = &declaration.Path
+		}
+		outputs = append(outputs, output)
+	}
+	return outputs
 }

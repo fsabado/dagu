@@ -12,8 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 )
 
 const (
@@ -23,11 +25,11 @@ const (
 	queuePollInterval        = 2 * time.Second
 )
 
-var _ exec.QueueStore = (*QueueStore)(nil)
+var _ queue.QueueStore = (*QueueStore)(nil)
 
-// QueueStore implements [exec.QueueStore] on top of a [persis.Collection].
+// QueueStore implements [queue.QueueStore] on top of a [persis.Collection].
 // Records are keyed as "{queueName}/{itemID}", while item IDs exposed through
-// exec.QueuedItemData intentionally stay as "{itemID}" for caller compatibility.
+// queue.QueuedItemData intentionally stay as "{itemID}" for caller compatibility.
 type QueueStore struct {
 	col     persis.Collection
 	indices map[string]*queueReadIndexCache
@@ -43,182 +45,120 @@ func NewQueueStore(col persis.Collection) *QueueStore {
 }
 
 // Enqueue adds a DAG-run reference to the named queue.
-func (s *QueueStore) Enqueue(ctx context.Context, name string, priority exec.QueuePriority, dagRun exec.DAGRunRef) error {
+func (s *QueueStore) Enqueue(ctx context.Context, name string, priority queue.QueuePriority, dagRun ir.DAGRunRef) error {
 	if name == "" {
 		return fmt.Errorf("queue store: queue name is required")
 	}
 	if dagRun.Name == "" || dagRun.ID == "" {
 		return fmt.Errorf("queue store: dag-run reference is required")
 	}
-	if priority != exec.QueuePriorityHigh && priority != exec.QueuePriorityLow {
+	if priority != queue.QueuePriorityHigh && priority != queue.QueuePriorityLow {
 		return fmt.Errorf("queue store: invalid queue priority %d", priority)
 	}
 
-	now := time.Now().UTC()
-	return s.withQueueLock(ctx, name, func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		itemID, queuedAt, err := s.nextQueueItemID(ctx, name, priority, dagRun.ID, now)
-		if err != nil {
-			return err
-		}
-		payload := queueItemPayload{
+	itemID, err := s.createQueueItem(ctx, name, priority, dagRun, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	s.addQueueIndexItemLocked(ctx, name, priority, itemID)
+	return nil
+}
+
+func (s *QueueStore) createQueueItem(
+	ctx context.Context,
+	name string,
+	priority queue.QueuePriority,
+	dagRun ir.DAGRunRef,
+	start time.Time,
+) (string, error) {
+	start = start.UTC()
+	for attempt := range queueItemIDMaxCollisions {
+		queuedAt := start.Add(time.Duration(attempt) * time.Nanosecond)
+		itemID := newQueueItemID(priority, dagRun.ID, queuedAt)
+		data, err := persis.Encode(queueItemPayload{
 			FileName: itemID + ".json",
 			DAGRun:   dagRun,
 			QueuedAt: queuedAt,
-		}
-		data, err := persis.Encode(payload)
+		})
 		if err != nil {
-			return fmt.Errorf("queue store: encode item: %w", err)
+			return "", fmt.Errorf("queue store: encode item: %w", err)
 		}
-
-		if err := s.col.Put(ctx, &persis.Record{
+		err = s.col.Create(ctx, &persis.Record{
 			ID:        queueRecordID(name, itemID),
 			Data:      data,
 			CreatedAt: queuedAt,
 			UpdatedAt: queuedAt,
-		}); err != nil {
-			return err
+		})
+		if err == nil {
+			return itemID, nil
 		}
-
-		s.addQueueIndexItemLocked(ctx, name, priority, itemID)
-		return nil
-	})
-}
-
-func (s *QueueStore) nextQueueItemID(
-	ctx context.Context,
-	name string,
-	priority exec.QueuePriority,
-	dagRunID string,
-	start time.Time,
-) (string, time.Time, error) {
-	start = start.UTC()
-	for attempt := range queueItemIDMaxCollisions {
-		queuedAt := start.Add(time.Duration(attempt) * time.Nanosecond)
-		itemID := newQueueItemID(priority, dagRunID, queuedAt)
-		_, err := s.col.Get(ctx, queueRecordID(name, itemID))
-		if errors.Is(err, persis.ErrNotFound) {
-			return itemID, queuedAt, nil
-		}
-		if err != nil {
-			return "", time.Time{}, err
+		if !errors.Is(err, persis.ErrConflict) {
+			return "", err
 		}
 	}
-	return "", time.Time{}, fmt.Errorf("queue store: could not allocate unique item ID for dag-run %q", dagRunID)
-}
-
-// DequeueByName retrieves and removes the next item from the queue. Items
-// sort by filename (priority-prefixed ID) so `item_high_*` is dequeued
-// before `item_low_*`; the surrounding withQueueLock + s.mu provides
-// serialization, so a plain Get→Delete is atomic in practice.
-func (s *QueueStore) DequeueByName(ctx context.Context, name string) (exec.QueuedItemData, error) {
-	var item exec.QueuedItemData
-	err := s.withQueueLock(ctx, name, func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		ids, err := s.queueRecordIDs(ctx, queueItemPrefix(name))
-		if err != nil {
-			return err
-		}
-		if len(ids) == 0 {
-			return exec.ErrQueueEmpty
-		}
-		nextID := ids[0]
-		rec, err := s.col.Get(ctx, nextID)
-		if err != nil {
-			if errors.Is(err, persis.ErrNotFound) {
-				return exec.ErrQueueEmpty
-			}
-			return err
-		}
-		queueItem, err := queueItemFromRecord(rec)
-		if err != nil {
-			return err
-		}
-		if queueItem.dataErr != nil {
-			return queueItem.dataErr
-		}
-		if err := s.col.Delete(ctx, nextID); err != nil {
-			return err
-		}
-		s.removeQueueIndexItemsLocked(ctx, name, queueItem.ID())
-		item = queueItem
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return item, nil
+	return "", fmt.Errorf("queue store: could not allocate unique item ID for dag-run %q", dagRun.ID)
 }
 
 // DequeueByDAGRunID removes all queued items matching dagRun from the named queue.
-func (s *QueueStore) DequeueByDAGRunID(ctx context.Context, name string, dagRun exec.DAGRunRef) ([]exec.QueuedItemData, error) {
-	var removed []exec.QueuedItemData
-	err := s.withQueueLock(ctx, name, func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
+func (s *QueueStore) DequeueByDAGRunID(ctx context.Context, name string, dagRun ir.DAGRunRef) ([]queue.QueuedItemData, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		items, err := s.listQueue(ctx, name)
-		if err != nil {
-			return err
-		}
-
-		removed = make([]exec.QueuedItemData, 0)
-		for _, item := range items {
-			if item.dataErr != nil || item.dagRun != dagRun {
-				continue
-			}
-			if err := s.col.Delete(ctx, item.recordID); err != nil && !errors.Is(err, persis.ErrNotFound) {
-				return err
-			}
-			removed = append(removed, item)
-		}
-		if len(removed) == 0 {
-			return exec.ErrQueueItemNotFound
-		}
-		removedIDs := make([]string, 0, len(removed))
-		for _, item := range removed {
-			removedIDs = append(removedIDs, item.ID())
-		}
-		s.removeQueueIndexItemsLocked(ctx, name, removedIDs...)
-		return nil
-	})
+	items, err := s.listQueue(ctx, name)
 	if err != nil {
 		return nil, err
 	}
+
+	removed := make([]queue.QueuedItemData, 0)
+	removedIDs := make([]string, 0)
+	for _, item := range items {
+		if item.dataErr != nil || item.dagRun != dagRun {
+			continue
+		}
+		deleted, err := s.deleteQueueRecord(ctx, item.recordID)
+		if err != nil {
+			return nil, err
+		}
+		if !deleted {
+			continue
+		}
+		removed = append(removed, item)
+		removedIDs = append(removedIDs, item.ID())
+	}
+	if len(removed) == 0 {
+		return nil, queue.ErrQueueItemNotFound
+	}
+	s.removeQueueIndexItemsLocked(ctx, name, removedIDs...)
 	return removed, nil
 }
 
 // DeleteByItemIDs removes exact queue item IDs from the named queue.
 func (s *QueueStore) DeleteByItemIDs(ctx context.Context, name string, itemIDs []string) (int, error) {
-	deleted := 0
-	err := s.withQueueLock(ctx, name, func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		deletedIDs := make([]string, 0, len(itemIDs))
-		for _, itemID := range itemIDs {
-			itemID = normalizeQueueItemID(itemID)
-			if itemID == "" {
-				continue
-			}
-			recordID := queueRecordID(name, itemID)
-			ok, err := s.deleteQueueRecord(ctx, recordID)
-			if err != nil {
-				return err
-			}
-			if ok {
-				deleted++
-				deletedIDs = append(deletedIDs, itemID)
-			}
+	deleted := 0
+	deletedIDs := make([]string, 0, len(itemIDs))
+	for _, itemID := range itemIDs {
+		itemID = normalizeQueueItemID(itemID)
+		if itemID == "" {
+			continue
 		}
-		s.removeQueueIndexItemsLocked(ctx, name, deletedIDs...)
-		return nil
-	})
-	return deleted, err
+		recordID := queueRecordID(name, itemID)
+		ok, err := s.deleteQueueRecord(ctx, recordID)
+		if err != nil {
+			return deleted, err
+		}
+		if ok {
+			deleted++
+			deletedIDs = append(deletedIDs, itemID)
+		}
+	}
+	s.removeQueueIndexItemsLocked(ctx, name, deletedIDs...)
+	return deleted, nil
 }
 
 // Len returns the number of queued items in the named queue.
@@ -231,7 +171,7 @@ func (s *QueueStore) Len(ctx context.Context, name string) (int, error) {
 }
 
 // List returns all queued items in the named queue.
-func (s *QueueStore) List(ctx context.Context, name string) ([]exec.QueuedItemData, error) {
+func (s *QueueStore) List(ctx context.Context, name string) ([]queue.QueuedItemData, error) {
 	items, err := s.listQueue(ctx, name)
 	if err != nil {
 		return nil, err
@@ -239,29 +179,56 @@ func (s *QueueStore) List(ctx context.Context, name string) ([]exec.QueuedItemDa
 	return queueItemsAsData(items), nil
 }
 
+// GetByItemID returns an exact queued item from the named queue.
+func (s *QueueStore) GetByItemID(ctx context.Context, name, itemID string) (queue.QueuedItemData, error) {
+	itemID = normalizeQueueItemID(itemID)
+	if name == "" || itemID == "" {
+		return nil, queue.ErrQueueItemNotFound
+	}
+
+	recordID := queueRecordID(name, itemID)
+	rec, err := s.col.Get(ctx, recordID)
+	if errors.Is(err, persis.ErrNotFound) {
+		return nil, queue.ErrQueueItemNotFound
+	}
+	if err != nil {
+		return invalidQueueItemFromRecordID(recordID, err)
+	}
+	return queueItemFromRecord(rec)
+}
+
 // ListCursor returns one forward-only page of queued items.
-func (s *QueueStore) ListCursor(ctx context.Context, name, cursor string, limit int) (exec.CursorResult[exec.QueuedItemData], error) {
+func (s *QueueStore) ListCursor(ctx context.Context, name, cursor string, limit int) (pagination.CursorResult[queue.QueuedItemData], error) {
 	if limit <= 0 {
 		limit = 1
 	}
 	decoded, err := decodeQueueCursor(name, cursor)
 	if err != nil {
-		return exec.CursorResult[exec.QueuedItemData]{}, err
+		return pagination.CursorResult[queue.QueuedItemData]{}, err
 	}
 
-	var result exec.CursorResult[exec.QueuedItemData]
-	err = s.withQueueLock(ctx, name, func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		var err error
-		result, err = s.listCursorLocked(ctx, name, decoded, limit)
-		return err
-	})
-	return result, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCursorLocked(ctx, name, decoded, limit)
+}
+
+// Revision returns the current ordered membership revision of the named queue.
+func (s *QueueStore) Revision(ctx context.Context, name string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	idx, err := s.loadOrRebuildQueueIndexLocked(ctx, name)
+	if err != nil {
+		return 0, err
+	}
+	if idx.total() == 0 {
+		return 0, nil
+	}
+	return idx.Revision, nil
 }
 
 // All returns all queued items across all queues.
-func (s *QueueStore) All(ctx context.Context) ([]exec.QueuedItemData, error) {
+func (s *QueueStore) All(ctx context.Context) ([]queue.QueuedItemData, error) {
 	items, err := s.listAllQueueItems(ctx, persis.ListQuery{})
 	if err != nil {
 		return nil, err
@@ -270,7 +237,7 @@ func (s *QueueStore) All(ctx context.Context) ([]exec.QueuedItemData, error) {
 }
 
 // ListByDAGName returns all items in a queue for a DAG name.
-func (s *QueueStore) ListByDAGName(ctx context.Context, name, dagName string) ([]exec.QueuedItemData, error) {
+func (s *QueueStore) ListByDAGName(ctx context.Context, name, dagName string) ([]queue.QueuedItemData, error) {
 	items, err := s.listQueue(ctx, name)
 	if err != nil {
 		return nil, err
@@ -309,7 +276,7 @@ func (s *QueueStore) QueueList(ctx context.Context) ([]string, error) {
 }
 
 // QueueWatcher returns a backend-neutral polling watcher.
-func (s *QueueStore) QueueWatcher(ctx context.Context) exec.QueueWatcher {
+func (s *QueueStore) QueueWatcher(ctx context.Context) queue.QueueWatcher {
 	return newPollingQueueWatcher(queuePollInterval, func(watchCtx context.Context) (string, error) {
 		if watchCtx == nil {
 			watchCtx = ctx
@@ -354,25 +321,6 @@ func (s *QueueStore) listAllQueueItems(ctx context.Context, q persis.ListQuery) 
 	return items, nil
 }
 
-type queueLockCollection interface {
-	WithLock(ctx context.Context, key string, fn func() error) error
-}
-
-type recordIDsCollection interface {
-	RecordIDs(ctx context.Context, prefix string) ([]string, error)
-}
-
-type deleteIfExistsCollection interface {
-	DeleteIfExists(ctx context.Context, id string) (bool, error)
-}
-
-func (s *QueueStore) withQueueLock(ctx context.Context, name string, fn func() error) error {
-	if col, ok := s.col.(queueLockCollection); ok {
-		return col.WithLock(ctx, name, fn)
-	}
-	return fn()
-}
-
 func (s *QueueStore) queueRecordIDs(ctx context.Context, prefix string) ([]string, error) {
 	if col, ok := s.col.(recordIDsCollection); ok {
 		return col.RecordIDs(ctx, prefix)
@@ -389,19 +337,25 @@ func (s *QueueStore) queueRecordIDs(ctx context.Context, prefix string) ([]strin
 }
 
 func (s *QueueStore) deleteQueueRecord(ctx context.Context, recordID string) (bool, error) {
-	if col, ok := s.col.(deleteIfExistsCollection); ok {
-		return col.DeleteIfExists(ctx, recordID)
-	}
-	if _, err := s.col.Get(ctx, recordID); err != nil {
+	deleted := false
+	err := retryConflict(ctx, func(ctx context.Context) error {
+		rec, err := s.col.Get(ctx, recordID)
 		if errors.Is(err, persis.ErrNotFound) {
-			return false, nil
+			return nil
 		}
-		return false, err
-	}
-	if err := s.col.Delete(ctx, recordID); err != nil {
-		return false, err
-	}
-	return true, nil
+		if err != nil {
+			return err
+		}
+		err = s.col.CompareAndDelete(ctx, rec)
+		if errors.Is(err, persis.ErrNotFound) {
+			return nil
+		}
+		if err == nil {
+			deleted = true
+		}
+		return err
+	})
+	return deleted, err
 }
 
 func (s *QueueStore) queueFingerprint(ctx context.Context) (string, error) {

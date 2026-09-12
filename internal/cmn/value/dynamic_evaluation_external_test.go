@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -97,6 +97,7 @@ func TestNonDynamicFieldsPreserveCommandSubstitutionText(t *testing.T) {
 		{name: "container env", field: value.ContainerEnvField("steps[0].container.env.OUTSIDE")},
 		{name: "executor config", field: value.ExecutorConfigField("steps[0].with.value")},
 		{name: "condition value", field: value.ConditionValueField("steps[0].preconditions[0].condition")},
+		{name: "condition runtime value", field: value.ConditionRuntimeValueField("steps[0].preconditions[0].condition")},
 		{name: "retry integer", field: value.RetryIntegerField("steps[0].retryPolicy.limit")},
 		{name: "repeat integer", field: value.RepeatIntegerField("steps[0].repeatPolicy.repeat")},
 		{name: "server base path", field: value.ServerBasePathField("config.serverBasePath")},
@@ -112,4 +113,38 @@ func TestNonDynamicFieldsPreserveCommandSubstitutionText(t *testing.T) {
 			assert.Equal(t, "`printf one` and $(printf two)", got)
 		})
 	}
+}
+
+func TestConditionRuntimeValueFieldPreservesCommandSubstitution(t *testing.T) {
+	t.Parallel()
+
+	resolver := value.NewResolver(value.StaticScope{}, value.RuntimeScope{})
+	got, err := resolver.String(context.Background(), "`printf one` and $(printf two)", value.ConditionRuntimeValueField("steps[0].preconditions[0].condition"))
+	require.NoError(t, err)
+	assert.Equal(t, "`printf one` and $(printf two)", got)
+}
+
+func TestConditionEvalFieldRunsCommandSubstitution(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX command snippets")
+	}
+
+	resolver := value.NewResolver(value.StaticScope{}, value.RuntimeScope{})
+	got, err := resolver.String(context.Background(), "`printf one` and $(printf two)", value.ConditionEvalField("steps[0].preconditions[0].eval"))
+	require.NoError(t, err)
+	assert.Equal(t, "one and two", got)
+}
+
+func TestResolverWithoutCommandSubstitutionPreservesDynamicEvalCommands(t *testing.T) {
+	t.Parallel()
+
+	resolver := value.NewResolver(
+		value.StaticScope{},
+		value.RuntimeScope{},
+		value.WithoutCommandSubstitution(),
+	)
+	got, err := resolver.String(context.Background(), "`printf one` and $(printf two)", value.ConditionEvalField("steps[0].preconditions[0].eval"))
+	require.NoError(t, err)
+	assert.Equal(t, "`printf one` and $(printf two)", got)
 }

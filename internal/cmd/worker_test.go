@@ -4,12 +4,14 @@
 package cmd_test
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
-	"time"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	cmdprocess "github.com/dagucloud/dagu/internal/cmd/process"
-	"github.com/dagucloud/dagu/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/service/worker"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,6 +36,9 @@ func TestWorkerCommand(t *testing.T) {
 		// The actual flag names depend on how they're registered
 		assert.NotEmpty(t, cli.Long, "Long description should be set")
 		require.NotNil(t, flags.Lookup("worker.health-port"))
+		coordinatorsFlag := flags.Lookup("worker.coordinators")
+		require.NotNil(t, coordinatorsFlag)
+		assert.Contains(t, coordinatorsFlag.Usage, "Required")
 	})
 
 	t.Run("WorkerCommandLongDescriptionContainsUsageInfo", func(t *testing.T) {
@@ -58,155 +63,33 @@ func TestWorkerCommand(t *testing.T) {
 	})
 }
 
-func TestBuildCoordinatorClientConfig(t *testing.T) {
+func TestWorkerContextSkipsLocalPersistence(t *testing.T) {
 	t.Parallel()
 
-	t.Run("EmptyCoordinatorsReturnsError", func(t *testing.T) {
-		t.Parallel()
+	home := t.TempDir()
+	blockedProcDir := filepath.Join(home, "blocked-proc")
+	require.NoError(t, os.WriteFile(blockedProcDir, []byte("not a directory"), 0o600))
+	configPath := filepath.Join(home, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, fmt.Appendf(nil, `
+paths:
+  proc_dir: %q
+`, blockedProcDir), 0o600))
 
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: []string{},
-			},
-		}
-		result, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		require.ErrorContains(t, err, "worker.coordinators is required")
-		assert.Nil(t, result)
-	})
+	command := cmd.CmdWorker()
+	command.SetContext(t.Context())
+	require.NoError(t, command.Flags().Set("dagu-home", home))
+	require.NoError(t, command.Flags().Set("config", configPath))
 
-	t.Run("NilCoordinatorsReturnsError", func(t *testing.T) {
-		t.Parallel()
+	ctx, err := cmd.NewContext(command, nil)
+	require.NoError(t, err)
+	assert.Zero(t, ctx.Persistence)
+}
 
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: nil,
-			},
-		}
-		result, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		require.ErrorContains(t, err, "worker.coordinators is required")
-		assert.Nil(t, result)
-	})
+func TestWorkerCoordinatorClientRequiresAddress(t *testing.T) {
+	t.Parallel()
 
-	t.Run("StaticCoordinatorsReturnsConfig", func(t *testing.T) {
-		t.Parallel()
+	client, err := worker.NewCoordinatorClient(t.Context(), &config.Config{})
 
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: []string{"localhost:50055"},
-			},
-			Core: config.Core{
-				Peer: config.Peer{
-					Insecure: true,
-				},
-			},
-		}
-		result, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		assert.NoError(t, err)
-		require.NotNil(t, result)
-		assert.True(t, result.Insecure)
-	})
-
-	t.Run("StaticCoordinatorsPreservePeerRetryConfig", func(t *testing.T) {
-		t.Parallel()
-
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: []string{"localhost:50055"},
-			},
-			Core: config.Core{
-				Peer: config.Peer{
-					Insecure:      true,
-					MaxRetries:    7,
-					RetryInterval: 3 * time.Second,
-				},
-			},
-		}
-		result, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		assert.NoError(t, err)
-		require.NotNil(t, result)
-		assert.Equal(t, 7, result.MaxRetries)
-		assert.Equal(t, 3*time.Second, result.RetryInterval)
-	})
-
-	t.Run("TLSValidationFailure", func(t *testing.T) {
-		t.Parallel()
-
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: []string{"localhost:50055"},
-			},
-			Core: config.Core{
-				Peer: config.Peer{
-					Insecure: false,
-					// Missing CertFile and KeyFile - should fail validation
-				},
-			},
-		}
-		_, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		require.ErrorContains(t, err, "invalid coordinator client configuration")
-	})
-
-	t.Run("ValidTLSConfig", func(t *testing.T) {
-		t.Parallel()
-
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: []string{"localhost:50055"},
-			},
-			Core: config.Core{
-				Peer: config.Peer{
-					Insecure:     false,
-					CertFile:     "/path/to/cert.pem",
-					KeyFile:      "/path/to/key.pem",
-					ClientCaFile: "/path/to/ca.pem",
-				},
-			},
-		}
-		result, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		assert.NoError(t, err)
-		require.NotNil(t, result)
-		assert.Equal(t, "/path/to/cert.pem", result.CertFile)
-		assert.Equal(t, "/path/to/key.pem", result.KeyFile)
-		assert.Equal(t, "/path/to/ca.pem", result.CAFile)
-	})
-
-	t.Run("SkipTLSVerifyConfig", func(t *testing.T) {
-		t.Parallel()
-
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: []string{"localhost:50055"},
-			},
-			Core: config.Core{
-				Peer: config.Peer{
-					Insecure:      false,
-					CertFile:      "/path/to/cert.pem",
-					KeyFile:       "/path/to/key.pem",
-					SkipTLSVerify: true,
-				},
-			},
-		}
-		result, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		assert.NoError(t, err)
-		require.NotNil(t, result)
-		assert.True(t, result.SkipTLSVerify)
-	})
-
-	t.Run("MultipleCoordinators", func(t *testing.T) {
-		t.Parallel()
-
-		cfg := &config.Config{
-			Worker: config.Worker{
-				Coordinators: []string{"coord1:50055", "coord2:50055", "coord3:50055"},
-			},
-			Core: config.Core{
-				Peer: config.Peer{
-					Insecure: true,
-				},
-			},
-		}
-		result, err := cmdprocess.BuildWorkerCoordinatorClientConfig(cfg)
-		assert.NoError(t, err)
-		require.NotNil(t, result)
-	})
+	require.ErrorContains(t, err, "worker.coordinators is required")
+	assert.Nil(t, client)
 }

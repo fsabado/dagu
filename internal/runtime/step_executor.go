@@ -6,11 +6,12 @@ package runtime
 import (
 	"context"
 	"errors"
+	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
 var errNodeExecutionAborted = errors.New("node execution aborted before start")
@@ -31,12 +32,26 @@ func NewStepExecutor() *StepExecutor {
 // the node. Runner owns scheduling, retries, repeats, and final DAG-state
 // decisions; StepExecutor only preserves executor-provided status overrides.
 func (e *StepExecutor) Execute(ctx context.Context, node *Node, onSetup ...func()) error {
+	return e.execute(ctx, node, onSetup, nil)
+}
+
+// ExecuteWithProgress runs a step and reports live executor side-channel updates.
+func (e *StepExecutor) ExecuteWithProgress(ctx context.Context, node *Node, onSetup, onProgress func()) error {
+	var setup []func()
+	if onSetup != nil {
+		setup = append(setup, onSetup)
+	}
+	return e.execute(ctx, node, setup, onProgress)
+}
+
+func (e *StepExecutor) execute(ctx context.Context, node *Node, onSetup []func(), onProgress func()) error {
+	attemptStarted := time.Now()
+	node.SetStatusDetails(nil)
 	ctx, cancel, stepTimeout := node.setupContextWithTimeout(ctx)
 	defer cancel()
 
 	if err := preRunAbortErr(ctx, node); err != nil {
-		node.SetError(err)
-		return err
+		return recordPreRunAbort(ctx, node, err, stepTimeout, attemptStarted)
 	}
 
 	ctx, cmd, err := node.setupExecutor(ctx)
@@ -70,11 +85,18 @@ func (e *StepExecutor) Execute(ctx context.Context, node *Node, onSetup ...func(
 	}
 
 	if err := preRunAbortErr(ctx, node); err != nil {
-		node.SetError(err)
-		return err
+		return recordPreRunAbort(ctx, node, err, stepTimeout, attemptStarted)
 	}
 
 	e.setupExecutorSideChannels(cmd, node)
+	if progressAware, ok := cmd.(executor.ProgressCallbackAware); ok {
+		progressAware.SetProgressCallback(func() {
+			e.captureLiveExecutorSideChannels(cmd, node)
+			if onProgress != nil {
+				onProgress()
+			}
+		})
+	}
 
 	flusher := node.startOutputFlusher()
 	defer func() {
@@ -85,14 +107,21 @@ func (e *StepExecutor) Execute(ctx context.Context, node *Node, onSetup ...func(
 	node.SetError(err)
 	node.SetExitCode(exitCode)
 
-	if err := e.captureExecutorSideChannels(ctx, cmd, node); err != nil {
-		return err
+	declaredOutputsValue, hasDeclaredOutputs, captureErr := e.captureExecutorSideChannels(ctx, cmd, node)
+	if captureErr != nil {
+		if err == nil {
+			node.SetError(captureErr)
+		}
+		return captureErr
 	}
 
 	if err == nil {
 		if err := node.captureDeclaredStepOutputs(ctx); err != nil {
 			node.SetError(err)
 			return err
+		}
+		if hasDeclaredOutputs {
+			node.setStepOutputsValue(declaredOutputsValue)
 		}
 	}
 
@@ -108,10 +137,21 @@ func (e *StepExecutor) Execute(ctx context.Context, node *Node, onSetup ...func(
 }
 
 func preRunAbortErr(ctx context.Context, node *Node) error {
-	if node.Status() == core.NodeAborted {
+	if node.Status() == ir.NodeAborted {
 		return errNodeExecutionAborted
 	}
 	return ctx.Err()
+}
+
+func recordPreRunAbort(ctx context.Context, node *Node, err error, stepTimeout time.Duration, attemptStarted time.Time) error {
+	if stepTimeout > 0 && errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		exitCode, timeoutErr := node.handleTimeout(ctx, node.Step(), stepTimeout, time.Since(attemptStarted))
+		node.SetExitCode(exitCode)
+		return timeoutErr
+	}
+
+	node.SetError(err)
+	return err
 }
 
 func wrapStepSetupError(err error) error {
@@ -136,6 +176,9 @@ func (e *StepExecutor) setupExecutorSideChannels(cmd executor.Executor, node *No
 			chatHandler.SetContext(messages)
 		}
 	}
+	if agentHandler, ok := cmd.(executor.AgentSessionHandler); ok {
+		agentHandler.SetAgentSession(node.GetAgentSession())
+	}
 
 	state := node.State()
 	if state.ApprovalIteration <= 0 {
@@ -150,9 +193,30 @@ func (e *StepExecutor) setupExecutorSideChannels(cmd executor.Executor, node *No
 	}
 }
 
-func (e *StepExecutor) captureExecutorSideChannels(ctx context.Context, cmd executor.Executor, node *Node) error {
+func (e *StepExecutor) captureLiveExecutorSideChannels(cmd executor.Executor, node *Node) {
 	if chatHandler, ok := cmd.(executor.ChatMessageHandler); ok {
 		node.SetChatMessages(chatHandler.GetMessages())
+	}
+	if agentHandler, ok := cmd.(executor.AgentSessionHandler); ok {
+		node.SetAgentSession(agentHandler.GetAgentSession())
+	}
+}
+
+func (e *StepExecutor) captureExecutorSideChannels(
+	ctx context.Context,
+	cmd executor.Executor,
+	node *Node,
+) (string, bool, error) {
+	if statusDetailsProvider, ok := cmd.(executor.StatusDetailsProvider); ok {
+		node.SetStatusDetails(statusDetailsProvider.GetStatusDetails())
+	}
+
+	if chatHandler, ok := cmd.(executor.ChatMessageHandler); ok {
+		node.SetChatMessages(chatHandler.GetMessages())
+	}
+
+	if agentHandler, ok := cmd.(executor.AgentSessionHandler); ok {
+		node.SetAgentSession(agentHandler.GetAgentSession())
 	}
 
 	if subRunProvider, ok := cmd.(executor.SubRunProvider); ok {
@@ -175,16 +239,24 @@ func (e *StepExecutor) captureExecutorSideChannels(ctx context.Context, cmd exec
 
 	if outputsProvider, ok := cmd.(executor.OutputsProvider); ok {
 		outputs := outputsProvider.GetOutputs()
+		hasDeclaredOutputs := false
+		if declared, ok := cmd.(executor.DeclaredOutputsProvider); ok {
+			hasDeclaredOutputs = declared.PublishesDeclaredOutputs()
+		}
+		// An executor that published nothing declares nothing, so the step
+		// output channels stay empty rather than holding a null payload.
 		if len(outputs) == 0 {
 			node.clearOutputsValue()
-			return nil
+			return "", false, nil
 		}
-		value, err := serializeOutputsValue(ctx, outputs)
+
+		declaredOutputsValue, err := serializeOutputsValue(ctx, outputs)
 		if err != nil {
-			return err
+			return "", false, err
 		}
-		node.setOutputsValue(value)
+		node.setOutputsValue(declaredOutputsValue)
+		return declaredOutputsValue, hasDeclaredOutputs, nil
 	}
 
-	return nil
+	return "", false, nil
 }

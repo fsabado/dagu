@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/test"
 )
 
 func TestStartAllCommand(t *testing.T) {
@@ -28,7 +28,7 @@ func TestStartAllCommand(t *testing.T) {
 	})
 	t.Run("StartAllWithConfig", func(t *testing.T) {
 		th := test.SetupCommand(t)
-		cancelWhenLogContains(t, th, "Coordinator initialization")
+		cancelWhenLogContains(t, th, "Scheduler initialization", "Coordinator initialization")
 		th.RunCommand(t, cmd.StartAll(), test.CmdTest{
 			Args: []string{
 				"start-all",
@@ -38,4 +38,8 @@ func TestStartAllCommand(t *testing.T) {
 			ExpectedOut: []string{"54322", "dagu_test", "Coordinator initialization"},
 		})
 	})
+}
+
+func TestStartAllSecondInterruptTerminatesBlockedCleanup(t *testing.T) {
+	assertSecondInterruptTerminatesBlockedCleanup(t, "start-all", "All services stopped gracefully")
 }

@@ -14,16 +14,17 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
-	"github.com/dagucloud/dagu/internal/runtime/resourcelimit"
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/runtime/resourcelimit"
 )
 
 var errNoCommandSpecified = fmt.Errorf("no command specified")
@@ -302,8 +303,7 @@ func exitCodeFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		return exitErr.ExitCode()
 	}
 	return 1
@@ -312,7 +312,7 @@ func exitCodeFromError(err error) int {
 // NewCommand creates an executor that will run the provided step.
 // It returns an executor configured from the step, or an error if creating the command configuration fails.
 // If the step has multiple commands, it returns a multiCommandExecutor that runs them sequentially.
-func NewCommand(ctx context.Context, step core.Step) (executor.Executor, error) {
+func NewCommand(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	// If there are multiple commands, use the multi-command executor
 	if len(step.Commands) > 1 {
 		return newMultiCommandExecutor(ctx, step)
@@ -331,7 +331,7 @@ func NewCommand(ctx context.Context, step core.Step) (executor.Executor, error) 
 // extracts Command/Args from the first command entry, and sets UserSpecifiedShell to true
 // when the step explicitly provided a Shell.
 // It returns the constructed *commandConfig and a nil error.
-func NewCommandConfig(ctx context.Context, step core.Step) (*commandConfig, error) {
+func NewCommandConfig(ctx context.Context, step ir.Step) (*commandConfig, error) {
 	env := runtime.GetEnv(ctx)
 
 	var command string
@@ -366,12 +366,12 @@ func NewCommandConfig(ctx context.Context, step core.Step) (*commandConfig, erro
 // init registers command executors ("", "shell", "command") with the executor
 // framework, associating each with NewCommand and validateCommandStep.
 func init() {
-	caps := core.ExecutorCapabilities{
+	caps := registry.ExecutorCapabilities{
 		Command:          true,
 		MultipleCommands: true,
 		Script:           true,
 		Shell:            true,
-		CommandContext: func(ctx context.Context, step core.Step) cmnvalue.CommandContext {
+		CommandContext: func(ctx context.Context, step ir.Step) cmnvalue.CommandContext {
 			shell := commandContextShell(ctx, step)
 			return cmnvalue.CommandContext{
 				Target:          cmnvalue.CommandTargetLocal,
@@ -379,7 +379,7 @@ func init() {
 				ShellConfigured: len(shell) > 0,
 			}
 		},
-		ScriptContext: func(ctx context.Context, step core.Step) cmnvalue.CommandContext {
+		ScriptContext: func(ctx context.Context, step ir.Step) cmnvalue.CommandContext {
 			shell := commandContextShell(ctx, step)
 			return cmnvalue.CommandContext{
 				Target:          cmnvalue.CommandTargetLocal,
@@ -393,7 +393,7 @@ func init() {
 	executor.RegisterExecutor("command", NewCommand, validateCommandStep, caps)
 }
 
-func commandContextShell(ctx context.Context, step core.Step) []string {
+func commandContextShell(ctx context.Context, step ir.Step) []string {
 	if env, ok := runtime.LookupEnv(ctx); ok {
 		return env.Shell(ctx)
 	}

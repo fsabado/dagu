@@ -14,9 +14,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 )
 
 func TestQueueCursorHelpersRejectInvalidState(t *testing.T) {
@@ -28,20 +30,20 @@ func TestQueueCursorHelpersRejectInvalidState(t *testing.T) {
 
 	raw := encodeQueueCursor("queue-a", 1, "item-a")
 	_, err := decodeQueueCursor("queue-b", raw)
-	assert.ErrorIs(t, err, exec.ErrInvalidCursor)
+	assert.ErrorIs(t, err, pagination.ErrInvalidCursor)
 
 	start, err := resolveQueueCursorStart(items, queueReadCursor{Offset: 99, AfterItemID: "item-a"})
 	require.NoError(t, err)
 	assert.Equal(t, 1, start)
 
 	_, err = resolveQueueCursorStart(items, queueReadCursor{Offset: -1})
-	assert.ErrorIs(t, err, exec.ErrInvalidCursor)
+	assert.ErrorIs(t, err, pagination.ErrInvalidCursor)
 
 	_, err = resolveQueueCursorStart(items, queueReadCursor{Offset: 1})
-	assert.ErrorIs(t, err, exec.ErrInvalidCursor)
+	assert.ErrorIs(t, err, pagination.ErrInvalidCursor)
 
 	_, err = resolveQueueCursorStart(items, queueReadCursor{Offset: 2, AfterItemID: "missing"})
-	assert.ErrorIs(t, err, exec.ErrInvalidCursor)
+	assert.ErrorIs(t, err, pagination.ErrInvalidCursor)
 }
 
 func TestQueueItemHelpersHandleInvalidRecords(t *testing.T) {
@@ -61,7 +63,7 @@ func TestQueueItemHelpersHandleInvalidRecords(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
 	data, err := persis.Encode(queueItemPayload{
 		FileName: "bad-name.json",
-		DAGRun:   exec.DAGRunRef{},
+		DAGRun:   ir.DAGRunRef{},
 		QueuedAt: now,
 	})
 	require.NoError(t, err)
@@ -82,11 +84,11 @@ func TestQueueItemMetadataAndNormalization(t *testing.T) {
 	fallback := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
 
 	priority, queuedAt := queueItemMetadata("item_high_20260102_030405_000000007Z_run", fallback)
-	assert.Equal(t, exec.QueuePriorityHigh, priority)
+	assert.Equal(t, queue.QueuePriorityHigh, priority)
 	assert.Equal(t, time.Date(2026, 1, 2, 3, 4, 5, 7, time.UTC), queuedAt)
 
 	priority, queuedAt = queueItemMetadata("not-a-queue-item", fallback)
-	assert.Equal(t, exec.QueuePriorityLow, priority)
+	assert.Equal(t, queue.QueuePriorityLow, priority)
 	assert.Equal(t, fallback, queuedAt)
 
 	assert.Equal(t, "item.json.bak", normalizeQueueItemID("ignored/item.json.bak"))
@@ -139,13 +141,13 @@ func TestPollingQueueWatcherUsesDefaultInterval(t *testing.T) {
 	assert.Equal(t, queuePollInterval, watcher.interval)
 }
 
-func TestQueueStoreNextQueueItemIDSkipsExistingTimestamp(t *testing.T) {
+func TestQueueStoreCreateQueueItemSkipsExistingTimestamp(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	queueName := "main"
-	dagRun := exec.NewDAGRunRef("dag", "run-same")
-	priority := exec.QueuePriorityLow
+	dagRun := ir.NewDAGRunRef("dag", "run-same")
+	priority := queue.QueuePriorityLow
 	start := time.Date(2026, 1, 1, 0, 0, 0, 1, time.UTC)
 
 	s := NewQueueStore(testutil.NewMemoryBackend().Collection("queue"))
@@ -156,17 +158,16 @@ func TestQueueStoreNextQueueItemIDSkipsExistingTimestamp(t *testing.T) {
 		QueuedAt: start,
 	})
 	require.NoError(t, err)
-	require.NoError(t, s.col.Put(ctx, &persis.Record{
+	require.NoError(t, s.col.Create(ctx, &persis.Record{
 		ID:        queueRecordID(queueName, firstID),
 		Data:      data,
 		CreatedAt: start,
 		UpdatedAt: start,
 	}))
 
-	gotID, gotQueuedAt, err := s.nextQueueItemID(ctx, queueName, priority, dagRun.ID, start)
+	gotID, err := s.createQueueItem(ctx, queueName, priority, dagRun, start)
 	require.NoError(t, err)
 
 	wantQueuedAt := start.Add(time.Nanosecond)
 	assert.Equal(t, newQueueItemID(priority, dagRun.ID, wantQueuedAt), gotID)
-	assert.Equal(t, wantQueuedAt, gotQueuedAt)
 }

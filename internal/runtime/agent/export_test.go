@@ -4,13 +4,12 @@
 package agent
 
 import (
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 )
 
 // RetryNodesForTest returns runtime retry nodes for the supplied DAG and status.
-func RetryNodesForTest(dag *core.DAG, status *exec.DAGRunStatus) ([]*runtime.Node, error) {
+func RetryNodesForTest(dag *ir.DAG, status *ir.DAGRunStatus) ([]*runtime.Node, error) {
 	a := &Agent{
 		dag:         dag,
 		retryTarget: status,

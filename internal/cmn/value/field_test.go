@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,6 +65,8 @@ func TestResolverFieldPolicyMatrix(t *testing.T) {
 		"DAGShell":                   strictNoOS,
 		"StepShell":                  strictNoOS,
 		"ConditionValue":             strictNoOS,
+		"ConditionRuntimeValue":      strictNoOS,
+		"ConditionEval":              strictOS,
 		"ConditionCommand":           strictOS,
 		"DirectCommand":              strictOS,
 		"ShellCommand":               strictNoOS,
@@ -111,6 +113,8 @@ func TestResolverFieldPolicyBacktickMatrix(t *testing.T) {
 		{name: "step env", field: value.StepEnvField("field"), want: "`printf matrix`"},
 		{name: "container env", field: value.ContainerEnvField("field"), want: "`printf matrix`"},
 		{name: "dynamic params", field: value.DynamicParamEvalField("field"), want: "matrix"},
+		{name: "condition runtime value", field: value.ConditionRuntimeValueField("field"), want: "`printf matrix`"},
+		{name: "condition eval", field: value.ConditionEvalField("field"), want: "matrix"},
 		{name: "template script", field: value.TemplateScriptField("field"), want: "`printf matrix`"},
 		{name: "direct command", field: value.DirectCommandField("field", value.CommandContext{}), want: "`printf matrix`"},
 	} {

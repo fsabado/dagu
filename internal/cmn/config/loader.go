@@ -4,8 +4,13 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"path"
@@ -15,8 +20,10 @@ import (
 	"time"
 
 	"github.com/adrg/xdg"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
 // Service represents the type of service that is loading configuration.
@@ -45,24 +52,24 @@ const (
 	// Requires: Core, Paths, Coordinator
 	ServiceCoordinator
 
-	// ServiceAgent is for the agent executor (runs DAGs).
+	// ServiceAgent is for the DAG runtime executor.
 	// Requires: Core, Paths, Queues (to check if distributed execution is enabled)
 	ServiceAgent
-
-	// ServiceBots is the bot service (Telegram, etc.).
-	// Requires: Core, Paths, Bots config, and Proc for agent stores.
-	ServiceBots
 )
 
 // ConfigLoader reads and merges configuration from various sources.
 type ConfigLoader struct {
-	v                 *viper.Viper
-	configFile        string
-	notices           []string
-	warnings          []string
-	additionalBaseEnv []string
-	appHomeDir        string
-	service           Service
+	v                                *viper.Viper
+	configFile                       string
+	notices                          []string
+	warnings                         []string
+	additionalBaseEnv                []string
+	appHomeDir                       string
+	service                          Service
+	trustedProxyGroupMappings        map[string]string
+	trustedProxyGroupMappingsSet     bool
+	trustedProxyWorkspaceMappings    map[string][]TrustedProxyWorkspaceGrant
+	trustedProxyWorkspaceMappingsSet bool
 }
 
 // ConfigLoaderOption defines a functional option for configuring a ConfigLoader.
@@ -108,10 +115,9 @@ const (
 	SectionTunnel                                // 512
 	SectionLicense                               // 1024
 	SectionProc                                  // 2048
-	SectionBots                                  // 4096
 
 	// SectionAll combines all sections (useful for ServiceNone/CLI)
-	SectionAll = SectionServer | SectionScheduler | SectionWorker | SectionCoordinator | SectionUI | SectionQueues | SectionMonitoring | SectionGitSync | SectionTunnel | SectionLicense | SectionProc | SectionBots
+	SectionAll = SectionServer | SectionScheduler | SectionWorker | SectionCoordinator | SectionUI | SectionQueues | SectionMonitoring | SectionGitSync | SectionTunnel | SectionLicense | SectionProc
 )
 
 // serviceRequirements maps services to their required config sections using bitwise OR.
@@ -122,7 +128,6 @@ var serviceRequirements = map[Service]ConfigSection{
 	ServiceWorker:      SectionWorker | SectionCoordinator | SectionProc,
 	ServiceCoordinator: SectionCoordinator | SectionProc,
 	ServiceAgent:       SectionQueues | SectionProc,
-	ServiceBots:        SectionBots | SectionProc,
 }
 
 // requires checks if the loader's service requires the given config section.
@@ -197,8 +202,18 @@ func (l *ConfigLoader) Load() (*Config, error) {
 		}
 	}
 
+	var configFilesUsed []string
+	if l.v.ConfigFileUsed() != "" {
+		configFilesUsed = append(configFilesUsed, l.v.ConfigFileUsed())
+	}
+
 	if err := checkForLegacyKeys(l.v); err != nil {
 		return nil, err
+	}
+	if l.requires(SectionServer) {
+		if err := l.mergeTrustedProxyMappingsFile(l.v.ConfigFileUsed()); err != nil {
+			return nil, err
+		}
 	}
 
 	configFileUsed, err := l.resolvePath("config file", l.v.ConfigFileUsed())
@@ -212,12 +227,29 @@ func (l *ConfigLoader) Load() (*Config, error) {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			return nil, fmt.Errorf("failed to read admin config: %w", err)
 		}
+	} else if l.requires(SectionServer) {
+		configFilesUsed = append(configFilesUsed, l.v.ConfigFileUsed())
+		if err := l.mergeTrustedProxyMappingsFile(l.v.ConfigFileUsed()); err != nil {
+			return nil, err
+		}
+	}
+	if err := l.loadOIDCWorkspaceMappingsEnv(); err != nil {
+		return nil, err
+	}
+	if l.requires(SectionServer) {
+		if err := l.loadTrustedProxyMappingsEnv(); err != nil {
+			return nil, err
+		}
+		if err := l.validateTrustedProxyConfigKeys(); err != nil {
+			return nil, err
+		}
 	}
 
 	var def Definition
 	if err := l.v.Unmarshal(&def); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
+	l.applyTrustedProxyMappings(&def)
 
 	cfg, err := l.buildConfig(def)
 	if err != nil {
@@ -225,6 +257,13 @@ func (l *ConfigLoader) Load() (*Config, error) {
 	}
 
 	cfg.Paths.ConfigFileUsed = configFileUsed
+	for _, filename := range configFilesUsed {
+		resolved, err := l.resolvePath("config file", filename)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Paths.ConfigFilesUsed = append(cfg.Paths.ConfigFilesUsed, resolved)
+	}
 	l.finalizeBaseEnv(cfg)
 	cfg.Notices = l.notices
 	cfg.Warnings = l.warnings
@@ -273,7 +312,6 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 		{SectionMonitoring, func() { l.loadMonitoringConfig(&cfg, def) }},
 		{SectionGitSync, func() { l.loadGitSyncConfig(&cfg, def) }},
 		{SectionTunnel, func() { l.loadTunnelConfig(&cfg, def) }},
-		{SectionBots, func() { l.loadBotsConfig(&cfg, def) }},
 		{SectionLicense, func() { l.loadLicenseConfig(&cfg, def) }},
 	}
 
@@ -291,7 +329,9 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 		return nil, err
 	}
 	l.loadLegacyEnv(&cfg)
-	l.finalizePaths(&cfg)
+	if err := l.finalizePaths(&cfg); err != nil {
+		return nil, err
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -317,6 +357,17 @@ func (l *ConfigLoader) loadCoreConfig(cfg *Config, def Definition) error {
 		EnvPassthroughPrefixes: envPassthroughPrefixes,
 		BaseEnv:                baseEnv,
 		Peer:                   l.loadPeerConfig(def.Peer),
+	}
+	cfg.OpenCode = OpenCodeConfig{
+		Executable:     strings.TrimSpace(l.v.GetString("opencode.executable")),
+		EnvPassthrough: normalizeEnvEntries(parseStringList(l.v.Get("opencode.env_passthrough"))),
+	}
+	if cfg.OpenCode.Executable == "" {
+		cfg.OpenCode.Executable = "opencode"
+	}
+	cfg.DAGDiscovery = DAGDiscoveryConfig{
+		Recursive: l.v.GetBool("dag_discovery.recursive"),
+		Symlinks:  l.v.GetBool("dag_discovery.symlinks"),
 	}
 
 	if err := setTimezone(&cfg.Core); err != nil {
@@ -376,7 +427,6 @@ func (l *ConfigLoader) loadPathsConfig(cfg *Config, def Definition) error {
 		source string
 	}{
 		{"DAGsDir", &cfg.Paths.DAGsDir, def.Paths.DAGsDir},
-		{"DocsDir", &cfg.Paths.DocsDir, def.Paths.DocsDir},
 		{"AltDAGsDir", &cfg.Paths.AltDAGsDir, def.Paths.AltDagsDir},
 		{"SuspendFlagsDir", &cfg.Paths.SuspendFlagsDir, def.Paths.SuspendFlagsDir},
 		{"DataDir", &cfg.Paths.DataDir, def.Paths.DataDir},
@@ -389,13 +439,13 @@ func (l *ConfigLoader) loadPathsConfig(cfg *Config, def Definition) error {
 		{"BaseConfig", &cfg.Paths.BaseConfig, def.Paths.BaseConfig},
 		{"Executable", &cfg.Paths.Executable, def.Paths.Executable},
 		{"DAGRunsDir", &cfg.Paths.DAGRunsDir, def.Paths.DAGRunsDir},
+		{"DAGRunWorkDir", &cfg.Paths.DAGRunWorkDir, def.Paths.DAGRunWorkDir},
 		{"QueueDir", &cfg.Paths.QueueDir, def.Paths.QueueDir},
 		{"ProcDir", &cfg.Paths.ProcDir, def.Paths.ProcDir},
 		{"ServiceRegistryDir", &cfg.Paths.ServiceRegistryDir, def.Paths.ServiceRegistryDir},
 		{"UsersDir", &cfg.Paths.UsersDir, def.Paths.UsersDir},
 		{"APIKeysDir", &cfg.Paths.APIKeysDir, def.Paths.APIKeysDir},
 		{"WebhooksDir", &cfg.Paths.WebhooksDir, def.Paths.WebhooksDir},
-		{"SessionsDir", &cfg.Paths.SessionsDir, def.Paths.SessionsDir},
 		{"ContextsDir", &cfg.Paths.ContextsDir, def.Paths.ContextsDir},
 		{"RemoteNodesDir", &cfg.Paths.RemoteNodesDir, def.Paths.RemoteNodesDir},
 		{"WorkspacesDir", &cfg.Paths.WorkspacesDir, def.Paths.WorkspacesDir},
@@ -410,6 +460,24 @@ func (l *ConfigLoader) loadPathsConfig(cfg *Config, def Definition) error {
 		*m.target = resolved
 	}
 
+	wikiDir := def.Paths.WikiDir
+	if wikiDir != "" {
+		if def.Paths.DocsDir != "" {
+			l.warnings = append(l.warnings, "paths.docs_dir is deprecated and ignored because paths.wiki_dir is set")
+		}
+	} else if def.Paths.DocsDir != "" {
+		wikiDir = def.Paths.DocsDir
+		cfg.Paths.WikiDirLegacy = true
+		l.warnings = append(l.warnings, "paths.docs_dir is deprecated; use paths.wiki_dir instead")
+	}
+	if wikiDir != "" {
+		resolved, err := l.resolvePath("WikiDir", wikiDir)
+		if err != nil {
+			return err
+		}
+		cfg.Paths.WikiDir = resolved
+	}
+
 	return nil
 }
 
@@ -419,9 +487,30 @@ func (l *ConfigLoader) loadSecretsConfig(cfg *Config, def Definition) {
 	}
 
 	if def.Secrets.Vault != nil {
+		vaultCACert := def.Secrets.Vault.CACert
+		if resolved, err := l.resolvePath("secrets.vault.ca_cert", vaultCACert); err != nil {
+			l.warnings = append(l.warnings, err.Error())
+		} else {
+			vaultCACert = resolved
+		}
+		vaultClientCert := def.Secrets.Vault.ClientCert
+		if resolved, err := l.resolvePath("secrets.vault.client_cert", vaultClientCert); err != nil {
+			l.warnings = append(l.warnings, err.Error())
+		} else {
+			vaultClientCert = resolved
+		}
+		vaultClientKey := def.Secrets.Vault.ClientKey
+		if resolved, err := l.resolvePath("secrets.vault.client_key", vaultClientKey); err != nil {
+			l.warnings = append(l.warnings, err.Error())
+		} else {
+			vaultClientKey = resolved
+		}
 		cfg.Secrets.Vault = VaultSecretsConfig{
-			Address: def.Secrets.Vault.Address,
-			Token:   def.Secrets.Vault.Token,
+			Address:    def.Secrets.Vault.Address,
+			Token:      def.Secrets.Vault.Token,
+			CACert:     vaultCACert,
+			ClientCert: vaultClientCert,
+			ClientKey:  vaultClientKey,
 		}
 	}
 
@@ -438,6 +527,40 @@ func (l *ConfigLoader) loadSecretsConfig(cfg *Config, def Definition) {
 			Namespace:  def.Secrets.Kubernetes.Namespace,
 			Kubeconfig: kubeconfig,
 			Context:    def.Secrets.Kubernetes.Context,
+		}
+	}
+
+	if def.Secrets.AWS != nil {
+		cfg.Secrets.AWS = AWSSecretsConfig{
+			Region: def.Secrets.AWS.Region,
+		}
+	}
+
+	if def.Secrets.GCP != nil {
+		cfg.Secrets.GCP = GCPSecretsConfig{
+			ProjectID: def.Secrets.GCP.ProjectID,
+			Location:  def.Secrets.GCP.Location,
+		}
+	}
+
+	if def.Secrets.Azure != nil {
+		cfg.Secrets.Azure = AzureSecretsConfig{
+			VaultURL: def.Secrets.Azure.VaultURL,
+		}
+	}
+
+	if def.Secrets.Alibaba != nil {
+		caFile := def.Secrets.Alibaba.CAFile
+		resolved, err := l.resolvePath("secrets.alibaba.ca_file", caFile)
+		if err != nil {
+			l.warnings = append(l.warnings, err.Error())
+		} else {
+			caFile = resolved
+		}
+		cfg.Secrets.Alibaba = AlibabaSecretsConfig{
+			Region:   def.Secrets.Alibaba.Region,
+			Endpoint: def.Secrets.Alibaba.Endpoint,
+			CAFile:   caFile,
 		}
 	}
 }
@@ -499,14 +622,14 @@ func (l *ConfigLoader) loadServerFlags(cfg *Config, def Definition) {
 	if def.Headless != nil {
 		cfg.Server.Headless = *def.Headless
 	}
-	cfg.Server.AccessLog = AccessLogAll
+	cfg.Server.AccessLog = AccessLogNone
 	if def.AccessLog != nil {
 		switch AccessLogMode(*def.AccessLog) {
 		case AccessLogAll, AccessLogNonPublic, AccessLogNone:
 			cfg.Server.AccessLog = AccessLogMode(*def.AccessLog)
 		default:
 			l.warnings = append(l.warnings, fmt.Sprintf(
-				"Invalid access_log_mode value: %q, defaulting to 'all'", *def.AccessLog))
+				"Invalid access_log_mode value: %q, defaulting to 'none'", *def.AccessLog))
 		}
 	}
 	if def.LatestStatusToday != nil {
@@ -525,6 +648,7 @@ func (l *ConfigLoader) loadServerTLS(cfg *Config, def Definition) {
 }
 
 func (l *ConfigLoader) loadServerAuth(cfg *Config, def Definition) {
+	l.setTrustedProxyDefaults(cfg)
 	l.loadAuthMode(cfg, def)
 
 	if def.Auth == nil {
@@ -534,6 +658,7 @@ func (l *ConfigLoader) loadServerAuth(cfg *Config, def Definition) {
 
 	l.loadBasicAuth(cfg, def.Auth)
 	l.loadOIDCAuth(cfg, def.Auth)
+	l.loadTrustedProxyAuth(cfg, def.Auth)
 	l.loadBuiltinAuth(cfg, def.Auth)
 	l.setAuthDefaults(cfg)
 }
@@ -593,6 +718,8 @@ func (l *ConfigLoader) loadOIDCRoleMapping(cfg *Config, rm *OIDCRoleMappingDef) 
 	cfg.Server.Auth.OIDC.RoleMapping.DefaultRole = rm.DefaultRole
 	cfg.Server.Auth.OIDC.RoleMapping.GroupsClaim = rm.GroupsClaim
 	cfg.Server.Auth.OIDC.RoleMapping.GroupMappings = rm.GroupMappings
+	cfg.Server.Auth.OIDC.RoleMapping.WorkspaceMappings = rm.WorkspaceMappings
+	cfg.Server.Auth.OIDC.RoleMapping.DefaultWorkspaceAccess = rm.DefaultWorkspaceAccess
 	cfg.Server.Auth.OIDC.RoleMapping.RoleAttributePath = rm.RoleAttributePath
 
 	if rm.RoleAttributeStrict != nil {
@@ -601,6 +728,369 @@ func (l *ConfigLoader) loadOIDCRoleMapping(cfg *Config, rm *OIDCRoleMappingDef) 
 	if rm.SkipOrgRoleSync != nil {
 		cfg.Server.Auth.OIDC.RoleMapping.SkipOrgRoleSync = *rm.SkipOrgRoleSync
 	}
+}
+
+func (l *ConfigLoader) loadOIDCWorkspaceMappingsEnv() error {
+	const (
+		configKey = "auth.oidc.role_mapping.workspace_mappings"
+		envSuffix = "AUTH_OIDC_WORKSPACE_MAPPINGS"
+	)
+
+	envName := strings.ToUpper(AppSlug) + "_" + envSuffix
+	raw, exists := os.LookupEnv(envName)
+	if !exists {
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return fmt.Errorf("%s must be a JSON object", envName)
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	var mappings map[string][]OIDCWorkspaceGrant
+	if err := decoder.Decode(&mappings); err != nil {
+		return fmt.Errorf("invalid %s JSON: %w", envName, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("invalid %s JSON: expected a single object", envName)
+	}
+	l.v.Set(configKey, mappings)
+	return nil
+}
+
+func (l *ConfigLoader) loadTrustedProxyAuth(cfg *Config, authDef *AuthDef) {
+	if authDef.Proxy == nil {
+		return
+	}
+
+	trustedProxyDef := authDef.Proxy
+	trustedProxy := &cfg.Server.Auth.Proxy
+	if trustedProxyDef.Enabled != nil {
+		trustedProxy.Enabled = *trustedProxyDef.Enabled
+	}
+	if trustedProxyDef.Source != nil {
+		trustedProxy.Source = *trustedProxyDef.Source
+	}
+	if trustedProxyDef.ButtonLabel != nil {
+		trustedProxy.ButtonLabel = *trustedProxyDef.ButtonLabel
+	}
+	if trustedProxyDef.Headers != nil {
+		trustedProxy.Headers.User = trustedProxyDef.Headers.User
+		trustedProxy.Headers.Groups = trustedProxyDef.Headers.Groups
+	}
+	if trustedProxyDef.AutoSignup != nil {
+		trustedProxy.AutoSignup = *trustedProxyDef.AutoSignup
+	}
+	if trustedProxyDef.RoleMapping == nil {
+		return
+	}
+
+	roleMappingDef := trustedProxyDef.RoleMapping
+	roleMapping := &trustedProxy.RoleMapping
+	if roleMappingDef.DefaultRole != nil {
+		roleMapping.DefaultRole = *roleMappingDef.DefaultRole
+	}
+	roleMapping.GroupMappings = roleMappingDef.GroupMappings
+	roleMapping.WorkspaceMappings = roleMappingDef.WorkspaceMappings
+	if roleMappingDef.DefaultWorkspaceAccess != nil {
+		roleMapping.DefaultWorkspaceAccess = *roleMappingDef.DefaultWorkspaceAccess
+	}
+	if roleMappingDef.RequireMapping != nil {
+		roleMapping.RequireMapping = *roleMappingDef.RequireMapping
+	}
+	if roleMappingDef.SkipOrgRoleSync != nil {
+		roleMapping.SkipOrgRoleSync = *roleMappingDef.SkipOrgRoleSync
+	}
+}
+
+func (l *ConfigLoader) loadTrustedProxyMappingsEnv() error {
+	groupMappings, exists, err := loadStrictJSONObjectEnv[string]("AUTH_PROXY_GROUP_MAPPINGS")
+	if err != nil {
+		return err
+	}
+	if exists {
+		l.trustedProxyGroupMappings = cloneTrustedProxyGroupMappings(groupMappings)
+		l.trustedProxyGroupMappingsSet = true
+		l.v.Set("auth.proxy.role_mapping.group_mappings", groupMappings)
+	}
+
+	workspaceMappingsJSON, exists, err := loadStrictJSONObjectEnv[[]strictTrustedProxyWorkspaceGrant]("AUTH_PROXY_WORKSPACE_MAPPINGS")
+	if err != nil {
+		return err
+	}
+	if exists {
+		workspaceMappings := make(map[string][]TrustedProxyWorkspaceGrant, len(workspaceMappingsJSON))
+		for group, grants := range workspaceMappingsJSON {
+			converted := make([]TrustedProxyWorkspaceGrant, len(grants))
+			for i, grant := range grants {
+				converted[i] = TrustedProxyWorkspaceGrant(grant)
+			}
+			workspaceMappings[group] = converted
+		}
+		l.trustedProxyWorkspaceMappings = cloneTrustedProxyWorkspaceMappings(workspaceMappings)
+		l.trustedProxyWorkspaceMappingsSet = true
+		l.v.Set("auth.proxy.role_mapping.workspace_mappings", workspaceMappings)
+	}
+	return nil
+}
+
+type strictTrustedProxyWorkspaceGrant TrustedProxyWorkspaceGrant
+
+func (g *strictTrustedProxyWorkspaceGrant) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for key := range fields {
+		if key != "workspace" && key != "role" {
+			return fmt.Errorf("json: unknown field %q", key)
+		}
+	}
+
+	var grant TrustedProxyWorkspaceGrant
+	if raw, ok := fields["workspace"]; ok {
+		if err := json.Unmarshal(raw, &grant.Workspace); err != nil {
+			return fmt.Errorf("workspace: %w", err)
+		}
+	}
+	if raw, ok := fields["role"]; ok {
+		if err := json.Unmarshal(raw, &grant.Role); err != nil {
+			return fmt.Errorf("role: %w", err)
+		}
+	}
+	*g = strictTrustedProxyWorkspaceGrant(grant)
+	return nil
+}
+
+type trustedProxyMappingsDocument struct {
+	Auth  *trustedProxyMappingsAuth `yaml:"auth"`
+	Other map[string]yaml.Node      `yaml:",inline"`
+}
+
+type trustedProxyMappingsAuth struct {
+	Proxy *AuthTrustedProxyDef `yaml:"proxy"`
+	Other map[string]yaml.Node `yaml:",inline"`
+}
+
+func (l *ConfigLoader) mergeTrustedProxyMappingsFile(filename string) error {
+	if filename == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read proxy authentication mappings from %q: %w", filename, err)
+	}
+
+	var document trustedProxyMappingsDocument
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&document); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return fmt.Errorf("invalid auth.proxy config in %q: %w", filename, err)
+	}
+	if containsCaseVariantKey(document.Other, "auth") {
+		return fmt.Errorf("invalid auth.proxy config in %q: auth key must use canonical casing", filename)
+	}
+	if document.Auth == nil {
+		return nil
+	}
+	if containsCaseVariantKey(document.Auth.Other, "trusted_proxy") {
+		return fmt.Errorf("invalid auth.proxy config in %q: auth.trusted_proxy is not supported; use auth.proxy", filename)
+	}
+	if containsCaseVariantKey(document.Auth.Other, "proxy") {
+		return fmt.Errorf("invalid auth.proxy config in %q: auth.proxy key must use canonical casing", filename)
+	}
+	if document.Auth.Proxy == nil || document.Auth.Proxy.RoleMapping == nil {
+		return nil
+	}
+
+	roleMapping := document.Auth.Proxy.RoleMapping
+	if roleMapping.GroupMappings != nil {
+		if l.trustedProxyGroupMappings == nil {
+			l.trustedProxyGroupMappings = make(map[string]string, len(roleMapping.GroupMappings))
+		}
+		maps.Copy(l.trustedProxyGroupMappings, roleMapping.GroupMappings)
+		l.trustedProxyGroupMappingsSet = true
+	}
+	if roleMapping.WorkspaceMappings != nil {
+		if l.trustedProxyWorkspaceMappings == nil {
+			l.trustedProxyWorkspaceMappings = make(map[string][]TrustedProxyWorkspaceGrant, len(roleMapping.WorkspaceMappings))
+		}
+		for group, grants := range roleMapping.WorkspaceMappings {
+			l.trustedProxyWorkspaceMappings[group] = append([]TrustedProxyWorkspaceGrant(nil), grants...)
+		}
+		l.trustedProxyWorkspaceMappingsSet = true
+	}
+	return nil
+}
+
+func containsCaseVariantKey(fields map[string]yaml.Node, canonical string) bool {
+	for key := range fields {
+		if strings.EqualFold(key, canonical) {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *ConfigLoader) applyTrustedProxyMappings(def *Definition) {
+	if !l.trustedProxyGroupMappingsSet && !l.trustedProxyWorkspaceMappingsSet {
+		return
+	}
+	if def.Auth == nil {
+		def.Auth = &AuthDef{}
+	}
+	if def.Auth.Proxy == nil {
+		def.Auth.Proxy = &AuthTrustedProxyDef{}
+	}
+	if def.Auth.Proxy.RoleMapping == nil {
+		def.Auth.Proxy.RoleMapping = &TrustedProxyRoleMappingDef{}
+	}
+
+	roleMapping := def.Auth.Proxy.RoleMapping
+	if l.trustedProxyGroupMappingsSet {
+		roleMapping.GroupMappings = cloneTrustedProxyGroupMappings(l.trustedProxyGroupMappings)
+	}
+	if l.trustedProxyWorkspaceMappingsSet {
+		roleMapping.WorkspaceMappings = cloneTrustedProxyWorkspaceMappings(l.trustedProxyWorkspaceMappings)
+	}
+}
+
+func cloneTrustedProxyGroupMappings(mappings map[string]string) map[string]string {
+	cloned := make(map[string]string, len(mappings))
+	maps.Copy(cloned, mappings)
+	return cloned
+}
+
+func cloneTrustedProxyWorkspaceMappings(mappings map[string][]TrustedProxyWorkspaceGrant) map[string][]TrustedProxyWorkspaceGrant {
+	cloned := make(map[string][]TrustedProxyWorkspaceGrant, len(mappings))
+	for group, grants := range mappings {
+		cloned[group] = append([]TrustedProxyWorkspaceGrant(nil), grants...)
+	}
+	return cloned
+}
+
+func (l *ConfigLoader) validateTrustedProxyConfigKeys() error {
+	raw := l.v.GetStringMap("auth.proxy")
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var decoded AuthTrustedProxyDef
+	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		Result:           &decoded,
+		WeaklyTypedInput: true,
+		ErrorUnused:      true,
+		TagName:          "mapstructure",
+	})
+	if err != nil {
+		return fmt.Errorf("validate auth.proxy config: %w", err)
+	}
+	if err := decoder.Decode(raw); err != nil {
+		return fmt.Errorf("invalid auth.proxy config: %w", err)
+	}
+	return nil
+}
+
+func loadStrictJSONObjectEnv[T any](envSuffix string) (map[string]T, bool, error) {
+	envName := strings.ToUpper(AppSlug) + "_" + envSuffix
+	raw, exists := os.LookupEnv(envName)
+	if !exists {
+		return nil, false, nil
+	}
+	trimmed := strings.TrimSpace(raw)
+	if err := validateJSONObjectStructure(trimmed); err != nil {
+		return nil, true, fmt.Errorf("invalid %s JSON: %w", envName, err)
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	var value map[string]T
+	if err := decoder.Decode(&value); err != nil {
+		return nil, true, fmt.Errorf("invalid %s JSON: %w", envName, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, true, fmt.Errorf("invalid %s JSON: expected a single object", envName)
+	}
+	return value, true, nil
+}
+
+func validateJSONObjectStructure(raw string) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	if err := consumeUniqueJSONValue(decoder, true); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("expected a single object")
+		}
+		return err
+	}
+	return nil
+}
+
+func consumeUniqueJSONValue(decoder *json.Decoder, requireObject bool) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, isDelim := token.(json.Delim)
+	if requireObject && (!isDelim || delim != '{') {
+		return fmt.Errorf("must be a JSON object")
+	}
+	if !isDelim {
+		return nil
+	}
+
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("object key must be a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := consumeUniqueJSONValue(decoder, false); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return fmt.Errorf("invalid object terminator")
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeUniqueJSONValue(decoder, false); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return fmt.Errorf("invalid array terminator")
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+	return nil
 }
 
 func (l *ConfigLoader) loadBuiltinAuth(cfg *Config, auth *AuthDef) {
@@ -644,9 +1134,23 @@ func (l *ConfigLoader) setAuthDefaults(cfg *Config) {
 	if cfg.Server.Auth.OIDC.RoleMapping.DefaultRole == "" {
 		cfg.Server.Auth.OIDC.RoleMapping.DefaultRole = "viewer"
 	}
+	roleMapping := &cfg.Server.Auth.OIDC.RoleMapping
+	if roleMapping.DefaultWorkspaceAccess == "" && len(roleMapping.WorkspaceMappings) == 0 {
+		roleMapping.DefaultWorkspaceAccess = OIDCDefaultWorkspaceAccessAll
+	}
 	if cfg.Server.Auth.OIDC.ButtonLabel == "" {
 		cfg.Server.Auth.OIDC.ButtonLabel = "Login with SSO"
 	}
+}
+
+func (l *ConfigLoader) setTrustedProxyDefaults(cfg *Config) {
+	trustedProxy := &cfg.Server.Auth.Proxy
+	trustedProxy.ButtonLabel = "Continue with SSO"
+	trustedProxy.AutoSignup = true
+	trustedProxy.RoleMapping.DefaultRole = "viewer"
+	trustedProxy.RoleMapping.DefaultWorkspaceAccess = TrustedProxyDefaultWorkspaceAccessNone
+	trustedProxy.RoleMapping.RequireMapping = false
+	trustedProxy.RoleMapping.SkipOrgRoleSync = false
 }
 
 // warnIfWeakValue appends a warning if value matches any entry in weakList (case-insensitive).
@@ -663,6 +1167,21 @@ func (l *ConfigLoader) loadServerDefaults(cfg *Config, def Definition) {
 	cfg.Server.BasePath = cleanServerBasePath(cfg.Server.BasePath)
 	cfg.Server.CheckUpdates = l.v.GetBool("check_updates")
 	cfg.Server.CORSAllowedOrigins = parseStringList(l.v.Get("cors_allowed_origins"))
+	cfg.Server.IPAccess = IPAccessConfig{
+		AllowedIPs:     parseStringList(l.v.Get("ip_access.allowed_ips")),
+		TrustedProxies: parseStringList(l.v.Get("ip_access.trusted_proxies")),
+	}
+	for _, origin := range cfg.Server.CORSAllowedOrigins {
+		if strings.TrimSpace(origin) != "*" {
+			continue
+		}
+		warning := `cors_allowed_origins contains "*"; any website may make browser requests to the Dagu API`
+		if cfg.Server.Auth.Mode == AuthModeNone {
+			warning += `, and auth.mode "none" allows those requests to execute workflows without authentication`
+		}
+		l.warnings = append(l.warnings, warning)
+		break
+	}
 
 	cfg.Server.Metrics = MetricsAccessPrivate
 	if def.Metrics != nil {
@@ -689,8 +1208,6 @@ func (l *ConfigLoader) loadServerDefaults(cfg *Config, def Definition) {
 	}
 
 	cfg.Server.Audit.RetentionDays = l.v.GetInt("audit.retention_days")
-
-	cfg.Server.Session.MaxPerUser = l.v.GetInt("session.max_per_user")
 
 	cfg.Server.SSE.MaxTopicsPerConnection = l.v.GetInt("sse.max_topics_per_connection")
 	cfg.Server.SSE.MaxClients = l.v.GetInt("sse.max_clients")
@@ -959,11 +1476,6 @@ func (l *ConfigLoader) loadProcConfig(cfg *Config, def Definition) {
 			"proc.heartbeat_interval", l.v.GetString("proc.heartbeat_interval"),
 		)
 	}
-	if l.v.IsSet("proc.heartbeat_sync_interval") {
-		cfg.Proc.HeartbeatSyncInterval = l.parseDuration(
-			"proc.heartbeat_sync_interval", l.v.GetString("proc.heartbeat_sync_interval"),
-		)
-	}
 	if l.v.IsSet("proc.stale_threshold") {
 		cfg.Proc.StaleThreshold = l.parseDuration(
 			"proc.stale_threshold", l.v.GetString("proc.stale_threshold"),
@@ -980,12 +1492,6 @@ func (l *ConfigLoader) loadLegacySchedulerProcConfig(cfg *Config, def Definition
 		"proc.heartbeat_interval",
 		"scheduler.heartbeat_interval",
 		l.schedulerLegacyValue(def, "scheduler.heartbeat_interval", func(sd *SchedulerDef) string { return sd.HeartbeatInterval }),
-	)
-	l.applyDeprecatedProcAlias(
-		&cfg.Proc.HeartbeatSyncInterval,
-		"proc.heartbeat_sync_interval",
-		"scheduler.heartbeat_sync_interval",
-		l.schedulerLegacyValue(def, "scheduler.heartbeat_sync_interval", func(sd *SchedulerDef) string { return sd.HeartbeatSyncInterval }),
 	)
 	l.applyDeprecatedProcAlias(
 		&cfg.Proc.StaleThreshold,
@@ -1026,9 +1532,6 @@ func (l *ConfigLoader) applyDeprecatedProcAlias(
 func (l *ConfigLoader) setProcDefaults(cfg *Config) {
 	if cfg.Proc.HeartbeatInterval <= 0 {
 		cfg.Proc.HeartbeatInterval = 5 * time.Second
-	}
-	if cfg.Proc.HeartbeatSyncInterval <= 0 {
-		cfg.Proc.HeartbeatSyncInterval = 10 * time.Second
 	}
 	if cfg.Proc.StaleThreshold <= 0 {
 		cfg.Proc.StaleThreshold = 90 * time.Second
@@ -1196,189 +1699,6 @@ func setDefaultIfNotPositive(target *int, defaultValue int) {
 	}
 }
 
-func (l *ConfigLoader) loadBotsConfig(cfg *Config, def Definition) {
-	// Default safe mode to true
-	cfg.Bots.SafeMode = true
-	cfg.Bots.Telegram.InterestedEventTypes = append([]string(nil), DefaultBotInterestedEventTypes...)
-	cfg.Bots.Slack.InterestedEventTypes = append([]string(nil), DefaultBotInterestedEventTypes...)
-	cfg.Bots.Discord.InterestedEventTypes = append([]string(nil), DefaultBotInterestedEventTypes...)
-	cfg.Bots.Line.InterestedEventTypes = append([]string(nil), DefaultBotInterestedEventTypes...)
-	cfg.Bots.Slack.RespondToAll = true
-	cfg.Bots.Discord.RespondToAll = true
-	cfg.Bots.Line.RespondToAll = true
-
-	botsDef := def.Bots
-	if botsDef == nil {
-		botsDef = &BotsDef{}
-	}
-
-	// Check env var override for provider
-	if provider := l.v.GetString("bots.provider"); provider != "" {
-		cfg.Bots.Provider = BotProvider(provider)
-	}
-
-	// Check env var override for token
-	if token := l.v.GetString("bots.telegram.token"); token != "" {
-		cfg.Bots.Telegram.Token = token
-	}
-	if raw, ok := lookupInterestedEventTypesEnv("BOTS_TELEGRAM_INTERESTED_EVENT_TYPES"); ok {
-		cfg.Bots.Telegram.InterestedEventTypes = parseInterestedEventTypes(raw)
-	}
-
-	if cfg.Bots.Provider == BotProviderNone {
-		cfg.Bots.Provider = BotProvider(botsDef.Provider)
-	}
-
-	if botsDef.SafeMode != nil {
-		cfg.Bots.SafeMode = *botsDef.SafeMode
-	}
-
-	if botsDef.Telegram != nil {
-		if cfg.Bots.Telegram.Token == "" {
-			cfg.Bots.Telegram.Token = botsDef.Telegram.Token
-		}
-		if len(botsDef.Telegram.AllowedChatIDs) > 0 {
-			cfg.Bots.Telegram.AllowedChatIDs = botsDef.Telegram.AllowedChatIDs
-		}
-		if botsDef.Telegram.InterestedEventTypes != nil &&
-			!hasInterestedEventTypesEnv("BOTS_TELEGRAM_INTERESTED_EVENT_TYPES") {
-			cfg.Bots.Telegram.InterestedEventTypes = parseInterestedEventTypesSlice(botsDef.Telegram.InterestedEventTypes)
-		}
-	}
-
-	// Check env var override for Slack tokens
-	if botToken := l.v.GetString("bots.slack.bot_token"); botToken != "" {
-		cfg.Bots.Slack.BotToken = botToken
-	}
-	if appToken := l.v.GetString("bots.slack.app_token"); appToken != "" {
-		cfg.Bots.Slack.AppToken = appToken
-	}
-	if raw, ok := lookupInterestedEventTypesEnv("BOTS_SLACK_INTERESTED_EVENT_TYPES"); ok {
-		cfg.Bots.Slack.InterestedEventTypes = parseInterestedEventTypes(raw)
-	}
-
-	if botsDef.Slack != nil {
-		if cfg.Bots.Slack.BotToken == "" {
-			cfg.Bots.Slack.BotToken = botsDef.Slack.BotToken
-		}
-		if cfg.Bots.Slack.AppToken == "" {
-			cfg.Bots.Slack.AppToken = botsDef.Slack.AppToken
-		}
-		if len(botsDef.Slack.AllowedChannelIDs) > 0 {
-			cfg.Bots.Slack.AllowedChannelIDs = botsDef.Slack.AllowedChannelIDs
-		}
-		if botsDef.Slack.InterestedEventTypes != nil &&
-			!hasInterestedEventTypesEnv("BOTS_SLACK_INTERESTED_EVENT_TYPES") {
-			cfg.Bots.Slack.InterestedEventTypes = parseInterestedEventTypesSlice(botsDef.Slack.InterestedEventTypes)
-		}
-		if botsDef.Slack.RespondToAll != nil {
-			cfg.Bots.Slack.RespondToAll = *botsDef.Slack.RespondToAll
-		}
-	}
-
-	// Check env var override for Discord token
-	if token := l.v.GetString("bots.discord.token"); token != "" {
-		cfg.Bots.Discord.Token = token
-	}
-	if _, ok := os.LookupEnv(strings.ToUpper(AppSlug) + "_BOTS_DISCORD_ALLOWED_CHANNEL_IDS"); ok {
-		cfg.Bots.Discord.AllowedChannelIDs = parseStringList(l.v.Get("bots.discord.allowed_channel_ids"))
-	}
-	if raw, ok := lookupInterestedEventTypesEnv("BOTS_DISCORD_INTERESTED_EVENT_TYPES"); ok {
-		cfg.Bots.Discord.InterestedEventTypes = parseInterestedEventTypes(raw)
-	}
-	if _, ok := os.LookupEnv(strings.ToUpper(AppSlug) + "_BOTS_DISCORD_RESPOND_TO_ALL"); ok {
-		cfg.Bots.Discord.RespondToAll = l.v.GetBool("bots.discord.respond_to_all")
-	}
-
-	if botsDef.Discord != nil {
-		if cfg.Bots.Discord.Token == "" {
-			cfg.Bots.Discord.Token = botsDef.Discord.Token
-		}
-		if len(botsDef.Discord.AllowedChannelIDs) > 0 {
-			cfg.Bots.Discord.AllowedChannelIDs = botsDef.Discord.AllowedChannelIDs
-		}
-		if botsDef.Discord.InterestedEventTypes != nil &&
-			!hasInterestedEventTypesEnv("BOTS_DISCORD_INTERESTED_EVENT_TYPES") {
-			cfg.Bots.Discord.InterestedEventTypes = parseInterestedEventTypesSlice(botsDef.Discord.InterestedEventTypes)
-		}
-		if botsDef.Discord.RespondToAll != nil {
-			cfg.Bots.Discord.RespondToAll = *botsDef.Discord.RespondToAll
-		}
-	}
-
-	// Check env var override for LINE credentials
-	if token := l.v.GetString("bots.line.channel_access_token"); token != "" {
-		cfg.Bots.Line.ChannelAccessToken = token
-	}
-	if secret := l.v.GetString("bots.line.channel_secret"); secret != "" {
-		cfg.Bots.Line.ChannelSecret = secret
-	}
-	if _, ok := os.LookupEnv(strings.ToUpper(AppSlug) + "_BOTS_LINE_ALLOWED_SOURCE_IDS"); ok {
-		cfg.Bots.Line.AllowedSourceIDs = parseStringList(l.v.Get("bots.line.allowed_source_ids"))
-	}
-	if raw, ok := lookupInterestedEventTypesEnv("BOTS_LINE_INTERESTED_EVENT_TYPES"); ok {
-		cfg.Bots.Line.InterestedEventTypes = parseInterestedEventTypes(raw)
-	}
-	if _, ok := os.LookupEnv(strings.ToUpper(AppSlug) + "_BOTS_LINE_RESPOND_TO_ALL"); ok {
-		cfg.Bots.Line.RespondToAll = l.v.GetBool("bots.line.respond_to_all")
-	}
-
-	if botsDef.Line != nil {
-		if cfg.Bots.Line.ChannelAccessToken == "" {
-			cfg.Bots.Line.ChannelAccessToken = botsDef.Line.ChannelAccessToken
-		}
-		if cfg.Bots.Line.ChannelSecret == "" {
-			cfg.Bots.Line.ChannelSecret = botsDef.Line.ChannelSecret
-		}
-		if len(botsDef.Line.AllowedSourceIDs) > 0 &&
-			!hasEnv("BOTS_LINE_ALLOWED_SOURCE_IDS") {
-			cfg.Bots.Line.AllowedSourceIDs = botsDef.Line.AllowedSourceIDs
-		}
-		if botsDef.Line.InterestedEventTypes != nil &&
-			!hasInterestedEventTypesEnv("BOTS_LINE_INTERESTED_EVENT_TYPES") {
-			cfg.Bots.Line.InterestedEventTypes = parseInterestedEventTypesSlice(botsDef.Line.InterestedEventTypes)
-		}
-		if botsDef.Line.RespondToAll != nil &&
-			!hasEnv("BOTS_LINE_RESPOND_TO_ALL") {
-			cfg.Bots.Line.RespondToAll = *botsDef.Line.RespondToAll
-		}
-	}
-}
-
-func hasEnv(name string) bool {
-	_, ok := os.LookupEnv(strings.ToUpper(AppSlug) + "_" + name)
-	return ok
-}
-
-func parseInterestedEventTypes(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return []string{}
-	}
-	parts := strings.Split(raw, ",")
-	return parseInterestedEventTypesSlice(parts)
-}
-
-func parseInterestedEventTypesSlice(values []string) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		result = append(result, value)
-	}
-	return result
-}
-
-func lookupInterestedEventTypesEnv(suffix string) (string, bool) {
-	return os.LookupEnv(strings.ToUpper(AppSlug) + "_" + suffix)
-}
-
-func hasInterestedEventTypesEnv(suffix string) bool {
-	_, ok := lookupInterestedEventTypesEnv(suffix)
-	return ok
-}
-
 func (l *ConfigLoader) loadLicenseConfig(cfg *Config, def Definition) {
 	if def.License == nil {
 		return
@@ -1409,12 +1729,13 @@ func (l *ConfigLoader) loadCacheConfig(cfg *Config, def Definition) {
 	}
 }
 
-func (l *ConfigLoader) finalizePaths(cfg *Config) {
+func (l *ConfigLoader) finalizePaths(cfg *Config) error {
 	derivedPaths := []struct {
 		target      *string
 		defaultPath string
 	}{
 		{&cfg.Paths.DAGRunsDir, "dag-runs"},
+		{&cfg.Paths.DAGRunWorkDir, "dag-run-work"},
 		{&cfg.Paths.DAGStateDir, "dag-state"},
 		{&cfg.Paths.ProcDir, "proc"},
 		{&cfg.Paths.QueueDir, "queue"},
@@ -1434,9 +1755,6 @@ func (l *ConfigLoader) finalizePaths(cfg *Config) {
 		}
 	}
 
-	if cfg.Paths.SessionsDir == "" {
-		cfg.Paths.SessionsDir = filepath.Join(cfg.Paths.DataDir, "agent", "sessions")
-	}
 	if cfg.Paths.ToolsDir == "" {
 		cfg.Paths.ToolsDir = filepath.Join(cfg.Paths.DataDir, "tools")
 	}
@@ -1447,9 +1765,18 @@ func (l *ConfigLoader) finalizePaths(cfg *Config) {
 	if cfg.Paths.ArtifactDir == "" {
 		cfg.Paths.ArtifactDir = filepath.Join(cfg.Paths.DataDir, "artifacts")
 	}
-
-	if cfg.Paths.DocsDir == "" {
-		cfg.Paths.DocsDir = filepath.Join(cfg.Paths.DAGsDir, "docs")
+	if cfg.Paths.WikiDir == "" {
+		wikiDir := filepath.Join(cfg.Paths.DAGsDir, "wiki")
+		docsDir := filepath.Join(cfg.Paths.DAGsDir, "docs")
+		selected, legacy, err := selectRenamedPath(wikiDir, docsDir)
+		if err != nil {
+			return fmt.Errorf("wiki directory: %w", err)
+		}
+		cfg.Paths.WikiDir = selected
+		cfg.Paths.WikiDirLegacy = legacy
+		if legacy {
+			l.notices = append(l.notices, fmt.Sprintf("Using existing legacy docs directory %s for the Wiki; configure paths.wiki_dir to choose another location", selected))
+		}
 	}
 
 	if cfg.Paths.Executable == "" {
@@ -1457,6 +1784,36 @@ func (l *ConfigLoader) finalizePaths(cfg *Config) {
 			cfg.Paths.Executable = executable
 		}
 	}
+	return nil
+}
+
+func selectRenamedPath(canonical, legacy string) (string, bool, error) {
+	canonicalExists, err := pathExists(canonical)
+	if err != nil {
+		return "", false, err
+	}
+	legacyExists, err := pathExists(legacy)
+	if err != nil {
+		return "", false, err
+	}
+	if canonicalExists && legacyExists {
+		return "", false, fmt.Errorf("both %s and %s exist; set paths.wiki_dir explicitly after reconciling them", canonical, legacy)
+	}
+	if legacyExists {
+		return legacy, true, nil
+	}
+	return canonical, false, nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspect %s: %w", path, err)
 }
 
 // LoadLegacyFields applies deprecated configuration fields to the current Config.
@@ -1603,6 +1960,8 @@ func (l *ConfigLoader) setupViper(xdgConfig XDGConfig, homeDir, configFile, appH
 func (l *ConfigLoader) setViperDefaultValues(paths Paths) {
 	// Paths
 	l.v.SetDefault("skip_examples", false)
+	l.v.SetDefault("dag_discovery.recursive", false)
+	l.v.SetDefault("dag_discovery.symlinks", false)
 	l.v.SetDefault("paths.dags_dir", paths.DAGsDir)
 	l.v.SetDefault("paths.suspend_flags_dir", paths.SuspendFlagsDir)
 	l.v.SetDefault("paths.data_dir", paths.DataDir)
@@ -1623,7 +1982,7 @@ func (l *ConfigLoader) setViperDefaultValues(paths Paths) {
 	l.v.SetDefault("metrics", "private")
 	l.v.SetDefault("cache", "normal")
 	l.v.SetDefault("log_format", "text")
-	l.v.SetDefault("access_log_mode", "all")
+	l.v.SetDefault("access_log_mode", "none")
 
 	// Coordinator
 	l.v.SetDefault("coordinator.host", "127.0.0.1")
@@ -1671,9 +2030,6 @@ func (l *ConfigLoader) setViperDefaultValues(paths Paths) {
 	// Terminal
 	l.v.SetDefault("terminal.max_sessions", 5)
 
-	// Session
-	l.v.SetDefault("session.max_per_user", 100)
-
 	// SSE
 	l.v.SetDefault("sse.max_topics_per_connection", 20)
 	l.v.SetDefault("sse.max_clients", 1000)
@@ -1687,9 +2043,10 @@ func (l *ConfigLoader) setViperDefaultValues(paths Paths) {
 }
 
 type envBinding struct {
-	key    string
-	env    string
-	isPath bool
+	key      string
+	env      string
+	isPath   bool
+	requires ConfigSection
 }
 
 var envBindings = []envBinding{
@@ -1706,6 +2063,8 @@ var envBindings = []envBinding{
 	{key: "headless", env: "HEADLESS"},
 	{key: "check_updates", env: "CHECK_UPDATES"},
 	{key: "cors_allowed_origins", env: "CORS_ALLOWED_ORIGINS"},
+	{key: "ip_access.allowed_ips", env: "IP_ACCESS_ALLOWED_IPS", requires: SectionServer},
+	{key: "ip_access.trusted_proxies", env: "IP_ACCESS_TRUSTED_PROXIES", requires: SectionServer},
 	{key: "latest_status_today", env: "LATEST_STATUS_TODAY"},
 	{key: "metrics", env: "SERVER_METRICS"},
 	{key: "cache", env: "CACHE"},
@@ -1717,7 +2076,6 @@ var envBindings = []envBinding{
 	{key: "event_store.enabled", env: "EVENT_STORE_ENABLED"},
 	{key: "event_store.retention_days", env: "EVENT_STORE_RETENTION_DAYS"},
 	{key: "webhooks.max_payload_size", env: "WEBHOOKS_MAX_PAYLOAD_SIZE"},
-	{key: "session.max_per_user", env: "SESSION_MAX_PER_USER"},
 	{key: "sse.max_topics_per_connection", env: "SSE_MAX_TOPICS_PER_CONNECTION"},
 	{key: "sse.max_clients", env: "SSE_MAX_CLIENTS"},
 	{key: "sse.heartbeat_interval", env: "SSE_HEARTBEAT_INTERVAL"},
@@ -1727,15 +2085,29 @@ var envBindings = []envBinding{
 	// Core
 	{key: "default_shell", env: "DEFAULT_SHELL"},
 	{key: "skip_examples", env: "SKIP_EXAMPLES"},
+	{key: "dag_discovery.recursive", env: "DAG_DISCOVERY_RECURSIVE"},
+	{key: "dag_discovery.symlinks", env: "DAG_DISCOVERY_SYMLINKS"},
 	{key: "env_passthrough", env: "ENV_PASSTHROUGH"},
 	{key: "env_passthrough_prefixes", env: "ENV_PASSTHROUGH_PREFIXES"},
+	{key: "opencode.executable", env: "OPENCODE_EXECUTABLE"},
+	{key: "opencode.env_passthrough", env: "OPENCODE_ENV_PASSTHROUGH"},
 
 	// Secrets
 	{key: "secrets.vault.address", env: "SECRETS_VAULT_ADDRESS"},
 	{key: "secrets.vault.token", env: "SECRETS_VAULT_TOKEN"},
+	{key: "secrets.vault.ca_cert", env: "SECRETS_VAULT_CA_CERT", isPath: true},
+	{key: "secrets.vault.client_cert", env: "SECRETS_VAULT_CLIENT_CERT", isPath: true},
+	{key: "secrets.vault.client_key", env: "SECRETS_VAULT_CLIENT_KEY", isPath: true},
 	{key: "secrets.kubernetes.namespace", env: "SECRETS_KUBERNETES_NAMESPACE"},
 	{key: "secrets.kubernetes.kubeconfig", env: "SECRETS_KUBERNETES_KUBECONFIG", isPath: true},
 	{key: "secrets.kubernetes.context", env: "SECRETS_KUBERNETES_CONTEXT"},
+	{key: "secrets.aws.region", env: "SECRETS_AWS_REGION"},
+	{key: "secrets.gcp.project_id", env: "SECRETS_GCP_PROJECT_ID"},
+	{key: "secrets.gcp.location", env: "SECRETS_GCP_LOCATION"},
+	{key: "secrets.azure.vault_url", env: "SECRETS_AZURE_VAULT_URL"},
+	{key: "secrets.alibaba.region", env: "SECRETS_ALIBABA_REGION"},
+	{key: "secrets.alibaba.endpoint", env: "SECRETS_ALIBABA_ENDPOINT"},
+	{key: "secrets.alibaba.ca_file", env: "SECRETS_ALIBABA_CA_FILE", isPath: true},
 
 	// Scheduler
 	{key: "scheduler.port", env: "SCHEDULER_PORT"},
@@ -1747,11 +2119,9 @@ var envBindings = []envBinding{
 
 	// Proc
 	{key: "proc.heartbeat_interval", env: "PROC_HEARTBEAT_INTERVAL"},
-	{key: "proc.heartbeat_sync_interval", env: "PROC_HEARTBEAT_SYNC_INTERVAL"},
 	{key: "proc.stale_threshold", env: "PROC_STALE_THRESHOLD"},
 	// Proc (legacy scheduler aliases)
 	{key: "scheduler.heartbeat_interval", env: "SCHEDULER_HEARTBEAT_INTERVAL"},
-	{key: "scheduler.heartbeat_sync_interval", env: "SCHEDULER_HEARTBEAT_SYNC_INTERVAL"},
 	{key: "scheduler.stale_threshold", env: "SCHEDULER_STALE_THRESHOLD"},
 
 	// UI
@@ -1785,9 +2155,21 @@ var envBindings = []envBinding{
 	{key: "auth.oidc.role_mapping.default_role", env: "AUTH_OIDC_DEFAULT_ROLE"},
 	{key: "auth.oidc.role_mapping.groups_claim", env: "AUTH_OIDC_GROUPS_CLAIM"},
 	{key: "auth.oidc.role_mapping.group_mappings", env: "AUTH_OIDC_GROUP_MAPPINGS"},
+	{key: "auth.oidc.role_mapping.default_workspace_access", env: "AUTH_OIDC_DEFAULT_WORKSPACE_ACCESS"},
 	{key: "auth.oidc.role_mapping.role_attribute_path", env: "AUTH_OIDC_ROLE_ATTRIBUTE_PATH"},
 	{key: "auth.oidc.role_mapping.role_attribute_strict", env: "AUTH_OIDC_ROLE_ATTRIBUTE_STRICT"},
 	{key: "auth.oidc.role_mapping.skip_org_role_sync", env: "AUTH_OIDC_SKIP_ORG_ROLE_SYNC"},
+	// Auth proxy
+	{key: "auth.proxy.enabled", env: "AUTH_PROXY_ENABLED", requires: SectionServer},
+	{key: "auth.proxy.source", env: "AUTH_PROXY_SOURCE", requires: SectionServer},
+	{key: "auth.proxy.button_label", env: "AUTH_PROXY_BUTTON_LABEL", requires: SectionServer},
+	{key: "auth.proxy.headers.user", env: "AUTH_PROXY_HEADERS_USER", requires: SectionServer},
+	{key: "auth.proxy.headers.groups", env: "AUTH_PROXY_HEADERS_GROUPS", requires: SectionServer},
+	{key: "auth.proxy.auto_signup", env: "AUTH_PROXY_AUTO_SIGNUP", requires: SectionServer},
+	{key: "auth.proxy.role_mapping.default_role", env: "AUTH_PROXY_DEFAULT_ROLE", requires: SectionServer},
+	{key: "auth.proxy.role_mapping.default_workspace_access", env: "AUTH_PROXY_DEFAULT_WORKSPACE_ACCESS", requires: SectionServer},
+	{key: "auth.proxy.role_mapping.require_mapping", env: "AUTH_PROXY_REQUIRE_MAPPING", requires: SectionServer},
+	{key: "auth.proxy.role_mapping.skip_org_role_sync", env: "AUTH_PROXY_SKIP_ORG_ROLE_SYNC", requires: SectionServer},
 	// Auth (builtin)
 	{key: "auth.builtin.token.secret", env: "AUTH_TOKEN_SECRET"},
 	{key: "auth.builtin.token.ttl", env: "AUTH_TOKEN_TTL"},
@@ -1801,8 +2183,9 @@ var envBindings = []envBinding{
 	// Paths
 	{key: "paths.dags_dir", env: "DAGS", isPath: true},
 	{key: "paths.dags_dir", env: "DAGS_DIR", isPath: true},
-	{key: "paths.docs_dir", env: "DOCS_DIR", isPath: true},
 	{key: "paths.alt_dags_dir", env: "ALT_DAGS_DIR", isPath: true},
+	{key: "paths.wiki_dir", env: "WIKI_DIR", isPath: true},
+	{key: "paths.docs_dir", env: "DOCS_DIR", isPath: true},
 	{key: "paths.executable", env: "EXECUTABLE", isPath: true},
 	{key: "paths.log_dir", env: "LOG_DIR", isPath: true},
 	{key: "paths.artifact_dir", env: "ARTIFACT_DIR", isPath: true},
@@ -1814,6 +2197,7 @@ var envBindings = []envBinding{
 	{key: "paths.event_store_dir", env: "EVENT_STORE_DIR", isPath: true},
 	{key: "paths.base_config", env: "BASE_CONFIG", isPath: true},
 	{key: "paths.dag_runs_dir", env: "DAG_RUNS_DIR", isPath: true},
+	{key: "paths.dag_run_work_dir", env: "DAG_RUN_WORK_DIR", isPath: true},
 	{key: "paths.proc_dir", env: "PROC_DIR", isPath: true},
 	{key: "paths.queue_dir", env: "QUEUE_DIR", isPath: true},
 	{key: "paths.service_registry_dir", env: "SERVICE_REGISTRY_DIR", isPath: true},
@@ -1873,27 +2257,6 @@ var envBindings = []envBinding{
 	{key: "tunnel.rate_limiting.window_seconds", env: "TUNNEL_RATE_LIMITING_WINDOW_SECONDS"},
 	{key: "tunnel.rate_limiting.block_duration_seconds", env: "TUNNEL_RATE_LIMITING_BLOCK_DURATION_SECONDS"},
 
-	// Bots
-	{key: "bots.provider", env: "BOTS_PROVIDER"},
-	{key: "bots.safe_mode", env: "BOTS_SAFE_MODE"},
-	{key: "bots.telegram.token", env: "BOTS_TELEGRAM_TOKEN"},
-	{key: "bots.telegram.allowed_chat_ids", env: "BOTS_TELEGRAM_ALLOWED_CHAT_IDS"},
-	{key: "bots.telegram.interested_event_types", env: "BOTS_TELEGRAM_INTERESTED_EVENT_TYPES"},
-	{key: "bots.slack.bot_token", env: "BOTS_SLACK_BOT_TOKEN"},
-	{key: "bots.slack.app_token", env: "BOTS_SLACK_APP_TOKEN"},
-	{key: "bots.slack.allowed_channel_ids", env: "BOTS_SLACK_ALLOWED_CHANNEL_IDS"},
-	{key: "bots.slack.interested_event_types", env: "BOTS_SLACK_INTERESTED_EVENT_TYPES"},
-	{key: "bots.slack.respond_to_all", env: "BOTS_SLACK_RESPOND_TO_ALL"},
-	{key: "bots.discord.token", env: "BOTS_DISCORD_TOKEN"},
-	{key: "bots.discord.allowed_channel_ids", env: "BOTS_DISCORD_ALLOWED_CHANNEL_IDS"},
-	{key: "bots.discord.interested_event_types", env: "BOTS_DISCORD_INTERESTED_EVENT_TYPES"},
-	{key: "bots.discord.respond_to_all", env: "BOTS_DISCORD_RESPOND_TO_ALL"},
-	{key: "bots.line.channel_access_token", env: "BOTS_LINE_CHANNEL_ACCESS_TOKEN"},
-	{key: "bots.line.channel_secret", env: "BOTS_LINE_CHANNEL_SECRET"},
-	{key: "bots.line.allowed_source_ids", env: "BOTS_LINE_ALLOWED_SOURCE_IDS"},
-	{key: "bots.line.interested_event_types", env: "BOTS_LINE_INTERESTED_EVENT_TYPES"},
-	{key: "bots.line.respond_to_all", env: "BOTS_LINE_RESPOND_TO_ALL"},
-
 	// License
 	{key: "license.key", env: "LICENSE_KEY"},
 	{key: "license.cloud_url", env: "LICENSE_CLOUD_URL"},
@@ -1919,6 +2282,9 @@ func (l *ConfigLoader) bindEnvironmentVariables() {
 	prefix := strings.ToUpper(AppSlug) + "_"
 
 	for _, b := range envBindings {
+		if b.requires != SectionNone && !l.requires(b.requires) {
+			continue
+		}
 		fullEnv := prefix + b.env
 
 		if b.isPath {

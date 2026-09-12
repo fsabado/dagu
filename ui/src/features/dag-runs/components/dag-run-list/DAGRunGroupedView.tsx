@@ -7,6 +7,7 @@ import { useMemo, useState } from 'react';
 import { components, Status } from '../../../../api/v1/schema';
 import dayjs from '../../../../lib/dayjs';
 import { getDAGRunScheduleSortValue } from '../../../../lib/dagRunTiming';
+import RelativeTime from '@/components/ui/relative-time';
 import StatusChip from '@/components/ui/status-chip';
 import AutoRetryBadge from '../common/AutoRetryBadge';
 import {
@@ -14,12 +15,18 @@ import {
   getDAGRunSelectionKey,
 } from '../../hooks/useBulkDAGRunSelection';
 import { StepDetailsTooltip } from './StepDetailsTooltip';
+import { DAGRunArtifactsButton } from './DAGRunArtifactsButton';
+import { I18nText } from '@/i18n/I18nText';
+import { useI18n } from '@/i18n/I18nProvider';
 
 interface DAGRunGroupedViewProps {
   dagRuns: components['schemas']['DAGRunSummary'][];
+  /** True while the first page is being fetched; suppresses the empty state. */
+  isLoading?: boolean;
   selectedRunKeys?: Set<string>;
   selectedDAGRun?: { name: string; dagRunId: string } | null;
   onSelectDAGRun?: (dagRun: { name: string; dagRunId: string } | null) => void;
+  onViewArtifacts?: (dagRun: DAGRunSelectionItem) => void;
   onToggleBulkSelect?: (dagRun: DAGRunSelectionItem) => void;
 }
 
@@ -29,11 +36,14 @@ interface GroupedDAGRuns {
 
 function DAGRunGroupedView({
   dagRuns,
+  isLoading = false,
   selectedRunKeys,
   selectedDAGRun = null,
   onSelectDAGRun,
+  onViewArtifacts,
   onToggleBulkSelect,
 }: DAGRunGroupedViewProps) {
+  const { ts } = useI18n();
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
   // Group DAG runs by name
@@ -157,16 +167,26 @@ function DAGRunGroupedView({
     <div className="flex flex-col items-center justify-center py-12 px-4 border rounded-md bg-card">
       <div className="text-6xl mb-4">🔍</div>
       <h3 className="text-lg font-normal text-foreground mb-2">
-        No DAG runs found
+        <I18nText text={'No DAG runs found'} />
       </h3>
       <p className="text-sm text-muted-foreground text-center max-w-md mb-4">
-        There are no DAG runs matching your current filters. Try adjusting your
-        search criteria or date range.
+        <I18nText
+          text={
+            'No DAG runs in the selected time range. Adjust the date range or filters, or start a workflow from the Workflows page.'
+          }
+        />
       </p>
     </div>
   );
 
   if (dagRuns.length === 0) {
+    if (isLoading) {
+      return (
+        <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+          <I18nText text={'Loading DAG runs...'} />
+        </div>
+      );
+    }
     return <EmptyState />;
   }
 
@@ -221,28 +241,34 @@ function DAGRunGroupedView({
                       {dagName}
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      {summary.totalCount} run
-                      {summary.totalCount !== 1 ? 's' : ''}
+                      {ts(
+                        summary.totalCount === 1
+                          ? '{count} run'
+                          : '{count} runs',
+                        { count: summary.totalCount }
+                      )}
                       {!summary.allSameStatus && (
                         <>
                           {summary.runningCount > 0 && (
                             <span className="ml-2">
-                              {summary.runningCount} running
+                              {summary.runningCount}{' '}
+                              <I18nText text={'running'} />
                             </span>
                           )}
                           {summary.failedCount > 0 && (
                             <span className="ml-2">
-                              {summary.failedCount} failed
+                              {summary.failedCount} <I18nText text={'failed'} />
                             </span>
                           )}
                           {summary.abortedCount > 0 && (
                             <span className="ml-2">
-                              {summary.abortedCount} aborted
+                              {summary.abortedCount}{' '}
+                              <I18nText text={'aborted'} />
                             </span>
                           )}
                           {summary.queuedCount > 0 && (
                             <span className="ml-2">
-                              {summary.queuedCount} queued
+                              {summary.queuedCount} <I18nText text={'queued'} />
                             </span>
                           )}
                         </>
@@ -257,7 +283,7 @@ function DAGRunGroupedView({
                     </StatusChip>
                   ) : (
                     <StatusChip status={undefined} size="xs">
-                      Mixed
+                      <I18nText text={'Mixed'} />
                     </StatusChip>
                   )}
                 </div>
@@ -314,26 +340,32 @@ function DAGRunGroupedView({
                                 {dagRun.scheduleTime && (
                                   <div className="whitespace-nowrap">
                                     <span className="text-muted-foreground">
-                                      Scheduled:{' '}
+                                      <I18nText text={'Scheduled:'} />{' '}
                                     </span>
                                     {dagRun.scheduleTime}
                                   </div>
                                 )}
                                 <div className="whitespace-nowrap">
                                   <span className="text-muted-foreground">
-                                    Queued:{' '}
+                                    <I18nText text={'Queued:'} />{' '}
                                   </span>
-                                  {dagRun.queuedAt || '-'}
+                                  <RelativeTime
+                                    timestamp={dagRun.queuedAt}
+                                    absolute={dagRun.queuedAt}
+                                  />
                                 </div>
                                 <div className="whitespace-nowrap">
                                   <span className="text-muted-foreground">
-                                    Started:{' '}
+                                    <I18nText text={'Started:'} />{' '}
                                   </span>
-                                  {dagRun.startedAt || '-'}
+                                  <RelativeTime
+                                    timestamp={dagRun.startedAt}
+                                    absolute={dagRun.startedAt}
+                                  />
                                 </div>
                                 <div className="flex items-center gap-1 whitespace-nowrap">
                                   <span className="text-muted-foreground">
-                                    Duration:{' '}
+                                    <I18nText text={'Duration:'} />{' '}
                                   </span>
                                   {calculateDuration(
                                     dagRun.startedAt,
@@ -348,7 +380,13 @@ function DAGRunGroupedView({
                               </div>
                             </div>
                           </div>
-                          <div className="flex-shrink-0 mt-0.5">
+                          <div className="mt-0.5 flex flex-shrink-0 items-start gap-2">
+                            {onViewArtifacts && (
+                              <DAGRunArtifactsButton
+                                dagRun={dagRun}
+                                onClick={() => onViewArtifacts(dagRun)}
+                              />
+                            )}
                             <StepDetailsTooltip dagRun={dagRun}>
                               <div className="flex flex-col items-end gap-1">
                                 <StatusChip status={dagRun.status} size="xs">

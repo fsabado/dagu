@@ -13,18 +13,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/masking"
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/launcher"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/masking"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/launcher"
+	"github.com/dagucloud/dagu/v2/internal/test"
 )
 
 func TestNewSubCmdBuilder(t *testing.T) {
@@ -57,10 +58,11 @@ func TestSubCmdBuilderStartInheritsParentEnv(t *testing.T) {
 	}
 
 	builder := launcher.NewSubCmdBuilder(cfg)
-	dag := &core.DAG{Location: "/tmp/test.yaml"}
+	dag := &ir.DAG{Location: "/tmp/test.yaml", RuntimeResolved: true}
 	spec := builder.Start(dag, launcher.StartOptions{})
 
 	assert.Contains(t, spec.Env, "SUBCMD_PARENT_ENV=from-parent")
+	assert.True(t, spec.RuntimeResolved)
 }
 
 func TestSubCmdBuilderFilteredCommandsUseBaseEnv(t *testing.T) {
@@ -78,7 +80,7 @@ func TestSubCmdBuilderFilteredCommandsUseBaseEnv(t *testing.T) {
 	}
 
 	builder := launcher.NewSubCmdBuilder(cfg)
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:     "test-dag",
 		Location: "/tmp/test.yaml",
 	}
@@ -87,9 +89,27 @@ func TestSubCmdBuilderFilteredCommandsUseBaseEnv(t *testing.T) {
 	assert.Equal(t, baseEnv, enqueueSpec.Env)
 	assert.NotContains(t, enqueueSpec.Env, "SUBCMD_PARENT_ENV=from-parent")
 
-	dequeueSpec := builder.Dequeue(dag, exec.NewDAGRunRef("test-dag", "run-1"))
+	dequeueSpec := builder.Dequeue(dag, ir.NewDAGRunRef("test-dag", "run-1"))
 	assert.Equal(t, baseEnv, dequeueSpec.Env)
 	assert.NotContains(t, dequeueSpec.Env, "SUBCMD_PARENT_ENV=from-parent")
+}
+
+func TestSubCmdBuilderPropagatesDefinitionID(t *testing.T) {
+	t.Setenv(runenv.EnvKeyDAGDefinitionID, "inherited")
+
+	builder := launcher.NewSubCmdBuilder(&config.Config{
+		Paths: config.PathsConfig{Executable: "/path/to/dagu"},
+	})
+	dag := &ir.DAG{Location: "/tmp/test.yaml"}
+	want := runenv.EnvKeyDAGDefinitionID + "=definition-1"
+
+	start := builder.Start(dag, launcher.StartOptions{DefinitionID: "definition-1"})
+	enqueue := builder.Enqueue(dag, launcher.EnqueueOptions{DefinitionID: "definition-1"})
+	restart := builder.Restart(dag, launcher.RestartOptions{DefinitionID: "definition-1"})
+	for _, spec := range []launcher.CmdSpec{start, enqueue, restart} {
+		assert.Contains(t, spec.Env, want)
+		assert.NotContains(t, spec.Env, runenv.EnvKeyDAGDefinitionID+"=inherited")
+	}
 }
 
 func TestRunRetryWithBuiltExecutable(t *testing.T) {
@@ -102,28 +122,28 @@ steps:
 `)
 
 	runID := "built-exec-retry-run"
-	attempt, err := th.DAGRunStore.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
 	logPath := filepath.Join(th.Config.Paths.LogDir, "built-exec-retry.log")
 	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
 
-	status := transform.NewStatusBuilder(dagFile.DAG).Create(
+	status := ir.NewStatusBuilder(dagFile.DAG).Create(
 		runID,
-		core.Queued,
+		ir.Queued,
 		0,
 		time.Time{},
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithTriggerType(core.TriggerTypeRetry),
-		transform.WithQueuedAt(stringutil.FormatTime(time.Now())),
-		transform.WithLogFilePath(logPath),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithTriggerType(ir.TriggerTypeRetry),
+		ir.WithQueuedAt(stringutil.FormatTime(time.Now())),
+		ir.WithLogFilePath(logPath),
 	)
 
 	require.NoError(t, attempt.Open(th.Context))
 	require.NoError(t, attempt.Write(th.Context, status))
 	require.NoError(t, attempt.Close(th.Context))
 
-	spec := th.SubCmdBuilder.Retry(dagFile.DAG, runID, "")
+	spec := th.SubCmdBuilder.Retry(dagFile.DAG, launcher.RetryOptions{DAGRunID: runID})
 	err = launcher.Run(th.Context, spec)
 	require.NoError(t, err, "env=%s", strings.Join(spec.Env, "\n"))
 }
@@ -138,27 +158,27 @@ steps:
 `)
 
 	runID := "built-exec-queue-retry-run"
-	attempt, err := th.DAGRunStore.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
 	logPath := filepath.Join(th.Config.Paths.LogDir, dagFile.Name, runID+".log")
 	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
 
-	status := transform.NewStatusBuilder(dagFile.DAG).Create(
+	status := ir.NewStatusBuilder(dagFile.DAG).Create(
 		runID,
-		core.Queued,
+		ir.Queued,
 		0,
 		time.Time{},
-		transform.WithLogFilePath(logPath),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithHierarchyRefs(exec.NewDAGRunRef(dagFile.Name, runID), exec.DAGRunRef{}),
+		ir.WithLogFilePath(logPath),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithHierarchyRefs(ir.NewDAGRunRef(dagFile.Name, runID), ir.DAGRunRef{}),
 	)
 
 	require.NoError(t, attempt.Open(th.Context))
 	require.NoError(t, attempt.Write(th.Context, status))
 	require.NoError(t, attempt.Close(th.Context))
 
-	spec := th.SubCmdBuilder.Retry(dagFile.DAG, runID, "")
+	spec := th.SubCmdBuilder.Retry(dagFile.DAG, launcher.RetryOptions{DAGRunID: runID})
 	err = launcher.Run(th.Context, spec)
 	require.NoError(t, err, "env=%s", strings.Join(spec.Env, "\n"))
 }
@@ -173,27 +193,27 @@ steps:
 `)
 
 	runID := "built-exec-command-queue-retry-run"
-	attempt, err := th.DAGRunStore.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
 	logPath := filepath.Join(th.Config.Paths.LogDir, dagFile.Name, runID+".log")
 	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
 
-	status := transform.NewStatusBuilder(dagFile.DAG).Create(
+	status := ir.NewStatusBuilder(dagFile.DAG).Create(
 		runID,
-		core.Queued,
+		ir.Queued,
 		0,
 		time.Time{},
-		transform.WithLogFilePath(logPath),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithHierarchyRefs(exec.NewDAGRunRef(dagFile.Name, runID), exec.DAGRunRef{}),
+		ir.WithLogFilePath(logPath),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithHierarchyRefs(ir.NewDAGRunRef(dagFile.Name, runID), ir.DAGRunRef{}),
 	)
 
 	require.NoError(t, attempt.Open(th.Context))
 	require.NoError(t, attempt.Write(th.Context, status))
 	require.NoError(t, attempt.Close(th.Context))
 
-	spec := th.SubCmdBuilder.Retry(dagFile.DAG, runID, "")
+	spec := th.SubCmdBuilder.Retry(dagFile.DAG, launcher.RetryOptions{DAGRunID: runID})
 	err = launcher.Run(th.Context, spec)
 	require.NoError(t, err, "env=%s", strings.Join(spec.Env, "\n"))
 }
@@ -208,20 +228,20 @@ steps:
 `)
 
 	runID := "built-exec-fresh-config-retry-run"
-	attempt, err := th.DAGRunStore.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
 	logPath := filepath.Join(th.Config.Paths.LogDir, dagFile.Name, runID+".log")
 	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
 
-	status := transform.NewStatusBuilder(dagFile.DAG).Create(
+	status := ir.NewStatusBuilder(dagFile.DAG).Create(
 		runID,
-		core.Queued,
+		ir.Queued,
 		0,
 		time.Time{},
-		transform.WithLogFilePath(logPath),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithHierarchyRefs(exec.NewDAGRunRef(dagFile.Name, runID), exec.DAGRunRef{}),
+		ir.WithLogFilePath(logPath),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithHierarchyRefs(ir.NewDAGRunRef(dagFile.Name, runID), ir.DAGRunRef{}),
 	)
 
 	require.NoError(t, attempt.Open(th.Context))
@@ -236,7 +256,7 @@ steps:
 	freshCfg, err := loader.Load()
 	require.NoError(t, err)
 
-	spec := launcher.NewSubCmdBuilder(freshCfg).Retry(dagFile.DAG, runID, "")
+	spec := launcher.NewSubCmdBuilder(freshCfg).Retry(dagFile.DAG, launcher.RetryOptions{DAGRunID: runID})
 	err = launcher.Run(th.Context, spec)
 	require.NoError(t, err, "env=%s", strings.Join(spec.Env, "\n"))
 }
@@ -265,18 +285,19 @@ steps:
 `, test.EnvOutput("EXPORTED_SECRET", "SUBCMD_START_EXPLICIT_ENV")))
 
 	spec := th.SubCmdBuilder.Start(dagFile.DAG, launcher.StartOptions{})
-	err := launcher.Start(th.Context, spec)
+	started, err := launcher.StartProcess(th.Context, spec)
 	require.NoError(t, err, "env=%s", strings.Join(spec.Env, "\n"))
 
-	var status exec.DAGRunStatus
+	var status ir.DAGRunStatus
 	require.Eventually(t, func() bool {
 		latest, err := th.DAGRunMgr.GetLatestStatus(th.Context, dagFile.DAG)
 		if err != nil {
 			return false
 		}
 		status = latest
-		return status.Status == core.Succeeded
+		return status.Status == ir.Succeeded
 	}, statusTimeout, 100*time.Millisecond)
+	requireProcessCompletion(t, started, statusTimeout)
 	require.Equal(t, "from-host|", test.StatusOutputValue(t, &status, "RESULT"))
 }
 
@@ -301,18 +322,19 @@ steps:
 		require.False(t, strings.HasPrefix(entry, "_DAGU_PRESOLVED_SECRET_"), "unexpected presolved secret transport env: %s", entry)
 	}
 
-	err := launcher.Start(th.Context, spec)
+	started, err := launcher.StartProcess(th.Context, spec)
 	require.NoError(t, err, "env=%s", strings.Join(spec.Env, "\n"))
 
-	var status exec.DAGRunStatus
+	var status ir.DAGRunStatus
 	require.Eventually(t, func() bool {
 		latest, err := th.DAGRunMgr.GetLatestStatus(th.Context, dagFile.DAG)
 		if err != nil {
 			return false
 		}
 		status = latest
-		return status.Status == core.Succeeded
+		return status.Status == ir.Succeeded
 	}, statusTimeout, 100*time.Millisecond)
+	requireProcessCompletion(t, started, statusTimeout)
 	require.Equal(t, masking.DefaultMaskString+"|", test.StatusOutputValue(t, &status, "RESULT"))
 }
 
@@ -330,7 +352,7 @@ func TestStart(t *testing.T) {
 	}
 
 	builder := launcher.NewSubCmdBuilder(cfg)
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:     "test-dag",
 		Location: "/path/to/dag.yaml",
 	}
@@ -378,12 +400,22 @@ func TestStart(t *testing.T) {
 		assert.Contains(t, spec.Args, "--run-id=test-run-id")
 	})
 
+	t.Run("StartWithEmptySourceFileOverride", func(t *testing.T) {
+		t.Parallel()
+		sourceFile := ""
+		spec := builder.Start(dag, launcher.StartOptions{SourceFile: &sourceFile})
+
+		assert.Contains(t, spec.Args, "--source-file=")
+	})
+
 	t.Run("StartWithAllOptions", func(t *testing.T) {
 		t.Parallel()
 		opts := launcher.StartOptions{
-			Params:   "env=prod",
-			Quiet:    true,
-			DAGRunID: "full-test-id",
+			Params:       "env=prod",
+			Quiet:        true,
+			DAGRunID:     "full-test-id",
+			TriggerActor: "alice",
+			NoReuse:      true,
 		}
 		spec := builder.Start(dag, opts)
 
@@ -392,6 +424,8 @@ func TestStart(t *testing.T) {
 		assert.Contains(t, spec.Args, `"env=prod"`)
 		assert.Contains(t, spec.Args, "-q")
 		assert.Contains(t, spec.Args, "--run-id=full-test-id")
+		assert.Contains(t, spec.Args, "--trigger-actor=alice")
+		assert.Contains(t, spec.Args, "--no-reuse")
 		assert.Contains(t, spec.Args, "--config")
 		assert.Contains(t, spec.Args, "/path/to/dag.yaml")
 	})
@@ -422,7 +456,7 @@ func TestEnqueue(t *testing.T) {
 	}
 
 	builder := launcher.NewSubCmdBuilder(cfg)
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "test-dag",
 		Location:   "/path/to/dag.yaml",
 		WorkingDir: "/path/to",
@@ -487,10 +521,12 @@ func TestEnqueue(t *testing.T) {
 	t.Run("EnqueueWithAllOptions", func(t *testing.T) {
 		t.Parallel()
 		opts := launcher.EnqueueOptions{
-			Params:   "env=staging",
-			Quiet:    true,
-			DAGRunID: "full-enqueue-id",
-			Queue:    "priority-queue",
+			Params:       "env=staging",
+			Quiet:        true,
+			DAGRunID:     "full-enqueue-id",
+			Queue:        "priority-queue",
+			TriggerActor: "alice",
+			NoReuse:      true,
 		}
 		spec := builder.Enqueue(dag, opts)
 
@@ -501,6 +537,8 @@ func TestEnqueue(t *testing.T) {
 		assert.Contains(t, spec.Args, "--run-id=full-enqueue-id")
 		assert.Contains(t, spec.Args, "--queue")
 		assert.Contains(t, spec.Args, "priority-queue")
+		assert.Contains(t, spec.Args, "--trigger-actor=alice")
+		assert.Contains(t, spec.Args, "--no-reuse")
 		assert.Contains(t, spec.Args, "/path/to/dag.yaml")
 	})
 }
@@ -515,7 +553,7 @@ func TestDequeue(t *testing.T) {
 	}
 
 	builder := launcher.NewSubCmdBuilder(cfg)
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "test-dag",
 		Location:   "/path/to/dag.yaml",
 		WorkingDir: "/path/to",
@@ -523,7 +561,7 @@ func TestDequeue(t *testing.T) {
 
 	t.Run("BasicDequeue", func(t *testing.T) {
 		t.Parallel()
-		dagRun := exec.NewDAGRunRef("test-dag", "run-123")
+		dagRun := ir.NewDAGRunRef("test-dag", "run-123")
 		spec := builder.Dequeue(dag, dagRun)
 
 		assert.Equal(t, "/usr/bin/dagu", spec.Executable)
@@ -545,7 +583,7 @@ func TestDequeue(t *testing.T) {
 			},
 		}
 		builderNoFile := launcher.NewSubCmdBuilder(cfgNoFile)
-		dagRun := exec.NewDAGRunRef("test-dag", "run-456")
+		dagRun := ir.NewDAGRunRef("test-dag", "run-456")
 		spec := builderNoFile.Dequeue(dag, dagRun)
 
 		assert.NotContains(t, spec.Args, "--config")
@@ -556,13 +594,13 @@ func TestDequeue(t *testing.T) {
 
 	t.Run("DequeueWithCustomQueue", func(t *testing.T) {
 		t.Parallel()
-		dagWithQueue := &core.DAG{
+		dagWithQueue := &ir.DAG{
 			Name:       "test-dag",
 			Queue:      "custom-queue",
 			Location:   "/path/to/dag.yaml",
 			WorkingDir: "/path/to",
 		}
-		dagRun := exec.NewDAGRunRef("test-dag", "run-789")
+		dagRun := ir.NewDAGRunRef("test-dag", "run-789")
 		spec := builder.Dequeue(dagWithQueue, dagRun)
 
 		// Queue name should be the custom queue, not the DAG name
@@ -581,7 +619,7 @@ func TestRestart(t *testing.T) {
 	}
 
 	builder := launcher.NewSubCmdBuilder(cfg)
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "test-dag",
 		Location:   "/path/to/dag.yaml",
 		WorkingDir: "/path/to",
@@ -643,7 +681,7 @@ func TestRetry(t *testing.T) {
 	}
 
 	builder := launcher.NewSubCmdBuilder(cfg)
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "test-dag",
 		Location:   "/path/to/dag.yaml",
 		WorkingDir: "/path/to",
@@ -651,7 +689,7 @@ func TestRetry(t *testing.T) {
 
 	t.Run("BasicRetry", func(t *testing.T) {
 		t.Parallel()
-		spec := builder.Retry(dag, "retry-run-id", "")
+		spec := builder.Retry(dag, launcher.RetryOptions{DAGRunID: "retry-run-id"})
 
 		assert.Equal(t, "/usr/bin/dagu", spec.Executable)
 		assert.Contains(t, spec.Args, "retry")
@@ -663,14 +701,65 @@ func TestRetry(t *testing.T) {
 
 	t.Run("RetryWithStepName", func(t *testing.T) {
 		t.Parallel()
-		spec := builder.Retry(dag, "retry-run-id", "step-1")
+		spec := builder.Retry(dag, launcher.RetryOptions{
+			DAGRunID: "retry-run-id",
+			Step:     "step-1",
+		})
 
 		assert.Contains(t, spec.Args, "--step=step-1")
+		assert.NotContains(t, spec.Args, "--downstream")
+	})
+
+	t.Run("RetryWithDownstream", func(t *testing.T) {
+		t.Parallel()
+		spec := builder.Retry(dag, launcher.RetryOptions{
+			DAGRunID:          "retry-run-id",
+			Step:              "step-1",
+			IncludeDownstream: true,
+		})
+
+		assert.Contains(t, spec.Args, "--step=step-1")
+		assert.Contains(t, spec.Args, "--downstream")
+	})
+
+	t.Run("RetryOmitsDownstreamWithoutStep", func(t *testing.T) {
+		t.Parallel()
+		spec := builder.Retry(dag, launcher.RetryOptions{
+			DAGRunID:          "retry-run-id",
+			IncludeDownstream: true,
+		})
+
+		assert.NotContains(t, spec.Args, "--downstream")
+	})
+
+	t.Run("RetryWithActor", func(t *testing.T) {
+		t.Parallel()
+		spec := builder.Retry(dag, launcher.RetryOptions{
+			DAGRunID:     "retry-run-id",
+			TriggerActor: "alice",
+		})
+
+		assert.Contains(t, spec.Args, "--trigger-actor=alice")
+	})
+
+	t.Run("RetryWithRootDAGRun", func(t *testing.T) {
+		t.Parallel()
+		root := ir.NewDAGRunRef("root-dag", "root-run-id")
+		spec := builder.Retry(dag, launcher.RetryOptions{
+			DAGRunID: "child-run-id",
+			Root:     root,
+		})
+
+		assert.Contains(t, spec.Args, "--root=root-dag:root-run-id")
 	})
 
 	t.Run("RetryWithAllOptions", func(t *testing.T) {
 		t.Parallel()
-		spec := builder.Retry(dag, "full-retry-id", "step-2")
+		spec := builder.Retry(dag, launcher.RetryOptions{
+			DAGRunID:     "full-retry-id",
+			Step:         "step-2",
+			TriggerActor: "alice",
+		})
 
 		assert.Contains(t, spec.Args, "retry")
 		assert.Contains(t, spec.Args, "--run-id=full-retry-id")
@@ -680,16 +769,16 @@ func TestRetry(t *testing.T) {
 
 	t.Run("RetryDoesNotMarkQueueDispatch", func(t *testing.T) {
 		t.Parallel()
-		spec := builder.Retry(dag, "retry-run-id", "")
+		spec := builder.Retry(dag, launcher.RetryOptions{DAGRunID: "retry-run-id"})
 
-		assert.NotContains(t, spec.Env, exec.EnvKeyQueueDispatchRetry+"=1")
+		assert.NotContains(t, spec.Env, runenv.EnvKeyQueueDispatchRetry+"=1")
 	})
 
 	t.Run("RetryStripsInheritedQueueDispatchMarker", func(t *testing.T) {
-		t.Setenv(exec.EnvKeyQueueDispatchRetry, "1")
-		spec := builder.Retry(dag, "retry-run-id", "")
+		t.Setenv(runenv.EnvKeyQueueDispatchRetry, "1")
+		spec := builder.Retry(dag, launcher.RetryOptions{DAGRunID: "retry-run-id"})
 
-		assert.NotContains(t, spec.Env, exec.EnvKeyQueueDispatchRetry+"=1")
+		assert.NotContains(t, spec.Env, runenv.EnvKeyQueueDispatchRetry+"=1")
 	})
 
 	t.Run("RetryWithoutConfig", func(t *testing.T) {
@@ -700,7 +789,7 @@ func TestRetry(t *testing.T) {
 			},
 		}
 		builderNoFile := launcher.NewSubCmdBuilder(cfgNoFile)
-		spec := builderNoFile.Retry(dag, "retry-run-id", "")
+		spec := builderNoFile.Retry(dag, launcher.RetryOptions{DAGRunID: "retry-run-id"})
 
 		assert.NotContains(t, spec.Args, "--config")
 	})
@@ -735,12 +824,17 @@ func TestStartProcessReportsPIDAndCompletion(t *testing.T) {
 	require.Positive(t, result.PID)
 	require.NotNil(t, result.Done)
 
+	requireProcessCompletion(t, result, 5*time.Second)
+}
+
+func requireProcessCompletion(t *testing.T, result *launcher.StartResult, timeout time.Duration) {
+	t.Helper()
 	select {
 	case err, ok := <-result.Done:
 		require.True(t, ok)
 		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("start process helper did not exit")
+	case <-time.After(timeout):
+		t.Fatal("started process did not exit")
 	}
 }
 

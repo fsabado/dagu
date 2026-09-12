@@ -7,28 +7,29 @@ import (
 	"context"
 	"testing"
 
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestCommandResolutionWithoutRuntimeEnvUsesDAGShell(t *testing.T) {
-	ctx := runtime.NewContextForTest(context.Background(), &core.DAG{
+	ctx := runtime.NewContextForTest(context.Background(), &ir.DAG{
 		Name:               "test-dag",
 		WorkingDir:         t.TempDir(),
 		WorkingDirExplicit: true,
 		Shell:              "dag-shell",
 		ShellArgs:          []string{"-lc"},
 	}, "run-1", "test.log")
-	step := core.Step{
+	step := ir.Step{
 		Name:           "run",
-		ExecutorConfig: core.ExecutorConfig{Type: "command"},
+		ExecutorConfig: ir.ExecutorConfig{Type: "command"},
 	}
 
 	for _, command := range []cmnvalue.CommandContext{
-		step.CommandResolution(ctx),
-		step.ScriptResolution(ctx),
+		registry.CommandResolution(ctx, step),
+		registry.ScriptResolution(ctx, step),
 	} {
 		assert.Equal(t, cmnvalue.CommandTargetLocal, command.Target)
 		assert.True(t, command.ShellConfigured)
@@ -37,23 +38,23 @@ func TestCommandResolutionWithoutRuntimeEnvUsesDAGShell(t *testing.T) {
 }
 
 func TestCommandResolutionWithoutRuntimeEnvPrefersStepShell(t *testing.T) {
-	ctx := runtime.NewContextForTest(context.Background(), &core.DAG{
+	ctx := runtime.NewContextForTest(context.Background(), &ir.DAG{
 		Name:               "test-dag",
 		WorkingDir:         t.TempDir(),
 		WorkingDirExplicit: true,
 		Shell:              "dag-shell",
 		ShellArgs:          []string{"-lc"},
 	}, "run-1", "test.log")
-	step := core.Step{
+	step := ir.Step{
 		Name:           "run",
 		Shell:          "step-shell",
 		ShellArgs:      []string{"-c"},
-		ExecutorConfig: core.ExecutorConfig{Type: "command"},
+		ExecutorConfig: ir.ExecutorConfig{Type: "command"},
 	}
 
 	for _, command := range []cmnvalue.CommandContext{
-		step.CommandResolution(ctx),
-		step.ScriptResolution(ctx),
+		registry.CommandResolution(ctx, step),
+		registry.ScriptResolution(ctx, step),
 	} {
 		assert.Equal(t, cmnvalue.CommandTargetLocal, command.Target)
 		assert.True(t, command.ShellConfigured)
@@ -62,16 +63,16 @@ func TestCommandResolutionWithoutRuntimeEnvPrefersStepShell(t *testing.T) {
 }
 
 func TestCommandResolutionWithoutDAGContextUsesStepShell(t *testing.T) {
-	step := core.Step{
+	step := ir.Step{
 		Name:           "run",
 		Shell:          "step-shell",
 		ShellArgs:      []string{"-c"},
-		ExecutorConfig: core.ExecutorConfig{Type: "command"},
+		ExecutorConfig: ir.ExecutorConfig{Type: "command"},
 	}
 
 	for _, command := range []cmnvalue.CommandContext{
-		step.CommandResolution(context.Background()),
-		step.ScriptResolution(context.Background()),
+		registry.CommandResolution(context.Background(), step),
+		registry.ScriptResolution(context.Background(), step),
 	} {
 		assert.Equal(t, cmnvalue.CommandTargetLocal, command.Target)
 		assert.True(t, command.ShellConfigured)

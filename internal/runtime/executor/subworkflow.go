@@ -7,38 +7,66 @@ import (
 	"context"
 	"os"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime/workspacebundle"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 )
 
 // SubWorkflowRunner runs child workflows behind a workflow-level interface.
 type SubWorkflowRunner interface {
 	ShouldRun(ctx context.Context, req SubWorkflowRequest) bool
-	Run(ctx context.Context, req SubWorkflowRequest) (*exec.RunStatus, error)
-	Retry(ctx context.Context, req SubWorkflowRetryRequest) (*exec.RunStatus, error)
+	Run(ctx context.Context, req SubWorkflowRequest) (*ir.RunStatus, error)
+	Retry(ctx context.Context, req SubWorkflowRetryRequest) (*ir.RunStatus, error)
 	Cancel(ctx context.Context, req SubWorkflowCancelRequest) error
+}
+
+// Enqueuer admits child workflows to the control-plane queue.
+type Enqueuer interface {
+	Enqueue(ctx context.Context, req EnqueueRequest) (EnqueueResult, error)
+}
+
+// EnqueueRequest describes a child workflow queue admission.
+type EnqueueRequest struct {
+	DAG            *ir.DAG
+	RootDAGRun     ir.DAGRunRef
+	RunID          string
+	QueueName      string
+	ProfileName    string
+	TriggerActor   string
+	ParallelItem   string
+	WorkerSelector map[string]string
+}
+
+// EnqueueResult describes the persisted state after queue admission.
+type EnqueueResult struct {
+	Status        ir.Status
+	AlreadyExists bool
 }
 
 // SubWorkflowRequest describes a child workflow invocation.
 type SubWorkflowRequest struct {
-	DAG               *core.DAG
-	ParentDAG         *core.DAG
-	RootDAGRun        exec.DAGRunRef
-	ParentDAGRun      exec.DAGRunRef
+	DAG               *ir.DAG
+	ParentDAG         *ir.DAG
+	RootDAGRun        ir.DAGRunRef
+	ParentDAGRun      ir.DAGRunRef
 	RunID             string
 	Params            string
+	ParallelItem      string
 	ProfileName       string
+	TriggerActor      string
 	WorkDir           string
 	WorkerSelector    map[string]string
 	ExternalStepRetry bool
+	Reuse             bool
+	RetryPath         dagrun.RetryPath
 	Workspace         *SubWorkflowWorkspace
 }
 
 // SubWorkflowRetryRequest describes a child workflow step retry.
 type SubWorkflowRetryRequest struct {
 	SubWorkflowRequest
-	StepName string
+	StepName          string
+	IncludeDownstream bool
 }
 
 // SubWorkflowCancelMode describes how a child workflow should be stopped.
@@ -59,8 +87,8 @@ type SubWorkflowCancelIntent struct {
 
 // SubWorkflowCancelRequest describes a child workflow cancellation.
 type SubWorkflowCancelRequest struct {
-	DAG        *core.DAG
-	RootDAGRun exec.DAGRunRef
+	DAG        *ir.DAG
+	RootDAGRun ir.DAGRunRef
 	RunID      string
 	Intent     SubWorkflowCancelIntent
 }

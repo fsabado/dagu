@@ -11,9 +11,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/runtime/executor"
-	"github.com/minio/minio-go/v7"
+	"github.com/dagucloud/dagu/v2/internal/executor/registry"
+
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
 const (
@@ -32,10 +34,10 @@ var (
 )
 
 func init() {
-	executor.RegisterExecutor(executorType, newExecutor, validateStep, core.ExecutorCapabilities{Command: true})
+	executor.RegisterExecutor(executorType, newExecutor, validateStep, registry.ExecutorCapabilities{Command: true})
 }
 
-func validateStep(step core.Step) error {
+func validateStep(step ir.Step) error {
 	if step.ExecutorConfig.Type != executorType {
 		return nil
 	}
@@ -45,7 +47,7 @@ func validateStep(step core.Step) error {
 		command = step.Commands[0].Command
 	}
 	if strings.TrimSpace(command) == "" {
-		return core.NewValidationError("command", nil, fmt.Errorf("%w: command is required (upload, download, list, delete)", ErrConfig))
+		return ir.NewValidationError("command", nil, fmt.Errorf("%w: command is required (upload, download, list, delete)", ErrConfig))
 	}
 	return nil
 }
@@ -60,11 +62,11 @@ type executorImpl struct {
 
 	cfg       *Config
 	operation string
-	client    *minio.Client
+	client    *awss3.Client
 	closed    bool
 }
 
-func newExecutor(ctx context.Context, step core.Step) (executor.Executor, error) {
+func newExecutor(ctx context.Context, step ir.Step) (executor.Executor, error) {
 	cfg := DefaultConfig()
 
 	// Get DAG-level S3 config from context and apply as defaults
@@ -101,7 +103,6 @@ func newExecutor(ctx context.Context, step core.Step) (executor.Executor, error)
 
 	rCtx, cancel := context.WithCancel(ctx)
 
-	// Create MinIO client (works with AWS S3 and S3-compatible services)
 	client, err := createClient(rCtx, cfg)
 	if err != nil {
 		cancel()
@@ -183,7 +184,6 @@ func (e *executorImpl) Close() error {
 		return nil
 	}
 	e.closed = true
-	// MinIO clients don't need explicit close
 	return nil
 }
 

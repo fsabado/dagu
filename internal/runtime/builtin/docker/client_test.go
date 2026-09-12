@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
@@ -51,10 +51,6 @@ func mustAddr(s string) netip.Addr {
 	return netip.MustParseAddr(s)
 }
 
-// TestLoadConfigFromMap covers LoadConfigFromMap with 92.7% coverage.
-// The uncovered lines (7.3%) are error handling for mapstructure.NewDecoder failures
-// which cannot be triggered in practice because we always pass valid struct pointers.
-// These error checks exist as defensive programming for potential future changes.
 func TestLoadConfigFromMap(t *testing.T) {
 	hostWorkPath := testAbsoluteVolumePath("/workhost", "C:/workhost")
 	t.Setenv("DAGU_TEST_WORKHOST", hostWorkPath)
@@ -66,6 +62,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 	hostPath := absVolumeSource("/host/path")
 	dataPath := absVolumeSource("/data")
 	newPath := absVolumeSource("/new")
+	pidsLimit := int64(128)
 
 	tests := []struct {
 		name        string
@@ -81,7 +78,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine:latest",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -95,7 +92,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				ContainerName: "my-container",
-				Pull:          core.PullPolicyMissing,
+				Pull:          ir.PullPolicyMissing,
 				Container:     &container.Config{},
 				Host:          &container.HostConfig{},
 				Network:       &network.NetworkingConfig{},
@@ -133,7 +130,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			expected: &Config{
 				Image:      "ubuntu:20.04",
 				Platform:   "linux/arm64",
-				Pull:       core.PullPolicyAlways,
+				Pull:       ir.PullPolicyAlways,
 				AutoRemove: true,
 				Container: &container.Config{
 					Env:        []string{"FOO=bar"},
@@ -151,6 +148,94 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 		},
 		{
+			name: "HostConfigWithFlatResources",
+			input: map[string]any{
+				"image": "alpine",
+				"host": map[string]any{
+					"NetworkMode": "bridge",
+					"SecurityOpt": []string{"seccomp=unconfined"},
+					"Memory":      536870912,
+					"CPUShares":   512,
+					"NanoCPUs":    1_000_000_000,
+					"PidsLimit":   128,
+					"Devices": []map[string]any{{
+						"PathOnHost":        "/dev/fuse",
+						"PathInContainer":   "/dev/fuse",
+						"CgroupPermissions": "rwm",
+					}},
+				},
+			},
+			expected: &Config{
+				Image:     "alpine",
+				Pull:      ir.PullPolicyMissing,
+				Container: &container.Config{},
+				Host: &container.HostConfig{
+					NetworkMode: "bridge",
+					SecurityOpt: []string{"seccomp=unconfined"},
+					Resources: container.Resources{
+						CPUShares: 512,
+						Memory:    536870912,
+						NanoCPUs:  1_000_000_000,
+						Devices: []container.DeviceMapping{{
+							PathOnHost:        "/dev/fuse",
+							PathInContainer:   "/dev/fuse",
+							CgroupPermissions: "rwm",
+						}},
+						PidsLimit: &pidsLimit,
+					},
+				},
+				Network:     &network.NetworkingConfig{},
+				ExecOptions: &client.ExecCreateOptions{},
+			},
+		},
+		{
+			name: "HostConfigWithNestedResources",
+			input: map[string]any{
+				"image": "alpine",
+				"host": map[string]any{
+					"resources": map[string]any{
+						"Memory": 268435456,
+					},
+				},
+			},
+			expected: &Config{
+				Image:     "alpine",
+				Pull:      ir.PullPolicyMissing,
+				Container: &container.Config{},
+				Host: &container.HostConfig{
+					Resources: container.Resources{Memory: 268435456},
+				},
+				Network:     &network.NetworkingConfig{},
+				ExecOptions: &client.ExecCreateOptions{},
+			},
+		},
+		{
+			name: "FlatHostResourcesOverrideNested",
+			input: map[string]any{
+				"image": "alpine",
+				"host": map[string]any{
+					"resources": map[string]any{
+						"Memory":    64,
+						"CPUShares": 256,
+					},
+					"Memory": 128,
+				},
+			},
+			expected: &Config{
+				Image:     "alpine",
+				Pull:      ir.PullPolicyMissing,
+				Container: &container.Config{},
+				Host: &container.HostConfig{
+					Resources: container.Resources{
+						CPUShares: 256,
+						Memory:    128,
+					},
+				},
+				Network:     &network.NetworkingConfig{},
+				ExecOptions: &client.ExecCreateOptions{},
+			},
+		},
+		{
 			name: "ExecModeWithContainerNameAndExecOptions",
 			input: map[string]any{
 				"container_name": "test-container",
@@ -162,7 +247,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				ContainerName: "test-container",
-				Pull:          core.PullPolicyMissing,
+				Pull:          ir.PullPolicyMissing,
 				Container:     &container.Config{},
 				Host:          &container.HostConfig{},
 				Network:       &network.NetworkingConfig{},
@@ -183,7 +268,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:      "alpine",
-				Pull:       core.PullPolicyMissing,
+				Pull:       ir.PullPolicyMissing,
 				AutoRemove: true,
 				Container:  &container.Config{},
 				Host: &container.HostConfig{
@@ -204,7 +289,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:      "alpine",
-				Pull:       core.PullPolicyMissing,
+				Pull:       ir.PullPolicyMissing,
 				AutoRemove: true,
 				Container:  &container.Config{},
 				Host: &container.HostConfig{
@@ -222,7 +307,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				AutoRemove:  true,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
@@ -238,7 +323,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				AutoRemove:  false,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
@@ -254,7 +339,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				AutoRemove:  true,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
@@ -270,7 +355,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				AutoRemove:  false,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
@@ -304,7 +389,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyNever,
+				Pull:        ir.PullPolicyNever,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -319,7 +404,22 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
+				Container:   &container.Config{},
+				Host:        &container.HostConfig{},
+				Network:     &network.NetworkingConfig{},
+				ExecOptions: &client.ExecCreateOptions{},
+			},
+		},
+		{
+			name: "PullPolicyFallback",
+			input: map[string]any{
+				"image": "alpine",
+				"pull":  "fallback",
+			},
+			expected: &Config{
+				Image:       "alpine",
+				Pull:        ir.PullPolicyFallback,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -334,7 +434,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyAlways,
+				Pull:        ir.PullPolicyAlways,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -349,7 +449,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyNever,
+				Pull:        ir.PullPolicyNever,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -364,7 +464,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyAlways,
+				Pull:        ir.PullPolicyAlways,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -399,7 +499,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image: "alpine",
-				Pull:  core.PullPolicyMissing,
+				Pull:  ir.PullPolicyMissing,
 				Container: &container.Config{
 					Env: []string{"FOO=bar"},
 				},
@@ -455,7 +555,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -491,7 +591,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			expected: &Config{
 				Image:       "alpine",
 				Platform:    "123",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -505,7 +605,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				ContainerName: "123",
-				Pull:          core.PullPolicyMissing,
+				Pull:          ir.PullPolicyMissing,
 				Container:     &container.Config{},
 				Host:          &container.HostConfig{},
 				Network:       &network.NetworkingConfig{},
@@ -519,7 +619,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "123",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -537,7 +637,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -552,7 +652,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -567,7 +667,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:       "alpine",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -583,7 +683,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			expected: &Config{
 				Image:       "alpine",
 				AutoRemove:  false,
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -599,7 +699,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			expected: &Config{
 				Image:       "alpine",
 				Platform:    "",
-				Pull:        core.PullPolicyMissing,
+				Pull:        ir.PullPolicyMissing,
 				Container:   &container.Config{},
 				Host:        &container.HostConfig{},
 				Network:     &network.NetworkingConfig{},
@@ -615,7 +715,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			expected: &Config{
 				Image:         "alpine",
 				ContainerName: "",
-				Pull:          core.PullPolicyMissing,
+				Pull:          ir.PullPolicyMissing,
 				Container:     &container.Config{},
 				Host:          &container.HostConfig{},
 				Network:       &network.NetworkingConfig{},
@@ -631,7 +731,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			expected: &Config{
 				Image:         "",
 				ContainerName: "test",
-				Pull:          core.PullPolicyMissing,
+				Pull:          ir.PullPolicyMissing,
 				Container:     &container.Config{},
 				Host:          &container.HostConfig{},
 				Network:       &network.NetworkingConfig{},
@@ -646,7 +746,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image: "alpine",
-				Pull:  core.PullPolicyMissing,
+				Pull:  ir.PullPolicyMissing,
 				Container: &container.Config{
 					WorkingDir: "/app",
 				},
@@ -663,7 +763,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:     "alpine",
-				Pull:      core.PullPolicyMissing,
+				Pull:      ir.PullPolicyMissing,
 				Container: &container.Config{},
 				Host: &container.HostConfig{
 					Binds: []string{hostPath + ":/container/path:rw", dataPath + ":/data:ro"},
@@ -681,7 +781,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image: "golang:1.22",
-				Pull:  core.PullPolicyMissing,
+				Pull:  ir.PullPolicyMissing,
 				Container: &container.Config{
 					WorkingDir: "/work",
 				},
@@ -703,7 +803,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image: "alpine",
-				Pull:  core.PullPolicyMissing,
+				Pull:  ir.PullPolicyMissing,
 				Container: &container.Config{
 					WorkingDir: "/explicit",
 				},
@@ -723,7 +823,7 @@ func TestLoadConfigFromMap(t *testing.T) {
 			},
 			expected: &Config{
 				Image:     "alpine",
-				Pull:      core.PullPolicyMissing,
+				Pull:      ir.PullPolicyMissing,
 				Container: &container.Config{},
 				Host: &container.HostConfig{
 					Binds: []string{"/existing:/existing", newPath + ":/new:rw"},
@@ -760,6 +860,9 @@ func TestLoadConfigFromMap(t *testing.T) {
 			assert.Equal(t, tt.expected.Host.AutoRemove, result.Host.AutoRemove)
 			assert.Equal(t, tt.expected.Host.Privileged, result.Host.Privileged)
 			assert.Equal(t, tt.expected.Host.Binds, result.Host.Binds)
+			assert.Equal(t, tt.expected.Host.Resources, result.Host.Resources)
+			assert.Equal(t, tt.expected.Host.NetworkMode, result.Host.NetworkMode)
+			assert.Equal(t, tt.expected.Host.SecurityOpt, result.Host.SecurityOpt)
 
 			// Compare exec options
 			assert.Equal(t, tt.expected.ExecOptions.User, result.ExecOptions.User)
@@ -776,20 +879,20 @@ func TestLoadConfig(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		input       core.Container
+		input       ir.Container
 		expected    *Config
 		expectError bool
 		errorMsg    string
 	}{
 		{
 			name: "MinimalContainerWithImageOnly",
-			input: core.Container{
+			input: ir.Container{
 				Image: "alpine:latest",
 			},
 			expected: &Config{
 				Image:      "alpine:latest",
-				Pull:       core.PullPolicyAlways, // Zero value of PullPolicy
-				AutoRemove: true,                  // Default when KeepContainer is false
+				Pull:       ir.PullPolicyAlways, // Zero value of PullPolicy
+				AutoRemove: true,                // Default when KeepContainer is false
 				Container: &container.Config{
 					Image: "alpine:latest",
 				},
@@ -800,7 +903,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "ErrorWhenImageIsEmpty",
-			input: core.Container{
+			input: ir.Container{
 				Platform: "linux/amd64",
 			},
 			expectError: true,
@@ -808,9 +911,9 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "FullContainerConfiguration",
-			input: core.Container{
+			input: ir.Container{
 				Image:         "ubuntu:20.04",
-				PullPolicy:    core.PullPolicyAlways,
+				PullPolicy:    ir.PullPolicyAlways,
 				Env:           []string{"FOO=bar", "BAZ=qux"},
 				Volumes:       []string{hostDataPath + ":/data:ro", "myvolume:/app"},
 				User:          "1000:1000",
@@ -823,7 +926,7 @@ func TestLoadConfig(t *testing.T) {
 			expected: &Config{
 				Image:      "ubuntu:20.04",
 				Platform:   "linux/arm64",
-				Pull:       core.PullPolicyAlways,
+				Pull:       ir.PullPolicyAlways,
 				AutoRemove: false, // KeepContainer is true
 				Container: &container.Config{
 					Image:      "ubuntu:20.04",
@@ -865,7 +968,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "StandardNetworkModes",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "nginx",
 				Network: "host",
 			},
@@ -884,7 +987,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "ContainerNetworkReference",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "nginx",
 				Network: "container:myapp",
 			},
@@ -903,7 +1006,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "BindMountWithDefaultRwMode",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "alpine",
 				Volumes: []string{hostPath + ":/container/path"},
 			},
@@ -922,7 +1025,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "RelativeBindMount",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "alpine",
 				Volumes: []string{"./data:/data:ro"},
 			},
@@ -946,7 +1049,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "HomeDirectoryBindMount",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "alpine",
 				Volumes: []string{"~/data:/data:rw"},
 			},
@@ -970,7 +1073,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "PortWithIPAddress",
-			input: core.Container{
+			input: ir.Container{
 				Image: "nginx",
 				Ports: []string{"127.0.0.1:8080:80/tcp"},
 			},
@@ -999,7 +1102,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "UdpPort",
-			input: core.Container{
+			input: ir.Container{
 				Image: "dns-server",
 				Ports: []string{"53:53/udp"},
 			},
@@ -1028,7 +1131,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "InvalidVolumeFormatTooFewParts",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "alpine",
 				Volumes: []string{"/data"},
 			},
@@ -1037,7 +1140,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "InvalidVolumeFormatTooManyParts",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "alpine",
 				Volumes: []string{invalidVolumeSpec},
 			},
@@ -1046,7 +1149,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "InvalidVolumeMode",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "alpine",
 				Volumes: []string{"/data:/data:invalid"},
 			},
@@ -1055,7 +1158,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "InvalidPortFormatTooManyParts",
-			input: core.Container{
+			input: ir.Container{
 				Image: "nginx",
 				Ports: []string{"1.2.3.4:8080:80:extra"},
 			},
@@ -1064,7 +1167,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "InvalidPortProtocolDelimiter",
-			input: core.Container{
+			input: ir.Container{
 				Image: "nginx",
 				Ports: []string{"80/tcp/extra"},
 			},
@@ -1073,7 +1176,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "InvalidPortProtocol",
-			input: core.Container{
+			input: ir.Container{
 				Image: "nginx",
 				Ports: []string{"80/invalid"},
 			},
@@ -1082,7 +1185,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "SctpPortProtocol",
-			input: core.Container{
+			input: ir.Container{
 				Image: "sctp-server",
 				Ports: []string{"132/sctp"},
 			},
@@ -1102,7 +1205,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "WhitespaceInPortSpecification",
-			input: core.Container{
+			input: ir.Container{
 				Image: "nginx",
 				Ports: []string{" 8080:80 "},
 			},
@@ -1131,7 +1234,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "EmptyNetworkUsesDefault",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "nginx",
 				Network: "",
 			},
@@ -1150,7 +1253,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "BridgeNetworkMode",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "nginx",
 				Network: "bridge",
 			},
@@ -1169,7 +1272,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "NoneNetworkMode",
-			input: core.Container{
+			input: ir.Container{
 				Image:   "nginx",
 				Network: "none",
 			},
@@ -1188,7 +1291,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "KeepContainerFalseSetsAutoRemoveTrue",
-			input: core.Container{
+			input: ir.Container{
 				Image:         "alpine",
 				KeepContainer: false,
 			},
@@ -1205,7 +1308,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "KeepContainerTrueSetsAutoRemoveFalse",
-			input: core.Container{
+			input: ir.Container{
 				Image:         "alpine",
 				KeepContainer: true,
 			},
@@ -1222,13 +1325,13 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "PullPolicyPropagation",
-			input: core.Container{
+			input: ir.Container{
 				Image:      "alpine",
-				PullPolicy: core.PullPolicyNever,
+				PullPolicy: ir.PullPolicyNever,
 			},
 			expected: &Config{
 				Image:      "alpine",
-				Pull:       core.PullPolicyNever,
+				Pull:       ir.PullPolicyNever,
 				AutoRemove: true,
 				Container: &container.Config{
 					Image: "alpine",
@@ -1240,7 +1343,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "PlatformPropagation",
-			input: core.Container{
+			input: ir.Container{
 				Image:    "alpine",
 				Platform: "linux/386",
 			},
@@ -1258,7 +1361,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "ContainerNamePropagation",
-			input: core.Container{
+			input: ir.Container{
 				Name:  "my-dag-container",
 				Image: "alpine",
 			},
@@ -1276,7 +1379,7 @@ func TestLoadConfig(t *testing.T) {
 		},
 		{
 			name: "ContainerNameEmptyWhenNotSpecified",
-			input: core.Container{
+			input: ir.Container{
 				Image: "alpine",
 			},
 			expected: &Config{

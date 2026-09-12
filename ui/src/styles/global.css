@@ -5,7 +5,7 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
-@theme {
+@theme inline {
   /* Core Obsidian Semantic Colors */
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -18,6 +18,7 @@
 
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-primary-hover: var(--primary-hover);
 
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
@@ -36,6 +37,8 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-surface: var(--surface);
+  --color-surface-variant: var(--surface-variant);
+  --color-text-secondary: var(--text-secondary);
 
   /* Sidebar */
   --color-sidebar: var(--sidebar);
@@ -57,14 +60,21 @@
 
   /* Status Colors */
   --color-success: var(--success);
+  --color-success-muted: var(--success-muted);
   --color-warning: var(--warning);
+  --color-warning-muted: var(--warning-muted);
+  --color-error: var(--status-error);
+  --color-error-muted: var(--error-muted);
   --color-info: var(--info);
+  --color-info-muted: var(--info-muted);
 
   /* Font Family */
   --font-sans:
-    'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    'Hanken Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    sans-serif;
   --font-heading:
-    'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    'Hanken Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    sans-serif;
 
   /* Font Sizes */
   --text-xs: 11px;
@@ -83,142 +93,147 @@
 
 @layer base {
   :root {
-    /* "Discovery One" daylight flight deck — clinical cool-white surfaces and
-       instrument-panel neutrals. The blue primary accent and the canonical
-       status colors are intentionally left unchanged. */
-    --background: #f6f8fc;
-    --foreground: #0e141d;
+    /* "Kiln" daylight — warm cream paper, ink sidebar, one violet accent,
+       signal-green success. */
+    --background: #f4f2ed;
+    --foreground: #14161b;
 
-    --card: #ffffff;
-    --card-foreground: #0e141d;
-    --popover: #ffffff;
-    --popover-foreground: #0e141d;
-    --surface: #ffffff;
-    --surface-variant: #eef2f8;
+    --card: #fbfaf6;
+    --card-foreground: #14161b;
+    --popover: #fbfaf6;
+    --popover-foreground: #14161b;
+    --surface: #fbfaf6;
+    --surface-variant: #ece9e0;
 
-    --primary: #0e8ca0;
+    --primary: #5d4fe0;
     --primary-foreground: #ffffff;
-    --primary-hover: #0b7286;
+    --primary-hover: #4b3dd1;
 
-    --secondary: #eef2f8;
-    --secondary-foreground: #1a2230;
-    --muted: #eef2f8;
-    --muted-foreground: #5e6c7e;
-    --accent: #e7edf6;
-    --accent-foreground: #0e141d;
+    --secondary: #ece9e0;
+    --secondary-foreground: #1c1e25;
+    --muted: #ece9e0;
+    --muted-foreground: #6d7078;
+    --accent: #eae6dc;
+    --accent-foreground: #14161b;
 
-    --destructive: #dc2626;
+    --destructive: #c8382f;
     --destructive-foreground: #ffffff;
-    --success: #16a34a;
+    --success: #178a44;
     --success-foreground: #ffffff;
-    --warning: #d97706;
+    --success-muted: color-mix(in srgb, var(--success) 10%, transparent);
+    --warning: #b47110;
     --warning-foreground: #111827;
-    --info: #0284c7;
+    --warning-muted: color-mix(in srgb, var(--warning) 10%, transparent);
+    --info: #5d4fe0;
     --info-foreground: #ffffff;
+    --info-muted: color-mix(in srgb, var(--info) 10%, transparent);
 
-    --status-success: #16a34a;
-    --status-error: #dc2626;
-    --status-running: #0284c7;
-    --status-neutral: #64748b;
-    --status-warning: #d97706;
+    --status-success: #178a44;
+    --status-error: #c8382f;
+    --error-muted: color-mix(in srgb, var(--status-error) 10%, transparent);
+    --status-running: #5d4fe0;
+    --status-neutral: #83868f;
+    --status-warning: #b47110;
     --status-aborted: #9333ea;
 
-    --border: #d3dbe8;
-    --border-strong: #c3cdde;
-    --input: #c3cdde;
-    --ring: #0e8ca0;
+    --border: #e0dcd0;
+    --border-strong: #cdc8b9;
+    --input: #cdc8b9;
+    --ring: #5d4fe0;
 
-    --text-primary: #0e141d;
-    --text-secondary: #48566a;
-    --text-tertiary: #5e6c7e;
-    --text-disabled: #94a3b8;
+    --text-primary: #14161b;
+    --text-secondary: #4c4f58;
+    --text-tertiary: #75787f;
+    --text-disabled: #a3a6ad;
 
-    --sidebar: #0a0e15;
-    --sidebar-foreground: #99a6b6;
-    --sidebar-border: #1b2230;
-    --sidebar-hover: #0e131b;
-    --sidebar-active: #141b27;
-    --sidebar-primary: #36d3e0;
-    --sidebar-primary-foreground: #07090e;
-    --sidebar-accent: #0e131b;
-    --sidebar-accent-foreground: #eef2f7;
-    --sidebar-ring: #36d3e0;
+    --sidebar: #0b0d12;
+    --sidebar-foreground: #a2a5ad;
+    --sidebar-border: #1e212b;
+    --sidebar-hover: #12141b;
+    --sidebar-active: #1a1c23;
+    --sidebar-primary: #a89ff8;
+    --sidebar-primary-foreground: #0b0d12;
+    --sidebar-accent: #12141b;
+    --sidebar-accent-foreground: #f2f1ec;
+    --sidebar-ring: #7c6ef4;
 
-    --shadow-sm: 0 1px 2px 0 rgba(7, 9, 14, 0.06);
+    --shadow-sm: 0 1px 2px 0 rgba(30, 26, 12, 0.05);
     --shadow-md:
-      0 1px 3px 0 rgba(7, 9, 14, 0.1), 0 1px 2px 0 rgba(7, 9, 14, 0.06);
+      0 1px 3px 0 rgba(30, 26, 12, 0.08), 0 1px 2px 0 rgba(30, 26, 12, 0.05);
     --shadow-lg:
-      0 10px 15px -3px rgba(7, 9, 14, 0.12),
-      0 4px 6px -4px rgba(7, 9, 14, 0.1);
+      0 10px 15px -3px rgba(30, 26, 12, 0.1), 0 4px 6px -4px rgba(30, 26, 12, 0.08);
 
-    --bg: 246 248 252;
-    --text: 14 20 29;
-    --sidebar-bg: 10 14 21;
-    --sidebar-text: 153 166 182;
-    --primary-rgb: 14 140 160;
+    --bg: 244 242 237;
+    --text: 20 22 27;
+    --sidebar-bg: 11 13 18;
+    --sidebar-text: 162 165 173;
+    --primary-rgb: 93 79 224;
   }
 
   .dark {
-    /* "Discovery One" — the void. Deep-space surfaces lit by backlit panels.
-       The blue primary accent and the canonical status colors are
-       intentionally left unchanged. */
-    --background: #07090e;
-    --foreground: #eef2f7;
+    /* "Kiln" — the ink room. Matte #0B0D12 surfaces, one violet accent,
+       signal-green success. */
+    --background: #0b0d12;
+    --foreground: #f2f1ec;
 
-    --card: #0e131b;
-    --card-foreground: #eef2f7;
-    --popover: #141b27;
-    --popover-foreground: #eef2f7;
-    --surface: #0e131b;
-    --surface-variant: #141b27;
+    --card: #12141b;
+    --card-foreground: #f2f1ec;
+    --popover: #1a1c23;
+    --popover-foreground: #f2f1ec;
+    --surface: #12141b;
+    --surface-variant: #1a1c23;
 
-    --primary: #36d3e0;
-    --primary-foreground: #0b1220;
-    --primary-hover: #5fdfeb;
+    --primary: #7c6ef4;
+    --primary-foreground: #ffffff;
+    --primary-hover: #948af7;
 
-    --secondary: #141b27;
-    --secondary-foreground: #eef2f7;
-    --muted: #141b27;
-    --muted-foreground: #99a6b6;
-    --accent: #141b27;
-    --accent-foreground: #eef2f7;
+    --secondary: #1a1c23;
+    --secondary-foreground: #f2f1ec;
+    --muted: #1a1c23;
+    --muted-foreground: #a2a5ad;
+    --accent: #1a1c23;
+    --accent-foreground: #f2f1ec;
 
-    --destructive: #f87171;
+    --destructive: #ef5350;
     --destructive-foreground: #1f0909;
-    --success: #4ade80;
+    --success: #22c55e;
     --success-foreground: #052e16;
-    --warning: #fbbf24;
+    --success-muted: color-mix(in srgb, var(--success) 15%, transparent);
+    --warning: #d9a03c;
     --warning-foreground: #261a00;
-    --info: #38bdf8;
-    --info-foreground: #082f49;
+    --warning-muted: color-mix(in srgb, var(--warning) 15%, transparent);
+    --info: #a89ff8;
+    --info-foreground: #17123f;
+    --info-muted: color-mix(in srgb, var(--info) 15%, transparent);
 
-    --status-success: #4ade80;
-    --status-error: #f87171;
-    --status-running: #38bdf8;
-    --status-neutral: #9ca3af;
-    --status-warning: #fbbf24;
+    --status-success: #22c55e;
+    --status-error: #ef5350;
+    --error-muted: color-mix(in srgb, var(--status-error) 15%, transparent);
+    --status-running: #a89ff8;
+    --status-neutral: #8a8d99;
+    --status-warning: #d9a03c;
     --status-aborted: #c084fc;
 
-    --border: #1b2230;
-    --border-strong: #2d3744;
-    --input: #2d3744;
-    --ring: #36d3e0;
+    --border: #1e212b;
+    --border-strong: #2c3040;
+    --input: #2c3040;
+    --ring: #7c6ef4;
 
-    --text-primary: #eef2f7;
-    --text-secondary: #99a6b6;
-    --text-tertiary: #5e6c7e;
-    --text-disabled: #5e6c7e;
+    --text-primary: #f2f1ec;
+    --text-secondary: #a2a5ad;
+    --text-tertiary: #6d707b;
+    --text-disabled: #6d707b;
 
-    --sidebar: #0a0e15;
-    --sidebar-foreground: #99a6b6;
-    --sidebar-border: #1b2230;
-    --sidebar-hover: #0e131b;
-    --sidebar-active: #141b27;
-    --sidebar-primary: #36d3e0;
-    --sidebar-primary-foreground: #07090e;
-    --sidebar-accent: #141b27;
-    --sidebar-accent-foreground: #eef2f7;
-    --sidebar-ring: #36d3e0;
+    --sidebar: #0b0d12;
+    --sidebar-foreground: #a2a5ad;
+    --sidebar-border: #1e212b;
+    --sidebar-hover: #12141b;
+    --sidebar-active: #1a1c23;
+    --sidebar-primary: #a89ff8;
+    --sidebar-primary-foreground: #0b0d12;
+    --sidebar-accent: #1a1c23;
+    --sidebar-accent-foreground: #f2f1ec;
+    --sidebar-ring: #7c6ef4;
 
     /* Elevation (More Subtle in Dark Mode) */
     --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
@@ -227,11 +242,11 @@
       0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
 
     /* RGB fallbacks */
-    --bg: 7 9 14;
-    --text: 238 242 247;
-    --sidebar-bg: 10 14 21;
-    --sidebar-text: 153 166 182;
-    --primary-rgb: 54 211 224;
+    --bg: 11 13 18;
+    --text: 242 241 236;
+    --sidebar-bg: 11 13 18;
+    --sidebar-text: 162 165 173;
+    --primary-rgb: 124 110 244;
   }
 
   * {
@@ -434,6 +449,18 @@
   }
 }
 
+/* Pulse running graph nodes. The graph styler force-sets stroke properties
+   inline with !important, so only opacity is safe to animate here. */
+@media (prefers-reduced-motion: no-preference) {
+  .mermaid g.node.running rect,
+  .mermaid g.node.running polygon,
+  .mermaid g.node.running path,
+  .mermaid g.node.running circle,
+  .mermaid g.node.running ellipse {
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+}
+
 /* Toast Shadow Utility */
 .shadow-toast {
   box-shadow: var(--shadow-lg);
@@ -563,73 +590,6 @@ select:focus-visible {
 
 .dark ::-webkit-scrollbar-thumb:hover {
   background: var(--border-strong);
-}
-
-/* Agent modal — CRT power-on (subtle) */
-@keyframes agent-modal-in {
-  0% {
-    opacity: 0;
-    transform: scaleX(0.85) scaleY(0.01);
-    filter: brightness(2);
-  }
-  30% {
-    opacity: 1;
-    transform: scaleX(0.95) scaleY(0.01);
-    filter: brightness(1.8);
-  }
-  60% {
-    transform: scaleX(1.01) scaleY(1.02);
-    filter: brightness(1.1);
-  }
-  80% {
-    transform: scale(0.995);
-    filter: brightness(1);
-  }
-  100% {
-    transform: scale(1);
-    filter: brightness(1);
-  }
-}
-
-/* Agent modal — CRT power-off */
-@keyframes agent-modal-out {
-  0% {
-    opacity: 1;
-    transform: scale(1);
-    filter: brightness(1);
-  }
-  25% {
-    opacity: 0.4;
-  }
-  30% {
-    opacity: 1;
-    filter: brightness(1.6);
-  }
-  65% {
-    transform: scaleX(0.8) scaleY(0.005);
-    filter: brightness(5);
-  }
-  100% {
-    opacity: 0;
-    transform: scaleX(0.4) scaleY(0.005);
-    filter: brightness(8);
-  }
-}
-
-/* Sub-agent panel animations */
-@keyframes delegate-panel-in {
-  0% {
-    opacity: 0;
-    transform: scale(0.9) translateX(20px);
-    filter: blur(4px);
-  }
-  60% {
-    opacity: 1;
-    filter: blur(0px);
-  }
-  100% {
-    transform: scale(1) translateX(0);
-  }
 }
 
 /* Loading States */

@@ -10,23 +10,22 @@ import (
 	"strings"
 	"time"
 
-	api "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
-func toCoreDAG(name string) *core.DAG {
-	return &core.DAG{Name: name}
+func toCoreDAG(name string) *ir.DAG {
+	return &ir.DAG{Name: name}
 }
 
-func toExecStatus(detail *api.DAGRunDetails) (*exec.DAGRunStatus, error) {
+func toExecStatus(detail *api.DAGRunDetails) (*ir.DAGRunStatus, error) {
 	if detail == nil {
 		return nil, fmt.Errorf("remote DAG run details are empty")
 	}
-	status := &exec.DAGRunStatus{
+	status := &ir.DAGRunStatus{
 		Name:         detail.Name,
 		DAGRunID:     detail.DagRunId,
-		Status:       core.Status(detail.Status),
+		Status:       ir.Status(detail.Status),
 		QueuedAt:     derefString(detail.QueuedAt),
 		ScheduleTime: derefString(detail.ScheduleTime),
 		StartedAt:    detail.StartedAt,
@@ -34,52 +33,73 @@ func toExecStatus(detail *api.DAGRunDetails) (*exec.DAGRunStatus, error) {
 		Log:          detail.Log,
 		Params:       derefString(detail.Params),
 		WorkerID:     derefString(detail.WorkerId),
+		NoReuse:      derefBool(detail.NoReuse),
 		Labels:       labelsFromAPI(detail.Labels, detail.Tags),
-		Nodes:        make([]*exec.Node, 0, len(detail.Nodes)),
+		Nodes:        make([]*ir.Node, 0, len(detail.Nodes)),
 	}
-	status.Root = exec.NewDAGRunRef(detail.RootDAGRunName, detail.RootDAGRunId)
+	status.Root = ir.NewDAGRunRef(detail.RootDAGRunName, detail.RootDAGRunId)
 	if detail.ParentDAGRunName != nil && detail.ParentDAGRunId != nil {
-		status.Parent = exec.NewDAGRunRef(*detail.ParentDAGRunName, *detail.ParentDAGRunId)
+		status.Parent = ir.NewDAGRunRef(*detail.ParentDAGRunName, *detail.ParentDAGRunId)
 	}
 	for _, node := range detail.Nodes {
 		status.Nodes = append(status.Nodes, mapAPINode(node))
 	}
+	status.OnInit = mapAPINodePtr(detail.OnInit)
 	status.OnExit = mapAPINodePtr(detail.OnExit)
 	status.OnSuccess = mapAPINodePtr(detail.OnSuccess)
 	status.OnFailure = mapAPINodePtr(detail.OnFailure)
 	status.OnAbort = mapAPINodePtr(detail.OnAbort)
+	status.OnWait = mapAPINodePtr(detail.OnWait)
 	return status, nil
 }
 
-func mapAPINodePtr(node *api.Node) *exec.Node {
+func mapAPINodePtr(node *api.Node) *ir.Node {
 	if node == nil {
 		return nil
 	}
 	return mapAPINode(*node)
 }
 
-func mapAPINode(node api.Node) *exec.Node {
-	return &exec.Node{
+func mapAPINode(node api.Node) *ir.Node {
+	mapped := &ir.Node{
 		Step:       mapAPIStep(node.Step),
 		Stdout:     node.Stdout,
 		Stderr:     node.Stderr,
 		StartedAt:  node.StartedAt,
 		FinishedAt: node.FinishedAt,
-		Status:     core.NodeStatus(node.Status),
+		Status:     ir.NodeStatus(node.Status),
 		RetryCount: node.RetryCount,
 		DoneCount:  node.DoneCount,
 		Error:      derefString(node.Error),
 		SubRuns:    mapAPISubRuns(node.SubRuns),
 	}
+	if node.Build != nil {
+		mapped.Build = &ir.BuildExecution{
+			Decision:           ir.BuildDecision(node.Build.Decision),
+			Phase:              ir.BuildPhase(node.Build.Phase),
+			Reason:             ir.BuildReason(node.Build.Reason),
+			Detail:             derefString(node.Build.Detail),
+			Fingerprint:        derefString(node.Build.Fingerprint),
+			MaterializationKey: derefString(node.Build.MaterializationKey),
+			ProducerAttemptID:  derefString(node.Build.ProducerAttemptId),
+		}
+		if node.Build.ProducerRun != nil {
+			mapped.Build.ProducerRun = ir.NewDAGRunRef(
+				derefString(node.Build.ProducerRun.Name),
+				derefString(node.Build.ProducerRun.Id),
+			)
+		}
+	}
+	return mapped
 }
 
-func mapAPISubRuns(subRuns *[]api.SubDAGRun) []exec.SubDAGRun {
+func mapAPISubRuns(subRuns *[]api.SubDAGRun) []ir.SubDAGRun {
 	if subRuns == nil {
 		return nil
 	}
-	out := make([]exec.SubDAGRun, 0, len(*subRuns))
+	out := make([]ir.SubDAGRun, 0, len(*subRuns))
 	for _, sub := range *subRuns {
-		out = append(out, exec.SubDAGRun{
+		out = append(out, ir.SubDAGRun{
 			DAGRunID: sub.DagRunId,
 			Params:   derefString(sub.Params),
 			DAGName:  derefString(sub.DagName),
@@ -88,8 +108,8 @@ func mapAPISubRuns(subRuns *[]api.SubDAGRun) []exec.SubDAGRun {
 	return out
 }
 
-func mapAPIStep(step api.Step) core.Step {
-	mapped := core.Step{
+func mapAPIStep(step api.Step) ir.Step {
+	mapped := ir.Step{
 		Name:        step.Name,
 		Description: derefString(step.Description),
 		Dir:         derefString(step.Dir),
@@ -99,29 +119,30 @@ func mapAPIStep(step api.Step) core.Step {
 		Output:      derefString(step.Output),
 		Depends:     derefStringSlice(step.Depends),
 		MailOnError: derefBool(step.MailOnError),
+		Inputs:      mapAPIStepInputs(step.Inputs),
 		Outputs:     mapAPIStepOutputs(step.Outputs),
 	}
 	if step.Id != nil {
 		mapped.ID = *step.Id
 	}
 	if step.ExecutorConfig != nil {
-		mapped.ExecutorConfig = core.ExecutorConfig{
+		mapped.ExecutorConfig = ir.ExecutorConfig{
 			Type:   derefString(step.ExecutorConfig.Type),
 			Config: derefMap(step.ExecutorConfig.Config),
 		}
 	}
 	if step.Call != nil {
-		mapped.SubDAG = &core.SubDAG{
+		mapped.SubDAG = &ir.SubDAG{
 			Name: *step.Call,
 		}
 	}
 	if step.Params != nil {
-		mapped.Params = core.NewRawParams([]byte(*step.Params))
+		mapped.Params = ir.NewRawParams([]byte(*step.Params))
 	}
 	if step.Commands != nil {
-		mapped.Commands = make([]core.CommandEntry, 0, len(*step.Commands))
+		mapped.Commands = make([]ir.CommandEntry, 0, len(*step.Commands))
 		for _, cmd := range *step.Commands {
-			entry := core.CommandEntry{Command: cmd.Command}
+			entry := ir.CommandEntry{Command: cmd.Command}
 			if cmd.Args != nil {
 				entry.Args = append([]string{}, (*cmd.Args)...)
 			}
@@ -131,26 +152,40 @@ func mapAPIStep(step api.Step) core.Step {
 	return mapped
 }
 
-func mapAPIStepOutputs(outputs *[]api.StepOutputDeclaration) []core.StepOutputDeclaration {
+func mapAPIStepOutputs(outputs *[]api.StepOutputDeclaration) []ir.StepOutputDeclaration {
 	if outputs == nil || len(*outputs) == 0 {
 		return nil
 	}
-	mapped := make([]core.StepOutputDeclaration, 0, len(*outputs))
+	mapped := make([]ir.StepOutputDeclaration, 0, len(*outputs))
 	for _, output := range *outputs {
-		outputType := core.StepDeclaredOutputTypeString
+		outputType := ""
 		if output.Type != nil {
 			outputType = string(*output.Type)
+		} else if output.Path == nil {
+			outputType = ir.StepDeclaredOutputTypeString
 		}
-		mapped = append(mapped, core.StepOutputDeclaration{
+		mapped = append(mapped, ir.StepOutputDeclaration{
 			Name: output.Name,
 			Type: outputType,
+			Path: derefString(output.Path),
 		})
 	}
 	return mapped
 }
 
+func mapAPIStepInputs(inputs *[]api.StepInputDeclaration) []ir.StepInputDeclaration {
+	if inputs == nil || len(*inputs) == 0 {
+		return nil
+	}
+	mapped := make([]ir.StepInputDeclaration, 0, len(*inputs))
+	for _, input := range *inputs {
+		mapped = append(mapped, ir.StepInputDeclaration{Name: input.Name, Path: input.Path})
+	}
+	return mapped
+}
+
 func validateRemoteStartLikeFlags(ctx *Context) error {
-	disallowed := []string{"parent", "root", "worker-id", "attempt-id", "schedule-time", "profile"}
+	disallowed := []string{"parent", "root", "worker-id", "attempt-id", "schedule-time", "profile", "trigger-actor"}
 	for _, flag := range disallowed {
 		if ctx.Command.Flags().Changed(flag) {
 			return fmt.Errorf("--%s is only supported in the local context", flag)
@@ -228,11 +263,16 @@ func remoteRunStart(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	noReuse, err := ctx.Command.Flags().GetBool("no-reuse")
+	if err != nil {
+		return err
+	}
 	resp, err := ctx.Remote.startDAG(ctx, dag.FileName, api.ExecuteDAGJSONBody{
 		DagName:  stringPtrOrNil(nameOverride),
 		DagRunId: stringPtrOrNil(runID),
 		Params:   stringPtrOrNil(params),
 		Labels:   labels,
+		NoReuse:  &noReuse,
 	})
 	if err != nil {
 		return err
@@ -268,12 +308,17 @@ func remoteRunEnqueue(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	noReuse, err := ctx.Command.Flags().GetBool("no-reuse")
+	if err != nil {
+		return err
+	}
 	resp, err := ctx.Remote.enqueueDAG(ctx, dag.FileName, api.EnqueueDAGDAGRunJSONBody{
 		DagName:  stringPtrOrNil(nameOverride),
 		DagRunId: stringPtrOrNil(runID),
 		Params:   stringPtrOrNil(params),
 		Queue:    stringPtrOrNil(queueOverride),
 		Labels:   labels,
+		NoReuse:  &noReuse,
 	})
 	if err != nil {
 		return err
@@ -330,12 +375,12 @@ func remoteRunHistory(ctx *Context, args []string) error {
 	if len(runs) > limit {
 		runs = runs[:limit]
 	}
-	statuses := make([]*exec.DAGRunStatus, 0, len(runs))
+	statuses := make([]*ir.DAGRunStatus, 0, len(runs))
 	for _, run := range runs {
-		status := &exec.DAGRunStatus{
+		status := &ir.DAGRunStatus{
 			Name:         run.Name,
 			DAGRunID:     run.DagRunId,
-			Status:       core.Status(run.Status),
+			Status:       ir.Status(run.Status),
 			StartedAt:    run.StartedAt,
 			FinishedAt:   run.FinishedAt,
 			QueuedAt:     derefString(run.QueuedAt),
@@ -379,14 +424,30 @@ func remoteRunRetry(ctx *Context, args []string) error {
 		return fmt.Errorf("invalid run-id: %w", err)
 	}
 	stepName, _ := ctx.StringParam("step")
+	includeDownstream, err := ctx.Command.Flags().GetBool("downstream")
+	if err != nil {
+		return fmt.Errorf("failed to get --downstream: %w", err)
+	}
+	if includeDownstream && stepName == "" {
+		return fmt.Errorf("--downstream requires --step")
+	}
+	subDAGRunID, _ := ctx.StringParam("sub-run-id")
+	if subDAGRunID != "" && stepName == "" {
+		return fmt.Errorf("--sub-run-id requires --step")
+	}
 	dag, err := remoteResolveDAG(ctx, args[0])
 	if err != nil {
 		return err
 	}
-	return ctx.Remote.retryDAGRun(ctx, dag.Dag.Name, runID, api.RetryDAGRunJSONBody{
-		DagRunId: runID,
-		StepName: stringPtrOrNil(stepName),
-	})
+	body := api.RetryDAGRunJSONBody{
+		DagRunId:    runID,
+		StepName:    stringPtrOrNil(stepName),
+		SubDAGRunId: stringPtrOrNil(subDAGRunID),
+	}
+	if includeDownstream {
+		body.IncludeDownstream = &includeDownstream
+	}
+	return ctx.Remote.retryDAGRun(ctx, dag.Dag.Name, runID, body)
 }
 
 func remoteRunRestart(ctx *Context, args []string) error {
@@ -404,8 +465,8 @@ func remoteRunRestart(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if core.Status(detail.Status) != core.Running {
-		return fmt.Errorf("DAG %s is not running, current status: %s", dag.Dag.Name, core.Status(detail.Status))
+	if ir.Status(detail.Status) != ir.Running {
+		return fmt.Errorf("DAG %s is not running, current status: %s", dag.Dag.Name, ir.Status(detail.Status))
 	}
 	if err := ctx.Remote.stopDAGRun(ctx, dag.Dag.Name, detail.DagRunId); err != nil {
 		return err
@@ -425,7 +486,7 @@ func remoteRunDequeue(ctx *Context, args []string) error {
 	queueName := args[0]
 	dagRunRef, _ := ctx.StringParam("dag-run")
 	if dagRunRef != "" {
-		ref, err := exec.ParseDAGRunRef(dagRunRef)
+		ref, err := ir.ParseDAGRunRef(dagRunRef)
 		if err != nil {
 			return err
 		}
@@ -450,8 +511,8 @@ func remoteLabelsFromFlag(ctx *Context) (*api.Labels, error) {
 	if labelsStr == "" {
 		return nil, nil
 	}
-	labels := core.NewLabels(parseLabels(labelsStr))
-	if err := core.ValidateLabels(labels); err != nil {
+	labels := ir.NewLabels(parseLabels(labelsStr))
+	if err := ir.ValidateLabels(labels); err != nil {
 		return nil, fmt.Errorf("invalid labels: %w", err)
 	}
 	labelStrings := labels.Strings()
@@ -587,7 +648,7 @@ func waitForRemoteStop(ctx *Context, name, dagRunID string) error {
 			if err != nil {
 				return err
 			}
-			if core.Status(detail.Status) != core.Running {
+			if ir.Status(detail.Status) != ir.Running {
 				return nil
 			}
 		}
@@ -638,7 +699,7 @@ func joinNonEmpty(parts []string) string {
 	return strings.Join(filtered, " ")
 }
 
-func enrichRemoteHistoryStatus(status *exec.DAGRunStatus, detail *api.DAGRunDetails) error {
+func enrichRemoteHistoryStatus(status *ir.DAGRunStatus, detail *api.DAGRunDetails) error {
 	remoteStatus, err := toExecStatus(detail)
 	if err != nil {
 		return err

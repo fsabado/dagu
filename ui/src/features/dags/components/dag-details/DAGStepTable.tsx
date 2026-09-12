@@ -12,6 +12,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import DAGStepTableRow from './DAGStepTableRow';
+import { I18nText } from '@/i18n/I18nText';
 
 /**
  * Props for the DAGStepTable component
@@ -33,25 +34,23 @@ function DAGStepTable({ steps }: Props) {
   }
 
   return (
-    <div className="w-full overflow-x-auto">
-      <Table>
-        <TableHeader>
-          <TableRow className="h-8">
-            <TableHead className="w-[4%] text-center">No</TableHead>
-            <TableHead className="w-[20%]">Step Details</TableHead>
-            <TableHead className="w-[22%]">Execution</TableHead>
-            <TableHead className="w-[18%]">Dependencies</TableHead>
-            <TableHead className="w-[18%]">Configuration</TableHead>
-            <TableHead className="w-[18%]">Conditions</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {steps.map((step, idx) => (
-            <DAGStepTableRow key={idx} step={step} index={idx} />
-          ))}
-        </TableBody>
-      </Table>
-    </div>
+    <Table className="min-w-[960px] table-fixed">
+      <TableHeader>
+        <TableRow className="h-8">
+          <TableHead className="w-[4%] text-center"><I18nText text={"No"} /></TableHead>
+          <TableHead className="w-[28%]"><I18nText text={"Step Details"} /></TableHead>
+          <TableHead className="w-[22%]"><I18nText text={"Execution"} /></TableHead>
+          <TableHead className="w-[14%]"><I18nText text={"Dependencies"} /></TableHead>
+          <TableHead className="w-[18%]"><I18nText text={"Configuration"} /></TableHead>
+          <TableHead className="w-[14%]"><I18nText text={"Conditions"} /></TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {steps.map((step, idx) => (
+          <DAGStepTableRow key={idx} step={step} index={idx} />
+        ))}
+      </TableBody>
+    </Table>
   );
 }
 

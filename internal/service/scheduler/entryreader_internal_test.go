@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	filedag "github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,8 +31,8 @@ func TestSendEvent_UnblocksOnQuit(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		er.sendEvent(context.Background(), DAGChangeEvent{
-			Type:    DAGChangeAdded,
-			DAGName: "test",
+			Type:     DAGChangeAdded,
+			DAGEntry: DAGEntry{DAG: &ir.DAG{Name: "test"}},
 		})
 		close(done)
 	}()
@@ -63,8 +65,8 @@ func TestSendEvent_UnblocksOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		er.sendEvent(ctx, DAGChangeEvent{
-			Type:    DAGChangeAdded,
-			DAGName: "test",
+			Type:     DAGChangeAdded,
+			DAGEntry: DAGEntry{DAG: &ir.DAG{Name: "test"}},
 		})
 		close(done)
 	}()
@@ -95,8 +97,8 @@ func TestSendEvent_NilChannelReturnsImmediately(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		er.sendEvent(context.Background(), DAGChangeEvent{
-			Type:    DAGChangeAdded,
-			DAGName: "test",
+			Type:     DAGChangeAdded,
+			DAGEntry: DAGEntry{DAG: &ir.DAG{Name: "test"}},
 		})
 		close(done)
 	}()
@@ -122,8 +124,8 @@ func writeDAGFile(t *testing.T, dir, fileName, dagName string) string {
 func newTestEntryReader(dir string, events chan DAGChangeEvent) *entryReaderImpl {
 	return &entryReaderImpl{
 		targetDir: dir,
-		registry:  make(map[string]*core.DAG),
-		dagSource: newDAGFileSource(dir),
+		registry:  make(map[string]*ir.DAG),
+		dagSource: newDAGFileSource(dir, nil),
 		quit:      make(chan struct{}),
 		events:    events,
 	}
@@ -155,7 +157,7 @@ func TestHandleFSEvent_CreateAddsDAG(t *testing.T) {
 	select {
 	case event := <-events:
 		assert.Equal(t, DAGChangeAdded, event.Type)
-		assert.Equal(t, "create-test", event.DAGName)
+		assert.Equal(t, "create-test", event.DAG.Name)
 		assert.NotNil(t, event.DAG)
 	case <-time.After(time.Second):
 		t.Fatal("expected DAGChangeAdded event")
@@ -171,7 +173,7 @@ func TestHandleFSEvent_WriteUpdatesDAG(t *testing.T) {
 	er := newTestEntryReader(tmpDir, events)
 
 	// Pre-populate registry with existing DAG
-	er.registry["update-test.yaml"] = &core.DAG{Name: "update-test"}
+	er.registry["update-test.yaml"] = &ir.DAG{Name: "update-test"}
 
 	// Write updated file
 	writeDAGFile(t, tmpDir, "update-test.yaml", "update-test")
@@ -185,7 +187,7 @@ func TestHandleFSEvent_WriteUpdatesDAG(t *testing.T) {
 	select {
 	case event := <-events:
 		assert.Equal(t, DAGChangeUpdated, event.Type)
-		assert.Equal(t, "update-test", event.DAGName)
+		assert.Equal(t, "update-test", event.DAG.Name)
 	case <-time.After(time.Second):
 		t.Fatal("expected DAGChangeUpdated event")
 	}
@@ -200,7 +202,7 @@ func TestHandleFSEvent_RemoveDeletesDAG(t *testing.T) {
 	er := newTestEntryReader(tmpDir, events)
 
 	// Pre-populate registry
-	er.registry["remove-test.yaml"] = &core.DAG{Name: "remove-test"}
+	er.registry["remove-test.yaml"] = &ir.DAG{Name: "remove-test"}
 
 	er.handleFSEvent(context.Background(), fsnotify.Event{
 		Name: filepath.Join(tmpDir, "remove-test.yaml"),
@@ -217,7 +219,7 @@ func TestHandleFSEvent_RemoveDeletesDAG(t *testing.T) {
 	select {
 	case event := <-events:
 		assert.Equal(t, DAGChangeDeleted, event.Type)
-		assert.Equal(t, "remove-test", event.DAGName)
+		assert.Equal(t, "remove-test", event.DAG.Name)
 	case <-time.After(time.Second):
 		t.Fatal("expected DAGChangeDeleted event")
 	}
@@ -231,7 +233,7 @@ func TestHandleFSEvent_RemoveReloadsDAGWhenFileStillExists(t *testing.T) {
 	events := make(chan DAGChangeEvent, 10)
 	er := newTestEntryReader(tmpDir, events)
 
-	er.registry["replace-test.yaml"] = &core.DAG{Name: "replace-test"}
+	er.registry["replace-test.yaml"] = &ir.DAG{Name: "replace-test"}
 	writeDAGFile(t, tmpDir, "replace-test.yaml", "replace-test")
 
 	er.handleFSEvent(context.Background(), fsnotify.Event{
@@ -248,7 +250,7 @@ func TestHandleFSEvent_RemoveReloadsDAGWhenFileStillExists(t *testing.T) {
 	select {
 	case event := <-events:
 		assert.Equal(t, DAGChangeUpdated, event.Type)
-		assert.Equal(t, "replace-test", event.DAGName)
+		assert.Equal(t, "replace-test", event.DAG.Name)
 		assert.NotNil(t, event.DAG)
 	case <-time.After(time.Second):
 		t.Fatal("expected DAGChangeUpdated event")
@@ -264,7 +266,7 @@ func TestHandleFSEvent_NameChangeEmitsDeleteThenAdd(t *testing.T) {
 	er := newTestEntryReader(tmpDir, events)
 
 	// Pre-populate registry with old name
-	er.registry["rename-test.yaml"] = &core.DAG{Name: "old-name"}
+	er.registry["rename-test.yaml"] = &ir.DAG{Name: "old-name"}
 
 	// Write file with new name
 	writeDAGFile(t, tmpDir, "rename-test.yaml", "new-name")
@@ -288,7 +290,139 @@ func TestHandleFSEvent_NameChangeEmitsDeleteThenAdd(t *testing.T) {
 
 	require.Len(t, receivedEvents, 2)
 	assert.Equal(t, DAGChangeDeleted, receivedEvents[0].Type)
-	assert.Equal(t, "old-name", receivedEvents[0].DAGName)
+	assert.Equal(t, "old-name", receivedEvents[0].DAG.Name)
 	assert.Equal(t, DAGChangeAdded, receivedEvents[1].Type)
-	assert.Equal(t, "new-name", receivedEvents[1].DAGName)
+	assert.Equal(t, "new-name", receivedEvents[1].DAG.Name)
+}
+
+func TestRecursiveEntryReaderRecoversFromNameConflict(t *testing.T) {
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "team"), 0750))
+	firstPath := writeDAGFile(t, filepath.Join(tmpDir, "team"), "first.yaml", "shared-name")
+	require.NoError(t, os.WriteFile(firstPath, []byte(`
+name: shared-name
+overlap_policy: latest
+steps:
+  - name: step1
+    command: echo hello
+`), 0600))
+
+	store := testutil.NewFileDAGRepository(
+		tmpDir,
+		filedag.WithSkipExamples(true),
+		filedag.WithRecursiveDiscovery(true),
+	)
+	events := make(chan DAGChangeEvent, 10)
+	er := NewFileEntryReader(tmpDir, store, true).(*entryReaderImpl)
+	er.events = events
+	require.NoError(t, er.Init(context.Background()))
+	t.Cleanup(er.Stop)
+
+	require.Len(t, er.Entries(), 1)
+	assert.Equal(t, ir.OverlapPolicyLatest, er.Entries()[0].DAG.OverlapPolicy)
+	assert.Contains(t, er.watchedDirs, filepath.Join(tmpDir, "team"))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "other"), 0750))
+	writeDAGFile(t, filepath.Join(tmpDir, "other"), "second.yaml", "shared-name")
+	require.NoError(t, er.refreshRecursive(context.Background()))
+	require.Empty(t, er.Entries())
+
+	select {
+	case event := <-events:
+		assert.Equal(t, DAGChangeDeleted, event.Type)
+		assert.Equal(t, "shared-name", event.DAG.Name)
+	case <-time.After(time.Second):
+		t.Fatal("expected conflict to remove the scheduled DAG")
+	}
+
+	require.NoError(t, os.Remove(filepath.Join(tmpDir, "other", "second.yaml")))
+	require.NoError(t, er.refreshRecursive(context.Background()))
+	require.Len(t, er.Entries(), 1)
+
+	select {
+	case event := <-events:
+		assert.Equal(t, DAGChangeAdded, event.Type)
+		assert.Equal(t, "shared-name", event.DAG.Name)
+	case <-time.After(time.Second):
+		t.Fatal("expected the resolved DAG conflict to recover")
+	}
+}
+
+func TestEntryReaderExternalDAGFileSymlink(t *testing.T) {
+	tests := []struct {
+		name      string
+		recursive bool
+		symlinks  bool
+		expected  int
+	}{
+		{name: "NonRecursiveDisabled"},
+		{name: "NonRecursiveEnabled", symlinks: true, expected: 1},
+		{name: "RecursiveDisabled", recursive: true},
+		{name: "RecursiveEnabled", recursive: true, symlinks: true, expected: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			linkDir := root
+			if tc.recursive {
+				linkDir = filepath.Join(root, "nested")
+				require.NoError(t, os.MkdirAll(linkDir, 0750))
+			}
+			targetDir := t.TempDir()
+			targetPath := filepath.Join(targetDir, "resolved-target-name-that-is-not-the-entry.yaml")
+			require.NoError(t, os.WriteFile(targetPath, []byte("steps:\n  - run: echo external\n"), 0644))
+			if err := os.Symlink(targetPath, filepath.Join(linkDir, "external.yaml")); err != nil {
+				t.Skipf("symlink creation is unavailable: %v", err)
+			}
+
+			store := testutil.NewFileDAGRepository(
+				root,
+				filedag.WithSkipExamples(true),
+				filedag.WithRecursiveDiscovery(tc.recursive),
+				filedag.WithSymlinks(tc.symlinks),
+			)
+			reader := NewFileEntryReader(root, store, tc.recursive)
+			require.NoError(t, reader.Init(context.Background()))
+			t.Cleanup(reader.Stop)
+
+			entries := reader.Entries()
+			require.Len(t, entries, tc.expected)
+			if tc.expected == 1 {
+				assert.Equal(t, "external", entries[0].DAG.Name)
+			}
+		})
+	}
+}
+
+func TestRecursiveEntryReaderWatchesNewDirectories(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := testutil.NewFileDAGRepository(
+		tmpDir,
+		filedag.WithSkipExamples(true),
+		filedag.WithRecursiveDiscovery(true),
+	)
+	events := make(chan DAGChangeEvent, 10)
+	er := NewFileEntryReader(tmpDir, store, true).(*entryReaderImpl)
+	er.events = events
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, er.Init(ctx))
+	go er.Start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		er.Stop()
+	})
+
+	nestedDir := filepath.Join(tmpDir, "new", "nested")
+	require.NoError(t, os.MkdirAll(nestedDir, 0750))
+	writeDAGFile(t, nestedDir, "watched.yaml", "watched")
+
+	select {
+	case event := <-events:
+		assert.Equal(t, DAGChangeAdded, event.Type)
+		assert.Equal(t, "watched", event.DAG.Name)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a nested DAG add event")
+	}
 }

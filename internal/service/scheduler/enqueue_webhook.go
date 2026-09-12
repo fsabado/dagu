@@ -9,40 +9,42 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/dagrun/intake"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/intake"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
 )
 
 // EnqueueWebhookRun enqueues a webhook-triggered run while preserving the same
 // runtime-param semantics as direct webhook execution.
 func EnqueueWebhookRun(
 	ctx context.Context,
-	dagRunStore exec.DAGRunStore,
-	queueStore exec.QueueStore,
+	dagRunRepository *persis.DAGRunRepository,
+	queueStore queuedomain.QueueStore,
 	baseLogDir string,
 	baseArtifactDir string,
 	baseConfig string,
-	dag *core.DAG,
+	dag *ir.DAG,
 	runID string,
 	params string,
 	now time.Time,
 ) error {
-	dagRun := exec.NewDAGRunRef(dag.Name, runID)
+	dagRun := ir.NewDAGRunRef(dag.Name, runID)
 
-	if _, err := dagRunStore.FindAttempt(ctx, dagRun); err == nil {
+	if _, err := dagRunRepository.FindAttempt(ctx, dagRun); err == nil {
 		logger.Info(ctx, "Webhook run already exists; skipping",
 			tag.DAG(dag.Name),
 			tag.RunID(runID),
 		)
 		return nil
-	} else if !errors.Is(err, exec.ErrDAGRunIDNotFound) {
+	} else if !errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 		return fmt.Errorf("failed to check existing webhook run: %w", err)
 	}
 
-	fullDAG, err := rehydrateExecutionDAG(ctx, dag, params, baseConfig)
+	fullDAG, err := rehydrateExecutionDAG(ctx, dag, params, baseConfig, "")
 	if err != nil {
 		return fmt.Errorf("failed to load full DAG for webhook enqueue: %w", err)
 	}
@@ -54,14 +56,14 @@ func EnqueueWebhookRun(
 	dagCopy.Location = ""
 
 	_, err = intake.EnqueueRun(ctx, intake.QueueRequest{
-		DAGRunStore:     dagRunStore,
-		QueueStore:      queueStore,
-		DAG:             dagCopy,
-		DAGRunID:        runID,
-		LogBaseDir:      baseLogDir,
-		ArtifactBaseDir: baseArtifactDir,
-		TriggerType:     core.TriggerTypeWebhook,
-		Now:             func() time.Time { return now },
+		DAGRunRepository: dagRunRepository,
+		QueueStore:       queueStore,
+		DAG:              dagCopy,
+		DAGRunID:         runID,
+		LogBaseDir:       baseLogDir,
+		ArtifactBaseDir:  baseArtifactDir,
+		TriggerType:      ir.TriggerTypeWebhook,
+		Now:              func() time.Time { return now },
 	})
 	if err != nil {
 		return fmt.Errorf("failed to enqueue webhook run: %w", err)

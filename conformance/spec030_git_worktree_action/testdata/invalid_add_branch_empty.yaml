@@ -1,0 +1,4 @@
+steps:
+  - action: git.worktree.add
+    with:
+      branch: ""

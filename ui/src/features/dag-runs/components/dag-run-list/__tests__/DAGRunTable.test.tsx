@@ -31,9 +31,10 @@ const config = {
   setupRequired: false,
   oidcEnabled: false,
   oidcButtonLabel: '',
+  proxyEnabled: false,
+  proxyButtonLabel: '',
   terminalEnabled: false,
   gitSyncEnabled: false,
-  agentEnabled: false,
   updateAvailable: false,
   latestVersion: '',
   permissions: {
@@ -67,6 +68,31 @@ const config = {
 } as Config;
 
 describe('DAGRunTable', () => {
+  it('shows a loading row instead of the empty state while the first page loads', () => {
+    render(
+      <MemoryRouter>
+        <ConfigContext.Provider value={config}>
+          <DAGRunTable dagRuns={[]} isLoading />
+        </ConfigContext.Provider>
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('Loading DAG runs...')).toBeInTheDocument();
+    expect(screen.queryByText('No DAG runs found')).not.toBeInTheDocument();
+  });
+
+  it('shows the empty state once loading finishes with no runs', () => {
+    render(
+      <MemoryRouter>
+        <ConfigContext.Provider value={config}>
+          <DAGRunTable dagRuns={[]} />
+        </ConfigContext.Provider>
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('No DAG runs found')).toBeInTheDocument();
+  });
+
   it('shows the scheduled at column and value when schedule time exists', () => {
     render(
       <MemoryRouter>
@@ -94,8 +120,16 @@ describe('DAGRunTable', () => {
     );
 
     expect(screen.getByText('Scheduled At')).toBeInTheDocument();
-    expect(screen.getByText('2026-03-13T10:00:00Z')).toBeInTheDocument();
-    expect(screen.getByText('2026-03-13T10:00:30Z')).toBeInTheDocument();
+    expect(screen.getByText('2026-03-13 10:00:00')).toHaveAttribute(
+      'title',
+      '2026-03-13T10:00:00Z'
+    );
+    expect(screen.getByRole('link', { name: 'scheduled-dag' })).toHaveAttribute(
+      'href',
+      '/dag-runs/scheduled-dag/run-1'
+    );
+    // Queued At renders as relative time with the absolute time in the tooltip
+    expect(screen.getByTitle('2026-03-13T10:00:30Z')).toBeInTheDocument();
     expect(screen.getByText('1/3 auto retries')).toBeInTheDocument();
     expect(screen.queryByText('Select')).not.toBeInTheDocument();
   });
@@ -128,6 +162,37 @@ describe('DAGRunTable', () => {
 
     expect(screen.getByText('Profile')).toBeInTheDocument();
     expect(screen.getByText('prod')).toBeInTheDocument();
+  });
+
+  it('shows the attributable actor with the trigger type', () => {
+    render(
+      <MemoryRouter>
+        <ConfigContext.Provider value={config}>
+          <DAGRunTable
+            dagRuns={[
+              {
+                dagRunId: 'run-1',
+                name: 'manual-dag',
+                status: Status.Success,
+                statusLabel: StatusLabel.succeeded,
+                artifactsAvailable: false,
+                autoRetryCount: 0,
+                triggerType: TriggerType.manual,
+                triggerActor: 'alice',
+                startedAt: '2026-03-13T10:01:00Z',
+                finishedAt: '2026-03-13T10:02:00Z',
+              },
+            ]}
+          />
+        </ConfigContext.Provider>
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('Manual')).toBeInTheDocument();
+    expect(screen.getByText('(alice)')).toHaveClass(
+      'text-muted-foreground',
+      'font-mono'
+    );
   });
 
   it('omits the profile column when no runs use a runtime profile', () => {
@@ -196,6 +261,47 @@ describe('DAGRunTable', () => {
       name: 'bulk-dag',
       dagRunId: 'run-1',
     });
+    expect(onSelectDAGRun).not.toHaveBeenCalled();
+  });
+
+  it('opens available artifacts without opening the status view', () => {
+    const onSelectDAGRun = vi.fn();
+    const onViewArtifacts = vi.fn();
+
+    render(
+      <MemoryRouter>
+        <ConfigContext.Provider value={config}>
+          <DAGRunTable
+            dagRuns={[
+              {
+                dagRunId: 'run-1',
+                name: 'artifact-dag',
+                status: Status.Success,
+                statusLabel: StatusLabel.succeeded,
+                artifactsAvailable: true,
+                autoRetryCount: 0,
+                triggerType: TriggerType.manual,
+                queuedAt: '2026-03-13T10:00:30Z',
+                startedAt: '2026-03-13T10:01:00Z',
+                finishedAt: '2026-03-13T10:02:00Z',
+              },
+            ]}
+            onSelectDAGRun={onSelectDAGRun}
+            onViewArtifacts={onViewArtifacts}
+          />
+        </ConfigContext.Provider>
+      </MemoryRouter>
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'View artifacts for artifact-dag run-1',
+      })
+    );
+
+    expect(onViewArtifacts).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'artifact-dag', dagRunId: 'run-1' })
+    );
     expect(onSelectDAGRun).not.toHaveBeenCalled();
   });
 

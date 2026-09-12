@@ -9,18 +9,20 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/gitsync"
-	"github.com/dagucloud/dagu/internal/service/audit"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/gitsync"
 )
 
 // SyncService is the interface for Git sync operations.
 type SyncService interface {
 	Pull(ctx context.Context) (*gitsync.SyncResult, error)
-	Publish(ctx context.Context, dagID, message string, force bool) (*gitsync.SyncResult, error)
-	PublishAll(ctx context.Context, message string, dagIDs []string) (*gitsync.SyncResult, error)
-	Discard(ctx context.Context, dagID string) error
+	Publish(ctx context.Context, itemID, message string, force bool) (*gitsync.SyncResult, error)
+	PublishAll(ctx context.Context, message string, itemIDs []string) (*gitsync.SyncResult, error)
+	Discard(ctx context.Context, itemID string) error
 	Forget(ctx context.Context, itemIDs []string) ([]string, error)
 	Cleanup(ctx context.Context) ([]string, error)
 	Delete(ctx context.Context, itemID, message string, force bool) error
@@ -28,8 +30,8 @@ type SyncService interface {
 	DeleteAllMissing(ctx context.Context, message string) ([]string, error)
 	Move(ctx context.Context, oldID, newID, message string, force bool) error
 	GetStatus(ctx context.Context) (*gitsync.OverallStatus, error)
-	GetDAGStatus(ctx context.Context, dagID string) (*gitsync.DAGState, error)
-	GetDAGDiff(ctx context.Context, dagID string) (*gitsync.DAGDiff, error)
+	GetSyncItemStatus(ctx context.Context, itemID string) (*gitsync.SyncItemState, error)
+	GetSyncItemDiff(ctx context.Context, itemID string) (*gitsync.SyncItemDiff, error)
 	GetConfig(ctx context.Context) (*gitsync.Config, error)
 	UpdateConfig(ctx context.Context, cfg *gitsync.Config) error
 	TestConnection(ctx context.Context) (*gitsync.ConnectionResult, error)
@@ -50,6 +52,60 @@ func (a *API) requireSyncService() error {
 	return nil
 }
 
+func (a *API) requireSyncRead(ctx context.Context) error {
+	if a.authService == nil {
+		return nil
+	}
+	user, ok := auth.UserFromContext(ctx)
+	if !ok {
+		return errAuthRequired
+	}
+	if !auth.NormalizeWorkspaceAccess(user.WorkspaceAccess).All {
+		return errInsufficientPermissions
+	}
+	return nil
+}
+
+func (a *API) requireSyncWrite(ctx context.Context) error {
+	if err := a.requireDAGWrite(ctx); err != nil {
+		return err
+	}
+	return a.requireSyncRead(ctx)
+}
+
+// syncProxyAuthorization checks local permissions before remote node credentials are applied.
+func (a *API) syncProxyAuthorization(apiBasePath string) func(http.Handler) http.Handler {
+	syncPath := strings.TrimRight(apiBasePath, "/") + "/sync"
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			remoteNode := r.URL.Query().Get("remoteNode")
+			if remoteNode == "" || remoteNode == "local" ||
+				(r.URL.Path != syncPath && !strings.HasPrefix(r.URL.Path, syncPath+"/")) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			var err error
+			switch {
+			case r.Method == http.MethodGet:
+				err = a.requireSyncRead(r.Context())
+			case r.Method == http.MethodPut && r.URL.Path == syncPath+"/config":
+				err = a.requireAdmin(r.Context())
+			case r.Method == http.MethodPost && r.URL.Path == syncPath+"/test-connection":
+				err = a.requireAdmin(r.Context())
+			default:
+				err = a.requireSyncWrite(r.Context())
+			}
+			if err != nil {
+				WriteErrorResponse(w, err)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // internalError creates an internal server error from an error.
 func internalError(err error) *Error {
 	return &Error{
@@ -61,6 +117,9 @@ func internalError(err error) *Error {
 
 // GetSyncStatus returns the overall Git sync status.
 func (a *API) GetSyncStatus(ctx context.Context, _ api.GetSyncStatusRequestObject) (api.GetSyncStatusResponseObject, error) {
+	if err := a.requireSyncRead(ctx); err != nil {
+		return nil, err
+	}
 	if a.syncService == nil {
 		return disabledSyncStatusResponse(), nil
 	}
@@ -79,7 +138,7 @@ func (a *API) GetSyncStatus(ctx context.Context, _ api.GetSyncStatusRequestObjec
 		LastSyncCommit: ptrOf(status.LastSyncCommit),
 		LastSyncStatus: ptrOf(status.LastSyncStatus),
 		LastError:      status.LastError,
-		Items:          toAPISyncItems(status.DAGs),
+		Items:          toAPISyncItems(status.Items),
 		Counts:         toAPISyncCounts(status.Counts),
 	}, nil
 }
@@ -102,10 +161,10 @@ func disabledSyncStatusResponse() api.GetSyncStatus200JSONResponse {
 
 // SyncPull pulls changes from the remote repository.
 func (a *API) SyncPull(ctx context.Context, _ api.SyncPullRequestObject) (api.SyncPullResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -116,6 +175,7 @@ func (a *API) SyncPull(ctx context.Context, _ api.SyncPullRequestObject) (api.Sy
 
 	a.logAudit(ctx, audit.CategoryGitSync, "sync_pull", map[string]any{
 		"synced":    result.Synced,
+		"deleted":   result.Deleted,
 		"modified":  result.Modified,
 		"conflicts": result.Conflicts,
 	})
@@ -123,12 +183,12 @@ func (a *API) SyncPull(ctx context.Context, _ api.SyncPullRequestObject) (api.Sy
 	return api.SyncPull200JSONResponse(toAPISyncResult(result)), nil
 }
 
-// SyncPublishAll publishes selected DAGs.
+// SyncPublishAll publishes selected sync items.
 func (a *API) SyncPublishAll(ctx context.Context, req api.SyncPublishAllRequestObject) (api.SyncPublishAllResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 	if req.Body == nil {
@@ -148,7 +208,7 @@ func (a *API) SyncPublishAll(ctx context.Context, req api.SyncPublishAllRequestO
 	if len(itemIDs) == 0 {
 		return nil, &Error{
 			Code:       api.ErrorCodeBadRequest,
-			Message:    "No modified or untracked items to publish",
+			Message:    "No modified or untracked sync items to publish",
 			HTTPStatus: http.StatusBadRequest,
 		}
 	}
@@ -184,8 +244,8 @@ func collectPublishableItemIDs(status *gitsync.OverallStatus) []string {
 	if status == nil {
 		return nil
 	}
-	itemIDs := make([]string, 0, len(status.DAGs))
-	for id, item := range status.DAGs {
+	itemIDs := make([]string, 0, len(status.Items))
+	for id, item := range status.Items {
 		if item == nil {
 			continue
 		}
@@ -198,6 +258,9 @@ func collectPublishableItemIDs(status *gitsync.OverallStatus) []string {
 
 // SyncTestConnection tests the connection to the remote repository.
 func (a *API) SyncTestConnection(ctx context.Context, _ api.SyncTestConnectionRequestObject) (api.SyncTestConnectionResponseObject, error) {
+	if err := a.requireAdmin(ctx); err != nil {
+		return nil, err
+	}
 	if a.syncService == nil {
 		return api.SyncTestConnection200JSONResponse{
 			Success: false,
@@ -227,6 +290,9 @@ func (a *API) SyncTestConnection(ctx context.Context, _ api.SyncTestConnectionRe
 
 // GetSyncConfig returns the Git sync configuration.
 func (a *API) GetSyncConfig(ctx context.Context, _ api.GetSyncConfigRequestObject) (api.GetSyncConfigResponseObject, error) {
+	if err := a.requireSyncRead(ctx); err != nil {
+		return nil, err
+	}
 	if a.syncService == nil {
 		return api.GetSyncConfig200JSONResponse{Enabled: false}, nil
 	}
@@ -241,11 +307,14 @@ func (a *API) GetSyncConfig(ctx context.Context, _ api.GetSyncConfigRequestObjec
 
 // GetSyncItemDiff returns the diff between local and remote versions of a sync item.
 func (a *API) GetSyncItemDiff(ctx context.Context, req api.GetSyncItemDiffRequestObject) (api.GetSyncItemDiffResponseObject, error) {
+	if err := a.requireSyncRead(ctx); err != nil {
+		return nil, err
+	}
 	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
-	diff, err := a.syncService.GetDAGDiff(ctx, req.ItemId)
+	diff, err := a.syncService.GetSyncItemDiff(ctx, req.ItemId)
 	if err != nil {
 		if gitsync.IsDAGNotFound(err) {
 			return api.GetSyncItemDiff404JSONResponse{
@@ -256,24 +325,36 @@ func (a *API) GetSyncItemDiff(ctx context.Context, req api.GetSyncItemDiffReques
 		return nil, internalError(err)
 	}
 
-	return api.GetSyncItemDiff200JSONResponse{
-		ItemId:        diff.DAGID,
-		FilePath:      syncItemFilePath(diff.DAGID, gitsync.KindForDAGID(diff.DAGID)),
-		Status:        toAPISyncStatus(diff.Status),
-		LocalContent:  diff.LocalContent,
-		RemoteContent: ptrOf(diff.RemoteContent),
-		RemoteCommit:  ptrOf(diff.RemoteCommit),
-		RemoteAuthor:  ptrOf(diff.RemoteAuthor),
-		RemoteMessage: ptrOf(diff.RemoteMessage),
-	}, nil
+	filePath := syncItemFilePath(diff.ItemID, diff.Kind, diff.FileExtension)
+	resp := api.GetSyncItemDiff200JSONResponse{
+		ItemId:           diff.ItemID,
+		FilePath:         filePath,
+		Status:           toAPISyncStatus(diff.Status),
+		Kind:             ptrOf(toAPISyncItemKind(diff.Kind)),
+		RemoteCommit:     ptrOf(diff.RemoteCommit),
+		RemoteAuthor:     ptrOf(diff.RemoteAuthor),
+		RemoteMessage:    ptrOf(diff.RemoteMessage),
+		RemoteDeleted:    ptrOf(diff.RemoteDeleted),
+		LocalExecutable:  diff.LocalExecutable,
+		RemoteExecutable: diff.RemoteExecutable,
+	}
+	if diff.Binary {
+		resp.Binary = ptrOf(true)
+		resp.LocalSize = diff.LocalSize
+		resp.RemoteSize = diff.RemoteSize
+		return resp, nil
+	}
+	resp.LocalContent = ptrOf(diff.LocalContent)
+	resp.RemoteContent = ptrOf(diff.RemoteContent)
+	return resp, nil
 }
 
 // UpdateSyncConfig updates the Git sync configuration.
 func (a *API) UpdateSyncConfig(ctx context.Context, req api.UpdateSyncConfigRequestObject) (api.UpdateSyncConfigResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireAdmin(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireAdmin(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -308,10 +389,10 @@ func (a *API) UpdateSyncConfig(ctx context.Context, req api.UpdateSyncConfigRequ
 
 // PublishSyncItem publishes a single sync item.
 func (a *API) PublishSyncItem(ctx context.Context, req api.PublishSyncItemRequestObject) (api.PublishSyncItemResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -331,12 +412,12 @@ func (a *API) PublishSyncItem(ctx context.Context, req api.PublishSyncItemReques
 	return api.PublishSyncItem200JSONResponse(toAPISyncResult(result)), nil
 }
 
-// DiscardSyncItemChanges discards local changes for a sync item.
+// DiscardSyncItemChanges discards local changes for a DAG.
 func (a *API) DiscardSyncItemChanges(ctx context.Context, req api.DiscardSyncItemChangesRequestObject) (api.DiscardSyncItemChangesResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -357,12 +438,12 @@ func (a *API) DiscardSyncItemChanges(ctx context.Context, req api.DiscardSyncIte
 	}, nil
 }
 
-// ForgetSyncItem removes a sync item's state entry.
+// ForgetSyncItem removes a DAG's sync state entry.
 func (a *API) ForgetSyncItem(ctx context.Context, req api.ForgetSyncItemRequestObject) (api.ForgetSyncItemResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -395,10 +476,10 @@ func (a *API) ForgetSyncItem(ctx context.Context, req api.ForgetSyncItemRequestO
 
 // SyncCleanup removes all missing entries from sync state.
 func (a *API) SyncCleanup(ctx context.Context, _ api.SyncCleanupRequestObject) (api.SyncCleanupResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -411,7 +492,7 @@ func (a *API) SyncCleanup(ctx context.Context, _ api.SyncCleanupRequestObject) (
 		"forgotten": forgotten,
 	})
 
-	message := fmt.Sprintf("Cleaned up %d missing item(s)", len(forgotten))
+	message := fmt.Sprintf("Cleaned up %d missing sync item(s)", len(forgotten))
 	return api.SyncCleanup200JSONResponse{
 		Forgotten: forgotten,
 		Message:   message,
@@ -420,10 +501,10 @@ func (a *API) SyncCleanup(ctx context.Context, _ api.SyncCleanupRequestObject) (
 
 // DeleteSyncItem deletes a sync item from remote, local, and state.
 func (a *API) DeleteSyncItem(ctx context.Context, req api.DeleteSyncItemRequestObject) (api.DeleteSyncItemResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -451,8 +532,7 @@ func (a *API) DeleteSyncItem(ctx context.Context, req api.DeleteSyncItemRequestO
 				Message: err.Error(),
 			}, nil
 		}
-		var validationErr *gitsync.ValidationError
-		if errors.As(err, &validationErr) {
+		if _, ok := errors.AsType[*gitsync.ValidationError](err); ok {
 			return api.DeleteSyncItem400JSONResponse{
 				Code:    api.ErrorCodeBadRequest,
 				Message: err.Error(),
@@ -472,12 +552,12 @@ func (a *API) DeleteSyncItem(ctx context.Context, req api.DeleteSyncItemRequestO
 	}, nil
 }
 
-// SyncDeleteMissing deletes all missing items from remote, local, and state.
+// SyncDeleteMissing deletes all missing sync items from remote, local, and state.
 func (a *API) SyncDeleteMissing(ctx context.Context, req api.SyncDeleteMissingRequestObject) (api.SyncDeleteMissingResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -507,16 +587,16 @@ func (a *API) SyncDeleteMissing(ctx context.Context, req api.SyncDeleteMissingRe
 
 	return api.SyncDeleteMissing200JSONResponse{
 		Deleted: deleted,
-		Message: fmt.Sprintf("Deleted %d missing item(s)", len(deleted)),
+		Message: fmt.Sprintf("Deleted %d missing sync item(s)", len(deleted)),
 	}, nil
 }
 
-// SyncDeleteBatch deletes multiple items from remote, local, and state in a single commit.
+// SyncDeleteBatch deletes multiple sync items in a single commit.
 func (a *API) SyncDeleteBatch(ctx context.Context, req api.SyncDeleteBatchRequestObject) (api.SyncDeleteBatchResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 
@@ -556,8 +636,7 @@ func (a *API) SyncDeleteBatch(ctx context.Context, req api.SyncDeleteBatchReques
 				Message: err.Error(),
 			}, nil
 		}
-		var validationErr *gitsync.ValidationError
-		if errors.As(err, &validationErr) {
+		if _, ok := errors.AsType[*gitsync.ValidationError](err); ok {
 			return api.SyncDeleteBatch400JSONResponse{
 				Code:    api.ErrorCodeBadRequest,
 				Message: err.Error(),
@@ -579,16 +658,16 @@ func (a *API) SyncDeleteBatch(ctx context.Context, req api.SyncDeleteBatchReques
 
 	return api.SyncDeleteBatch200JSONResponse{
 		Deleted: deleted,
-		Message: fmt.Sprintf("Deleted %d item(s)", len(deleted)),
+		Message: fmt.Sprintf("Deleted %d sync item(s)", len(deleted)),
 	}, nil
 }
 
-// MoveSyncItem atomically renames an item across local, remote, and state.
+// MoveSyncItem renames a tracked sync item.
 func (a *API) MoveSyncItem(ctx context.Context, req api.MoveSyncItemRequestObject) (api.MoveSyncItemResponseObject, error) {
-	if err := a.requireSyncService(); err != nil {
+	if err := a.requireSyncWrite(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.requireSyncService(); err != nil {
 		return nil, err
 	}
 	if req.Body == nil {
@@ -617,15 +696,13 @@ func (a *API) MoveSyncItem(ctx context.Context, req api.MoveSyncItemRequestObjec
 				Message: err.Error(),
 			}, nil
 		}
-		var validationErr *gitsync.ValidationError
-		if errors.As(err, &validationErr) {
+		if _, ok := errors.AsType[*gitsync.ValidationError](err); ok {
 			return api.MoveSyncItem400JSONResponse{
 				Code:    api.ErrorCodeBadRequest,
 				Message: err.Error(),
 			}, nil
 		}
-		var conflictErr *gitsync.ConflictError
-		if errors.As(err, &conflictErr) {
+		if conflictErr, ok := errors.AsType[*gitsync.ConflictError](err); ok {
 			return api.MoveSyncItem409JSONResponse{
 				ItemId:        conflictErr.DAGID,
 				RemoteCommit:  ptrOf(conflictErr.RemoteCommit),
@@ -691,47 +768,27 @@ func toAPISyncStatus(s gitsync.SyncStatus) api.SyncStatus {
 	}
 }
 
-func resolveKind(itemID string, kind gitsync.DAGKind) gitsync.DAGKind {
-	if kind == "" {
-		return gitsync.KindForDAGID(itemID)
-	}
-	return kind
-}
-
-func toAPISyncItemKind(itemID string, kind gitsync.DAGKind) api.SyncItemKind {
-	kind = resolveKind(itemID, kind)
-
+func syncItemFilePath(itemID string, kind gitsync.SyncItemKind, fileExtension string) string {
 	switch kind {
-	case gitsync.DAGKindMemory:
-		return api.SyncItemKindMemory
-	case gitsync.DAGKindSkill:
-		return api.SyncItemKindSkill
-	case gitsync.DAGKindSoul:
-		return api.SyncItemKindSoul
-	case gitsync.DAGKindDoc:
-		return api.SyncItemKindDoc
-	case gitsync.DAGKindConfig:
-		return api.SyncItemKindConfig
-	case gitsync.DAGKindDAG:
-		return api.SyncItemKindDag
-	default:
-		return api.SyncItemKindDag
+	case gitsync.SyncItemKindFile:
+		return itemID
+	case gitsync.SyncItemKindWikiPageAsset:
+		// Asset IDs already carry their extension.
+		return itemID
+	case gitsync.SyncItemKindWikiPage:
+		if strings.EqualFold(fileExtension, ".md") {
+			return itemID + fileExtension
+		}
+		return itemID + ".md"
+	case gitsync.SyncItemKindDAG:
 	}
+	if strings.EqualFold(fileExtension, ".yml") {
+		return itemID + ".yml"
+	}
+	return itemID + ".yaml"
 }
 
-func syncItemFilePath(itemID string, kind gitsync.DAGKind) string {
-	kind = resolveKind(itemID, kind)
-	ext := ".yaml"
-	switch kind {
-	case gitsync.DAGKindMemory, gitsync.DAGKindSkill, gitsync.DAGKindSoul, gitsync.DAGKindDoc:
-		ext = ".md"
-	case gitsync.DAGKindDAG, gitsync.DAGKindConfig:
-		// default .yaml extension
-	}
-	return itemID + ext
-}
-
-func toAPISyncItems(states map[string]*gitsync.DAGState) []api.SyncItem {
+func toAPISyncItems(states map[string]*gitsync.SyncItemState) []api.SyncItem {
 	if states == nil {
 		return []api.SyncItem{}
 	}
@@ -741,13 +798,13 @@ func toAPISyncItems(states map[string]*gitsync.DAGState) []api.SyncItem {
 		if state == nil {
 			continue
 		}
-		filePath := syncItemFilePath(itemID, state.Kind)
+		filePath := syncItemFilePath(itemID, state.Kind, state.FileExtension)
 		item := api.SyncItem{
 			ItemId:             itemID,
 			FilePath:           filePath,
 			DisplayName:        filePath,
 			Status:             toAPISyncStatus(state.Status),
-			Kind:               toAPISyncItemKind(itemID, state.Kind),
+			Kind:               toAPISyncItemKind(state.Kind),
 			BaseCommit:         ptrOf(state.BaseCommit),
 			LastSyncedHash:     ptrOf(state.LastSyncedHash),
 			LastSyncedAt:       state.LastSyncedAt,
@@ -772,6 +829,19 @@ func toAPISyncItems(states map[string]*gitsync.DAGState) []api.SyncItem {
 	return result
 }
 
+func toAPISyncItemKind(kind gitsync.SyncItemKind) api.SyncItemKind {
+	switch kind {
+	case gitsync.SyncItemKindFile:
+		return api.SyncItemKindFile
+	case gitsync.SyncItemKindWikiPageAsset:
+		return api.SyncItemKindDocAsset
+	case gitsync.SyncItemKindWikiPage:
+		return api.SyncItemKindDoc
+	case gitsync.SyncItemKindDAG:
+	}
+	return api.SyncItemKindDag
+}
+
 func toAPISyncCounts(counts gitsync.StatusCounts) api.SyncStatusCounts {
 	return api.SyncStatusCounts{
 		Synced:    counts.Synced,
@@ -787,6 +857,7 @@ func toAPISyncResult(result *gitsync.SyncResult) api.SyncResultResponse {
 		Success:   result.Success,
 		Message:   ptrOf(result.Message),
 		Synced:    ptrOf(result.Synced),
+		Deleted:   ptrOf(result.Deleted),
 		Modified:  ptrOf(result.Modified),
 		Conflicts: ptrOf(result.Conflicts),
 		Errors:    toAPISyncErrors(result.Errors),
@@ -801,7 +872,7 @@ func toAPISyncErrors(errors []gitsync.SyncError) *[]api.SyncError {
 	result := make([]api.SyncError, len(errors))
 	for i, e := range errors {
 		result[i] = api.SyncError{
-			ItemId:  ptrOf(e.DAGID),
+			ItemId:  ptrOf(e.ItemID),
 			Message: e.Message,
 		}
 	}
@@ -895,8 +966,7 @@ func extractPublishOptions(body *api.PublishSyncItemJSONRequestBody) (message st
 
 // handlePublishError handles errors from the publish operation.
 func handlePublishError(err error) (api.PublishSyncItemResponseObject, error) {
-	var conflictErr *gitsync.ConflictError
-	if errors.As(err, &conflictErr) {
+	if conflictErr, ok := errors.AsType[*gitsync.ConflictError](err); ok {
 		return api.PublishSyncItem409JSONResponse{
 			ItemId:        conflictErr.DAGID,
 			RemoteCommit:  ptrOf(conflictErr.RemoteCommit),

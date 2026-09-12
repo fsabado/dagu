@@ -1,0 +1,7 @@
+working_dir: .
+steps:
+  - id: write
+    preconditions:
+      - condition: "printf 1 >> condition-order.txt; exit 1"
+      - condition: "printf 2 >> condition-order.txt"
+    run: printf '%s\n' ran > multiple-conditions-ran.txt

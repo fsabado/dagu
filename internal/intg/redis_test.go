@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/test"
 )
 
 const redisTestImage = "redis:7-alpine"
@@ -274,7 +274,7 @@ steps:
 			th := test.Setup(t)
 			dag := th.DAG(t, tt.dagConfigFunc(port))
 			dag.Agent().RunSuccess(t)
-			dag.AssertLatestStatus(t, core.Succeeded)
+			dag.AssertLatestStatus(t, ir.Succeeded)
 			if tt.expectedOutputs != nil {
 				dag.AssertOutputs(t, tt.expectedOutputs)
 			}

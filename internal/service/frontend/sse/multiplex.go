@@ -15,7 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/google/uuid"
 )
 
@@ -209,8 +210,12 @@ func (m *Multiplexer) WakeTopicType(topicType TopicType) {
 	}
 	m.mu.RUnlock()
 
+	var batch *persis.DAGRunListReadBatch
+	if topicType == TopicTypeDAGRuns {
+		batch = persis.NewDAGRunListReadBatch()
+	}
 	for _, topic := range topics {
-		topic.requestPoll()
+		topic.requestPoll(batch)
 	}
 }
 
@@ -221,7 +226,11 @@ func (m *Multiplexer) wakeTopicKey(key string) {
 	if topic == nil {
 		return
 	}
-	topic.requestPoll()
+	var batch *persis.DAGRunListReadBatch
+	if topic.topicType == TopicTypeDAGRuns {
+		batch = persis.NewDAGRunListReadBatch()
+	}
+	topic.requestPoll(batch)
 }
 
 // Shutdown stops all multiplexed sessions and topic watchers.
@@ -707,6 +716,7 @@ type streamSession struct {
 	slowClientTimeout time.Duration
 
 	mutationMu      sync.Mutex
+	publishMu       sync.Mutex
 	mu              sync.Mutex
 	closed          bool
 	topics          map[string]*multiplexTopic
@@ -780,11 +790,54 @@ func (s *streamSession) topicKeys() []string {
 }
 
 func (s *streamSession) bootstrapTopics(ctx context.Context, lastEventID uint64, topics []*multiplexTopic) {
+	eligible := make([]*multiplexTopic, 0, len(topics))
 	for _, topic := range topics {
 		if lastEventID > 0 && !topic.changedSince(lastEventID) {
 			continue
 		}
-		if err := topic.sendSnapshot(ctx, s, s.mux.nextID()); err != nil {
+		eligible = append(eligible, topic)
+	}
+
+	// A list-only bootstrap can share one day load; mixed topic batches retain their ordering.
+	allDAGRuns := len(eligible) > 1 && !slices.ContainsFunc(eligible, func(topic *multiplexTopic) bool {
+		return topic.topicType != TopicTypeDAGRuns
+	})
+	if allDAGRuns {
+		ctx = persis.WithDAGRunListReadBatch(ctx, persis.NewDAGRunListReadBatch())
+		type snapshotResult struct {
+			payload         []byte
+			attachmentID    uint64
+			lastPublishedID uint64
+			err             error
+		}
+		results := make([]snapshotResult, len(eligible))
+		for i, topic := range eligible {
+			results[i].attachmentID, results[i].lastPublishedID = topic.snapshotState(s)
+		}
+
+		var wg sync.WaitGroup
+		for i, topic := range eligible {
+			wg.Go(func() {
+				results[i].payload, results[i].err = topic.fetchPayload(ctx)
+			})
+		}
+		wg.Wait()
+		for i, result := range results {
+			if result.err != nil {
+				continue
+			}
+			_ = eligible[i].sendSnapshotPayload(
+				s,
+				result.payload,
+				result.attachmentID,
+				result.lastPublishedID,
+			)
+		}
+		return
+	}
+
+	for _, topic := range eligible {
+		if err := topic.sendSnapshot(ctx, s); err != nil {
 			continue
 		}
 	}
@@ -823,6 +876,14 @@ func (s *streamSession) enqueueMessage(topic string, eventID uint64, data []byte
 		existing.data = data
 		existing.size = size
 		s.queuedBytes += size
+		for i, msg := range s.queue {
+			if msg != existing {
+				continue
+			}
+			copy(s.queue[i:], s.queue[i+1:])
+			s.queue[len(s.queue)-1] = existing
+			break
+		}
 		for s.queuedBytes > s.writeBufferSize {
 			if !s.dropOldestExcept(topic) {
 				s.closed = true
@@ -1010,24 +1071,30 @@ func (s *streamSession) Serve(ctx context.Context) error {
 }
 
 type multiplexTopic struct {
-	mux               *Multiplexer
-	key               string
-	topicType         TopicType
-	identifier        string
-	fetcher           FetchFunc
-	refreshMode       TopicRefreshMode
-	publishOnWake     bool
-	clientsMu         sync.RWMutex
-	sessions          map[*streamSession]struct{}
-	retiring          bool
-	lastHashBySession map[*streamSession]string
-	lastChangeEventID uint64
-	stopCh            chan struct{}
-	notifyCh          chan struct{}
-	wg                sync.WaitGroup
-	errorBackoff      backoff.Retrier
-	backoffUntil      time.Time
-	currentInterval   time.Duration
+	mux                      *Multiplexer
+	key                      string
+	topicType                TopicType
+	identifier               string
+	fetcher                  FetchFunc
+	refreshMode              TopicRefreshMode
+	publishOnWake            bool
+	clientsMu                sync.RWMutex
+	sessions                 map[*streamSession]struct{}
+	retiring                 bool
+	lastHashBySession        map[*streamSession]string
+	lastPublishedIDBySession map[*streamSession]uint64
+	attachmentIDBySession    map[*streamSession]uint64
+	nextAttachmentID         uint64
+	lastChangeEventID        uint64
+	stopCh                   chan struct{}
+	notifyMu                 sync.Mutex
+	notifyCh                 chan struct{}
+	pendingBatch             *persis.DAGRunListReadBatch
+	pollPending              bool
+	wg                       sync.WaitGroup
+	errorBackoff             backoff.Retrier
+	backoffUntil             time.Time
+	currentInterval          time.Duration
 }
 
 func newMultiplexTopic(
@@ -1041,19 +1108,21 @@ func newMultiplexTopic(
 	policy.MaxInterval = 30 * time.Second
 
 	return &multiplexTopic{
-		mux:               mux,
-		key:               parsed.Key,
-		topicType:         parsed.Type,
-		identifier:        parsed.Identifier,
-		fetcher:           fetcher,
-		refreshMode:       refreshMode,
-		publishOnWake:     publishOnWake,
-		sessions:          make(map[*streamSession]struct{}),
-		lastHashBySession: make(map[*streamSession]string),
-		stopCh:            make(chan struct{}),
-		notifyCh:          make(chan struct{}, 1),
-		errorBackoff:      backoff.NewRetrier(policy),
-		currentInterval:   mux.watcherBaseInterval,
+		mux:                      mux,
+		key:                      parsed.Key,
+		topicType:                parsed.Type,
+		identifier:               parsed.Identifier,
+		fetcher:                  fetcher,
+		refreshMode:              refreshMode,
+		publishOnWake:            publishOnWake,
+		sessions:                 make(map[*streamSession]struct{}),
+		lastHashBySession:        make(map[*streamSession]string),
+		lastPublishedIDBySession: make(map[*streamSession]uint64),
+		attachmentIDBySession:    make(map[*streamSession]uint64),
+		stopCh:                   make(chan struct{}),
+		notifyCh:                 make(chan struct{}, 1),
+		errorBackoff:             backoff.NewRetrier(policy),
+		currentInterval:          mux.watcherBaseInterval,
 	}
 }
 
@@ -1067,7 +1136,9 @@ func (t *multiplexTopic) addSession(session *streamSession) bool {
 	if _, exists := t.sessions[session]; exists {
 		return true
 	}
+	t.nextAttachmentID++
 	t.sessions[session] = struct{}{}
+	t.attachmentIDBySession[session] = t.nextAttachmentID
 	if len(t.sessions) == 1 {
 		t.start()
 	}
@@ -1079,6 +1150,14 @@ func (t *multiplexTopic) removeSession(session *streamSession) {
 	defer t.clientsMu.Unlock()
 	delete(t.sessions, session)
 	delete(t.lastHashBySession, session)
+	delete(t.lastPublishedIDBySession, session)
+	delete(t.attachmentIDBySession, session)
+}
+
+func (t *multiplexTopic) snapshotState(session *streamSession) (uint64, uint64) {
+	t.clientsMu.RLock()
+	defer t.clientsMu.RUnlock()
+	return t.attachmentIDBySession[session], t.lastPublishedIDBySession[session]
 }
 
 func (t *multiplexTopic) sessionCount() int {
@@ -1130,7 +1209,7 @@ func (t *multiplexTopic) start() {
 				return
 			case <-timerCh:
 				timerCh = nil
-				t.poll(false)
+				t.poll(false, nil)
 				if delay, shouldRetry := t.nextRetryDelay(); shouldRetry {
 					t.resetTimer(timer, &timerCh, delay)
 					continue
@@ -1139,7 +1218,7 @@ func (t *multiplexTopic) start() {
 					t.resetTimer(timer, &timerCh, t.currentInterval)
 				}
 			case <-t.notifyCh:
-				t.poll(t.publishOnWake)
+				t.poll(t.publishOnWake, t.takePendingBatch())
 				if delay, shouldRetry := t.nextRetryDelay(); shouldRetry {
 					t.resetTimer(timer, &timerCh, delay)
 					continue
@@ -1163,11 +1242,25 @@ func (t *multiplexTopic) stop() {
 	t.wg.Wait()
 }
 
-func (t *multiplexTopic) requestPoll() {
-	select {
-	case t.notifyCh <- struct{}{}:
-	default:
+func (t *multiplexTopic) requestPoll(batch *persis.DAGRunListReadBatch) {
+	t.notifyMu.Lock()
+	t.pendingBatch = batch
+	if t.pollPending {
+		t.notifyMu.Unlock()
+		return
 	}
+	t.pollPending = true
+	t.notifyMu.Unlock()
+	t.notifyCh <- struct{}{}
+}
+
+func (t *multiplexTopic) takePendingBatch() *persis.DAGRunListReadBatch {
+	t.notifyMu.Lock()
+	defer t.notifyMu.Unlock()
+	batch := t.pendingBatch
+	t.pendingBatch = nil
+	t.pollPending = false
+	return batch
 }
 
 func (t *multiplexTopic) stopTimer(timer *time.Timer, timerCh *<-chan time.Time) {
@@ -1194,7 +1287,7 @@ func (t *multiplexTopic) nextRetryDelay() (time.Duration, bool) {
 	return delay, true
 }
 
-func (t *multiplexTopic) poll(forcePublish bool) {
+func (t *multiplexTopic) poll(forcePublish bool, batch *persis.DAGRunListReadBatch) {
 	if time.Now().Before(t.backoffUntil) {
 		return
 	}
@@ -1212,7 +1305,11 @@ func (t *multiplexTopic) poll(forcePublish bool) {
 
 	for _, session := range sessions {
 		start := time.Now()
-		payload, err := t.fetchPayload(session.fetchCtx)
+		fetchCtx := session.fetchCtx
+		if batch != nil {
+			fetchCtx = persis.WithDAGRunListReadBatch(fetchCtx, batch)
+		}
+		payload, err := t.fetchPayload(fetchCtx)
 		fetchDuration := time.Since(start)
 		if err != nil {
 			if firstErr == nil {
@@ -1227,25 +1324,30 @@ func (t *multiplexTopic) poll(forcePublish bool) {
 		}
 
 		hash := computeHash(payload)
-		t.clientsMu.Lock()
-		if _, ok := t.sessions[session]; !ok {
-			t.clientsMu.Unlock()
-			continue
-		}
-		if hash == t.lastHashBySession[session] && !forcePublish {
-			t.clientsMu.Unlock()
-			continue
-		}
-		t.lastHashBySession[session] = hash
-		eventID := t.mux.nextID()
-		t.lastChangeEventID = eventID
-		t.clientsMu.Unlock()
-
 		data, err := buildMessageData(t.key, payload)
 		if err != nil {
 			continue
 		}
+
+		session.publishMu.Lock()
+		t.clientsMu.Lock()
+		if _, ok := t.sessions[session]; !ok {
+			t.clientsMu.Unlock()
+			session.publishMu.Unlock()
+			continue
+		}
+		if hash == t.lastHashBySession[session] && !forcePublish {
+			t.clientsMu.Unlock()
+			session.publishMu.Unlock()
+			continue
+		}
+		t.lastHashBySession[session] = hash
+		eventID := t.mux.nextID()
+		t.lastPublishedIDBySession[session] = eventID
+		t.lastChangeEventID = eventID
+		t.clientsMu.Unlock()
 		session.enqueueMessage(t.key, eventID, data)
+		session.publishMu.Unlock()
 	}
 
 	if firstErr != nil && t.mux.metrics != nil {
@@ -1269,26 +1371,50 @@ func (t *multiplexTopic) poll(forcePublish bool) {
 	)
 }
 
-func (t *multiplexTopic) sendSnapshot(ctx context.Context, session *streamSession, eventID uint64) error {
+func (t *multiplexTopic) sendSnapshot(ctx context.Context, session *streamSession) error {
+	attachmentID, lastPublishedID := t.snapshotState(session)
 	payload, err := t.fetchPayload(ctx)
 	if err != nil {
 		return err
 	}
+	return t.sendSnapshotPayload(session, payload, attachmentID, lastPublishedID)
+}
+
+func (t *multiplexTopic) sendSnapshotPayload(
+	session *streamSession,
+	payload []byte,
+	attachmentID uint64,
+	lastPublishedID uint64,
+) error {
 	hash := computeHash(payload)
+	data, err := buildMessageData(t.key, payload)
+	if err != nil {
+		return err
+	}
+
+	session.publishMu.Lock()
+	defer session.publishMu.Unlock()
+
 	t.clientsMu.Lock()
 	if _, ok := t.sessions[session]; !ok {
 		t.clientsMu.Unlock()
 		return nil
 	}
+	if t.attachmentIDBySession[session] != attachmentID {
+		t.clientsMu.Unlock()
+		return nil
+	}
+	if t.lastPublishedIDBySession[session] != lastPublishedID {
+		t.clientsMu.Unlock()
+		return nil
+	}
 	t.lastHashBySession[session] = hash
+	eventID := t.mux.nextID()
+	t.lastPublishedIDBySession[session] = eventID
 	if t.lastChangeEventID == 0 {
 		t.lastChangeEventID = eventID
 	}
 	t.clientsMu.Unlock()
-	data, err := buildMessageData(t.key, payload)
-	if err != nil {
-		return err
-	}
 	session.enqueueMessage(t.key, eventID, data)
 	return nil
 }

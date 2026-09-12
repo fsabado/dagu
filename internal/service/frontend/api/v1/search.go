@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"strings"
 
-	api "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/agent"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/textsearch"
+	"github.com/dagucloud/dagu/v2/internal/wiki"
 )
 
 const (
@@ -64,7 +66,7 @@ func scopedDAGSearchLabels(labelsParam *string) []string {
 	return parseCommaSeparatedLabels(labelsParam)
 }
 
-func toSearchMatchItems(matches []*exec.Match) []api.SearchMatchItem {
+func toSearchMatchItems(matches []*textsearch.Match) []api.SearchMatchItem {
 	items := make([]api.SearchMatchItem, 0, len(matches))
 	for _, match := range matches {
 		items = append(items, api.SearchMatchItem{
@@ -76,7 +78,7 @@ func toSearchMatchItems(matches []*exec.Match) []api.SearchMatchItem {
 	return items
 }
 
-func mapCursorItems[TIn any, TOut any](result *exec.CursorResult[TIn], mapItem func(TIn) TOut) ([]TOut, bool, *string) {
+func mapCursorItems[TIn any, TOut any](result *pagination.CursorResult[TIn], mapItem func(TIn) TOut) ([]TOut, bool, *string) {
 	items := make([]TOut, 0, len(result.Items))
 	for _, item := range result.Items {
 		items = append(items, mapItem(item))
@@ -84,7 +86,7 @@ func mapCursorItems[TIn any, TOut any](result *exec.CursorResult[TIn], mapItem f
 	return items, result.HasMore, optionalString(result.NextCursor)
 }
 
-func toDAGSearchPageItem(item exec.SearchDAGResult) api.DAGSearchPageItem {
+func toDAGSearchPageItem(item persis.DAGSearchResult) api.DAGSearchPageItem {
 	name := item.Name
 	if name == "" {
 		// File-backed DAG search uses the DAG file name as its display label.
@@ -100,7 +102,7 @@ func toDAGSearchPageItem(item exec.SearchDAGResult) api.DAGSearchPageItem {
 	}
 }
 
-func toDAGSearchFeedResponse(result *exec.CursorResult[exec.SearchDAGResult]) api.DAGSearchFeedResponse {
+func toDAGSearchFeedResponse(result *pagination.CursorResult[persis.DAGSearchResult]) api.DAGSearchFeedResponse {
 	items, hasMore, nextCursor := mapCursorItems(result, toDAGSearchPageItem)
 	return api.DAGSearchFeedResponse{
 		Results:    items,
@@ -109,39 +111,43 @@ func toDAGSearchFeedResponse(result *exec.CursorResult[exec.SearchDAGResult]) ap
 	}
 }
 
-func toDocSearchPageItem(
-	item agent.DocSearchResult,
+func toWikiPageSearchPageItem(
+	item wiki.PageSearchResult,
 	workspaceName string,
-	visibility docWorkspaceVisibility,
-) api.DocSearchPageItem {
-	return api.DocSearchPageItem{
+	visibility wikiWorkspaceVisibility,
+) api.WikiPageSearchPageItem {
+	result := api.WikiPageSearchPageItem{
 		Id:                item.ID,
 		Title:             item.Title,
 		Description:       item.Description,
-		Workspace:         docWorkspaceValue(workspaceName, item.ID, visibility, false),
+		Tags:              wikiPageTagsValue(item.Tags),
+		Workspace:         wikiWorkspaceValue(workspaceName, item.ID, visibility, false),
 		HasMoreMatches:    item.HasMoreMatches,
 		NextMatchesCursor: optionalString(item.NextMatchesCursor),
 		Matches:           toSearchMatchItems(item.Matches),
 	}
+	if !item.ModTime.IsZero() {
+		result.ModifiedAt = ptrOf(item.ModTime)
+	}
+	return result
 }
 
-func toDocSearchFeedResponse(
-	result *exec.CursorResult[agent.DocSearchResult],
+func toWikiPageSearchFeedResponse(
+	result *pagination.CursorResult[wiki.PageSearchResult],
 	workspaceName string,
-	visibility docWorkspaceVisibility,
-) api.DocSearchFeedResponse {
-	items := make([]api.DocSearchPageItem, 0, len(result.Items))
-	for _, item := range result.Items {
-		items = append(items, toDocSearchPageItem(item, workspaceName, visibility))
-	}
-	return api.DocSearchFeedResponse{
+	visibility wikiWorkspaceVisibility,
+) api.WikiPageSearchFeedResponse {
+	items, hasMore, nextCursor := mapCursorItems(result, func(item wiki.PageSearchResult) api.WikiPageSearchPageItem {
+		return toWikiPageSearchPageItem(item, workspaceName, visibility)
+	})
+	return api.WikiPageSearchFeedResponse{
 		Results:    items,
-		HasMore:    result.HasMore,
-		NextCursor: optionalString(result.NextCursor),
+		HasMore:    hasMore,
+		NextCursor: nextCursor,
 	}
 }
 
-func toSearchMatchesResponse(result *exec.CursorResult[*exec.Match]) api.SearchMatchesResponse {
+func toSearchMatchesResponse(result *pagination.CursorResult[*textsearch.Match]) api.SearchMatchesResponse {
 	return api.SearchMatchesResponse{
 		Matches:    toSearchMatchItems(result.Items),
 		HasMore:    result.HasMore,
@@ -161,7 +167,7 @@ func (a *API) SearchDAGFeed(ctx context.Context, request api.SearchDAGFeedReques
 		return nil, err
 	}
 
-	result, errs, err := a.dagStore.SearchCursor(ctx, exec.SearchDAGsOptions{
+	result, errs, err := a.dagRepository.SearchCursor(ctx, persis.DAGSearchOptions{
 		Cursor:          valueOf(request.Params.Cursor),
 		Limit:           normalizeSearchLimit(valueOf(request.Params.Limit), searchDefaultLimit),
 		Query:           query,
@@ -170,7 +176,7 @@ func (a *API) SearchDAGFeed(ctx context.Context, request api.SearchDAGFeedReques
 		WorkspaceFilter: workspaceFilter,
 	})
 	if err != nil {
-		if errors.Is(err, exec.ErrInvalidCursor) {
+		if errors.Is(err, pagination.ErrInvalidCursor) {
 			return nil, invalidSearchCursorError()
 		}
 		logger.Error(ctx, "Failed to search DAGs", tag.Error(err))
@@ -183,34 +189,44 @@ func (a *API) SearchDAGFeed(ctx context.Context, request api.SearchDAGFeedReques
 	return api.SearchDAGFeed200JSONResponse(toDAGSearchFeedResponse(result)), nil
 }
 
-// SearchDocFeed returns cursor-based document search results for the global search page.
-func (a *API) SearchDocFeed(ctx context.Context, request api.SearchDocFeedRequestObject) (api.SearchDocFeedResponseObject, error) {
-	if err := a.requireDocManagement(); err != nil {
+// SearchWikiPageFeed returns cursor-based Wiki page search results for the global search page.
+func (a *API) SearchWikiPageFeed(ctx context.Context, request api.SearchWikiPageFeedRequestObject) (api.SearchWikiPageFeedResponseObject, error) {
+	if err := a.requireWikiManagement(); err != nil {
 		return nil, err
 	}
+	a.workspaceWikiMu.RLock()
+	defer a.workspaceWikiMu.RUnlock()
 
 	query, err := validateSearchQuery(request.Params.Q)
 	if err != nil {
 		return nil, err
 	}
-	workspaceName, visibility, err := a.docReadScopeForParams(ctx, request.Params.Workspace)
+	workspaceName, visibility, err := a.wikiReadScopeForParams(ctx, request.Params.Workspace)
 	if err != nil {
 		return nil, err
 	}
+	filterPrefix := string(valueOf(request.Params.Prefix))
+	if filterPrefix != "" {
+		if err := validateWikiPagePath(filterPrefix); err != nil {
+			return nil, err
+		}
+	}
 
-	result, err := a.docStore.SearchCursor(ctx, agent.SearchDocsOptions{
+	result, err := a.wikiStore.SearchCursor(ctx, wiki.SearchPagesOptions{
 		Cursor:           valueOf(request.Params.Cursor),
 		Limit:            normalizeSearchLimit(valueOf(request.Params.Limit), searchDefaultLimit),
 		Query:            query,
 		MatchLimit:       searchPreviewMatchesLimit,
 		PathPrefix:       workspaceName,
+		FilterPrefix:     filterPrefix,
+		Tags:             valueOf(request.Params.Tags),
 		ExcludePathRoots: visibility.excludedPathRoots(),
 	})
 	if err != nil {
-		if errors.Is(err, exec.ErrInvalidCursor) {
+		if errors.Is(err, pagination.ErrInvalidCursor) {
 			return nil, invalidSearchCursorError()
 		}
-		logger.Error(ctx, "Failed to search docs", tag.Error(err))
+		logger.Error(ctx, "Failed to search Wiki pages", tag.Error(err))
 		return nil, internalError(err)
 	}
 	if workspaceName == "" && !visibility.all {
@@ -223,7 +239,7 @@ func (a *API) SearchDocFeed(ctx context.Context, request api.SearchDocFeedReques
 		result.Items = items
 	}
 
-	return api.SearchDocFeed200JSONResponse(toDocSearchFeedResponse(result, workspaceName, visibility)), nil
+	return api.SearchWikiPageFeed200JSONResponse(toWikiPageSearchFeedResponse(result, workspaceName, visibility)), nil
 }
 
 // SearchDagMatches returns cursor-based snippets for one DAG result.
@@ -238,7 +254,7 @@ func (a *API) SearchDagMatches(ctx context.Context, request api.SearchDagMatches
 		return nil, err
 	}
 
-	result, err := a.dagStore.SearchMatches(ctx, request.FileName, exec.SearchDAGMatchesOptions{
+	result, err := a.dagRepository.SearchMatches(ctx, request.FileName, persis.DAGMatchSearchOptions{
 		Cursor:          valueOf(request.Params.Cursor),
 		Limit:           normalizeSearchLimit(valueOf(request.Params.Limit), searchDefaultMatchLimit),
 		Query:           query,
@@ -247,13 +263,13 @@ func (a *API) SearchDagMatches(ctx context.Context, request api.SearchDagMatches
 	})
 	if err != nil {
 		switch {
-		case errors.Is(err, exec.ErrDAGNotFound):
+		case errors.Is(err, persis.ErrDAGNotFound):
 			return nil, &Error{
 				Code:       api.ErrorCodeNotFound,
 				Message:    "DAG not found",
 				HTTPStatus: http.StatusNotFound,
 			}
-		case errors.Is(err, exec.ErrInvalidCursor):
+		case errors.Is(err, pagination.ErrInvalidCursor):
 			return nil, invalidSearchCursorError()
 		default:
 			logger.Error(ctx, "Failed to search DAG matches", tag.Name(request.FileName), tag.Error(err))
@@ -264,21 +280,23 @@ func (a *API) SearchDagMatches(ctx context.Context, request api.SearchDagMatches
 	return api.SearchDagMatches200JSONResponse(toSearchMatchesResponse(result)), nil
 }
 
-// SearchDocMatches returns cursor-based snippets for one document result.
-func (a *API) SearchDocMatches(ctx context.Context, request api.SearchDocMatchesRequestObject) (api.SearchDocMatchesResponseObject, error) {
-	if err := a.requireDocManagement(); err != nil {
+// SearchWikiPageMatches returns cursor-based snippets for one Wiki page result.
+func (a *API) SearchWikiPageMatches(ctx context.Context, request api.SearchWikiPageMatchesRequestObject) (api.SearchWikiPageMatchesResponseObject, error) {
+	if err := a.requireWikiManagement(); err != nil {
 		return nil, err
 	}
-	if err := validateDocPath(request.Params.Path); err != nil {
+	a.workspaceWikiMu.RLock()
+	defer a.workspaceWikiMu.RUnlock()
+	if err := validateWikiPagePath(request.Params.Path); err != nil {
 		return nil, err
 	}
-	workspaceName, visibility, err := a.docPointReadScopeForParams(ctx, request.Params.Workspace)
+	workspaceName, visibility, err := a.wikiPointReadScopeForParams(ctx, request.Params.Workspace)
 	if err != nil {
 		return nil, err
 	}
 	if workspaceName == "" && !visibility.all {
 		if !visibility.visible(request.Params.Path) {
-			return nil, errDocNotFound
+			return nil, errWikiPageNotFound
 		}
 	}
 
@@ -287,23 +305,37 @@ func (a *API) SearchDocMatches(ctx context.Context, request api.SearchDocMatches
 		return nil, err
 	}
 
-	result, err := a.docStore.SearchMatches(ctx, request.Params.Path, agent.SearchDocMatchesOptions{
-		Cursor:     valueOf(request.Params.Cursor),
+	cursor := valueOf(request.Params.Cursor)
+	matchOpts := wiki.SearchPageMatchesOptions{
+		Cursor:     cursor,
 		Limit:      normalizeSearchLimit(valueOf(request.Params.Limit), searchDefaultMatchLimit),
 		Query:      query,
 		PathPrefix: workspaceName,
-	})
+	}
+	result, err := a.wikiStore.SearchMatches(ctx, request.Params.Path, matchOpts)
+	if err != nil && errors.Is(err, pagination.ErrInvalidCursor) && workspaceName != "" && cursor != "" {
+		// Aggregate-search cursors encode an empty path prefix. Replaying the
+		// workspace-qualified ID preserves the authorized Wiki page scope.
+		aggregatePath, scopeErr := scopedWikiPagePath(workspaceName, request.Params.Path)
+		if scopeErr == nil {
+			aggregateOpts := matchOpts
+			aggregateOpts.PathPrefix = ""
+			if aggregateResult, aggregateErr := a.wikiStore.SearchMatches(ctx, aggregatePath, aggregateOpts); aggregateErr == nil {
+				return api.SearchWikiPageMatches200JSONResponse(toSearchMatchesResponse(aggregateResult)), nil
+			}
+		}
+	}
 	if err != nil {
 		switch {
-		case errors.Is(err, agent.ErrDocNotFound):
-			return nil, errDocNotFound
-		case errors.Is(err, exec.ErrInvalidCursor):
+		case errors.Is(err, wiki.ErrPageNotFound):
+			return nil, errWikiPageNotFound
+		case errors.Is(err, pagination.ErrInvalidCursor):
 			return nil, invalidSearchCursorError()
 		default:
-			logger.Error(ctx, "Failed to search doc matches", tag.Name(request.Params.Path), tag.Error(err))
+			logger.Error(ctx, "Failed to search page matches", tag.Name(request.Params.Path), tag.Error(err))
 			return nil, internalError(err)
 		}
 	}
 
-	return api.SearchDocMatches200JSONResponse(toSearchMatchesResponse(result)), nil
+	return api.SearchWikiPageMatches200JSONResponse(toSearchMatchesResponse(result)), nil
 }

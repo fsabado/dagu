@@ -8,14 +8,15 @@
  */
 import { useCanWriteForWorkspace } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
+import ConfirmModal from '@/components/ui/confirm-dialog';
 import { useErrorModal } from '@/components/ui/error-modal';
-import { PencilLine, Trash2, Wand2 } from 'lucide-react';
+import { PencilLine, Trash2 } from 'lucide-react';
 import React from 'react';
-import { Link } from 'react-router-dom';
 import { DAGNameInputModal } from '../../../../components/DAGNameInputModal';
-import { useConfig } from '../../../../contexts/ConfigContext';
 import { useRemoteNode } from '../../../../contexts/RemoteNodeContext';
 import { useClient } from '../../../../hooks/api';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 /**
  * Props for the DAGEditButtons component
@@ -34,8 +35,9 @@ function DAGEditButtons({ fileName, workspace }: Props) {
   const remoteNode = useRemoteNode();
   const canWrite = useCanWriteForWorkspace(workspace);
   const client = useClient();
-  const config = useConfig();
   const { showError } = useErrorModal();
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = React.useState(false);
+  const [isDeleteLoading, setIsDeleteLoading] = React.useState(false);
   const [isRenameModalOpen, setIsRenameModalOpen] = React.useState(false);
   const [renameError, setRenameError] = React.useState<string | null>(null);
   const [isRenameLoading, setIsRenameLoading] = React.useState(false);
@@ -91,63 +93,74 @@ function DAGEditButtons({ fileName, workspace }: Props) {
     }
   };
 
-  const designSearchParams = new URLSearchParams();
-  designSearchParams.set('dag', fileName);
-  designSearchParams.set('remoteNode', remoteNode);
-  const designURL = `/design?${designSearchParams.toString()}`;
-
   return (
     <div className="flex items-center gap-2">
       <Button onClick={() => setIsRenameModalOpen(true)}>
         <PencilLine className="h-4 w-4" />
-        Rename
+        <I18nText text={"Rename"} />
       </Button>
 
-      {config.agentEnabled && (
-        <Button asChild variant="outline" title="Open this DAG in Design">
-          <Link to={designURL}>
-            <Wand2 className="h-4 w-4" />
-            Design
-          </Link>
-        </Button>
-      )}
+      <Button variant="destructive" onClick={() => setIsDeleteModalOpen(true)}>
+        <Trash2 className="h-4 w-4" />
+        <I18nText text={"Delete"} />
+      </Button>
 
-      <Button
-        variant="destructive"
-        onClick={async () => {
-          if (!confirm('Are you sure to delete the DAG?')) {
-            return;
-          }
-          const { error } = await client.DELETE('/dags/{fileName}', {
-            params: {
-              path: {
-                fileName: fileName,
+      <I18nProps><ConfirmModal
+        title="Delete DAG"
+        buttonText="Delete"
+        visible={isDeleteModalOpen}
+        dismissModal={() => {
+          if (!isDeleteLoading) setIsDeleteModalOpen(false);
+        }}
+        submitDisabled={isDeleteLoading}
+        onSubmit={async () => {
+          if (isDeleteLoading) return;
+          setIsDeleteLoading(true);
+          try {
+            const { error } = await client.DELETE('/dags/{fileName}', {
+              params: {
+                path: {
+                  fileName: fileName,
+                },
+                query: {
+                  remoteNode,
+                },
               },
-              query: {
-                remoteNode,
-              },
-            },
-          });
-          if (error) {
+            });
+            if (error) {
+              showError(
+                error.message || 'Failed to delete DAG',
+                'Please try again or check the server connection.'
+              );
+              return;
+            }
+
+            setIsDeleteModalOpen(false);
+            const basePath = window.location.pathname.split('/dags')[0] || '';
+            const searchParams = new URLSearchParams();
+            searchParams.set('remoteNode', remoteNode);
+            const query = searchParams.toString();
+            window.location.href = query
+              ? `${basePath}/dags/?${query}`
+              : `${basePath}/dags/`;
+          } catch {
             showError(
-              error.message || 'Failed to delete DAG',
+              'Failed to delete DAG',
               'Please try again or check the server connection.'
             );
-            return;
+          } finally {
+            setIsDeleteLoading(false);
           }
-          // Redirect to the DAGs list page
-          const basePath = window.location.pathname.split('/dags')[0] || '';
-          const searchParams = new URLSearchParams();
-          searchParams.set('remoteNode', remoteNode);
-          const query = searchParams.toString();
-          window.location.href = query
-            ? `${basePath}/dags/?${query}`
-            : `${basePath}/dags/`;
         }}
       >
-        <Trash2 className="h-4 w-4" />
-        Delete
-      </Button>
+        <div className="space-y-2 text-sm">
+          <p><I18nText text={"Do you really want to delete this DAG?"} /></p>
+          <p className="font-mono text-xs">{fileName}</p>
+          <p className="text-muted-foreground">
+            <I18nText text={"The definition file is removed; past run history is kept. This action cannot be undone."} />
+          </p>
+        </div>
+      </ConfirmModal></I18nProps>
 
       <DAGNameInputModal
         isOpen={isRenameModalOpen}

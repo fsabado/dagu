@@ -35,6 +35,10 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Copy, Check } from 'lucide-react';
+import { useCopyFeedback } from '@/hooks/useCopyFeedback';
+import { buildMCPServerURL, buildMCPSetupPrompt } from './mcpSetupPrompt';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 type APIKey = components['schemas']['APIKey'];
 type WorkspaceAccess = components['schemas']['WorkspaceAccess'];
@@ -55,6 +59,7 @@ export function APIKeyFormModal({
 }: APIKeyFormModalProps) {
   const config = useConfig();
   const appBarContext = useContext(AppBarContext);
+  const remoteNode = appBarContext.selectedRemoteNode || 'local';
   const isEditing = !!apiKey;
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -73,7 +78,8 @@ export function APIKeyFormModal({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const keyCopy = useCopyFeedback();
+  const promptCopy = useCopyFeedback();
 
   useEffect(() => {
     if (open) {
@@ -107,7 +113,6 @@ export function APIKeyFormModal({
       }
       setError(null);
       setCreatedKey(null);
-      setCopied(false);
     }
   }, [open, apiKey]);
 
@@ -137,7 +142,6 @@ export function APIKeyFormModal({
 
     try {
       const token = localStorage.getItem(TOKEN_KEY);
-      const remoteNode = appBarContext.selectedRemoteNode || 'local';
       const url = isEditing
         ? `${config.apiURL}/api-keys/${apiKey.id}?remoteNode=${remoteNode}`
         : `${config.apiURL}/api-keys?remoteNode=${remoteNode}`;
@@ -187,14 +191,6 @@ export function APIKeyFormModal({
     }
   };
 
-  const handleCopy = async () => {
-    if (createdKey) {
-      await navigator.clipboard.writeText(createdKey);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  };
-
   const handleDone = () => {
     setCreatedKey(null);
     onSuccess();
@@ -210,35 +206,75 @@ export function APIKeyFormModal({
     });
   };
 
+  const canSetUpMCP =
+    remoteNode === 'local' &&
+    allowedSurfaces.includes(APIKeyAllowedSurfaces.mcp);
+
   // Show the key after creation
   if (createdKey) {
     return (
       <Dialog open={open} onOpenChange={() => handleDone()}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>API Key Created</DialogTitle>
+            <DialogTitle>
+              <I18nText text={'API Key Created'} />
+            </DialogTitle>
           </DialogHeader>
           <div className="space-y-4">
             <div className="p-3 bg-warning/10 border border-warning/20 rounded-md">
-              <p className="text-sm text-warning-foreground">
-                Copy this key now. You won&apos;t be able to see it again!
+              <p className="text-sm text-foreground">
+                <I18nText
+                  text={"Copy this key now. You won't be able to see it again!"}
+                />
               </p>
             </div>
             <div className="flex items-center gap-2">
               <code className="flex-1 p-2 text-sm bg-muted rounded-md break-all font-mono">
                 {createdKey}
               </code>
-              <Button variant="outline" size="icon" onClick={handleCopy}>
-                {copied ? (
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => void keyCopy.copy(createdKey)}
+              >
+                {keyCopy.copied ? (
                   <Check className="h-4 w-4" />
                 ) : (
                   <Copy className="h-4 w-4" />
                 )}
               </Button>
             </div>
+            {canSetUpMCP && (
+              <Button
+                variant="outline"
+                className="w-full"
+                aria-live="polite"
+                onClick={() =>
+                  void promptCopy.copy(
+                    buildMCPSetupPrompt(
+                      buildMCPServerURL(config.basePath),
+                      createdKey
+                    )
+                  )
+                }
+              >
+                {promptCopy.copied ? (
+                  <Check className="h-4 w-4" />
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
+                {promptCopy.copied ? (
+                  <I18nText text={'Copied'} />
+                ) : (
+                  <I18nText text={'Copy MCP setup prompt'} />
+                )}
+              </Button>
+            )}
           </div>
           <DialogFooter>
-            <Button onClick={handleDone}>Done</Button>
+            <Button onClick={handleDone}>
+              <I18nText text={'Done'} />
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -250,7 +286,11 @@ export function APIKeyFormModal({
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
-            {isEditing ? 'Edit API Key' : 'Create API Key'}
+            {isEditing ? (
+              <I18nText text={'Edit API Key'} />
+            ) : (
+              <I18nText text={'Create API Key'} />
+            )}
           </DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit}>
@@ -262,49 +302,65 @@ export function APIKeyFormModal({
             )}
 
             <div className="space-y-2">
-              <Label htmlFor="name">Name</Label>
-              <Input
-                id="name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="My API Key"
-                required
-              />
+              <Label htmlFor="name">
+                <I18nText text={'Name'} />
+              </Label>
+              <I18nProps>
+                <Input
+                  id="name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="My API Key"
+                  required
+                />
+              </I18nProps>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="description">Description (optional)</Label>
-              <Input
-                id="description"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="Used for CI/CD pipeline"
-              />
+              <Label htmlFor="description">
+                <I18nText text={'Description (optional)'} />
+              </Label>
+              <I18nProps>
+                <Input
+                  id="description"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="Used for CI/CD pipeline"
+                />
+              </I18nProps>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="role">Role</Label>
+              <Label htmlFor="role">
+                <I18nText text={'Role'} />
+              </Label>
               <Select
                 value={workspaceAccess.all ? role : UserRole.viewer}
                 onValueChange={(v) => setRole(v as UserRole)}
                 disabled={!workspaceAccess.all}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select role" />
+                  <I18nProps>
+                    <SelectValue placeholder="Select role" />
+                  </I18nProps>
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="admin">Admin - Full access</SelectItem>
+                  <SelectItem value="admin">
+                    <I18nText text={'Admin - Full access'} />
+                  </SelectItem>
                   <SelectItem value="manager">
-                    Manager - DAG CRUD, execution, and audit logs
+                    <I18nText
+                      text={'Manager - DAG CRUD, execution, and audit logs'}
+                    />
                   </SelectItem>
                   <SelectItem value="developer">
-                    Developer - DAG CRUD and execution
+                    <I18nText text={'Developer - DAG CRUD and execution'} />
                   </SelectItem>
                   <SelectItem value="operator">
-                    Operator - DAG execution only
+                    <I18nText text={'Operator - DAG execution only'} />
                   </SelectItem>
                   <SelectItem value="viewer">
-                    Viewer - Read-only access
+                    <I18nText text={'Viewer - Read-only access'} />
                   </SelectItem>
                 </SelectContent>
               </Select>
@@ -322,7 +378,9 @@ export function APIKeyFormModal({
             />
 
             <div className="space-y-2">
-              <Label>Accepted Surfaces</Label>
+              <Label>
+                <I18nText text={'Accepted Surfaces'} />
+              </Label>
               <div className="grid gap-2 sm:grid-cols-2">
                 <label className="flex items-center gap-2 rounded-md border border-border p-2 text-sm">
                   <Checkbox
@@ -336,7 +394,9 @@ export function APIKeyFormModal({
                       )
                     }
                   />
-                  <span>REST API</span>
+                  <span>
+                    <I18nText text={'REST API'} />
+                  </span>
                 </label>
                 <label className="flex items-center gap-2 rounded-md border border-border p-2 text-sm">
                   <Checkbox
@@ -347,13 +407,17 @@ export function APIKeyFormModal({
                       toggleSurface(APIKeyAllowedSurfaces.mcp, checked === true)
                     }
                   />
-                  <span>MCP</span>
+                  <span>
+                    <I18nText text={'MCP'} />
+                  </span>
                 </label>
               </div>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="attribution">Attribution</Label>
+              <Label htmlFor="attribution">
+                <I18nText text={'Attribution'} />
+              </Label>
               <Select
                 value={attributionClass}
                 onValueChange={(value) =>
@@ -361,14 +425,16 @@ export function APIKeyFormModal({
                 }
               >
                 <SelectTrigger id="attribution">
-                  <SelectValue placeholder="Select attribution" />
+                  <I18nProps>
+                    <SelectValue placeholder="Select attribution" />
+                  </I18nProps>
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={APIKeyAttributionClass.service_account}>
-                    Service account
+                    <I18nText text={'Service account'} />
                   </SelectItem>
                   <SelectItem value={APIKeyAttributionClass.user_owned}>
-                    User owned
+                    <I18nText text={'User owned'} />
                   </SelectItem>
                 </SelectContent>
               </Select>
@@ -376,7 +442,9 @@ export function APIKeyFormModal({
 
             {attributionClass === APIKeyAttributionClass.service_account ? (
               <div className="space-y-2">
-                <Label htmlFor="serviceAccountName">Service Account Name</Label>
+                <Label htmlFor="serviceAccountName">
+                  <I18nText text={'Service Account Name'} />
+                </Label>
                 <Input
                   id="serviceAccountName"
                   value={serviceAccountName}
@@ -386,19 +454,23 @@ export function APIKeyFormModal({
               </div>
             ) : (
               <div className="space-y-2">
-                <Label htmlFor="ownerUserId">Owner User ID</Label>
-                <Input
-                  id="ownerUserId"
-                  value={ownerUserId}
-                  onChange={(e) => setOwnerUserId(e.target.value)}
-                  placeholder="User ID"
-                  required={
-                    attributionClass === APIKeyAttributionClass.user_owned
-                  }
-                />
+                <Label htmlFor="ownerUserId">
+                  <I18nText text={'Owner User ID'} />
+                </Label>
+                <I18nProps>
+                  <Input
+                    id="ownerUserId"
+                    value={ownerUserId}
+                    onChange={(e) => setOwnerUserId(e.target.value)}
+                    placeholder="User ID"
+                    required={
+                      attributionClass === APIKeyAttributionClass.user_owned
+                    }
+                  />
+                </I18nProps>
                 {apiKey?.ownerUsername && (
                   <p className="text-xs text-muted-foreground">
-                    Current owner: {apiKey.ownerUsername}
+                    <I18nText text={'Current owner:'} /> {apiKey.ownerUsername}
                   </p>
                 )}
               </div>
@@ -407,14 +479,16 @@ export function APIKeyFormModal({
 
           <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>
-              Cancel
+              <I18nText text={'Cancel'} />
             </Button>
             <Button type="submit" disabled={isLoading || !name}>
-              {isLoading
-                ? 'Saving...'
-                : isEditing
-                  ? 'Save Changes'
-                  : 'Create Key'}
+              {isLoading ? (
+                <I18nText text={'Saving...'} />
+              ) : isEditing ? (
+                <I18nText text={'Save Changes'} />
+              ) : (
+                <I18nText text={'Create Key'} />
+              )}
             </Button>
           </DialogFooter>
         </form>

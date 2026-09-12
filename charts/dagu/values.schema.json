@@ -1,12 +1,246 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
-  "additionalProperties": true,
+  "additionalProperties": false,
+  "definitions": {
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number"]
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number"]
+          }
+        }
+      }
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "affinity": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "priorityClassName": {
+      "type": "string"
+    },
+    "volumeName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "workspaceGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "not": {
+            "pattern": "^([Aa][Ll][Ll]|[Dd][Ee][Ff][Aa][Uu][Ll][Tt]|[Gg][Ll][Oo][Bb][Aa][Ll])$"
+          }
+        },
+        "role": {
+          "type": "string",
+          "enum": ["manager", "developer", "operator", "viewer"]
+        }
+      },
+      "required": ["workspace", "role"]
+    }
+  },
   "properties": {
+    "nameOverride": {
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^$|^[a-z]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^$|^[a-z]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "deploymentMode": {
+      "type": "string",
+      "enum": ["standalone", "distributed"]
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^$|^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      },
+      "required": ["repository", "tag", "pullPolicy"]
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["name"]
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["create", "name", "annotations"]
+    },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "nodeSelector": {
+      "$ref": "#/definitions/nodeSelector"
+    },
+    "tolerations": {
+      "$ref": "#/definitions/tolerations"
+    },
+    "affinity": {
+      "$ref": "#/definitions/affinity"
+    },
+    "priorityClassName": {
+      "$ref": "#/definitions/priorityClassName"
+    },
+    "extraVolumes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/volumeName"
+              },
+              {
+                "not": {
+                  "enum": ["data", "config"]
+                }
+              }
+            ]
+          }
+        },
+        "required": ["name"]
+      }
+    },
+    "extraVolumeMounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/definitions/volumeName"
+          },
+          "mountPath": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["name", "mountPath"]
+      }
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "config": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
+        "publicUrl": {
+          "type": "string",
+          "anyOf": [
+            {
+              "const": ""
+            },
+            {
+              "format": "uri"
+            }
+          ]
+        },
+        "corsAllowedOrigins": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "ipAccess": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowedIPs": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "trustedProxies": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "required": ["allowedIPs", "trustedProxies"]
+        },
         "envPassthrough": {
           "type": "array",
           "items": {
@@ -19,16 +253,617 @@
             "type": "string"
           }
         }
+      },
+      "required": ["publicUrl", "corsAllowedOrigins", "ipAccess", "envPassthrough", "envPassthroughPrefixes"]
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "retain": {
+          "type": "boolean",
+          "description": "Retain the PVC when the Helm release is uninstalled."
+        },
+        "existingClaim": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "accessMode": {
+          "type": "string",
+          "enum": ["ReadWriteOnce", "ReadWriteMany"]
+        },
+        "size": {
+          "type": "string",
+          "minLength": 1
+        },
+        "storageClass": {
+          "type": "string",
+          "maxLength": 253
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["enabled", "retain", "existingClaim", "accessMode", "size", "storageClass", "annotations"]
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        }
+      },
+      "required": ["replicas", "resources"]
+    },
+    "coordinator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "healthPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        }
+      },
+      "required": ["replicas", "healthPort", "resources"]
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "healthPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "maxActiveRuns": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": ["healthPort", "maxActiveRuns"]
+    },
+    "workerPools": {
+      "type": "object",
+      "propertyNames": {
+        "maxLength": 54,
+        "pattern": "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "replicas": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "labels": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "dataVolume": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "sizeLimit": {
+                "type": "string"
+              }
+            },
+            "required": ["sizeLimit"]
+          },
+          "resources": {
+            "$ref": "#/definitions/resources"
+          },
+          "nodeSelector": {
+            "$ref": "#/definitions/nodeSelector"
+          },
+          "tolerations": {
+            "$ref": "#/definitions/tolerations"
+          },
+          "affinity": {
+            "$ref": "#/definitions/affinity"
+          },
+          "priorityClassName": {
+            "$ref": "#/definitions/priorityClassName"
+          }
+        },
+        "required": ["replicas"]
       }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "containerPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": ["type", "port", "annotations"]
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        }
+      },
+      "required": ["replicas", "containerPort", "service", "resources"]
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "className": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "host": {
+          "type": "string",
+          "anyOf": [
+            {
+              "const": ""
+            },
+            {
+              "format": "hostname"
+            }
+          ]
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "secretName": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            }
+          },
+          "required": ["enabled", "secretName"]
+        }
+      },
+      "required": ["enabled", "className", "annotations", "host", "tls"]
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "description": "Optional license-key Secret; Dagu also supports license env/file and persisted activation sources.",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "secretKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[-._a-zA-Z0-9]+$"
+        }
+      },
+      "required": ["existingSecret", "secretKey"]
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["none", "basic", "builtin"]
+        },
+        "basic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            },
+            "usernameKey": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[-._a-zA-Z0-9]+$"
+            },
+            "passwordKey": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[-._a-zA-Z0-9]+$"
+            }
+          },
+          "required": ["existingSecret", "usernameKey", "passwordKey"]
+        },
+        "builtin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "token": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "secret": {
+                  "type": "string"
+                },
+                "ttl": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": ["secret", "ttl"]
+            }
+          },
+          "required": ["token"]
+        },
+        "oidc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enables chart-managed OIDC configuration. Runtime requires an active license from any Dagu-supported source."
+            },
+            "clientId": {
+              "type": "string"
+            },
+            "clientUrl": {
+              "type": "string",
+              "anyOf": [
+                {
+                  "const": ""
+                },
+                {
+                  "format": "uri"
+                }
+              ]
+            },
+            "issuer": {
+              "type": "string",
+              "anyOf": [
+                {
+                  "const": ""
+                },
+                {
+                  "format": "uri"
+                }
+              ]
+            },
+            "scopes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "whitelist": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "format": "email"
+              }
+            },
+            "autoSignup": {
+              "type": "boolean"
+            },
+            "allowedDomains": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "buttonLabel": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "clientSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                },
+                "secretKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253,
+                  "pattern": "^[-._a-zA-Z0-9]+$"
+                }
+              },
+              "required": ["existingSecret", "secretKey"]
+            },
+            "roleMapping": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "defaultRole": {
+                  "type": "string",
+                  "enum": ["admin", "manager", "developer", "operator", "viewer"]
+                },
+                "groupsClaim": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "groupMappings": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string",
+                    "enum": ["admin", "manager", "developer", "operator", "viewer"]
+                  }
+                },
+                "workspaceMappings": {
+                  "type": "object",
+                  "propertyNames": {
+                    "pattern": ".*\\S.*"
+                  },
+                  "additionalProperties": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/definitions/workspaceGrant"
+                    }
+                  }
+                },
+                "defaultWorkspaceAccess": {
+                  "type": "string",
+                  "enum": ["all", "none"]
+                },
+                "roleAttributePath": {
+                  "type": "string"
+                },
+                "roleAttributeStrict": {
+                  "type": "boolean"
+                },
+                "skipOrgRoleSync": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "defaultRole",
+                "groupsClaim",
+                "groupMappings",
+                "workspaceMappings",
+                "defaultWorkspaceAccess",
+                "roleAttributePath",
+                "roleAttributeStrict",
+                "skipOrgRoleSync"
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "allOf": [
+                  {
+                    "properties": {
+                      "enabled": {
+                        "const": true
+                      }
+                    },
+                    "required": ["enabled"]
+                  },
+                  {
+                    "anyOf": [
+                      {
+                        "properties": {
+                          "whitelist": {
+                            "minItems": 1
+                          }
+                        },
+                        "required": ["whitelist"]
+                      },
+                      {
+                        "properties": {
+                          "allowedDomains": {
+                            "minItems": 1
+                          }
+                        },
+                        "required": ["allowedDomains"]
+                      }
+                    ]
+                  }
+                ]
+              },
+              "then": {
+                "properties": {
+                  "scopes": {
+                    "contains": {
+                      "const": "email"
+                    }
+                  }
+                },
+                "required": ["scopes"]
+              }
+            }
+          ],
+          "required": [
+            "enabled",
+            "clientId",
+            "clientUrl",
+            "issuer",
+            "scopes",
+            "whitelist",
+            "autoSignup",
+            "allowedDomains",
+            "buttonLabel",
+            "clientSecret",
+            "roleMapping"
+          ]
+        },
+        "proxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "source": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "buttonLabel": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "user": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+                  "not": {
+                    "pattern": "^([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Hh][Oo][Ss][Tt])$"
+                  }
+                },
+                "groups": {
+                  "type": "string",
+                  "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]*$",
+                  "not": {
+                    "pattern": "^([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Hh][Oo][Ss][Tt])$"
+                  }
+                }
+              },
+              "required": ["user", "groups"]
+            },
+            "autoSignup": {
+              "type": "boolean"
+            },
+            "roleMapping": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "defaultRole": {
+                  "type": "string",
+                  "enum": ["admin", "manager", "developer", "operator", "viewer"]
+                },
+                "defaultWorkspaceAccess": {
+                  "type": "string",
+                  "enum": ["all", "none"]
+                },
+                "requireMapping": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "skipOrgRoleSync": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "groupMappings": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string",
+                    "enum": ["admin", "manager", "developer", "operator", "viewer"]
+                  }
+                },
+                "workspaceMappings": {
+                  "type": "object",
+                  "propertyNames": {
+                    "pattern": ".*\\S.*"
+                  },
+                  "additionalProperties": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/definitions/workspaceGrant"
+                    }
+                  }
+                }
+              },
+              "required": [
+                "defaultRole",
+                "defaultWorkspaceAccess",
+                "requireMapping",
+                "skipOrgRoleSync",
+                "groupMappings",
+                "workspaceMappings"
+              ]
+            }
+          },
+          "required": [
+            "enabled",
+            "buttonLabel",
+            "headers",
+            "autoSignup",
+            "roleMapping"
+          ]
+        },
+        "trustedProxy": false,
+        "trusted_proxy": false
+      },
+      "required": ["mode", "basic", "builtin", "oidc", "proxy"]
     },
     "extraEnv": {
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "properties": {
           "name": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "value": {
             "type": "string"
@@ -41,6 +876,258 @@
           "name"
         ]
       }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          },
+          "required": ["repository", "tag", "pullPolicy"]
+        }
+      },
+      "required": ["image"]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "mode": {
+                "const": "basic"
+              }
+            },
+            "required": ["mode"]
+          }
+        },
+        "required": ["auth"]
+      },
+      "then": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "basic": {
+                "properties": {
+                  "existingSecret": {
+                    "minLength": 1
+                  },
+                  "usernameKey": {
+                    "minLength": 1
+                  },
+                  "passwordKey": {
+                    "minLength": 1
+                  }
+                },
+                "required": ["existingSecret", "usernameKey", "passwordKey"]
+              }
+            },
+            "required": ["basic"]
+          }
+        },
+        "required": ["auth"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ingress": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": ["enabled"]
+          }
+        },
+        "required": ["ingress"]
+      },
+      "then": {
+        "properties": {
+          "ingress": {
+            "properties": {
+              "host": {
+                "minLength": 1
+              }
+            },
+            "required": ["host"]
+          }
+        },
+        "required": ["ingress"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deploymentMode": {
+            "const": "standalone"
+          }
+        },
+        "required": ["deploymentMode"]
+      },
+      "then": {
+        "properties": {
+          "ui": {
+            "properties": {
+              "replicas": {
+                "const": 1
+              }
+            },
+            "required": ["replicas"]
+          }
+        },
+        "required": ["ui"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deploymentMode": {
+            "const": "distributed"
+          }
+        },
+        "required": ["deploymentMode"]
+      },
+      "then": {
+        "properties": {
+          "persistence": {
+            "properties": {
+              "accessMode": {
+                "const": "ReadWriteMany"
+              }
+            },
+            "required": ["accessMode"]
+          }
+        },
+        "required": ["persistence"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "oidc": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": ["enabled"]
+              }
+            },
+            "required": ["oidc"]
+          }
+        },
+        "required": ["auth"]
+      },
+      "then": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "mode": {
+                "const": "builtin"
+              },
+              "oidc": {
+                "properties": {
+                  "clientId": {
+                    "minLength": 1
+                  },
+                  "clientUrl": {
+                    "minLength": 1
+                  },
+                  "issuer": {
+                    "minLength": 1
+                  },
+                  "clientSecret": {
+                    "properties": {
+                      "existingSecret": {
+                        "minLength": 1
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "required": ["mode", "oidc"]
+          }
+        },
+        "required": ["auth"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "proxy": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": ["enabled"]
+              }
+            },
+            "required": ["proxy"]
+          }
+        },
+        "required": ["auth"]
+      },
+      "then": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "mode": {
+                "const": "builtin"
+              }
+            },
+            "required": ["mode"]
+          },
+          "ui": {
+            "properties": {
+              "replicas": {
+                "const": 1
+              },
+              "service": {
+                "properties": {
+                  "type": {
+                    "const": "ClusterIP"
+                  }
+                },
+                "required": ["type"]
+              }
+            },
+            "required": ["replicas", "service"]
+          },
+          "ingress": {
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            },
+            "required": ["enabled"]
+          }
+        },
+        "required": ["auth", "ui", "ingress"]
+      }
+    }
+  ]
 }

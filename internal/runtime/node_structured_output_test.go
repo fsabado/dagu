@@ -11,16 +11,16 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func structuredOutputTestContext(t *testing.T, dag *core.DAG, workDir string, envs ...string) context.Context {
+func structuredOutputTestContext(t *testing.T, dag *ir.DAG, workDir string, envs ...string) context.Context {
 	t.Helper()
 
 	if dag == nil {
-		dag = &core.DAG{Name: "structured-output-test"}
+		dag = &ir.DAG{Name: "structured-output-test"}
 	}
 
 	opts := []ContextOption{WithWorkDir(workDir)}
@@ -38,15 +38,15 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		dag     *core.DAG
-		entry   core.StepOutputEntry
+		dag     *ir.DAG
+		entry   ir.StepOutputEntry
 		prepare func(*testing.T, string, *Node)
 		want    any
 		wantErr string
 	}{
 		{
 			name: "LiteralValuePreservesShellSyntax",
-			entry: core.StepOutputEntry{
+			entry: ir.StepOutputEntry{
 				HasValue: true,
 				Value:    "`date +%Y` $HOME " + releaseRef,
 			},
@@ -54,7 +54,7 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "LiteralTypedMapRecurses",
-			entry: core.StepOutputEntry{
+			entry: ir.StepOutputEntry{
 				HasValue: true,
 				Value: map[string]string{
 					"version": releaseRef,
@@ -66,7 +66,7 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "LiteralTypedSliceRecurses",
-			entry: core.StepOutputEntry{
+			entry: ir.StepOutputEntry{
 				HasValue: true,
 				Value:    []string{releaseRef, "stable"},
 			},
@@ -74,7 +74,7 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "LiteralPointerRecurses",
-			entry: core.StepOutputEntry{
+			entry: ir.StepOutputEntry{
 				HasValue: true,
 				Value:    &releaseRef,
 			},
@@ -82,9 +82,9 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "JSONDecodeFailure",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStdout,
-				Decode: core.StepOutputDecodeJSON,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStdout,
+				Decode: ir.StepOutputDecodeJSON,
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
 				node.outputs.outputCaptured = true
@@ -94,15 +94,15 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "StdoutWithoutCaptureReturnsEmpty",
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceStdout,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceStdout,
 			},
 			want: "",
 		},
 		{
 			name: "TextFromStdoutIsTrimmed",
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceStdout,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceStdout,
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
 				node.outputs.outputCaptured = true
@@ -112,9 +112,9 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "JSONWithoutSelectReturnsObject",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStdout,
-				Decode: core.StepOutputDecodeJSON,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStdout,
+				Decode: ir.StepOutputDecodeJSON,
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
 				node.outputs.outputCaptured = true
@@ -126,9 +126,9 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "YAMLDecodeFailure",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStdout,
-				Decode: core.StepOutputDecodeYAML,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStdout,
+				Decode: ir.StepOutputDecodeYAML,
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
 				node.outputs.outputCaptured = true
@@ -138,9 +138,9 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "YAMLWithoutSelectReturnsObject",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStdout,
-				Decode: core.StepOutputDecodeYAML,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStdout,
+				Decode: ir.StepOutputDecodeYAML,
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
 				node.outputs.outputCaptured = true
@@ -154,9 +154,9 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "YAMLSelectSuccess",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStdout,
-				Decode: core.StepOutputDecodeYAML,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStdout,
+				Decode: ir.StepOutputDecodeYAML,
 				Select: ".artifact.path",
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
@@ -167,9 +167,9 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "SelectFailure",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStdout,
-				Decode: core.StepOutputDecodeJSON,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStdout,
+				Decode: ir.StepOutputDecodeJSON,
 				Select: ".artifact[",
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
@@ -180,8 +180,8 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "TextFromStderrIsTrimmed",
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceStderr,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceStderr,
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
 				node.outputs.stderrOutputCaptured = true
@@ -191,16 +191,16 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "StderrWithoutCaptureReturnsEmpty",
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceStderr,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceStderr,
 			},
 			want: "",
 		},
 		{
 			name: "JSONFromStderrSelectSuccess",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStderr,
-				Decode: core.StepOutputDecodeJSON,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStderr,
+				Decode: ir.StepOutputDecodeJSON,
 				Select: ".warning",
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
@@ -211,8 +211,8 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "UnsupportedDecode",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceStdout,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceStdout,
 				Decode: "xml",
 			},
 			prepare: func(_ *testing.T, _ string, node *Node) {
@@ -223,10 +223,10 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "FileSourceSuccess",
-			entry: core.StepOutputEntry{
-				From:   core.StepOutputSourceFile,
+			entry: ir.StepOutputEntry{
+				From:   ir.StepOutputSourceFile,
 				Path:   "meta.json",
-				Decode: core.StepOutputDecodeJSON,
+				Decode: ir.StepOutputDecodeJSON,
 				Select: ".artifact.path",
 			},
 			prepare: func(t *testing.T, workDir string, _ *Node) {
@@ -237,8 +237,8 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "FileSourceTextTrimmed",
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceFile,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceFile,
 				Path: "meta.txt",
 			},
 			prepare: func(t *testing.T, workDir string, _ *Node) {
@@ -249,16 +249,16 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "FileSourceMissing",
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceFile,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceFile,
 				Path: "missing.json",
 			},
 			wantErr: `result: failed to read file`,
 		},
 		{
 			name: "FileSourceReadError",
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceFile,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceFile,
 				Path: "meta.json",
 			},
 			prepare: func(t *testing.T, workDir string, _ *Node) {
@@ -269,12 +269,12 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "FileSourceAtLimit",
-			dag: &core.DAG{
+			dag: &ir.DAG{
 				Name:          "structured-output-test",
 				MaxOutputSize: 8,
 			},
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceFile,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceFile,
 				Path: "meta.txt",
 			},
 			prepare: func(t *testing.T, workDir string, _ *Node) {
@@ -285,12 +285,12 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "FileSourceTooLarge",
-			dag: &core.DAG{
+			dag: &ir.DAG{
 				Name:          "structured-output-test",
 				MaxOutputSize: 8,
 			},
-			entry: core.StepOutputEntry{
-				From: core.StepOutputSourceFile,
+			entry: ir.StepOutputEntry{
+				From: ir.StepOutputSourceFile,
 				Path: "meta.json",
 			},
 			prepare: func(t *testing.T, workDir string, _ *Node) {
@@ -301,7 +301,7 @@ func TestNodeResolveStructuredOutputEntry(t *testing.T) {
 		},
 		{
 			name: "UnsupportedSource",
-			entry: core.StepOutputEntry{
+			entry: ir.StepOutputEntry{
 				From: "network",
 			},
 			wantErr: `result: unsupported output source "network"`,
@@ -420,7 +420,7 @@ func TestNodeCaptureOutputSchema(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{OutputSchema: validSchema},
+			Step: ir.Step{OutputSchema: validSchema},
 		})
 		node.outputs.outputCaptured = true
 		node.outputs.outputData = `{"category":"bug","confidence":0.9}`
@@ -437,7 +437,7 @@ func TestNodeCaptureOutputSchema(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{OutputSchema: validSchema},
+			Step: ir.Step{OutputSchema: validSchema},
 		})
 		node.outputs.outputCaptured = true
 		node.outputs.outputData = `not-json secret-value`
@@ -454,7 +454,7 @@ func TestNodeCaptureOutputSchema(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{OutputSchema: validSchema},
+			Step: ir.Step{OutputSchema: validSchema},
 		})
 		node.outputs.outputCaptured = true
 		node.outputs.outputData = "  \n\t  "
@@ -470,7 +470,7 @@ func TestNodeCaptureOutputSchema(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{OutputSchema: validSchema},
+			Step: ir.Step{OutputSchema: validSchema},
 		})
 		node.outputs.outputCaptured = true
 		node.outputs.outputData = `{"category":"leak-sentinel-bug","confidence":2}`
@@ -487,7 +487,7 @@ func TestNodeCaptureOutputSchema(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{OutputSchema: validSchema},
+			Step: ir.Step{OutputSchema: validSchema},
 		})
 		node.outputs.outputCaptured = true
 		node.outputs.outputData = `not-json`
@@ -504,12 +504,12 @@ func TestNodeCaptureOutputSchema(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{
+			Step: ir.Step{
 				OutputSchema: validSchema,
-				StructuredOutput: map[string]core.StepOutputEntry{
+				StructuredOutput: map[string]ir.StepOutputEntry{
 					"category": {
-						From:   core.StepOutputSourceStdout,
-						Decode: core.StepOutputDecodeJSON,
+						From:   ir.StepOutputSourceStdout,
+						Decode: ir.StepOutputDecodeJSON,
 						Select: ".category",
 					},
 				},
@@ -530,7 +530,7 @@ func TestNodeCaptureOutputSchema(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{
+			Step: ir.Step{
 				Output:       "CLASSIFY_RAW",
 				OutputSchema: validSchema,
 			},
@@ -555,8 +555,8 @@ func TestNodeCaptureStdoutOutputs(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{
-				StdoutOutputs: &core.StepOutputsConfig{Field: "messageId"},
+			Step: ir.Step{
+				StdoutOutputs: &ir.StepOutputsConfig{Field: "messageId"},
 			},
 		})
 		node.outputs.outputCaptured = true
@@ -574,8 +574,8 @@ func TestNodeCaptureStdoutOutputs(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{
-				StdoutOutputs: &core.StepOutputsConfig{Decode: core.StepOutputDecodeJSON},
+			Step: ir.Step{
+				StdoutOutputs: &ir.StepOutputsConfig{Decode: ir.StepOutputDecodeJSON},
 			},
 		})
 		node.outputs.outputCaptured = true
@@ -593,12 +593,12 @@ func TestNodeCaptureStdoutOutputs(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{
-				StdoutOutputs: &core.StepOutputsConfig{
-					Fields: map[string]core.StepOutputEntry{
+			Step: ir.Step{
+				StdoutOutputs: &ir.StepOutputsConfig{
+					Fields: map[string]ir.StepOutputEntry{
 						"messageId": {
-							From:   core.StepOutputSourceStdout,
-							Decode: core.StepOutputDecodeJSON,
+							From:   ir.StepOutputSourceStdout,
+							Decode: ir.StepOutputDecodeJSON,
 							Select: ".id",
 						},
 						"status": {
@@ -628,8 +628,8 @@ func TestNodeEvaluateStructuredOutput(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir, "CHANNEL=stable")
 		node := NodeWithData(NodeData{
-			Step: core.Step{
-				StructuredOutput: map[string]core.StepOutputEntry{
+			Step: ir.Step{
+				StructuredOutput: map[string]ir.StepOutputEntry{
 					"version": {
 						HasValue: true,
 						Value:    "v1.2.3",
@@ -654,13 +654,13 @@ func TestNodeEvaluateStructuredOutput(t *testing.T) {
 		t.Parallel()
 
 		workDir := t.TempDir()
-		ctx := structuredOutputTestContext(t, &core.DAG{
+		ctx := structuredOutputTestContext(t, &ir.DAG{
 			Name:          "structured-output-test",
 			MaxOutputSize: 32,
 		}, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{
-				StructuredOutput: map[string]core.StepOutputEntry{
+			Step: ir.Step{
+				StructuredOutput: map[string]ir.StepOutputEntry{
 					"payload": {
 						HasValue: true,
 						Value:    strings.Repeat("x", 64),
@@ -680,8 +680,8 @@ func TestNodeEvaluateStructuredOutput(t *testing.T) {
 		workDir := t.TempDir()
 		ctx := structuredOutputTestContext(t, nil, workDir)
 		node := NodeWithData(NodeData{
-			Step: core.Step{
-				StructuredOutput: map[string]core.StepOutputEntry{
+			Step: ir.Step{
+				StructuredOutput: map[string]ir.StepOutputEntry{
 					"payload": {
 						From: "network",
 					},
@@ -693,4 +693,124 @@ func TestNodeEvaluateStructuredOutput(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), `payload: unsupported output source "network"`)
 	})
+}
+
+// Capture-published outputs must reach the strict ${steps.<id>.outputs.<name>}
+// channel, which reads StepOutputsValue, not just the legacy output channels.
+func TestNodeCaptureOutputPublishesStrictStepOutputs(t *testing.T) {
+	t.Parallel()
+
+	schema := map[string]any{
+		"type":     "object",
+		"required": []any{"value"},
+		"properties": map[string]any{
+			"value": map[string]any{"type": "string"},
+		},
+	}
+
+	cases := []struct {
+		name   string
+		step   ir.Step
+		stdout string
+	}{
+		{
+			name:   "OutputSchema",
+			step:   ir.Step{OutputSchema: schema},
+			stdout: `{"value":"hello"}`,
+		},
+		{
+			name: "StructuredOutput",
+			step: ir.Step{StructuredOutput: map[string]ir.StepOutputEntry{
+				"value": {From: ir.StepOutputSourceStdout, Decode: ir.StepOutputDecodeJSON, Select: ".value"},
+			}},
+			stdout: `{"value":"hello"}`,
+		},
+		{
+			name: "StdoutOutputs",
+			step: ir.Step{StdoutOutputs: &ir.StepOutputsConfig{
+				Fields: map[string]ir.StepOutputEntry{
+					"value": {From: ir.StepOutputSourceStdout, Decode: ir.StepOutputDecodeJSON, Select: ".value"},
+				},
+			}},
+			stdout: `{"value":"hello"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			workDir := t.TempDir()
+			ctx := structuredOutputTestContext(t, nil, workDir)
+			node := NodeWithData(NodeData{Step: tc.step})
+			node.outputs.outputCaptured = true
+			node.outputs.outputData = tc.stdout
+
+			require.NoError(t, node.captureOutput(ctx))
+			state := node.State()
+			require.NotNil(t, state.StepOutputsValue)
+			assert.JSONEq(t, `{"value":"hello"}`, *state.StepOutputsValue)
+		})
+	}
+}
+
+// A name already published by the step's own output contract keeps its value,
+// so the contract derived at build time and the run agree on where it came from.
+func TestNodeCaptureOutputKeepsPublishedStepOutputs(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	ctx := structuredOutputTestContext(t, nil, workDir)
+	node := NodeWithData(NodeData{
+		Step: ir.Step{
+			Outputs: []ir.StepOutputDeclaration{{Name: "value"}},
+			OutputSchema: map[string]any{
+				"type":       "object",
+				"required":   []any{"value", "extra"},
+				"properties": map[string]any{"value": map[string]any{"type": "string"}, "extra": map[string]any{"type": "string"}},
+			},
+		},
+	})
+	node.setStepOutputsValue(`{"value":"from-output-file"}`)
+	node.outputs.outputCaptured = true
+	node.outputs.outputData = `{"value":"from-stdout","extra":"captured"}`
+
+	require.NoError(t, node.captureOutput(ctx))
+	state := node.State()
+	require.NotNil(t, state.StepOutputsValue)
+	assert.JSONEq(t, `{"value":"from-output-file","extra":"captured"}`, *state.StepOutputsValue)
+}
+
+// An unconstrained output schema accepts any JSON. A payload that is not an
+// object carries no addressable names, so the step still succeeds.
+func TestNodeCaptureOutputAcceptsNonObjectSchemaOutput(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	ctx := structuredOutputTestContext(t, nil, workDir)
+	node := NodeWithData(NodeData{Step: ir.Step{OutputSchema: map[string]any{}}})
+	node.outputs.outputCaptured = true
+	node.outputs.outputData = `[1,2,3]`
+
+	require.NoError(t, node.captureOutput(ctx))
+	state := node.State()
+	require.NotNil(t, state.OutputValue)
+	assert.JSONEq(t, `[1,2,3]`, *state.OutputValue)
+	assert.Nil(t, state.StepOutputsValue)
+}
+
+// A published output may be typed, so rendering the map must not drop entries
+// the way a string-only decode would.
+func TestStepOutputsValueMapRendersTypedValues(t *testing.T) {
+	t.Parallel()
+
+	value := `{"name":"api","count":3,"ready":true,"meta":{"tag":"v1"}}`
+	data := NodeData{State: NodeState{StepOutputsValue: &value}}
+
+	assert.Equal(t, map[string]string{
+		"name":  "api",
+		"count": "3",
+		"ready": "true",
+		"meta":  `{"tag":"v1"}`,
+	}, data.StepOutputsValueMap())
 }

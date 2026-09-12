@@ -7,8 +7,28 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/mailer/oauthconfig"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestMailerConfigFromSMTP(t *testing.T) {
+	t.Parallel()
+
+	config, err := mailerConfigFromSMTP(&ir.SMTPConfig{
+		Username: "sender@example.com",
+		OAuth: &oauthconfig.Config{
+			Provider: oauthconfig.ProviderMicrosoft, TenantID: "tenant",
+			ClientID: "client", ClientSecret: "secret",
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "smtp.office365.com", config.Host)
+	assert.Equal(t, "587", config.Port)
+	assert.Equal(t, "sender@example.com", config.Username)
+	assert.NotNil(t, config.Token)
+}
 
 func TestErrorString(t *testing.T) {
 	t.Parallel()

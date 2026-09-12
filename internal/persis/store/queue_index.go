@@ -11,8 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 )
 
 const queueIndexVersion = 1
@@ -27,10 +28,6 @@ type queueReadIndex struct {
 type queueReadIndexCache struct {
 	index         *queueReadIndex
 	recordVersion string
-}
-
-type recordVersionCollection interface {
-	RecordVersion(ctx context.Context, id string) (string, error)
 }
 
 func newQueueReadIndex() *queueReadIndex {
@@ -74,17 +71,17 @@ func (idx *queueReadIndex) touch() {
 	idx.Revision = now
 }
 
-func (idx *queueReadIndex) append(priority exec.QueuePriority, itemID string) bool {
+func (idx *queueReadIndex) append(priority queue.QueuePriority, itemID string) bool {
 	itemID = normalizeQueueItemID(itemID)
 	if itemID == "" || idx.findItemOffset(itemID) >= 0 {
 		return false
 	}
 	entry := queueIndexEntryName(itemID)
 	switch priority {
-	case exec.QueuePriorityHigh:
+	case queue.QueuePriorityHigh:
 		idx.High = append(idx.High, entry)
 		sort.Strings(idx.High)
-	case exec.QueuePriorityLow:
+	case queue.QueuePriorityLow:
 		idx.Low = append(idx.Low, entry)
 		sort.Strings(idx.Low)
 	default:
@@ -125,11 +122,11 @@ func (idx *queueReadIndex) itemIDAt(offset int) (string, bool) {
 
 func (idx *queueReadIndex) resolveStart(cursor queueReadCursor) (int, error) {
 	if cursor.Offset < 0 {
-		return 0, exec.ErrInvalidCursor
+		return 0, pagination.ErrInvalidCursor
 	}
 	if cursor.AfterItemID == "" {
 		if cursor.Offset != 0 {
-			return 0, exec.ErrInvalidCursor
+			return 0, pagination.ErrInvalidCursor
 		}
 		return 0, nil
 	}
@@ -142,7 +139,7 @@ func (idx *queueReadIndex) resolveStart(cursor queueReadCursor) (int, error) {
 	if offset := idx.findItemOffset(cursor.AfterItemID); offset >= 0 {
 		return offset + 1, nil
 	}
-	return 0, exec.ErrInvalidCursor
+	return 0, pagination.ErrInvalidCursor
 }
 
 func (idx *queueReadIndex) slice(start, limit int) []string {
@@ -229,12 +226,12 @@ func queueIndexRecordID(name string) string {
 	return queuePrefix(name) + ".queue-index"
 }
 
-func queuePriorityFromItemID(itemID string) exec.QueuePriority {
+func queuePriorityFromItemID(itemID string) queue.QueuePriority {
 	itemID = normalizeQueueItemID(itemID)
 	if strings.HasPrefix(itemID, "item_high_") {
-		return exec.QueuePriorityHigh
+		return queue.QueuePriorityHigh
 	}
-	return exec.QueuePriorityLow
+	return queue.QueuePriorityLow
 }
 
 func (s *QueueStore) loadOrRebuildQueueIndexLocked(ctx context.Context, name string) (*queueReadIndex, error) {
@@ -254,19 +251,41 @@ func (s *QueueStore) loadOrRebuildQueueIndexLocked(ctx context.Context, name str
 		return nil, err
 	}
 
-	var loaded queueReadIndex
-	if err := persis.Decode(rec, &loaded); err != nil {
+	loaded, ok := queueIndexFromRecord(rec)
+	if !ok {
 		return s.rebuildQueueIndexLocked(ctx, name)
 	}
-	if loaded.Version != queueIndexVersion {
-		return s.rebuildQueueIndexLocked(ctx, name)
-	}
-	loaded.ensureDefaults()
-	s.cacheQueueIndexLocked(ctx, name, &loaded)
-	return &loaded, nil
+	s.cacheQueueIndexLocked(ctx, name, loaded)
+	return loaded, nil
 }
 
 func (s *QueueStore) rebuildQueueIndexLocked(ctx context.Context, name string) (*queueReadIndex, error) {
+	var rebuilt *queueReadIndex
+	err := retryConflict(ctx, func(ctx context.Context) error {
+		current, err := s.col.Get(ctx, queueIndexRecordID(name))
+		if errors.Is(err, persis.ErrNotFound) {
+			current = nil
+		} else if errors.Is(err, persis.ErrCorrupt) {
+			_, retryErr := removeCorruptRecordForRetry(ctx, s.col, queueIndexRecordID(name), err)
+			return retryErr
+		} else if err != nil {
+			return err
+		}
+
+		idx, err := s.buildQueueIndexLocked(ctx, name)
+		if err != nil {
+			return err
+		}
+		if err := s.saveQueueIndexLocked(ctx, name, current, idx); err != nil {
+			return err
+		}
+		rebuilt = idx
+		return nil
+	})
+	return rebuilt, err
+}
+
+func (s *QueueStore) buildQueueIndexLocked(ctx context.Context, name string) (*queueReadIndex, error) {
 	ids, err := s.queueRecordIDs(ctx, queueItemPrefix(name))
 	if err != nil {
 		return nil, err
@@ -281,14 +300,15 @@ func (s *QueueStore) rebuildQueueIndexLocked(ctx context.Context, name string) (
 		idx.append(queuePriorityFromItemID(itemID), itemID)
 	}
 	idx.touch()
-
-	if err := s.saveQueueIndexLocked(ctx, name, idx); err != nil {
-		return nil, err
-	}
 	return idx, nil
 }
 
-func (s *QueueStore) saveQueueIndexLocked(ctx context.Context, name string, idx *queueReadIndex) error {
+func (s *QueueStore) saveQueueIndexLocked(
+	ctx context.Context,
+	name string,
+	current *persis.Record,
+	idx *queueReadIndex,
+) error {
 	if idx == nil {
 		return nil
 	}
@@ -296,7 +316,14 @@ func (s *QueueStore) saveQueueIndexLocked(ctx context.Context, name string, idx 
 	recordID := queueIndexRecordID(name)
 	if idx.total() == 0 {
 		delete(s.indices, name)
-		return s.col.Delete(ctx, recordID)
+		if current == nil {
+			return nil
+		}
+		err := s.col.CompareAndDelete(ctx, current)
+		if errors.Is(err, persis.ErrNotFound) {
+			return nil
+		}
+		return err
 	}
 
 	idx.ensureDefaults()
@@ -305,10 +332,14 @@ func (s *QueueStore) saveQueueIndexLocked(ctx context.Context, name string, idx 
 		return fmt.Errorf("queue store: encode index: %w", err)
 	}
 	now := time.Now().UTC()
-	if err := s.col.Put(ctx, &persis.Record{
+	createdAt := now
+	if current != nil {
+		createdAt = current.CreatedAt
+	}
+	if err := createOrSwap(ctx, s.col, current, &persis.Record{
 		ID:        recordID,
 		Data:      data,
-		CreatedAt: now,
+		CreatedAt: createdAt,
 		UpdatedAt: now,
 	}); err != nil {
 		return err
@@ -319,7 +350,15 @@ func (s *QueueStore) saveQueueIndexLocked(ctx context.Context, name string, idx 
 
 func (s *QueueStore) invalidateQueueIndexLocked(ctx context.Context, name string) {
 	delete(s.indices, name)
-	_ = s.col.Delete(ctx, queueIndexRecordID(name))
+	recordID := queueIndexRecordID(name)
+	rec, err := s.col.Get(ctx, recordID)
+	if err == nil {
+		_ = s.col.CompareAndDelete(ctx, rec)
+		return
+	}
+	if errors.Is(err, persis.ErrCorrupt) {
+		_, _ = removeCorruptRecord(ctx, s.col, recordID, time.Time{})
+	}
 }
 
 func (s *QueueStore) cachedQueueIndexLocked(ctx context.Context, name string) (*queueReadIndex, bool, error) {
@@ -358,24 +397,13 @@ func (s *QueueStore) cacheQueueIndexLocked(ctx context.Context, name string, idx
 }
 
 func (s *QueueStore) queueIndexRecordVersion(ctx context.Context, name string) (string, bool, error) {
-	col, ok := s.col.(recordVersionCollection)
-	if !ok {
-		return "", false, nil
-	}
-	version, err := col.RecordVersion(ctx, queueIndexRecordID(name))
-	return version, true, err
+	return collectionRecordVersion(ctx, s.col, queueIndexRecordID(name))
 }
 
-func (s *QueueStore) addQueueIndexItemLocked(ctx context.Context, name string, priority exec.QueuePriority, itemID string) {
-	idx, err := s.loadOrRebuildQueueIndexLocked(ctx, name)
-	if err != nil {
-		s.invalidateQueueIndexLocked(ctx, name)
-		return
-	}
-	if !idx.append(priority, itemID) {
-		return
-	}
-	if err := s.saveQueueIndexLocked(ctx, name, idx); err != nil {
+func (s *QueueStore) addQueueIndexItemLocked(ctx context.Context, name string, priority queue.QueuePriority, itemID string) {
+	if err := s.mutateQueueIndexLocked(ctx, name, func(idx *queueReadIndex) bool {
+		return idx.append(priority, itemID)
+	}); err != nil {
 		s.invalidateQueueIndexLocked(ctx, name)
 	}
 }
@@ -384,47 +412,85 @@ func (s *QueueStore) removeQueueIndexItemsLocked(ctx context.Context, name strin
 	if len(itemIDs) == 0 {
 		return
 	}
-	idx, err := s.loadOrRebuildQueueIndexLocked(ctx, name)
-	if err != nil {
-		s.invalidateQueueIndexLocked(ctx, name)
-		return
-	}
-
-	changed := false
-	for _, itemID := range itemIDs {
-		if idx.removeItemID(itemID) {
-			changed = true
+	if err := s.mutateQueueIndexLocked(ctx, name, func(idx *queueReadIndex) bool {
+		changed := false
+		for _, itemID := range itemIDs {
+			if idx.removeItemID(itemID) {
+				changed = true
+			}
 		}
-	}
-	if !changed {
-		return
-	}
-	if err := s.saveQueueIndexLocked(ctx, name, idx); err != nil {
+		return changed
+	}); err != nil {
 		s.invalidateQueueIndexLocked(ctx, name)
 	}
 }
 
-func (s *QueueStore) listCursorLocked(ctx context.Context, name string, cursor queueReadCursor, limit int) (exec.CursorResult[exec.QueuedItemData], error) {
+func (s *QueueStore) mutateQueueIndexLocked(
+	ctx context.Context,
+	name string,
+	mutate func(*queueReadIndex) bool,
+) error {
+	return retryConflict(ctx, func(ctx context.Context) error {
+		current, err := s.col.Get(ctx, queueIndexRecordID(name))
+		missing := errors.Is(err, persis.ErrNotFound)
+		if missing {
+			current = nil
+		} else if errors.Is(err, persis.ErrCorrupt) {
+			_, retryErr := removeCorruptRecordForRetry(ctx, s.col, queueIndexRecordID(name), err)
+			return retryErr
+		} else if err != nil {
+			return err
+		}
+
+		idx, valid := queueIndexFromRecord(current)
+		if !valid {
+			idx, err = s.buildQueueIndexLocked(ctx, name)
+			if err != nil {
+				return err
+			}
+		}
+		changed := mutate(idx)
+		if !missing && valid && !changed {
+			s.cacheQueueIndexLocked(ctx, name, idx)
+			return nil
+		}
+		return s.saveQueueIndexLocked(ctx, name, current, idx)
+	})
+}
+
+func queueIndexFromRecord(rec *persis.Record) (*queueReadIndex, bool) {
+	if rec == nil {
+		return nil, false
+	}
+	var idx queueReadIndex
+	if err := persis.Decode(rec, &idx); err != nil || idx.Version != queueIndexVersion {
+		return nil, false
+	}
+	idx.ensureDefaults()
+	return &idx, true
+}
+
+func (s *QueueStore) listCursorLocked(ctx context.Context, name string, cursor queueReadCursor, limit int) (pagination.CursorResult[queue.QueuedItemData], error) {
 	idx, err := s.loadOrRebuildQueueIndexLocked(ctx, name)
 	if err != nil {
-		return exec.CursorResult[exec.QueuedItemData]{}, err
+		return pagination.CursorResult[queue.QueuedItemData]{}, err
 	}
 
 	for attempt := range 2 {
 		start, err := idx.resolveStart(cursor)
 		if err != nil {
-			return exec.CursorResult[exec.QueuedItemData]{}, err
+			return pagination.CursorResult[queue.QueuedItemData]{}, err
 		}
 
 		itemIDs := idx.slice(start, limit)
 		items, missing, err := s.queueItemsByID(ctx, name, itemIDs)
 		if err != nil {
-			return exec.CursorResult[exec.QueuedItemData]{}, err
+			return pagination.CursorResult[queue.QueuedItemData]{}, err
 		}
 		if missing && attempt == 0 {
 			idx, err = s.rebuildQueueIndexLocked(ctx, name)
 			if err != nil {
-				return exec.CursorResult[exec.QueuedItemData]{}, err
+				return pagination.CursorResult[queue.QueuedItemData]{}, err
 			}
 			continue
 		}
@@ -434,18 +500,18 @@ func (s *QueueStore) listCursorLocked(ctx context.Context, name string, cursor q
 		if hasMore && len(itemIDs) > 0 {
 			nextCursor = encodeQueueCursor(name, start+len(itemIDs), itemIDs[len(itemIDs)-1])
 		}
-		return exec.CursorResult[exec.QueuedItemData]{
+		return pagination.CursorResult[queue.QueuedItemData]{
 			Items:      items,
 			HasMore:    hasMore,
 			NextCursor: nextCursor,
 		}, nil
 	}
 
-	return exec.CursorResult[exec.QueuedItemData]{Items: []exec.QueuedItemData{}}, nil
+	return pagination.CursorResult[queue.QueuedItemData]{Items: []queue.QueuedItemData{}}, nil
 }
 
-func (s *QueueStore) queueItemsByID(ctx context.Context, name string, itemIDs []string) ([]exec.QueuedItemData, bool, error) {
-	items := make([]exec.QueuedItemData, 0, len(itemIDs))
+func (s *QueueStore) queueItemsByID(ctx context.Context, name string, itemIDs []string) ([]queue.QueuedItemData, bool, error) {
+	items := make([]queue.QueuedItemData, 0, len(itemIDs))
 	missing := false
 	for _, itemID := range itemIDs {
 		recordID := queueRecordID(name, itemID)

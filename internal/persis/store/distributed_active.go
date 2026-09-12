@@ -10,61 +10,69 @@ import (
 	"sort"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
-var _ exec.ActiveDistributedRunStore = (*ActiveDistributedRunStore)(nil)
+var _ dispatch.ActiveDistributedRunStore = (*ActiveDistributedRunStore)(nil)
 
-// ActiveDistributedRunStore implements [exec.ActiveDistributedRunStore] on top
+// ActiveDistributedRunStore implements [dispatch.ActiveDistributedRunStore] on top
 // of a [persis.Collection]. Record IDs intentionally match the file-backed
 // distributed store SHA-256 key.
 type ActiveDistributedRunStore struct {
-	col persis.Collection
+	col                      persis.Collection
+	corruptRecordGracePeriod time.Duration
 }
 
 // NewActiveDistributedRunStore creates an ActiveDistributedRunStore backed by col.
-func NewActiveDistributedRunStore(col persis.Collection) *ActiveDistributedRunStore {
-	return &ActiveDistributedRunStore{col: col}
+func NewActiveDistributedRunStore(col persis.Collection, opts ...DistributedStoreOption) *ActiveDistributedRunStore {
+	resolved := resolveDistributedStoreOptions(opts)
+	return &ActiveDistributedRunStore{
+		col:                      col,
+		corruptRecordGracePeriod: resolved.corruptRecordGracePeriod,
+	}
 }
 
-// Upsert writes the active-run record. Get → Create if absent /
-// CompareAndSwap if present, retrying on conflict.
-func (s *ActiveDistributedRunStore) Upsert(ctx context.Context, record exec.ActiveDistributedRun) error {
+// Upsert writes the active-run record.
+func (s *ActiveDistributedRunStore) Upsert(ctx context.Context, record dispatch.ActiveDistributedRun) error {
 	if record.AttemptKey == "" {
 		return fmt.Errorf("attempt key is required")
 	}
 	id := distributedRecordKey(record.AttemptKey)
 
-	return retryCAS(ctx, func(ctx context.Context) error {
+	return retryConflict(ctx, func(ctx context.Context) error {
 		now := time.Now().UTC()
 		record.UpdatedAt = now.UnixMilli()
-
-		existing, getErr := s.col.Get(ctx, id)
-		if getErr != nil && !errors.Is(getErr, persis.ErrNotFound) {
-			return getErr
-		}
 
 		data, err := persis.Encode(record)
 		if err != nil {
 			return err
 		}
+		stored := &persis.Record{
+			ID:        id,
+			Data:      data,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
 
-		if existing == nil {
-			return s.col.Create(ctx, &persis.Record{
-				ID:        id,
-				Data:      data,
-				CreatedAt: now,
-				UpdatedAt: now,
-			})
+		existing, getErr := s.col.Get(ctx, id)
+		if errors.Is(getErr, persis.ErrCorrupt) {
+			removed, retryErr := removeCorruptRecordForRetry(ctx, s.col, id, getErr)
+			if removed {
+				logger.Warn(ctx, "Removed corrupt active distributed run entry before replacement", tag.Name(id))
+			}
+			return retryErr
 		}
-		casErr := s.col.CompareAndSwap(ctx, id, existing.Data, data)
-		if errors.Is(casErr, persis.ErrNotFound) {
-			return persis.ErrConflict
+		if getErr != nil && !errors.Is(getErr, persis.ErrNotFound) {
+			return getErr
 		}
-		return casErr
+
+		if existing != nil {
+			stored.CreatedAt = existing.CreatedAt
+		}
+		return createOrSwap(ctx, s.col, existing, stored)
 	})
 }
 
@@ -72,45 +80,66 @@ func (s *ActiveDistributedRunStore) Delete(ctx context.Context, attemptKey strin
 	if attemptKey == "" {
 		return nil
 	}
-	if err := s.col.Delete(ctx, distributedRecordKey(attemptKey)); err != nil && !errors.Is(err, persis.ErrNotFound) {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return nil
+	return s.col.Delete(ctx, distributedRecordKey(attemptKey))
 }
 
-func (s *ActiveDistributedRunStore) Get(ctx context.Context, attemptKey string) (*exec.ActiveDistributedRun, error) {
+func (s *ActiveDistributedRunStore) Get(ctx context.Context, attemptKey string) (*dispatch.ActiveDistributedRun, error) {
 	rec, err := s.col.Get(ctx, distributedRecordKey(attemptKey))
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return nil, exec.ErrActiveRunNotFound
+			return nil, dispatch.ErrActiveRunNotFound
 		}
 		return nil, err
 	}
-	var record exec.ActiveDistributedRun
+	var record dispatch.ActiveDistributedRun
 	if err := persis.Decode(rec, &record); err != nil {
 		return nil, fmt.Errorf("active distributed run store: decode %q: %w", attemptKey, err)
 	}
 	return &record, nil
 }
 
-func (s *ActiveDistributedRunStore) ListAll(ctx context.Context) ([]exec.ActiveDistributedRun, error) {
-	recs, err := listAllBestEffort(ctx, s.col, persis.ListQuery{}, func(id string, err error) {
-		logger.Warn(ctx, "Skipping corrupted active distributed run entry",
-			tag.Name(id),
-			tag.Error(err),
+func (s *ActiveDistributedRunStore) ListAll(ctx context.Context) ([]dispatch.ActiveDistributedRun, error) {
+	recs, err := listAllStrictWithReadError(ctx, s.col, persis.ListQuery{}, func(id string, readErr error) (bool, error) {
+		if !errors.Is(readErr, persis.ErrCorrupt) {
+			logSkippedActiveDistributedRun(ctx, id, readErr)
+			return true, nil
+		}
+
+		removed, removeErr := removeStaleCorruptRecord(
+			ctx,
+			s.col,
+			id,
+			s.corruptRecordGracePeriod,
 		)
+		if errors.Is(removeErr, persis.ErrNotFound) {
+			return true, nil
+		}
+		if removeErr != nil {
+			logger.Warn(ctx, "Failed to remove corrupt active distributed run entry",
+				tag.Name(id),
+				tag.Error(removeErr),
+			)
+		} else if removed {
+			logger.Warn(ctx, "Removed stale corrupt active distributed run entry",
+				tag.Name(id),
+				tag.Error(readErr),
+			)
+			return true, nil
+		}
+		logSkippedActiveDistributedRun(ctx, id, readErr)
+		return true, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	records := make([]exec.ActiveDistributedRun, 0, len(recs))
+	records := make([]dispatch.ActiveDistributedRun, 0, len(recs))
 	for _, rec := range recs {
-		var record exec.ActiveDistributedRun
+		var record dispatch.ActiveDistributedRun
 		if err := persis.Decode(rec, &record); err != nil {
-			logger.Warn(ctx, "Skipping corrupted active distributed run entry",
-				tag.Name(rec.ID),
-				tag.Error(err),
-			)
+			logSkippedActiveDistributedRun(ctx, rec.ID, err)
 			continue
 		}
 		if record.AttemptKey == "" {
@@ -122,4 +151,11 @@ func (s *ActiveDistributedRunStore) ListAll(ctx context.Context) ([]exec.ActiveD
 		return records[i].AttemptKey < records[j].AttemptKey
 	})
 	return records, nil
+}
+
+func logSkippedActiveDistributedRun(ctx context.Context, id string, err error) {
+	logger.Warn(ctx, "Skipping corrupted active distributed run entry",
+		tag.Name(id),
+		tag.Error(err),
+	)
 }

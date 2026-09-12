@@ -11,13 +11,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/auth"
-	"github.com/dagucloud/dagu/internal/cmn/dirlock"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/service/audit"
-	authservice "github.com/dagucloud/dagu/internal/service/auth"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 )
 
 // Setup creates the initial admin user during first-run setup.
@@ -226,6 +226,12 @@ func (a *API) ChangePassword(ctx context.Context, request api.ChangePasswordRequ
 			return api.ChangePassword400JSONResponse{
 				Code:    api.ErrorCodeBadRequest,
 				Message: "New password does not meet security requirements",
+			}, nil
+		}
+		if errors.Is(err, authservice.ErrExternalAuthPasswordManagement) {
+			return api.ChangePassword403JSONResponse{
+				Code:    api.ErrorCodeForbidden,
+				Message: "Password is managed by the authentication provider for this user",
 			}, nil
 		}
 		return nil, err

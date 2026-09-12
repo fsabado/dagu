@@ -6,33 +6,33 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/buildenv"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/dagwarning"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/runtimeenv"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 )
 
 // parseTriggerTypeParam parses and validates the trigger-type flag from the command context.
 // Returns TriggerTypeUnknown (zero value) if the flag is empty, otherwise validates
 // that the provided value is a known trigger type.
-func parseTriggerTypeParam(ctx *Context) (core.TriggerType, error) {
+func parseTriggerTypeParam(ctx *Context) (ir.TriggerType, error) {
 	triggerTypeStr, err := ctx.StringParam("trigger-type")
 	if err != nil {
 		logger.Debug(ctx, "Failed to read trigger-type flag", tag.Error(err))
 	}
 	if triggerTypeStr == "" {
-		return core.TriggerTypeUnknown, nil
+		return ir.TriggerTypeUnknown, nil
 	}
 
-	triggerType := core.ParseTriggerType(triggerTypeStr)
-	if triggerType == core.TriggerTypeUnknown {
-		return core.TriggerTypeUnknown, fmt.Errorf(
+	triggerType := ir.ParseTriggerType(triggerTypeStr)
+	if triggerType == ir.TriggerTypeUnknown {
+		return ir.TriggerTypeUnknown, fmt.Errorf(
 			"invalid trigger-type %q: must be one of scheduler, manual, webhook, subdag, retry, catchup",
 			triggerTypeStr,
 		)
@@ -80,104 +80,38 @@ func parseScheduleTimeParam(ctx *Context) (string, error) {
 // restoreDAGFromStatus restores a DAG from a previous run's status and YAML.
 // It restores params from the status, loads dotenv, and rebuilds fields excluded
 // from JSON serialization (env, params JSON, registryAuths, etc.).
-func restoreDAGFromStatus(ctx context.Context, dag *core.DAG, status *exec.DAGRunStatus) (*core.DAG, error) {
+func restoreDAGFromStatus(ctx context.Context, dag *ir.DAG, status *ir.DAGRunStatus) (*ir.DAG, error) {
 	runtimeParams := append([]string(nil), status.ParamsList...)
 	dag.Params = runtimeParams
-	if err := dagwarning.LoadDotEnv(ctx, dag); err != nil {
-		return nil, err
+	resolvedEnv, err := runtimeenv.Resolve(ctx, dag)
+	dag.Env = resolvedEnv.Env
+	dag.RuntimeResolved = true
+	for _, warning := range resolvedEnv.Warnings {
+		logger.Warn(ctx, warning)
 	}
-	restored, err := rebuildDAGFromYAML(ctx, dag, spec.QuoteRuntimeParams(runtimeParams, dag.ParamDefs))
 	if err != nil {
 		return nil, err
+	}
+	restored, err := spec.RebuildFromYAML(ctx, dag, spec.QuoteRuntimeParams(runtimeParams, dag.ParamDefs))
+	if err != nil {
+		return nil, err
+	}
+	if status.ParallelItem != "" {
+		restored.Env = append(restored.Env,
+			ir.ParallelItemVariable+"="+status.ParallelItem,
+			runenv.EnvKeyParallelItem+"="+status.ParallelItem,
+		)
 	}
 	applyPersistedRunWorkingDir(restored, status)
 	return restored, nil
 }
 
-func applyPersistedRunWorkingDir(dag *core.DAG, status *exec.DAGRunStatus) {
+func applyPersistedRunWorkingDir(dag *ir.DAG, status *ir.DAGRunStatus) {
 	if dag == nil || status == nil || status.WorkingDir == "" {
 		return
 	}
 	dag.WorkingDir = status.WorkingDir
 	dag.WorkingDirExplicit = true
-}
-
-// rebuildDAGFromYAML rebuilds a DAG from its YamlData using the spec loader.
-// This populates fields excluded from JSON serialization (json:"-") and must be
-// called after LoadDotEnv() so dotenv values are available during rebuild.
-//
-// The function preserves all JSON-serialized fields from the original DAG and
-// only copies JSON-excluded fields (Env, Params, ParamsJSON, SMTP, SSH, S3,
-// Redis, Harness, Harnesses, Kubernetes, RegistryAuths, WorkingDirExplicit)
-// from the rebuilt DAG.
-func rebuildDAGFromYAML(ctx context.Context, dag *core.DAG, paramsOverride ...[]string) (*core.DAG, error) {
-	if len(dag.YamlData) == 0 {
-		return dag, nil
-	}
-
-	loadedEnv := append([]string{}, dag.Env...)
-	buildEnvMap := buildenv.ToMap(dag.Env)
-	for key, value := range dag.PresolvedBuildEnv {
-		if buildEnvMap == nil {
-			buildEnvMap = make(map[string]string)
-		}
-		buildEnvMap[key] = value
-	}
-	presolvedBuildEnv, err := buildenv.Load()
-	if err != nil {
-		return nil, fmt.Errorf("failed to load presolved build env: %w", err)
-	}
-	transportEnv := buildenv.FromMap(presolvedBuildEnv)
-	for key, value := range presolvedBuildEnv {
-		if buildEnvMap == nil {
-			buildEnvMap = make(map[string]string)
-		}
-		buildEnvMap[key] = value
-	}
-
-	params := dag.Params
-	if len(paramsOverride) > 0 {
-		params = paramsOverride[0]
-	}
-	loadOpts := []spec.LoadOption{
-		spec.WithParams(params),
-		spec.SkipSchemaValidation(),
-	}
-	if len(buildEnvMap) > 0 {
-		loadOpts = append(loadOpts, spec.WithBuildEnv(buildEnvMap))
-	}
-	if len(dag.BaseConfigData) > 0 {
-		loadOpts = append(loadOpts, spec.WithBaseConfigContent(dag.BaseConfigData))
-	}
-
-	if dag.Name != "" {
-		loadOpts = append(loadOpts, spec.WithName(dag.Name))
-	}
-
-	fresh, err := spec.LoadYAML(ctx, dag.YamlData, loadOpts...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Copy only fields excluded from JSON serialization (json:"-").
-	// All other fields (Queue, WorkerSelector, HandlerOn, Steps, Labels, etc.)
-	// are already correctly stored in dag.json and must be preserved.
-	dag.Env = buildenv.AppendMissing(fresh.Env, loadedEnv, buildenv.FromMap(dag.PresolvedBuildEnv), transportEnv)
-	dag.Params = fresh.Params
-	dag.ParamsJSON = fresh.ParamsJSON
-	dag.SMTP = fresh.SMTP
-	dag.SSH = fresh.SSH
-	dag.S3 = fresh.S3
-	dag.Redis = fresh.Redis
-	dag.Harness = fresh.Harness
-	dag.Harnesses = fresh.Harnesses
-	dag.Kubernetes = fresh.Kubernetes
-	dag.RegistryAuths = fresh.RegistryAuths
-	dag.WorkingDirExplicit = fresh.WorkingDirExplicit
-
-	core.InitializeDefaults(dag)
-
-	return dag, nil
 }
 
 // extractDAGName extracts the DAG name from a file path or name.
@@ -188,12 +122,19 @@ func extractDAGName(ctx *Context, name string) (string, error) {
 		return name, nil
 	}
 
-	dagStore, err := ctx.dagStore(dagStoreConfig{})
+	absolutePath, err := filepath.Abs(name)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve DAG file path %s: %w", name, err)
+	}
+
+	dagRepository, err := ctx.dagRepository(dagRepositoryConfig{
+		SearchPaths: []string{filepath.Dir(absolutePath)},
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to initialize DAG store: %w", err)
 	}
 
-	dag, err := dagStore.GetMetadata(ctx, name)
+	dag, err := dagRepository.GetMetadata(ctx, absolutePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read DAG metadata from file %s: %w", name, err)
 	}

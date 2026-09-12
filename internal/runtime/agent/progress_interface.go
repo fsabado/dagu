@@ -4,7 +4,7 @@
 package agent
 
 import (
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // ProgressReporter is the interface for progress display implementations
@@ -16,10 +16,10 @@ type ProgressReporter interface {
 	Stop()
 
 	// UpdateNode updates the progress for a specific node
-	UpdateNode(node *exec.Node)
+	UpdateNode(node *ir.Node)
 
 	// UpdateStatus updates the overall DAG status
-	UpdateStatus(status *exec.DAGRunStatus)
+	UpdateStatus(status *ir.DAGRunStatus)
 
 	// SetDAGRunInfo sets the DAG run ID and parameters
 	SetDAGRunInfo(dagRunID, params string)

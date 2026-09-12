@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 )
 
 // Error types for lock operations
@@ -96,7 +96,17 @@ type dirLock struct {
 
 var _ DirLock = (*dirLock)(nil)
 
-const lockOwnerFileName = "owner"
+const (
+	// LockDirectoryName is the reserved directory name for lock metadata.
+	LockDirectoryName           = ".dagu_lock"
+	releasedLockDirectoryPrefix = LockDirectoryName + ".releasing."
+	lockOwnerFileName           = "owner"
+)
+
+// IsLockDirectoryName reports whether name is reserved for lock metadata.
+func IsLockDirectoryName(name string) bool {
+	return name == LockDirectoryName || strings.HasPrefix(name, releasedLockDirectoryPrefix)
+}
 
 // New creates a new directory lock instance
 func New(directory string, opts *LockOptions) DirLock {
@@ -113,7 +123,7 @@ func New(directory string, opts *LockOptions) DirLock {
 
 	return &dirLock{
 		targetDir: directory,
-		lockPath:  filepath.Join(directory, ".dagu_lock"),
+		lockPath:  filepath.Join(directory, LockDirectoryName),
 		opts:      opts,
 	}
 }
@@ -131,7 +141,7 @@ func (l *dirLock) Heartbeat(_ context.Context) error {
 
 	// Verify we still own the lock by checking the fence token
 	tokenPath := filepath.Join(l.lockPath, lockOwnerFileName)
-	data, err := os.ReadFile(tokenPath) //nolint:gosec // path is constructed from lock directory, not user input
+	data, err := fileutil.ReadFile(tokenPath)
 	if err != nil {
 		l.isHeld = false
 		return fmt.Errorf("%w: failed to read lock token: %v", ErrLockNotHeld, err)
@@ -187,7 +197,7 @@ func (l *dirLock) TryLock() error {
 	}
 
 	// Ensure the target directory exists
-	if err := os.MkdirAll(l.targetDir, 0750); err != nil {
+	if err := fileutil.MkdirAll(l.targetDir, 0750); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
@@ -209,6 +219,9 @@ func (l *dirLock) TryLock() error {
 	tokenPath := filepath.Join(l.lockPath, lockOwnerFileName)
 	if err := os.WriteFile(tokenPath, []byte(token), 0600); err != nil {
 		_ = removeLockDir(l.lockPath)
+		if isRetryableLockStateError(err) {
+			return ErrLockConflict
+		}
 		return fmt.Errorf("failed to write lock token: %w", err)
 	}
 	l.fenceToken = token
@@ -269,7 +282,7 @@ func (l *dirLock) Unlock() error {
 
 	// Verify we still own the lock before removing
 	tokenPath := filepath.Join(l.lockPath, lockOwnerFileName)
-	data, err := os.ReadFile(tokenPath) //nolint:gosec // path is constructed from lock directory, not user input
+	data, err := fileutil.ReadFile(tokenPath)
 	if err != nil {
 		l.isHeld = false
 		return fmt.Errorf("%w: failed to read lock token: %v", ErrLockNotHeld, err)
@@ -310,7 +323,7 @@ func (l *dirLock) IsHeldByMe() bool {
 
 	// Verify the fence token still matches
 	tokenPath := filepath.Join(l.lockPath, lockOwnerFileName)
-	data, err := os.ReadFile(tokenPath) //nolint:gosec // path is constructed from lock directory, not user input
+	data, err := fileutil.ReadFile(tokenPath)
 	if err != nil || string(data) != l.fenceToken {
 		l.isHeld = false
 		return false
@@ -335,13 +348,13 @@ func (l *dirLock) Info() (*LockInfo, error) {
 
 	return &LockInfo{
 		AcquiredAt:  info.ModTime(),
-		LockDirName: ".dagu_lock",
+		LockDirName: LockDirectoryName,
 	}, nil
 }
 
 // ForceUnlock forcibly removes a lock (administrative operation)
 func ForceUnlock(directory string) error {
-	lockPath := filepath.Join(directory, ".dagu_lock")
+	lockPath := filepath.Join(directory, LockDirectoryName)
 	if err := removeLockDir(lockPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to force unlock: %w", err)
 	}

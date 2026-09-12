@@ -8,10 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmd"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/test"
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,9 +31,11 @@ steps:
 
 		// Create Context with required stores
 		ctx := &cmd.Context{
-			Context:     th.Context,
-			Config:      th.Config,
-			DAGRunStore: th.DAGRunStore,
+			Context: th.Context,
+			Config:  th.Config,
+			Persistence: cmd.Persistence{
+				DAGRunRepository: th.DAGRunRepository,
+			},
 		}
 
 		// Record the early failure
@@ -42,14 +43,14 @@ steps:
 		require.NoError(t, err)
 
 		// Verify the failure was recorded
-		ref := exec.NewDAGRunRef(dag.Name, dagRunID)
-		attempt, err := th.DAGRunStore.FindAttempt(th.Context, ref)
+		ref := ir.NewDAGRunRef(dag.Name, dagRunID)
+		attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ref)
 		require.NoError(t, err)
 		require.NotNil(t, attempt)
 
 		status, err := attempt.ReadStatus(th.Context)
 		require.NoError(t, err)
-		require.Equal(t, core.Failed, status.Status)
+		require.Equal(t, ir.Failed, status.Status)
 		require.Contains(t, status.Error, "process acquisition failed")
 	})
 
@@ -78,23 +79,25 @@ steps:
 		testErr := errors.New("retry failed due to lock contention")
 
 		ctx := &cmd.Context{
-			Context:     th.Context,
-			Config:      th.Config,
-			DAGRunStore: th.DAGRunStore,
+			Context: th.Context,
+			Config:  th.Config,
+			Persistence: cmd.Persistence{
+				DAGRunRepository: th.DAGRunRepository,
+			},
 		}
 
 		err = ctx.RecordEarlyFailure(dag.DAG, dagRunID, testErr)
 		require.NoError(t, err)
 
 		// Verify the failure was recorded (status should be updated)
-		ref := exec.NewDAGRunRef(dag.Name, dagRunID)
-		attempt, err := th.DAGRunStore.FindAttempt(th.Context, ref)
+		ref := ir.NewDAGRunRef(dag.Name, dagRunID)
+		attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ref)
 		require.NoError(t, err)
 		require.NotNil(t, attempt)
 
 		status, err := attempt.ReadStatus(th.Context)
 		require.NoError(t, err)
-		require.Equal(t, core.Failed, status.Status)
+		require.Equal(t, ir.Failed, status.Status)
 		require.Contains(t, status.Error, "retry failed due to lock contention")
 	})
 
@@ -104,9 +107,11 @@ steps:
 		th := test.SetupCommand(t)
 
 		ctx := &cmd.Context{
-			Context:     th.Context,
-			Config:      th.Config,
-			DAGRunStore: th.DAGRunStore,
+			Context: th.Context,
+			Config:  th.Config,
+			Persistence: cmd.Persistence{
+				DAGRunRepository: th.DAGRunRepository,
+			},
 		}
 
 		err := ctx.RecordEarlyFailure(nil, "some-run-id", errors.New("test error"))
@@ -126,9 +131,11 @@ steps:
 `)
 
 		ctx := &cmd.Context{
-			Context:     th.Context,
-			Config:      th.Config,
-			DAGRunStore: th.DAGRunStore,
+			Context: th.Context,
+			Config:  th.Config,
+			Persistence: cmd.Persistence{
+				DAGRunRepository: th.DAGRunRepository,
+			},
 		}
 
 		err := ctx.RecordEarlyFailure(dag.DAG, "", errors.New("test error"))
@@ -152,23 +159,25 @@ steps:
 
 		// Create Context and record early failure
 		ctx := &cmd.Context{
-			Context:     th.Context,
-			Config:      th.Config,
-			DAGRunStore: th.DAGRunStore,
+			Context: th.Context,
+			Config:  th.Config,
+			Persistence: cmd.Persistence{
+				DAGRunRepository: th.DAGRunRepository,
+			},
 		}
 
 		err := ctx.RecordEarlyFailure(dag.DAG, dagRunID, testErr)
 		require.NoError(t, err)
 
 		// Verify initial failure status
-		ref := exec.NewDAGRunRef(dag.Name, dagRunID)
-		attempt, err := th.DAGRunStore.FindAttempt(th.Context, ref)
+		ref := ir.NewDAGRunRef(dag.Name, dagRunID)
+		attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ref)
 		require.NoError(t, err)
 		require.NotNil(t, attempt)
 
 		status, err := attempt.ReadStatus(th.Context)
 		require.NoError(t, err)
-		require.Equal(t, core.Failed, status.Status)
+		require.Equal(t, ir.Failed, status.Status)
 
 		// Verify DAG can be read back (required for retry)
 		storedDAG, err := attempt.ReadDAG(th.Context)
@@ -184,12 +193,12 @@ steps:
 		// Wait for retry to complete
 		require.Eventually(t, func() bool {
 			currentStatus, err := th.DAGRunMgr.GetCurrentStatus(th.Context, dag.DAG, dagRunID)
-			return err == nil && currentStatus != nil && currentStatus.Status == core.Succeeded
+			return err == nil && currentStatus != nil && currentStatus.Status == ir.Succeeded
 		}, 5*time.Second, 100*time.Millisecond, "Retry should succeed")
 
 		// Verify final status is succeeded
 		finalStatus, err := th.DAGRunMgr.GetCurrentStatus(th.Context, dag.DAG, dagRunID)
 		require.NoError(t, err)
-		require.Equal(t, core.Succeeded, finalStatus.Status)
+		require.Equal(t, ir.Succeeded, finalStatus.Status)
 	})
 }

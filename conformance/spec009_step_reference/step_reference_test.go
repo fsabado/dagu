@@ -6,7 +6,7 @@ package spec009_step_reference_test
 import (
 	"testing"
 
-	"github.com/dagucloud/dagu/conformance/harness"
+	"github.com/dagucloud/dagu/v2/conformance/harness"
 )
 
 func TestValidateStepReferences(t *testing.T) {
@@ -84,7 +84,7 @@ func TestValidateStepReferences(t *testing.T) {
 			t.Parallel()
 
 			dagu := harness.NewRunner(t)
-			result := dagu.Run("validate", tc.file)
+			result := dagu.Run("validate", "--show-unresolved", tc.file)
 			result.ExpectExitCode(0)
 			result.ExpectStdout("")
 			result.ExpectStderrContains(tc.stderrParts...)

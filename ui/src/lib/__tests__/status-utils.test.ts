@@ -12,7 +12,7 @@ describe('status-utils', () => {
     expect(isActiveNodeStatus(NodeStatus.Retrying)).toBe(true);
     expect(getStatusClass(NodeStatus.Retrying)).toBe('status-warning');
     expect(getStatusColors(NodeStatus.Retrying)).toMatchObject({
-      bgClass: 'bg-[#e37400] dark:bg-[#fdd663]',
+      bgClass: 'bg-[var(--status-warning)]',
       animation: 'animate-pulse',
     });
   });

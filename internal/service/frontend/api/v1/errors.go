@@ -8,12 +8,19 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/dagucloud/dagu/api/v1"
+	"github.com/dagucloud/dagu/v2/api/v1"
 )
 
 type errorResponse struct {
 	Code    api.ErrorCode `json:"code"`
 	Message string        `json:"message,omitempty"`
+}
+
+// ErrInvalidRequestBody is returned when a request body is missing or invalid.
+var ErrInvalidRequestBody = &Error{
+	Code:       api.ErrorCodeBadRequest,
+	Message:    "Invalid request body",
+	HTTPStatus: http.StatusBadRequest,
 }
 
 func WriteErrorResponse(w http.ResponseWriter, err error) {
@@ -42,7 +49,7 @@ type Error struct {
 }
 
 // Error returns the error message.
-func (e Error) Error() string {
+func (e *Error) Error() string {
 	if e.Message == "" {
 		return string(e.Code)
 	}

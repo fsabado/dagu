@@ -9,6 +9,7 @@
 import { Button } from '@/components/ui/button';
 import { CommandDisplay } from '@/components/ui/command-display';
 import { useErrorModal } from '@/components/ui/error-modal';
+import { useSimpleToast } from '@/components/ui/simple-toast';
 import { ScriptBadge } from '@/components/ui/script-dialog';
 import { TableCell } from '@/components/ui/table';
 import {
@@ -37,18 +38,31 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
+  CircleDot,
   Code,
+  EllipsisVertical,
   GitBranch,
   Play,
   RefreshCw,
   X,
 } from 'lucide-react';
-import { useContext, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { buildDAGPageURL } from '../../../dag-runs/lib/dagRunUrls';
+import { useContext, useEffect, useRef, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import {
+  buildDAGPageURL,
+  buildDAGRunPageURL,
+} from '../../../dag-runs/lib/dagRunUrls';
+import { DAGRunContext } from '../../../dag-runs/contexts/DAGRunContext';
 import {
   components,
   NodeStatus,
@@ -58,12 +72,18 @@ import {
 import StyledTableRow from '@/components/ui/styled-table-row';
 import { DAGContext } from '../../contexts/DAGContext';
 import NodeStatusChip from '../common/NodeStatusChip';
+import { useOpenSubRun } from '../common/SubRunStackModal';
 import { InlineLogViewer } from '../common/InlineLogViewer';
 import StatusUpdateModal from '../dag-execution/StatusUpdateModal';
 import HarnessStepSummary from './HarnessStepSummary';
 import { LogStepMessage } from './LogStepMessage';
 import { SubDAGRunsList } from './SubDAGRunsList';
 import PushBackHistory from '../common/PushBackHistory';
+import { ManualActionSubject } from '../common/ManualActionSubject';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { useI18n } from '@/i18n/I18nProvider';
+import { I18nTemplate } from '@/i18n/I18nTemplate';
 
 /**
  * Props for the NodeStatusTableRow component
@@ -87,7 +107,70 @@ type Props = {
   dagRun: components['schemas']['DAGRunDetails'];
   /** View mode: desktop or mobile */
   view?: 'desktop' | 'mobile';
+  /** Hide the actions menu for nodes the step APIs cannot address */
+  hideActions?: boolean;
+  /** Whether the inline log starts expanded */
+  defaultLogExpanded?: boolean;
 };
+
+type BuildExecution = components['schemas']['BuildExecution'];
+
+function BuildDecisionBadge({
+  build,
+  remoteNode,
+}: {
+  build?: BuildExecution;
+  remoteNode: string;
+}) {
+  if (!build) return null;
+
+  const label =
+    build.decision === 'reuse'
+      ? 'reused'
+      : build.decision === 'always'
+        ? 'always run'
+        : build.decision;
+  const producer = build.producerRun;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className={cn(
+            'inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium',
+            build.decision === 'reuse'
+              ? 'border-success/30 bg-success/10 text-success'
+              : 'border-border bg-muted text-muted-foreground'
+          )}
+        >
+          {label}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-80 space-y-1 text-xs">
+        <div className="font-medium">{build.reason.replace(/_/g, ' ')}</div>
+        {build.decision === 'reuse' && (
+          <div>
+            <I18nText text={'No executor ran.'} />
+          </div>
+        )}
+        {build.detail && <div>{build.detail}</div>}
+        {producer?.name && producer.id && (
+          <Link
+            className="block underline underline-offset-2"
+            to={buildDAGRunPageURL({
+              rootDAGRunName: producer.name,
+              rootDAGRunId: producer.id,
+              remoteNode,
+            })}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <I18nText text={'Produced by'} /> {producer.name}:{producer.id}
+          </Link>
+        )}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
 
 /**
  * Format timestamp for better readability
@@ -138,6 +221,95 @@ const calculateDuration = (
   }
 };
 
+function ManualActionDetails({
+  node,
+  className,
+}: {
+  node: components['schemas']['Node'];
+  className?: string;
+}) {
+  const detailClassName = cn('text-xs text-muted-foreground', className);
+
+  return (
+    <>
+      {node.humanTaskCompletedBy || node.humanTaskCompletedById ? (
+        <div className={detailClassName}>
+          <span className="font-medium">
+            <I18nText text={'Completed by:'} />
+          </span>{' '}
+          <ManualActionSubject
+            name={node.humanTaskCompletedBy}
+            id={node.humanTaskCompletedById}
+            className="text-info"
+          />
+          {node.finishedAt && (
+            <span className="ml-1">
+              <I18nText text={'at'} /> {formatTimestamp(node.finishedAt)}
+            </span>
+          )}
+        </div>
+      ) : null}
+      {node.approvedBy || node.approvedById ? (
+        <div className={detailClassName}>
+          <span className="font-medium">
+            <I18nText text={'Approved by:'} />
+          </span>{' '}
+          <ManualActionSubject
+            name={node.approvedBy}
+            id={node.approvedById}
+            className="text-info"
+          />
+          {node.approvedAt && (
+            <span className="ml-1">
+              <I18nText text={'at'} /> {formatTimestamp(node.approvedAt)}
+            </span>
+          )}
+        </div>
+      ) : null}
+      {node.approvalInputs && Object.keys(node.approvalInputs).length > 0 && (
+        <div className={detailClassName}>
+          <span className="font-medium">
+            <I18nText text={'Inputs:'} />
+          </span>{' '}
+          <span className="whitespace-normal break-words font-mono text-foreground/80">
+            {JSON.stringify(node.approvalInputs)}
+          </span>
+        </div>
+      )}
+      {node.pushBackHistory && node.pushBackHistory.length > 0 && (
+        <PushBackHistory history={node.pushBackHistory} className="pt-1" />
+      )}
+      {node.rejectedBy || node.rejectedById ? (
+        <div className={detailClassName}>
+          <span className="font-medium">
+            <I18nText text={'Rejected by:'} />
+          </span>{' '}
+          <ManualActionSubject
+            name={node.rejectedBy}
+            id={node.rejectedById}
+            className="text-error"
+          />
+          {node.rejectedAt && (
+            <span className="ml-1">
+              <I18nText text={'at'} /> {formatTimestamp(node.rejectedAt)}
+            </span>
+          )}
+        </div>
+      ) : null}
+      {node.rejectionReason && (
+        <div className={detailClassName}>
+          <span className="font-medium">
+            <I18nText text={'Reason:'} />
+          </span>{' '}
+          <span className="whitespace-normal break-words text-foreground/80">
+            {node.rejectionReason}
+          </span>
+        </div>
+      )}
+    </>
+  );
+}
+
 /**
  * NodeStatusTableRow displays information about a single node's execution status
  */
@@ -149,26 +321,32 @@ function NodeStatusTableRow({
   onNodeStatusUpdated,
   dagRun,
   view = 'desktop',
+  hideActions = false,
+  defaultLogExpanded = false,
 }: Props) {
+  const { ts } = useI18n();
   const { dagRunId, name: dagName } = dagRun;
   const navigate = useNavigate();
+  const openSubRun = useOpenSubRun();
   const client = useClient();
   const config = useConfig();
   const dagContext = useContext(DAGContext);
+  const dagRunContext = useContext(DAGRunContext);
   const remoteNode = useRemoteNode();
   const { showError } = useErrorModal();
+  const { showToast } = useSimpleToast();
   // State to store the current duration for running tasks
   const [currentDuration, setCurrentDuration] = useState<string>('-');
   // State for expanding/collapsing parallel executions
   const [isExpanded, setIsExpanded] = useState(false);
   const [showDialog, setShowDialog] = useState(false);
+  const [includeDownstream, setIncludeDownstream] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
   // State for inline log expansion
-  const [isLogExpanded, setIsLogExpanded] = useState(false);
+  const [isLogExpanded, setIsLogExpanded] = useState(defaultLogExpanded);
   const [activeLogTab, setActiveLogTab] = useState<'stdout' | 'stderr'>(
-    'stdout'
+    defaultLogExpanded && node.stderr ? 'stderr' : 'stdout'
   );
   // State for status update modal
   const [showStatusModal, setShowStatusModal] = useState(false);
@@ -191,11 +369,46 @@ function NodeStatusTableRow({
     dagRun.rootDAGRunId !== dagRun.dagRunId;
   const shouldFetchLogStepOutput =
     logMessage !== null && hasStdout && !!dagRunId;
-  const showStepActions = Boolean(dagRunId && config.permissions.runDags);
+
+  // Expand the log when this row becomes the first failed step while already
+  // mounted (live polling). Applied once per false-to-true transition so a
+  // manual collapse afterwards is respected.
+  const autoExpandApplied = useRef(defaultLogExpanded);
+  useEffect(() => {
+    if (!defaultLogExpanded) {
+      autoExpandApplied.current = false;
+      return;
+    }
+    if (autoExpandApplied.current || !hasLogs) return;
+    autoExpandApplied.current = true;
+    setIsLogExpanded(true);
+    setActiveLogTab(hasStderr ? 'stderr' : 'stdout');
+  }, [defaultLogExpanded, hasLogs, hasStderr]);
+
+  const showStepActions = Boolean(
+    !hideActions && dagRunId && config.permissions.runDags
+  );
+  const canUpdateStepStatus =
+    showStepActions &&
+    !node.step.humanTask &&
+    dagRun.status !== Status.NotStarted &&
+    dagRun.status !== Status.Running &&
+    dagRun.status !== Status.Queued &&
+    dagRun.status !== Status.Waiting;
   const canRetryStep =
     showStepActions &&
+    dagRun.status !== Status.Waiting &&
+    dagRun.status !== Status.Queued &&
+    !node.step.humanTask &&
     node.status !== NodeStatus.Waiting &&
     node.status !== NodeStatus.Rejected;
+  const rootRunning =
+    isSubDAGRun && dagRunContext.rootStatus === Status.Running;
+  const retryDisabled =
+    loading || dagRun.status === Status.Running || rootRunning;
+  const retryTitle = rootRunning
+    ? 'Retry unavailable while the root DAG run is running.'
+    : 'Retry this step';
 
   const subDAGLogQuery = useQuery(
     '/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/log',
@@ -282,22 +495,6 @@ function NodeStatusTableRow({
     subDAGRunId: isSubDAGRun ? dagRun.dagRunId : undefined,
   });
 
-  // Determine row highlight based on status
-  const getRowHighlight = () => {
-    switch (node.status) {
-      case NodeStatus.Running:
-        return 'bg-success-muted';
-      case NodeStatus.Retrying:
-        return 'bg-warning-muted';
-      case NodeStatus.Failed:
-        return 'bg-error-muted';
-      case NodeStatus.Waiting:
-        return 'bg-warning/5';
-      default:
-        return '';
-    }
-  };
-
   // Handle sub dagRun navigation
   const handleSubDAGRunNavigation = (
     subRunIndex: number = 0,
@@ -305,6 +502,18 @@ function NodeStatusTableRow({
   ) => {
     if (hasSubDAGRun && allSubRuns[subRunIndex]) {
       const subDAGRunId = allSubRuns[subRunIndex].dagRunId;
+
+      // A plain click stacks the child run over the current view. A modifier
+      // click still opens a real page, so it can go to another tab.
+      const modifierClick = Boolean(e && (e.metaKey || e.ctrlKey));
+      if (openSubRun && !modifierClick) {
+        openSubRun({
+          name:
+            allSubRuns[subRunIndex].dagName || node.step.call || node.step.name,
+          dagRunId: subDAGRunId,
+        });
+        return;
+      }
 
       // Check if we're in a dagRun context or a DAG context
       // More reliable detection by checking the current URL path or the dagRun object
@@ -398,18 +607,40 @@ function NodeStatusTableRow({
     setLoading(true);
     setError(null);
     try {
-      await client.POST('/dag-runs/{name}/{dagRunId}/retry', {
-        params: {
-          path: { name: dagName, dagRunId },
-          query: { remoteNode },
-        },
-        body: { dagRunId, stepName: node.step.name },
-      });
-      setSuccess(true);
+      const retryDAGName = isSubDAGRun ? dagRun.rootDAGRunName : dagName;
+      const retryDAGRunId = isSubDAGRun ? dagRun.rootDAGRunId : dagRunId;
+      const { error: requestError } = await client.POST(
+        '/dag-runs/{name}/{dagRunId}/retry',
+        {
+          params: {
+            path: { name: retryDAGName, dagRunId: retryDAGRunId },
+            query: { remoteNode },
+          },
+          body: {
+            dagRunId: retryDAGRunId,
+            stepName: node.step.name,
+            ...(includeDownstream ? { includeDownstream: true } : {}),
+            ...(isSubDAGRun ? { subDAGRunId: dagRun.dagRunId } : {}),
+          },
+        }
+      );
+      if (requestError) {
+        setError(requestError.message || 'Failed to retry DAG run');
+        return;
+      }
       setShowDialog(false);
+      showToast('Step retry started');
+      dagContext.refresh();
     } catch (e) {
-      const error = e as { data?: { message?: string }; message?: string };
-      setError(error?.data?.message || error.message || 'Retry failed');
+      const requestError = e as {
+        data?: { message?: string };
+        message?: string;
+      };
+      setError(
+        requestError?.data?.message ||
+          requestError.message ||
+          'Failed to retry DAG run'
+      );
     } finally {
       setLoading(false);
     }
@@ -463,15 +694,155 @@ function NodeStatusTableRow({
   const currentStream: components['schemas']['Stream'] =
     activeLogTab === 'stderr' && hasStderr ? Stream.stderr : Stream.stdout;
 
+  const handleRetryDialogOpenChange = (open: boolean) => {
+    setShowDialog(open);
+    setError(null);
+    if (open) {
+      setIncludeDownstream(false);
+    }
+  };
+
+  const retryDialog = (
+    <Dialog open={showDialog} onOpenChange={handleRetryDialogOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>
+            <I18nText text={'Retry this step?'} />
+          </DialogTitle>
+        </DialogHeader>
+        <div className="py-2 text-sm space-y-3">
+          <p>
+            <I18nTemplate
+              text="This will re-execute {step}. Are you sure?"
+              values={{ step: <b>{node.step.name}</b> }}
+            />
+          </p>
+          <fieldset className="space-y-1.5">
+            <legend className="text-xs text-muted-foreground">
+              <I18nText text={'Retry scope'} />
+            </legend>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="retry-scope"
+                className="mt-0.5"
+                checked={!includeDownstream}
+                onChange={() => setIncludeDownstream(false)}
+              />
+              <span>
+                <span className="font-medium">
+                  <I18nText text={'This step only'} />
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  <I18nText
+                    text={'Downstream steps keep their current status.'}
+                  />
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="retry-scope"
+                className="mt-0.5"
+                checked={includeDownstream}
+                onChange={() => setIncludeDownstream(true)}
+              />
+              <span>
+                <span className="font-medium">
+                  <I18nText text={'This step and all downstream steps'} />
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  <I18nText
+                    text={
+                      'Reset this step and every reachable descendant. Unrelated branches are left unchanged.'
+                    }
+                  />
+                </span>
+              </span>
+            </label>
+          </fieldset>
+          {error && <div className="text-error mt-2">{error}</div>}
+        </div>
+        <DialogFooter>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => handleRetryDialogOpenChange(false)}
+            disabled={loading}
+          >
+            <X className="h-4 w-4" />
+            <I18nText text={'Cancel'} />
+          </Button>
+          <Button
+            size="sm"
+            onClick={handleRetry}
+            disabled={retryDisabled || !canRetryStep}
+          >
+            <Play className="h-4 w-4" />
+            {loading ? (
+              <I18nText text={'Retrying...'} />
+            ) : (
+              <I18nText text={'Retry'} />
+            )}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+
+  const stepActionsMenu =
+    canRetryStep || canUpdateStepStatus ? (
+      <DropdownMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <Button
+                aria-label={ts('Step actions')}
+                size="icon-sm"
+                title={ts('Step actions')}
+                variant="ghost"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <EllipsisVertical className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>
+            <I18nText text={'Step actions'} />
+          </TooltipContent>
+        </Tooltip>
+        <DropdownMenuContent
+          align="end"
+          onClick={(event) => event.stopPropagation()}
+        >
+          {canRetryStep && (
+            <DropdownMenuItem
+              disabled={retryDisabled}
+              onSelect={() => handleRetryDialogOpenChange(true)}
+              title={retryTitle}
+            >
+              <Play className="mr-2 h-4 w-4 text-success" />
+              <I18nText text={'Retry step'} />
+            </DropdownMenuItem>
+          )}
+          {canRetryStep && canUpdateStepStatus && <DropdownMenuSeparator />}
+          {canUpdateStepStatus && (
+            <DropdownMenuItem onSelect={() => setShowStatusModal(true)}>
+              <CircleDot className="mr-2 h-4 w-4" />
+              <I18nText text={'Change status'} />
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    ) : null;
+
   // Render desktop view (table row)
   if (view === 'desktop') {
     return (
       <>
         <StyledTableRow
-          className={cn(
-            'hover:bg-muted/50 transition-colors duration-200 h-auto cursor-pointer',
-            getRowHighlight()
-          )}
+          className="hover:bg-muted/50 transition-colors duration-200 h-auto cursor-pointer"
           onClick={() => {
             if (hasLogs) {
               setIsLogExpanded(!isLogExpanded);
@@ -521,7 +892,9 @@ function NodeStatusTableRow({
                       </span>
                     </TooltipTrigger>
                     <TooltipContent>
-                      <span className="text-xs">Sub DAG Run: {subDagName}</span>
+                      <span className="text-xs">
+                        <I18nText text={'Sub DAG Run:'} /> {subDagName}
+                      </span>
                     </TooltipContent>
                   </Tooltip>
                 )}
@@ -650,7 +1023,7 @@ function NodeStatusTableRow({
               {node.startedAt && (
                 <div className="text-xs text-muted-foreground flex items-center gap-1.5 leading-tight">
                   <span className="font-medium flex items-center">
-                    Duration:
+                    <I18nText text={'Duration:'} />
                     {isActiveNode && (
                       <span
                         className={`inline-block w-2 h-2 rounded-full ml-1.5 animate-pulse ${activeDotClass}`}
@@ -660,69 +1033,31 @@ function NodeStatusTableRow({
                   {currentDuration}
                 </div>
               )}
-              {/* Approval info */}
-              {node.approvedBy && (
-                <div className="text-xs text-muted-foreground leading-tight">
-                  <span className="font-medium">Approved by:</span>{' '}
-                  <span className="text-info">{node.approvedBy}</span>
-                  {node.approvedAt && (
-                    <span className="ml-1">
-                      at {formatTimestamp(node.approvedAt)}
-                    </span>
-                  )}
-                </div>
-              )}
-              {node.approvalInputs &&
-                Object.keys(node.approvalInputs).length > 0 && (
-                  <div className="text-xs text-muted-foreground leading-tight">
-                    <span className="font-medium">Inputs:</span>{' '}
-                    <span className="font-mono text-foreground/80">
-                      {JSON.stringify(node.approvalInputs)}
-                    </span>
-                  </div>
-                )}
-              {node.pushBackHistory && node.pushBackHistory.length > 0 && (
-                <PushBackHistory
-                  history={node.pushBackHistory}
-                  className="pt-1"
-                />
-              )}
-              {/* Rejection info */}
-              {node.rejectedBy && (
-                <div className="text-xs text-muted-foreground leading-tight">
-                  <span className="font-medium">Rejected by:</span>{' '}
-                  <span className="text-error">{node.rejectedBy}</span>
-                  {node.rejectedAt && (
-                    <span className="ml-1">
-                      at {formatTimestamp(node.rejectedAt)}
-                    </span>
-                  )}
-                </div>
-              )}
-              {node.rejectionReason && (
-                <div className="text-xs text-muted-foreground leading-tight">
-                  <span className="font-medium">Reason:</span>{' '}
-                  <span className="text-foreground/80">
-                    {node.rejectionReason}
-                  </span>
-                </div>
-              )}
+              <ManualActionDetails node={node} className="leading-tight" />
             </div>
           </TableCell>
 
           {/* Status */}
           <TableCell className="text-center">
-            <div
-              onClick={(e) => {
-                e.stopPropagation();
-                setShowStatusModal(true);
-              }}
-              className="inline-block cursor-pointer"
-              title="Click to update status"
-            >
-              <NodeStatusChip status={node.status} size="sm">
-                {node.statusLabel}
-              </NodeStatusChip>
+            <div className="inline-flex flex-col items-center gap-1">
+              <I18nProps>
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!canUpdateStepStatus) return;
+                    setShowStatusModal(true);
+                  }}
+                  className={cn(canUpdateStepStatus && 'cursor-pointer')}
+                  title={
+                    canUpdateStepStatus ? 'Click to update status' : undefined
+                  }
+                >
+                  <NodeStatusChip status={node.status} size="sm">
+                    {node.statusLabel}
+                  </NodeStatusChip>
+                </div>
+              </I18nProps>
+              <BuildDecisionBadge build={node.build} remoteNode={remoteNode} />
             </div>
           </TableCell>
 
@@ -744,14 +1079,20 @@ function NodeStatusTableRow({
                               handleViewLog(e);
                             }}
                             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors bg-card hover:bg-muted cursor-pointer"
-                            title="View stdout log (Cmd/Ctrl+Click for new tab)"
+                            title={ts(
+                              'View stdout log (Cmd/Ctrl+Click for new tab)'
+                            )}
                           >
                             <Code className="h-3.5 w-3.5 text-muted-foreground" />
-                            <span>stdout</span>
+                            <span>
+                              <I18nText text={'stdout'} />
+                            </span>
                           </a>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <span className="text-xs">Standard Output Log</span>
+                          <span className="text-xs">
+                            <I18nText text={'Standard Output Log'} />
+                          </span>
                         </TooltipContent>
                       </Tooltip>
                       {node.stderr && <div className="w-px h-5 bg-border" />}
@@ -775,14 +1116,20 @@ function NodeStatusTableRow({
                             }
                           }}
                           className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors bg-card hover:bg-warning/10 cursor-pointer"
-                          title="View stderr log (Cmd/Ctrl+Click for new tab)"
+                          title={ts(
+                            'View stderr log (Cmd/Ctrl+Click for new tab)'
+                          )}
                         >
                           <AlertCircle className="h-3.5 w-3.5 text-warning" />
-                          <span className="text-warning">stderr</span>
+                          <span className="text-warning">
+                            <I18nText text={'stderr'} />
+                          </span>
                         </a>
                       </TooltipTrigger>
                       <TooltipContent>
-                        <span className="text-xs">Error Output Log</span>
+                        <span className="text-xs">
+                          <I18nText text={'Error Output Log'} />
+                        </span>
                       </TooltipContent>
                     </Tooltip>
                   )}
@@ -797,7 +1144,7 @@ function NodeStatusTableRow({
               )}
               {node.step.preconditions?.some((cond) => cond.error) && (
                 <div className="text-xs text-warning leading-relaxed">
-                  Precondition unmet
+                  <I18nText text={'Precondition unmet'} />
                 </div>
               )}
             </div>
@@ -805,50 +1152,9 @@ function NodeStatusTableRow({
           {showStepActions && (
             <TableCell className="text-center">
               <div className="flex items-center justify-center gap-1">
-                {canRetryStep && (
-                  <Button
-                    size="icon-sm"
-                    variant="secondary"
-                    title="Retry from this step"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setShowDialog(true);
-                    }}
-                    disabled={loading || dagRun.status === Status.Running}
-                  >
-                    <Play className="h-4 w-4 text-success" />
-                  </Button>
-                )}
+                {stepActionsMenu}
               </div>
-              <Dialog open={showDialog} onOpenChange={setShowDialog}>
-                <DialogContent>
-                  <DialogHeader>
-                    <DialogTitle>Retry from this step?</DialogTitle>
-                  </DialogHeader>
-                  <div className="py-2 text-sm">
-                    This will re-execute <b>{node.step.name}</b>. Are you sure?
-                    {error && <div className="text-error mt-2">{error}</div>}
-                    {success && (
-                      <div className="text-success mt-2">Retry started!</div>
-                    )}
-                  </div>
-                  <DialogFooter>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => setShowDialog(false)}
-                      disabled={loading}
-                    >
-                      <X className="h-4 w-4" />
-                      Cancel
-                    </Button>
-                    <Button size="sm" onClick={handleRetry} disabled={loading}>
-                      <Play className="h-4 w-4" />
-                      {loading ? 'Retrying...' : 'Retry'}
-                    </Button>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
+              {retryDialog}
             </TableCell>
           )}
         </StyledTableRow>
@@ -875,7 +1181,7 @@ function NodeStatusTableRow({
                             : 'text-muted-foreground border-transparent hover:text-foreground'
                         )}
                       >
-                        stdout
+                        <I18nText text={'stdout'} />
                       </button>
                       <button
                         onClick={(e) => {
@@ -889,35 +1195,43 @@ function NodeStatusTableRow({
                             : 'text-muted-foreground border-transparent hover:text-foreground'
                         )}
                       >
-                        stderr
+                        <I18nText text={'stderr'} />
                       </button>
                     </div>
                   ) : (
                     <div className="text-xs font-medium text-muted-foreground">
-                      {hasStdout ? 'stdout' : 'stderr'}
+                      {hasStdout ? (
+                        <I18nText text={'stdout'} />
+                      ) : (
+                        <I18nText text={'stderr'} />
+                      )}
                     </div>
                   )}
 
                   {/* Expand to modal button */}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (onViewLog) {
-                        onViewLog(
-                          currentStream === 'stderr'
-                            ? `${node.step.name}_stderr`
-                            : node.step.name,
-                          dagRunId || '',
-                          node
-                        );
-                      }
-                    }}
-                    className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-primary hover:text-primary transition-colors"
-                    title="Open in full modal"
-                  >
-                    <Code className="h-3 w-3" />
-                    <span>Full view</span>
-                  </button>
+                  <I18nProps>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (onViewLog) {
+                          onViewLog(
+                            currentStream === 'stderr'
+                              ? `${node.step.name}_stderr`
+                              : node.step.name,
+                            dagRunId || '',
+                            node
+                          );
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-primary hover:text-primary transition-colors"
+                      title="Open in full modal"
+                    >
+                      <Code className="h-3 w-3" />
+                      <span>
+                        <I18nText text={'Full view'} />
+                      </span>
+                    </button>
+                  </I18nProps>
                 </div>
 
                 {/* Simple inline log viewer - no controls */}
@@ -946,12 +1260,7 @@ function NodeStatusTableRow({
 
   // Render mobile view (card)
   return (
-    <div
-      className={cn(
-        'p-4 rounded-2xl border border-border bg-card hover:',
-        getRowHighlight()
-      )}
-    >
+    <div className="p-4 rounded-2xl border border-border bg-card">
       {/* Header with number and status */}
       <div className="flex justify-between items-center mb-3">
         <div className="flex items-center gap-2">
@@ -967,9 +1276,13 @@ function NodeStatusTableRow({
             )}
           </h3>
         </div>
-        <NodeStatusChip status={node.status} size="sm">
-          {node.statusLabel}
-        </NodeStatusChip>
+        <div className="flex items-center gap-1">
+          <NodeStatusChip status={node.status} size="sm">
+            {node.statusLabel}
+          </NodeStatusChip>
+          <BuildDecisionBadge build={node.build} remoteNode={remoteNode} />
+          {stepActionsMenu}
+        </div>
       </div>
 
       {/* Description */}
@@ -989,11 +1302,11 @@ function NodeStatusTableRow({
                 className="text-xs text-primary font-medium cursor-pointer hover:underline mb-1"
                 onClick={(e) => handleSubDAGRunNavigation(0, e)}
               >
-                View Sub DAG Run: {subDagName}
+                <I18nText text={'View Sub DAG Run:'} /> {subDagName}
               </div>
               {allSubRuns[0]?.params && (
                 <div className="text-xs text-muted-foreground mb-3">
-                  Parameters:{' '}
+                  <I18nText text={'Parameters:'} />{' '}
                   <span className="font-mono">{allSubRuns[0].params}</span>
                 </div>
               )}
@@ -1020,13 +1333,15 @@ function NodeStatusTableRow({
       {/* Command section */}
       <div className="mb-3">
         <div className="text-xs font-medium text-foreground/90 mb-1">
-          {logMessage !== null
-            ? 'Message:'
-            : isHarnessStep(node.step)
-              ? 'Execution:'
-              : node.step.commands && node.step.commands.length > 1
-                ? 'Commands:'
-                : 'Command:'}
+          {logMessage !== null ? (
+            <I18nText text={'Message:'} />
+          ) : isHarnessStep(node.step) ? (
+            <I18nText text={'Execution:'} />
+          ) : node.step.commands && node.step.commands.length > 1 ? (
+            <I18nText text={'Commands:'} />
+          ) : (
+            <I18nText text={'Command:'} />
+          )}
         </div>
         <div className="space-y-1.5">
           {isHarnessStep(node.step) ? (
@@ -1083,16 +1398,16 @@ function NodeStatusTableRow({
       {/* Timing section */}
       <div className="mb-3">
         <div className="text-xs font-medium text-foreground/90 mb-1">
-          Timing:
+          <I18nText text={'Timing:'} />
         </div>
         <div className="space-y-0.5">
           <div className="text-xs text-muted-foreground">
-            Started: {formatTimestamp(node.startedAt)}
+            <I18nText text={'Started:'} /> {formatTimestamp(node.startedAt)}
           </div>
           {node.startedAt && (
             <div className="text-xs text-muted-foreground flex items-center gap-1.5">
               <span className="font-medium flex items-center">
-                Duration:
+                <I18nText text={'Duration:'} />
                 {isActiveNode && (
                   <span
                     className={`inline-block w-2 h-2 rounded-full ml-1.5 animate-pulse ${activeDotClass}`}
@@ -1102,48 +1417,7 @@ function NodeStatusTableRow({
               {currentDuration}
             </div>
           )}
-          {/* Approval info */}
-          {node.approvedBy && (
-            <div className="text-xs text-muted-foreground">
-              <span className="font-medium">Approved by:</span>{' '}
-              <span className="text-info">{node.approvedBy}</span>
-              {node.approvedAt && (
-                <span className="ml-1">
-                  at {formatTimestamp(node.approvedAt)}
-                </span>
-              )}
-            </div>
-          )}
-          {node.approvalInputs &&
-            Object.keys(node.approvalInputs).length > 0 && (
-              <div className="text-xs text-muted-foreground">
-                <span className="font-medium">Inputs:</span>{' '}
-                <span className="font-mono text-foreground/80">
-                  {JSON.stringify(node.approvalInputs)}
-                </span>
-              </div>
-            )}
-          {node.pushBackHistory && node.pushBackHistory.length > 0 && (
-            <PushBackHistory history={node.pushBackHistory} className="pt-1" />
-          )}
-          {/* Rejection info */}
-          {node.rejectedBy && (
-            <div className="text-xs text-muted-foreground">
-              <span className="font-medium">Rejected by:</span>{' '}
-              <span className="text-error">{node.rejectedBy}</span>
-              {node.rejectedAt && (
-                <span className="ml-1">
-                  at {formatTimestamp(node.rejectedAt)}
-                </span>
-              )}
-            </div>
-          )}
-          {node.rejectionReason && (
-            <div className="text-xs text-muted-foreground">
-              <span className="font-medium">Reason:</span>{' '}
-              <span className="text-foreground/80">{node.rejectionReason}</span>
-            </div>
-          )}
+          <ManualActionDetails node={node} />
         </div>
       </div>
 
@@ -1151,7 +1425,7 @@ function NodeStatusTableRow({
       {(node.error || node.step.preconditions?.some((cond) => cond.error)) && (
         <div className="mb-3">
           <div className="text-xs font-medium text-foreground/90 mb-1">
-            Errors:
+            <I18nText text={'Errors:'} />
           </div>
 
           {node.error && (
@@ -1163,7 +1437,7 @@ function NodeStatusTableRow({
           {node.step.preconditions?.some((cond) => cond.error) && (
             <div>
               <div className="text-xs font-medium text-warning mb-1">
-                Precondition Unmet:
+                <I18nText text={'Precondition Unmet:'} />
               </div>
               {node.step.preconditions
                 .filter((cond) => cond.error)
@@ -1173,10 +1447,14 @@ function NodeStatusTableRow({
                     className="text-xs bg-warning-muted border border-warning/20 rounded-md p-1.5 mb-1 whitespace-pre-wrap break-words text-warning leading-tight"
                   >
                     <div className="font-medium">
-                      Condition: {cond.condition}
+                      <I18nText text={'Condition:'} /> {cond.condition}
                     </div>
-                    <div>Expected: {cond.expected}</div>
-                    <div>Error: {cond.error}</div>
+                    <div>
+                      <I18nText text={'Expected:'} /> {cond.expected}
+                    </div>
+                    <div>
+                      <I18nText text={'Error:'} /> {cond.error}
+                    </div>
                   </div>
                 ))}
             </div>
@@ -1191,83 +1469,58 @@ function NodeStatusTableRow({
             {/* stdout button */}
             {node.stdout && (
               <>
-                <a
-                  href={url}
-                  onClick={handleViewLog}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors bg-card hover:bg-muted cursor-pointer"
-                  title="View stdout log (Cmd/Ctrl+Click for new tab)"
-                >
-                  <Code className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span>stdout</span>
-                </a>
+                <I18nProps>
+                  <a
+                    href={url}
+                    onClick={handleViewLog}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors bg-card hover:bg-muted cursor-pointer"
+                    title="View stdout log (Cmd/Ctrl+Click for new tab)"
+                  >
+                    <Code className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span>
+                      <I18nText text={'stdout'} />
+                    </span>
+                  </a>
+                </I18nProps>
                 {node.stderr && <div className="w-px h-5 bg-border" />}
               </>
             )}
 
             {/* stderr button */}
             {node.stderr && (
-              <a
-                href={`${url}&stream=stderr`}
-                onClick={(e) => {
-                  if (!(e.metaKey || e.ctrlKey) && onViewLog) {
-                    e.preventDefault();
-                    onViewLog(`${node.step.name}_stderr`, dagRunId || '', node);
-                  }
-                }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors bg-card hover:bg-warning/10 cursor-pointer"
-                title="View stderr log (Cmd/Ctrl+Click for new tab)"
-              >
-                <AlertCircle className="h-3.5 w-3.5 text-warning" />
-                <span className="text-warning">stderr</span>
-              </a>
+              <I18nProps>
+                <a
+                  href={`${url}&stream=stderr`}
+                  onClick={(e) => {
+                    if (!(e.metaKey || e.ctrlKey) && onViewLog) {
+                      e.preventDefault();
+                      onViewLog(
+                        `${node.step.name}_stderr`,
+                        dagRunId || '',
+                        node
+                      );
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors bg-card hover:bg-warning/10 cursor-pointer"
+                  title="View stderr log (Cmd/Ctrl+Click for new tab)"
+                >
+                  <AlertCircle className="h-3.5 w-3.5 text-warning" />
+                  <span className="text-warning">
+                    <I18nText text={'stderr'} />
+                  </span>
+                </a>
+              </I18nProps>
             )}
           </div>
         </div>
       )}
-
-      {showStepActions && (
-        <div className="flex justify-end mt-4 gap-2">
-          {canRetryStep && (
-            <button
-              className="p-2 rounded-full hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Retry from this step"
-              onClick={() => setShowDialog(true)}
-              disabled={loading || dagRun.status === Status.Running}
-            >
-              <Play className="h-6 w-6 text-success" />
-            </button>
-          )}
-          <Dialog open={showDialog} onOpenChange={setShowDialog}>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Retry from this step?</DialogTitle>
-              </DialogHeader>
-              <div className="py-2 text-sm">
-                This will re-execute <b>{node.step.name}</b>. Are you sure?
-                {error && <div className="text-error mt-2">{error}</div>}
-                {success && (
-                  <div className="text-success mt-2">Retry started!</div>
-                )}
-              </div>
-              <DialogFooter>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setShowDialog(false)}
-                  disabled={loading}
-                >
-                  <X className="h-4 w-4" />
-                  Cancel
-                </Button>
-                <Button size="sm" onClick={handleRetry} disabled={loading}>
-                  <Play className="h-4 w-4" />
-                  {loading ? 'Retrying...' : 'Retry'}
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        </div>
-      )}
+      {retryDialog}
+      <StatusUpdateModal
+        visible={showStatusModal}
+        dismissModal={() => setShowStatusModal(false)}
+        step={node.step}
+        onSubmit={handleStatusUpdate}
+      />
     </div>
   );
 }

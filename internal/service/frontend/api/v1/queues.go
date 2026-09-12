@@ -11,12 +11,14 @@ import (
 	"sort"
 	"time"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
 )
 
 const (
@@ -24,6 +26,46 @@ const (
 	maxQueueListLimit     = 500
 	queueCursorScanBatch  = 64
 )
+
+// queueItemsScanCap bounds records scanned by one item-list request.
+var queueItemsScanCap = 500
+
+// queuedCountScanCap bounds how many queued items a single count may scan.
+// Counting is O(items) with a status read per item, so an uncapped scan on a
+// deep queue can take tens of seconds and stall both GET /queues and the queues
+// SSE topic. Past the cap the count is reported as a lower bound via the
+// queuedCountCapped/totalQueuedCapped flags.
+//
+// Declared as a var so tests can lower it instead of enqueuing thousands of runs.
+var queuedCountScanCap = 500
+
+// queuedCountRequestScanCap bounds how many queued entries a single request may
+// scan across all queues combined. The per-queue cap alone does not bound a
+// request: collectQueues counts every queue returned by QueueList, so the total
+// would still grow with the number of queues.
+//
+// Declared as a var for the same reason as queuedCountScanCap.
+var queuedCountRequestScanCap = 2000
+
+// scanBudget bounds the queued entries one request may scan in total, shared
+// across every queue that request counts.
+type scanBudget struct {
+	remaining int
+}
+
+func newScanBudget(total int) *scanBudget {
+	return &scanBudget{remaining: total}
+}
+
+func (b *scanBudget) exhausted() bool {
+	return b != nil && b.remaining <= 0
+}
+
+func (b *scanBudget) consume() {
+	if b != nil && b.remaining > 0 {
+		b.remaining--
+	}
+}
 
 // ListQueues implements api.StrictServerInterface.
 func (a *API) ListQueues(ctx context.Context, _ api.ListQueuesRequestObject) (api.ListQueuesResponseObject, error) {
@@ -39,6 +81,7 @@ func (a *API) ListQueues(ctx context.Context, _ api.ListQueuesRequestObject) (ap
 	}
 	sort.Strings(queueNames)
 	var totalRunning, totalQueued, totalCapacity int
+	var totalQueuedCapped bool
 	for _, queueName := range queueNames {
 		q := queueMap[queueName]
 		queue, err := a.toQueueResource(ctx, q)
@@ -47,6 +90,7 @@ func (a *API) ListQueues(ctx context.Context, _ api.ListQueuesRequestObject) (ap
 		}
 		totalRunning += len(q.running)
 		totalQueued += q.queuedCount
+		totalQueuedCapped = totalQueuedCapped || q.queuedCountCapped
 		if q.maxConcurrency > 0 {
 			totalCapacity += q.maxConcurrency
 		}
@@ -69,6 +113,9 @@ func (a *API) ListQueues(ctx context.Context, _ api.ListQueuesRequestObject) (ap
 			TotalCapacity:         totalCapacity,
 			UtilizationPercentage: utilizationPercentage,
 		},
+	}
+	if totalQueuedCapped {
+		response.Summary.TotalQueuedCapped = &totalQueuedCapped
 	}
 
 	return api.ListQueues200JSONResponse(response), nil
@@ -99,8 +146,8 @@ func (a *API) GetQueue(ctx context.Context, req api.GetQueueRequestObject) (api.
 }
 
 // fetchDAGRunSummary fetches the status and converts it to a summary for a given DAG-run reference.
-func (a *API) fetchDAGRunSummary(ctx context.Context, dagRun exec.DAGRunRef) (api.DAGRunSummary, error) {
-	attempt, err := a.dagRunStore.FindAttempt(ctx, dagRun)
+func (a *API) fetchDAGRunSummary(ctx context.Context, dagRun ir.DAGRunRef) (api.DAGRunSummary, error) {
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, dagRun)
 	if err != nil {
 		return api.DAGRunSummary{}, err
 	}
@@ -121,7 +168,7 @@ func (a *API) ListQueueItems(ctx context.Context, req api.ListQueueItemsRequestO
 
 	items, nextCursor, err := a.listVisibleQueuedItems(ctx, req.Name, limit, cursor)
 	if err != nil {
-		if errors.Is(err, exec.ErrInvalidCursor) {
+		if errors.Is(err, pagination.ErrInvalidCursor) {
 			return nil, &Error{
 				Code:       api.ErrorCodeBadRequest,
 				Message:    "Invalid queue cursor",
@@ -151,6 +198,9 @@ type queueInfo struct {
 	maxConcurrency int
 	running        []api.DAGRunSummary
 	queuedCount    int
+	// queuedCountCapped reports that queuedCount hit queuedCountScanCap and is
+	// therefore a lower bound rather than an exact total.
+	queuedCountCapped bool
 }
 
 // getOrCreateQueue returns an existing queue from the map or creates a new one.
@@ -214,10 +264,10 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 		}
 	}
 
-	runningByGroup := map[string][]exec.DAGRunRef{}
-	if a.procStore != nil {
+	runningByGroup := map[string][]ir.DAGRunRef{}
+	if a.procRepository != nil {
 		var err error
-		runningByGroup, err = a.procStore.ListAllAlive(ctx)
+		runningByGroup, err = a.procRepository.ListAllAlive(ctx)
 		if err != nil {
 			return nil, &Error{
 				Code:       api.ErrorCodeInternalError,
@@ -234,7 +284,7 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 		}
 		var queue *queueInfo
 		for _, dagRun := range dagRuns {
-			attempt, err := a.dagRunStore.FindAttempt(ctx, dagRun)
+			attempt, err := a.dagRunRepository.FindAttempt(ctx, dagRun)
 			if err != nil {
 				continue
 			}
@@ -262,8 +312,11 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 		return queueMap, nil
 	}
 
+	// One budget shared by every queue counted in this request.
+	budget := newScanBudget(queuedCountRequestScanCap)
+
 	if onlyQueue != "" {
-		count, err := a.countVisibleQueuedItems(ctx, onlyQueue)
+		count, capped, err := a.countVisibleQueuedItems(ctx, onlyQueue, budget)
 		if err != nil {
 			return nil, &Error{
 				Code:       api.ErrorCodeInternalError,
@@ -271,9 +324,12 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 				HTTPStatus: 500,
 			}
 		}
-		if count > 0 {
+		// A capped scan proves entries exist even when none seen so far were
+		// visible, so the queue must still surface rather than read as absent.
+		if count > 0 || capped {
 			queue := getOrCreateQueue(queueMap, onlyQueue, a.config)
 			queue.queuedCount = count
+			queue.queuedCountCapped = capped
 		}
 	} else {
 		queueNames, err := a.queueStore.QueueList(ctx)
@@ -285,7 +341,7 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			}
 		}
 		for _, queueName := range queueNames {
-			count, err := a.countVisibleQueuedItems(ctx, queueName)
+			count, capped, err := a.countVisibleQueuedItems(ctx, queueName, budget)
 			if err != nil {
 				logger.Warn(ctx, "Failed to get queue length",
 					tag.Queue(queueName),
@@ -294,6 +350,7 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			}
 			queue := getOrCreateQueue(queueMap, queueName, a.config)
 			queue.queuedCount = count
+			queue.queuedCountCapped = capped
 		}
 	}
 
@@ -312,6 +369,10 @@ func (a *API) toQueueResource(_ context.Context, q *queueInfo) (api.Queue, error
 		RunningCount: len(q.running),
 		QueuedCount:  q.queuedCount,
 	}
+	if q.queuedCountCapped {
+		capped := true
+		queue.QueuedCountCapped = &capped
+	}
 	if q.maxConcurrency > 0 {
 		queue.MaxConcurrency = &q.maxConcurrency
 	}
@@ -325,8 +386,9 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 
 	items := make([]api.DAGRunSummary, 0, limit)
 	currentCursor := cursor
-	for len(items) < limit {
-		batchSize := min(max(limit-len(items), 1), queueCursorScanBatch)
+	scanned := 0
+	for len(items) < limit && scanned < queueItemsScanCap {
+		batchSize := min(max(limit-len(items), 1), queueCursorScanBatch, queueItemsScanCap-scanned)
 		page, err := a.queueStore.ListCursor(ctx, queueName, currentCursor, batchSize)
 		if err != nil {
 			return nil, "", err
@@ -334,6 +396,7 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 		if len(page.Items) == 0 {
 			return items, "", nil
 		}
+		scanned += len(page.Items)
 
 		for _, queuedItem := range page.Items {
 			dagRunRef, err := queuedItem.Data()
@@ -355,7 +418,7 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 				logger.Warn(ctx, "Failed to fetch queued DAG run summary",
 					tag.Queue(queueName),
 					tag.Error(err),
-					slog.String("dagRunId", dagRunRef.ID),
+					tag.RunID(dagRunRef.ID),
 				)
 				continue
 			}
@@ -377,29 +440,60 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 	return items, currentCursor, nil
 }
 
-func (a *API) countVisibleQueuedItems(ctx context.Context, queueName string) (int, error) {
+// countVisibleQueuedItems counts queued items that are not already running.
+//
+// The scan is bounded twice: by queuedCountScanCap for this queue, and by the
+// caller's shared budget for the request as a whole. Counting requires a status
+// read per entry to exclude entries whose run has already started, so without
+// both bounds the cost grows with queue depth and with the number of queues.
+// When either bound is reached, counting stops and the returned bool reports
+// that the count is a lower bound.
+func (a *API) countVisibleQueuedItems(ctx context.Context, queueName string, budget *scanBudget) (int, bool, error) {
 	if a.queueStore == nil {
-		return 0, nil
+		return 0, false, nil
+	}
+	if budget.exhausted() {
+		// Earlier queues already consumed the request budget. Report zero as a
+		// lower bound rather than spending more reads on this one.
+		return 0, true, nil
 	}
 	count := 0
+	scanned := 0
 	cursor := ""
 	for {
 		page, err := a.queueStore.ListCursor(ctx, queueName, cursor, queueCursorScanBatch)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
-		for _, queuedItem := range page.Items {
-			dagRunRef, err := queuedItem.Data()
-			if err != nil {
-				continue
+		for i, queuedItem := range page.Items {
+			if budget.exhausted() {
+				// This entry and everything after it stays unscanned.
+				return count, true, nil
 			}
-			summary, err := a.fetchDAGRunSummary(ctx, *dagRunRef)
-			if err == nil && summary.Status != api.StatusRunning {
-				count++
+			budget.consume()
+
+			// Every entry costs a status read, whether or not it ends up visible,
+			// so the cap tracks entries processed rather than entries counted.
+			// Capping on the visible count alone would leave a queue made up of
+			// running or unreadable entries scanning without bound.
+			scanned++
+
+			dagRunRef, err := queuedItem.Data()
+			if err == nil {
+				summary, err := a.fetchDAGRunSummary(ctx, *dagRunRef)
+				if err == nil && summary.Status != api.StatusRunning {
+					count++
+				}
+			}
+
+			if scanned >= queuedCountScanCap {
+				// Only a lower bound if entries actually remain unscanned.
+				remaining := i+1 < len(page.Items) || page.HasMore
+				return count, remaining, nil
 			}
 		}
 		if !page.HasMore {
-			return count, nil
+			return count, false, nil
 		}
 		cursor = page.NextCursor
 	}
@@ -423,7 +517,7 @@ func (a *API) effectiveLeaseStaleThreshold() time.Duration {
 	if a.leaseStaleThreshold > 0 {
 		return a.leaseStaleThreshold
 	}
-	return exec.DefaultStaleLeaseThreshold
+	return dagrun.DefaultStaleLeaseThreshold
 }
 
 func (a *API) activeDistributedRunningSummaries(ctx context.Context, queueName string, excludeRunIDs map[string]struct{}) map[string][]api.DAGRunSummary {
@@ -463,8 +557,8 @@ func (a *API) activeDistributedRunningSummaries(ctx context.Context, queueName s
 	return result
 }
 
-func (a *API) runningSummaryFromLease(ctx context.Context, lease exec.DAGRunLease) (api.DAGRunSummary, bool) {
-	attempt, err := a.dagRunStore.FindAttempt(ctx, lease.DAGRun)
+func (a *API) runningSummaryFromLease(ctx context.Context, lease dispatch.DAGRunLease) (api.DAGRunSummary, bool) {
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, lease.DAGRun)
 	if err != nil {
 		return api.DAGRunSummary{}, false
 	}
@@ -479,16 +573,18 @@ func (a *API) runningSummaryFromLease(ctx context.Context, lease exec.DAGRunLeas
 		return api.DAGRunSummary{}, false
 	}
 	switch status.Status {
-	case core.Running:
+	case ir.Running:
 		return toDAGRunSummary(*status), true
-	case core.NotStarted, core.Queued:
+	case ir.NotStarted, ir.Queued:
 		// A fresh lease means the worker owns the queue slot, even if the
 		// persisted status has not caught up to running yet.
 		summary := toDAGRunSummary(*status)
 		summary.Status = api.StatusRunning
+		summary.StatusLabel = api.StatusLabelRunning
+		summary.Conditions = nil
 		return summary, true
-	case core.Failed, core.Aborted, core.Succeeded,
-		core.PartiallySucceeded, core.Waiting, core.Rejected:
+	case ir.Failed, ir.Aborted, ir.Succeeded,
+		ir.PartiallySucceeded, ir.Waiting, ir.Rejected:
 		return api.DAGRunSummary{}, false
 	}
 

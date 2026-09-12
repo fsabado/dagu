@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -30,9 +31,10 @@ import (
 	aquaregistry "github.com/aquaproj/aqua/v2/pkg/install-registry"
 	aquainstallpackage "github.com/aquaproj/aqua/v2/pkg/installpackage"
 	aquaruntime "github.com/aquaproj/aqua/v2/pkg/runtime"
-	"github.com/dagucloud/dagu/internal/cmn/dirlock"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/tools"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/tools"
 	"github.com/spf13/afero"
 )
 
@@ -47,6 +49,9 @@ const (
 type Installer struct {
 	logger     *slog.Logger
 	httpClient *http.Client
+
+	githubAPIBase string
+	now           func() time.Time
 }
 
 // Option configures an Installer.
@@ -69,8 +74,10 @@ func WithHTTPClient(client *http.Client) Option {
 // New returns an aqua-backed Dagu tool installer.
 func New(opts ...Option) *Installer {
 	installer := &Installer{
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: http.DefaultClient,
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient:    http.DefaultClient,
+		githubAPIBase: defaultGitHubAPIBase,
+		now:           time.Now,
 	}
 	for _, opt := range opts {
 		opt(installer)
@@ -79,15 +86,57 @@ func New(opts ...Option) *Installer {
 }
 
 // Install installs declared tools and returns resolved command paths.
-func (i *Installer) Install(ctx context.Context, cfg *core.ToolConfig, opts tools.InstallOptions) (*tools.Manifest, error) {
+//
+// The standard registry resolves to the latest aqua-registry release, cached
+// on disk for a day, unless the DAG pins tools.registry.ref. When the latest
+// release cannot be resolved, the most recent cached release is used.
+func (i *Installer) Install(ctx context.Context, cfg *ir.ToolConfig, opts tools.InstallOptions) (*tools.Manifest, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("tools config is required")
 	}
 	if cfg.Provider != "" && cfg.Provider != providerAqua {
 		return nil, fmt.Errorf("unsupported tools provider %q", cfg.Provider)
 	}
-	cfg = effectiveToolConfig(cfg)
 
+	if !standardRefDefaulted(cfg) {
+		effective := effectiveToolConfig(cfg)
+		manifest, err := i.installResolved(ctx, effective, opts)
+		if err != nil {
+			return nil, describeInstallError(effective, err)
+		}
+		return manifest, nil
+	}
+
+	resolved := i.resolveStandardRegistryRef(ctx, opts, false)
+	resolvedCfg := effectiveToolConfigWithRef(cfg, resolved.SHA)
+	manifest, err := i.installResolved(ctx, resolvedCfg, opts)
+	if err == nil {
+		return manifest, nil
+	}
+	err = describeInstallError(resolvedCfg, err)
+	if resolved.Source == registryRefSourceLive || ctx.Err() != nil || !isRegistryResolutionError(err) {
+		return nil, err
+	}
+
+	// The failed attempt used a cached or bootstrap ref; a newer registry
+	// release may already carry the missing package, so refresh and retry once.
+	refreshed := i.resolveStandardRegistryRef(ctx, opts, true)
+	if refreshed.Source != registryRefSourceLive || refreshed.SHA == resolved.SHA {
+		return nil, err
+	}
+	logger.Info(ctx, "Retrying DAG tools with the latest aqua registry release",
+		slog.String("previous", shortRef(resolved.SHA)),
+		slog.String("latest", refreshed.Tag),
+		slog.String("latestRef", shortRef(refreshed.SHA)))
+	refreshedCfg := effectiveToolConfigWithRef(cfg, refreshed.SHA)
+	manifest, retryErr := i.installResolved(ctx, refreshedCfg, opts)
+	if retryErr != nil {
+		return nil, errors.Join(err, describeInstallError(refreshedCfg, retryErr))
+	}
+	return manifest, nil
+}
+
+func (i *Installer) installResolved(ctx context.Context, cfg *ir.ToolConfig, opts tools.InstallOptions) (*tools.Manifest, error) {
 	rt := aquaruntime.NewR(ctx)
 	platform := opts.Platform
 	if platform == "" {
@@ -101,6 +150,7 @@ func (i *Installer) Install(ctx context.Context, cfg *core.ToolConfig, opts tool
 	if err != nil {
 		return nil, err
 	}
+	paths = applyDigestIsolation(paths, cfg)
 	if manifest, err := readyManifest(paths, platform, hash); err != nil {
 		return nil, err
 	} else if manifest != nil {
@@ -116,6 +166,14 @@ func (i *Installer) Install(ctx context.Context, cfg *core.ToolConfig, opts tool
 		return nil, err
 	} else if manifest != nil {
 		return manifest, nil
+	}
+	if hasPackageDigests(cfg) {
+		// Digest-pinned toolsets install into a clean room: leftovers from an
+		// interrupted install could otherwise satisfy aqua's exists-check with
+		// bytes the recorded checksums no longer describe.
+		if err := os.RemoveAll(paths.EnvDir); err != nil {
+			return nil, fmt.Errorf("reset digest-pinned aqua env dir: %w", err)
+		}
 	}
 
 	// Tool caches live under the worker-local data dir and are owned by the
@@ -141,7 +199,7 @@ func (i *Installer) Install(ctx context.Context, cfg *core.ToolConfig, opts tool
 		return nil, err
 	}
 	if err := i.ensureRegistriesInstalled(ctx, param, paths, rt, aquaCfg); err != nil {
-		return nil, err
+		return nil, &registryResolutionError{err: err}
 	}
 	unlockProxy, err := i.lockColdProxyInstall(ctx, paths, rt)
 	if err != nil {
@@ -167,14 +225,26 @@ func (i *Installer) Install(ctx context.Context, cfg *core.ToolConfig, opts tool
 		return nil, fmt.Errorf("initialize aqua install controller: %w", err)
 	}
 	if err := installController.Install(ctx, i.logger, param); err != nil {
-		return nil, fmt.Errorf("install aqua tools: %w", err)
+		return nil, &registryResolutionError{err: fmt.Errorf("install aqua tools: %w", err)}
+	}
+	if hasPackageDigests(cfg) {
+		checksumIDs, err := i.packageChecksumIDs(ctx, cfg, param, paths, rt)
+		if err != nil {
+			return nil, &registryResolutionError{err: err}
+		}
+		if err := verifyPackageDigests(paths.ChecksumFile, cfg.Packages, checksumIDs); err != nil {
+			return nil, err
+		}
 	}
 
 	commandSets, err := i.packageCommands(ctx, cfg, param, paths, rt)
 	if err != nil {
-		return nil, err
+		return nil, &registryResolutionError{err: err}
 	}
-	whichController := aquacontroller.InitializeWhichCommandController(ctx, i.logger, param, i.httpClient, rt)
+	whichController, err := aquacontroller.InitializeWhichCommandController(ctx, i.logger, param, i.httpClient, rt)
+	if err != nil {
+		return nil, fmt.Errorf("initialize aqua which controller: %w", err)
+	}
 	manifest := &tools.Manifest{
 		Provider:     providerAqua,
 		Platform:     platform,
@@ -276,7 +346,7 @@ func isPathWithin(dir, path string) bool {
 	return rel == "." || (rel != "" && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-func (i *Installer) packageCommands(ctx context.Context, cfg *core.ToolConfig, param *aquaparam.Param, paths tools.CacheLayout, rt *aquaruntime.Runtime) ([][]string, error) {
+func (i *Installer) packageCommands(ctx context.Context, cfg *ir.ToolConfig, param *aquaparam.Param, paths tools.CacheLayout, rt *aquaruntime.Runtime) ([][]string, error) {
 	commandSets := make([][]string, len(cfg.Packages))
 	needsInference := false
 	for idx, pkg := range cfg.Packages {
@@ -313,9 +383,10 @@ func (i *Installer) packageCommands(ctx context.Context, cfg *core.ToolConfig, p
 	}
 	defer updateChecksum()
 
-	httpDownloader := aquadownload.NewHTTPDownloader(i.logger, i.httpClient)
-	registryDownloader := aquadownload.NewGitHubContentFileDownloader(aquagithub.New(ctx, i.logger), httpDownloader)
-	registryInstaller := aquaregistry.New(param, registryDownloader, fs, rt, nil, nil)
+	registryInstaller, err := i.newRegistryInstaller(ctx, param, fs, rt)
+	if err != nil {
+		return nil, err
+	}
 	registryContents := make(map[string]*aquaregistryconfig.Config, len(aquaCfg.Registries))
 
 	for idx, pkg := range cfg.Packages {
@@ -338,6 +409,88 @@ func (i *Installer) packageCommands(ctx context.Context, cfg *core.ToolConfig, p
 		commandSets[idx] = commands
 	}
 	return commandSets, nil
+}
+
+// applyDigestIsolation moves the aqua root under the toolset env dir when any
+// package declares a digest. Digest verification compares against checksums
+// recorded for this install, and aqua skips downloading packages that already
+// exist under the root; a shared root could therefore hold bytes the recorded
+// checksums do not describe.
+func applyDigestIsolation(paths tools.CacheLayout, cfg *ir.ToolConfig) tools.CacheLayout {
+	if !hasPackageDigests(cfg) {
+		return paths
+	}
+	paths.RootDir = filepath.Join(paths.EnvDir, "root")
+	return paths
+}
+
+func hasPackageDigests(cfg *ir.ToolConfig) bool {
+	for _, pkg := range cfg.Packages {
+		if strings.TrimSpace(pkg.Digest) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// packageChecksumIDs resolves the aqua checksum-file ID for every package that
+// declares a digest, keyed by package index. The ID identifies the artifact
+// aqua verified for the run platform.
+func (i *Installer) packageChecksumIDs(ctx context.Context, cfg *ir.ToolConfig, param *aquaparam.Param, paths tools.CacheLayout, rt *aquaruntime.Runtime) (map[int]string, error) {
+	aquaCfg, err := i.readRenderedConfig(param, paths.ConfigFile)
+	if err != nil {
+		return nil, err
+	}
+	if len(aquaCfg.Packages) != len(cfg.Packages) {
+		return nil, fmt.Errorf("resolve aqua checksum IDs: rendered package count mismatch")
+	}
+
+	fs := afero.NewOsFs()
+	checksums, updateChecksum, err := aquachecksum.Open(i.logger, fs, paths.ConfigFile, param.ChecksumEnabled(aquaCfg))
+	if err != nil {
+		return nil, fmt.Errorf("read aqua checksum file: %w", err)
+	}
+	defer updateChecksum()
+
+	registryInstaller, err := i.newRegistryInstaller(ctx, param, fs, rt)
+	if err != nil {
+		return nil, err
+	}
+	registryContents := make(map[string]*aquaregistryconfig.Config, len(aquaCfg.Registries))
+
+	ids := make(map[int]string, len(cfg.Packages))
+	for idx, pkg := range cfg.Packages {
+		if strings.TrimSpace(pkg.Digest) == "" {
+			continue
+		}
+		aquaPkg := aquaCfg.Packages[idx]
+		registryContent, err := i.registryContent(ctx, registryInstaller, registryContents, aquaCfg, aquaPkg, paths.ConfigFile, checksums)
+		if err != nil {
+			return nil, err
+		}
+		pkgInfo := registryContent.Package(i.logger, aquaPkg.Name)
+		if pkgInfo == nil {
+			return nil, fmt.Errorf("resolve aqua checksum ID for %s@%s: package is not found in registry %q", pkg.Package, pkg.Version, aquaPkg.Registry)
+		}
+		pkgInfo, err = pkgInfo.Override(i.logger, aquaPkg.Version, rt)
+		if err != nil {
+			return nil, fmt.Errorf("resolve aqua checksum ID for %s@%s: apply version/runtime overrides: %w", pkg.Package, pkg.Version, err)
+		}
+		composite := &aquaparam.Package{
+			Package:     aquaPkg,
+			PackageInfo: pkgInfo,
+			Registry:    aquaCfg.Registries[aquaPkg.Registry],
+		}
+		id, err := composite.ChecksumID(rt)
+		if err != nil {
+			return nil, fmt.Errorf("resolve aqua checksum ID for %s@%s: %w", pkg.Package, pkg.Version, err)
+		}
+		if id == "" {
+			return nil, fmt.Errorf("digest pinning is not supported for %s@%s: package type %q records no artifact checksum", pkg.Package, pkg.Version, pkgInfo.Type)
+		}
+		ids[idx] = id
+	}
+	return ids, nil
 }
 
 func (i *Installer) readRenderedConfig(param *aquaparam.Param, configFile string) (*aquaconfig.Config, error) {
@@ -420,6 +573,16 @@ func isCommandName(command string) bool {
 	return true
 }
 
+func (i *Installer) newRegistryInstaller(ctx context.Context, param *aquaparam.Param, fs afero.Fs, rt *aquaruntime.Runtime) (*aquaregistry.Installer, error) {
+	githubClient, err := aquagithub.New(ctx, i.logger)
+	if err != nil {
+		return nil, fmt.Errorf("initialize aqua GitHub client: %w", err)
+	}
+	httpDownloader := aquadownload.NewHTTPDownloader(i.logger, i.httpClient)
+	registryDownloader := aquadownload.NewGitHubContentFileDownloader(githubClient, httpDownloader)
+	return aquaregistry.New(param, registryDownloader, fs, rt, nil, nil), nil
+}
+
 func (i *Installer) ensureRegistriesInstalled(ctx context.Context, param *aquaparam.Param, paths tools.CacheLayout, rt *aquaruntime.Runtime, aquaCfg *aquaconfig.Config) error {
 	fs := afero.NewOsFs()
 	checksums, updateChecksum, err := aquachecksum.Open(i.logger, fs, paths.ConfigFile, param.ChecksumEnabled(aquaCfg))
@@ -428,9 +591,10 @@ func (i *Installer) ensureRegistriesInstalled(ctx context.Context, param *aquapa
 	}
 	defer updateChecksum()
 
-	httpDownloader := aquadownload.NewHTTPDownloader(i.logger, i.httpClient)
-	registryDownloader := aquadownload.NewGitHubContentFileDownloader(aquagithub.New(ctx, i.logger), httpDownloader)
-	registryInstaller := aquaregistry.New(param, registryDownloader, fs, rt, nil, nil)
+	registryInstaller, err := i.newRegistryInstaller(ctx, param, fs, rt)
+	if err != nil {
+		return err
+	}
 
 	for _, registry := range aquaCfg.Registries {
 		if registry == nil || registry.Type == aquaconfig.RegistryTypeLocal {
@@ -478,11 +642,11 @@ func (i *Installer) lockColdProxyInstall(ctx context.Context, paths tools.CacheL
 	return unlock, nil
 }
 
-func (i *Installer) lockPackages(ctx context.Context, paths tools.CacheLayout, cfg *core.ToolConfig, platform string) (func(), error) {
+func (i *Installer) lockPackages(ctx context.Context, paths tools.CacheLayout, cfg *ir.ToolConfig, platform string) (func(), error) {
 	return i.lockResources(ctx, paths, "package", packageLockKeys(cfg, platform))
 }
 
-func packageLockKeys(cfg *core.ToolConfig, platform string) []string {
+func packageLockKeys(cfg *ir.ToolConfig, platform string) []string {
 	keys := make([]string, 0, len(cfg.Packages))
 	seen := map[string]struct{}{}
 	for _, pkg := range cfg.Packages {
@@ -506,16 +670,16 @@ func (i *Installer) lockResources(ctx context.Context, paths tools.CacheLayout, 
 	for _, key := range keys {
 		unlock, err := i.lockResource(ctx, paths, kind, key)
 		if err != nil {
-			for idx := len(unlocks) - 1; idx >= 0; idx-- {
-				unlocks[idx]()
+			for _, unlock := range slices.Backward(unlocks) {
+				unlock()
 			}
 			return nil, err
 		}
 		unlocks = append(unlocks, unlock)
 	}
 	return func() {
-		for idx := len(unlocks) - 1; idx >= 0; idx-- {
-			unlocks[idx]()
+		for _, unlock := range slices.Backward(unlocks) {
+			unlock()
 		}
 	}, nil
 }
@@ -560,6 +724,50 @@ func (i *Installer) lockResource(ctx context.Context, paths tools.CacheLayout, k
 func lockHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// registryResolutionError marks install failures that a newer standard
+// registry release could plausibly fix: registry download, package install,
+// and package metadata resolution. Local failures (cache setup, locks, file
+// writes, digest mismatches) are never marked and are returned directly
+// without a registry refresh.
+type registryResolutionError struct {
+	err error
+}
+
+func (e *registryResolutionError) Error() string { return e.err.Error() }
+
+func (e *registryResolutionError) Unwrap() error { return e.err }
+
+func isRegistryResolutionError(err error) bool {
+	var resolutionErr *registryResolutionError
+	return errors.As(err, &resolutionErr)
+}
+
+func describeInstallError(cfg *ir.ToolConfig, err error) error {
+	packages := make([]string, 0, len(cfg.Packages))
+	for _, pkg := range cfg.Packages {
+		packages = append(packages, pkg.Package+"@"+pkg.Version)
+	}
+	return fmt.Errorf("aqua registry %s could not provide packages [%s]: %w",
+		describeRegistry(cfg.Registry), strings.Join(packages, ", "), err)
+}
+
+func describeRegistry(registry *ir.ToolRegistry) string {
+	if registry == nil {
+		return "standard"
+	}
+	if strings.TrimSpace(registry.Type) == "github_content" {
+		return fmt.Sprintf("%s/%s@%s", registry.RepoOwner, registry.RepoName, shortRef(registry.Ref))
+	}
+	return "standard@" + shortRef(registry.Ref)
+}
+
+func shortRef(ref string) string {
+	if isCommitSHA(ref) {
+		return ref[:12]
+	}
+	return ref
 }
 
 func toolsDir(opts tools.InstallOptions) string {

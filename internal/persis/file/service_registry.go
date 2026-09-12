@@ -4,12 +4,12 @@
 package file
 
 import (
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	fileserviceregistry "github.com/dagucloud/dagu/internal/persis/file/serviceregistry"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	fileserviceregistry "github.com/dagucloud/dagu/v2/internal/persis/file/serviceregistry"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 )
 
 // NewServiceRegistry wires the file-backed service registry from application config.
-func NewServiceRegistry(cfg *config.Config) exec.ServiceRegistry {
+func NewServiceRegistry(cfg *config.Config) serviceregistry.ServiceRegistry {
 	return fileserviceregistry.New(cfg.Paths.ServiceRegistryDir)
 }

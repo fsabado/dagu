@@ -9,12 +9,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/runtime/agent"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/agent"
 	"github.com/spf13/cobra"
 )
 
@@ -57,16 +58,16 @@ func runRestart(ctx *Context, args []string) error {
 
 	name := args[0]
 
-	var attempt exec.DAGRunAttempt
+	var attempt dagrun.Attempt
 	if dagRunID != "" {
 		// Retrieve the previous run for the specified dag-run ID.
-		dagRunRef := exec.NewDAGRunRef(name, dagRunID)
-		attempt, err = ctx.DAGRunStore.FindAttempt(ctx, dagRunRef)
+		dagRunRef := ir.NewDAGRunRef(name, dagRunID)
+		attempt, err = ctx.Persistence.DAGRunRepository.FindAttempt(ctx, dagRunRef)
 		if err != nil {
 			return fmt.Errorf("failed to find the run for dag-run ID %s: %w", dagRunID, err)
 		}
 	} else {
-		attempt, err = ctx.DAGRunStore.LatestAttempt(ctx, name)
+		attempt, err = ctx.Persistence.DAGRunRepository.LatestAttempt(ctx, name, persis.DAGRunLatestAttemptOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to find the latest execution history for DAG %s: %w", name, err)
 		}
@@ -76,7 +77,7 @@ func runRestart(ctx *Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read status: %w", err)
 	}
-	if dagStatus.Status != core.Running {
+	if dagStatus.Status != ir.Running {
 		return fmt.Errorf("DAG %s is not running, current status: %s", name, dagStatus.Status)
 	}
 
@@ -90,14 +91,22 @@ func runRestart(ctx *Context, args []string) error {
 		return fmt.Errorf("failed to restore DAG from status: %w", err)
 	}
 
-	if err := handleRestartProcess(ctx, dag, dagRunID, scheduleTime); err != nil {
+	definitionID := dagStatus.DAGDefinitionID()
+	if err := handleRestartProcess(ctx, dag, dagRunID, scheduleTime, definitionID, dagStatus.NoReuse); err != nil {
 		return fmt.Errorf("restart process failed for DAG %s: %w", dag.Name, err)
 	}
 
 	return nil
 }
 
-func handleRestartProcess(ctx *Context, d *core.DAG, oldDagRunID string, scheduleTime string) error {
+func handleRestartProcess(
+	ctx *Context,
+	d *ir.DAG,
+	oldDagRunID string,
+	scheduleTime string,
+	definitionID string,
+	noReuse bool,
+) error {
 	if err := stopDAGIfRunning(ctx, ctx.DAGRunMgr, d, oldDagRunID); err != nil {
 		return err
 	}
@@ -116,22 +125,33 @@ func handleRestartProcess(ctx *Context, d *core.DAG, oldDagRunID string, schedul
 		ctx,
 		d,
 		newDagRunID,
-		exec.NewDAGRunRef(d.Name, newDagRunID),
-		exec.DAGRunRef{},
-		core.TriggerTypeUnknown,
-		scheduleTime,
-		"",
-		func(execCtx context.Context) (exec.DAGRunAttempt, error) {
-			return ctx.DAGRunStore.CreateAttempt(execCtx, d, time.Now(), newDagRunID, exec.NewDAGRunAttemptOptions{})
+		runOptions{
+			root:         ir.NewDAGRunRef(d.Name, newDagRunID),
+			triggerType:  ir.TriggerTypeUnknown,
+			scheduleTime: scheduleTime,
+			definitionID: definitionID,
+			noReuse:      noReuse,
 		},
-		func(preparedAttempt exec.DAGRunAttempt) error {
-			return executeDAGWithRunID(ctx, ctx.DAGRunMgr, d, newDagRunID, scheduleTime, preparedAttempt)
+		func(execCtx context.Context) (dagrun.Attempt, error) {
+			return ctx.Persistence.DAGRunRepository.CreateAttempt(execCtx, d, time.Now(), newDagRunID, persis.DAGRunCreateAttemptOptions{})
+		},
+		func(preparedAttempt dagrun.Attempt) error {
+			return executeDAGWithRunID(ctx, ctx.DAGRunMgr, d, newDagRunID, scheduleTime, definitionID, noReuse, preparedAttempt)
 		},
 	)
 }
 
 // executeDAGWithRunID executes a DAG with a pre-generated run ID.
-func executeDAGWithRunID(ctx *Context, cli runtime.Manager, dag *core.DAG, dagRunID string, scheduleTime string, preparedAttempt exec.DAGRunAttempt) error {
+func executeDAGWithRunID(
+	ctx *Context,
+	cli runtime.Manager,
+	dag *ir.DAG,
+	dagRunID string,
+	scheduleTime string,
+	definitionID string,
+	noReuse bool,
+	preparedAttempt dagrun.Attempt,
+) error {
 	logFile, err := ctx.OpenLogFile(dag, dagRunID)
 	if err != nil {
 		return fmt.Errorf("failed to initialize log file: %w", err)
@@ -151,14 +171,14 @@ func executeDAGWithRunID(ctx *Context, cli runtime.Manager, dag *core.DAG, dagRu
 		return fmt.Errorf("failed to initialize artifact directory: %w", err)
 	}
 
-	dr, err := ctx.dagStore(dagStoreConfig{
+	dr, err := ctx.dagRepository(dagRepositoryConfig{
 		SearchPaths: []string{filepath.Dir(dag.Location)},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize DAG store: %w", err)
 	}
 
-	as := ctx.agentStores()
+	as := ctx.runtimeStores()
 	extraEnvs, err := prepareDAGTools(ctx, dag)
 	if err != nil {
 		return err
@@ -172,31 +192,29 @@ func executeDAGWithRunID(ctx *Context, cli runtime.Manager, dag *core.DAG, dagRu
 		cli,
 		dr,
 		agent.Options{
-			Dry:                        false,
-			ExtraEnvs:                  extraEnvs,
-			PreparedAttempt:            preparedAttempt,
-			DAGRunStore:                ctx.DAGRunStore,
-			QueueStore:                 ctx.QueueStore,
-			StateStore:                 ctx.StateStore,
-			SecretStore:                as.SecretStore,
-			ProfileStore:               as.ProfileStore,
-			ServiceRegistry:            ctx.ServiceRegistry,
-			SubWorkflowRunnerFactory:   ctx.SubWorkflowRunnerFactory(),
-			RootDAGRun:                 exec.NewDAGRunRef(dag.Name, dagRunID),
-			PeerConfig:                 ctx.Config.Core.Peer,
-			DefaultExecMode:            ctx.Config.DefaultExecMode,
-			AgentConfigStore:           as.ConfigStore,
-			AgentModelStore:            as.ModelStore,
-			AgentMemoryStore:           as.MemoryStore,
-			AgentSoulStore:             as.SoulStore,
-			AgentOAuthManager:          as.OAuthManager,
-			AgentRemoteContextResolver: as.ContextResolver,
-			ScheduleTime:               scheduleTime,
-			ArtifactDir:                artifactDir,
-			DAGRunLogDir:               ctx.Config.Paths.LogDir,
-			DAGRunArtifactDir:          ctx.Config.Paths.ArtifactDir,
+			Dry:                      false,
+			ExtraEnvs:                extraEnvs,
+			AttemptID:                agentAttemptID("", preparedAttempt),
+			RunStateStore:            persis.NewRunStateStore(ctx.Persistence.DAGRunRepository, preparedAttempt),
+			StateStore:               ctx.Persistence.StateStore,
+			MaterializationStore:     as.MaterializationStore,
+			NoReuse:                  noReuse,
+			DAGDefinitionID:          definitionID,
+			ParallelItem:             parallelItemFromEnv(dag.Env),
+			SecretStore:              as.SecretStore,
+			ProfileStore:             as.ProfileStore,
+			ServiceRegistry:          ctx.Persistence.ServiceRegistry,
+			SubWorkflowRunnerFactory: ctx.SubWorkflowRunnerFactory(),
+			RootDAGRun:               ir.NewDAGRunRef(dag.Name, dagRunID),
+			PeerConfig:               ctx.Config.Core.Peer,
+			DefaultExecMode:          ctx.Config.DefaultExecMode,
+			ScheduleTime:             scheduleTime,
+			ArtifactDir:              artifactDir,
+			DAGRunLogDir:             ctx.Config.Paths.LogDir,
+			DAGRunArtifactDir:        ctx.Config.Paths.ArtifactDir,
 		})
 
+	ctx.LogToFile(logFile)
 	listenSignals(ctx, agentInstance)
 	if err := agentInstance.Run(ctx); err != nil {
 		if !ctx.Quiet {
@@ -208,13 +226,13 @@ func executeDAGWithRunID(ctx *Context, cli runtime.Manager, dag *core.DAG, dagRu
 	return nil
 }
 
-func stopDAGIfRunning(ctx context.Context, cli runtime.Manager, dag *core.DAG, dagRunID string) error {
+func stopDAGIfRunning(ctx context.Context, cli runtime.Manager, dag *ir.DAG, dagRunID string) error {
 	dagStatus, err := cli.GetCurrentStatus(ctx, dag, dagRunID)
 	if err != nil {
 		return fmt.Errorf("failed to get current status: %w", err)
 	}
 
-	if dagStatus.Status == core.Running {
+	if dagStatus.Status == ir.Running {
 		logger.Info(ctx, "Stopping DAG", tag.DAG(dag.Name))
 		if err := stopRunningDAG(ctx, cli, dag, dagRunID); err != nil {
 			return fmt.Errorf("failed to stop running DAG: %w", err)
@@ -223,7 +241,7 @@ func stopDAGIfRunning(ctx context.Context, cli runtime.Manager, dag *core.DAG, d
 	return nil
 }
 
-func stopRunningDAG(ctx context.Context, cli runtime.Manager, dag *core.DAG, dagRunID string) error {
+func stopRunningDAG(ctx context.Context, cli runtime.Manager, dag *ir.DAG, dagRunID string) error {
 	const stopPollInterval = 100 * time.Millisecond
 	for {
 		dagStatus, err := cli.GetCurrentStatus(ctx, dag, dagRunID)
@@ -231,7 +249,7 @@ func stopRunningDAG(ctx context.Context, cli runtime.Manager, dag *core.DAG, dag
 			return fmt.Errorf("failed to get current status: %w", err)
 		}
 
-		if dagStatus.Status != core.Running {
+		if dagStatus.Status != ir.Running {
 			return nil
 		}
 

@@ -6,12 +6,17 @@
  *
  * @module features/dags/components/dag-editor
  */
+import {
+  KILN_DARK,
+  KILN_LIGHT,
+  registerKilnThemes,
+} from '@/lib/monaco-theme';
 import type { JSONSchema } from '@/lib/schema-utils';
 import { cn } from '@/lib/utils';
 import MonacoEditor, { loader } from '@monaco-editor/react';
 import * as monaco from 'monaco-editor';
 import { configureMonacoYaml } from 'monaco-yaml';
-import { useEffect, useId, useRef } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import {
   buildSchemaRegistration,
   removeSchemaRegistration,
@@ -38,6 +43,8 @@ const monacoYaml = configureMonacoYaml(monaco, {
 });
 
 loader.config({ monaco });
+
+registerKilnThemes();
 
 async function refreshRegisteredSchemas() {
   await monacoYaml.update({
@@ -76,6 +83,8 @@ type Props = {
   modelUri?: string;
   /** Optional document-specific schema */
   schema?: JSONSchema | null;
+  /** Server-side validation markers rendered under the 'dagu-server' owner */
+  markers?: monaco.editor.IMarkerData[];
 };
 
 /**
@@ -91,6 +100,7 @@ function DAGEditor({
   onCursorPositionChange,
   modelUri,
   schema,
+  markers,
 }: Omit<Props, 'highlightLine'>) {
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const activeSchemaRegistrationRef = useRef<SchemaRegistrationOwner | null>(
@@ -161,11 +171,31 @@ function DAGEditor({
   useEffect(() => {
     if (editorRef.current) {
       const newTheme = document.documentElement.classList.contains('dark')
-        ? 'vs-dark'
-        : 'vs';
+        ? KILN_DARK
+        : KILN_LIGHT;
       monaco.editor.setTheme(newTheme);
     }
   }, []);
+
+  // Apply server-side validation markers to the model under a dedicated
+  // owner so monaco-yaml's own schema diagnostics are untouched. The model
+  // exists only after the editor mounts.
+  const [isEditorMounted, setIsEditorMounted] = useState(false);
+  useEffect(() => {
+    if (!isEditorMounted) {
+      return;
+    }
+    const model = monaco.editor.getModel(monaco.Uri.parse(effectiveModelUri));
+    if (!model) {
+      return;
+    }
+    monaco.editor.setModelMarkers(model, 'dagu-server', markers ?? []);
+    return () => {
+      if (!model.isDisposed()) {
+        monaco.editor.setModelMarkers(model, 'dagu-server', []);
+      }
+    };
+  }, [markers, effectiveModelUri, isEditorMounted]);
 
   // Listen for theme changes
   useEffect(() => {
@@ -177,8 +207,8 @@ function DAGEditor({
         ) {
           if (editorRef.current) {
             const newTheme = document.documentElement.classList.contains('dark')
-              ? 'vs-dark'
-              : 'vs';
+              ? KILN_DARK
+              : KILN_LIGHT;
             monaco.editor.setTheme(newTheme);
           }
         }
@@ -198,6 +228,7 @@ function DAGEditor({
    */
   const editorDidMount = (editor: monaco.editor.IStandaloneCodeEditor) => {
     editorRef.current = editor;
+    setIsEditorMounted(true);
 
     if (!readOnly) {
       editor.addAction({
@@ -215,11 +246,6 @@ function DAGEditor({
         },
       });
     }
-
-    // Format document after a short delay
-    setTimeout(() => {
-      editor.getAction('editor.action.formatDocument')?.run();
-    }, 100);
 
     // Prevent 'f' key from propagating to prevent fullscreen shortcuts
     // when user is typing in the editor
@@ -263,7 +289,7 @@ function DAGEditor({
         height="100%"
         language="yaml"
         path={effectiveModelUri}
-        theme={isDarkMode ? 'vs-dark' : 'vs'}
+        theme={isDarkMode ? KILN_DARK : KILN_LIGHT}
         value={value}
         onChange={readOnly ? undefined : onChange}
         onMount={editorDidMount}
@@ -276,7 +302,7 @@ function DAGEditor({
             ? false
             : { other: true, comments: false, strings: true },
           suggestOnTriggerCharacters: !readOnly,
-          formatOnType: !readOnly,
+          formatOnType: false,
           formatOnPaste: !readOnly,
           renderValidationDecorations: readOnly ? 'off' : 'on',
           lineNumbers: lineNumbers ? 'on' : 'off',

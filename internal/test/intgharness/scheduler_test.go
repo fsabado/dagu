@@ -7,18 +7,18 @@ import (
 	"context"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSchedulerProbeHasLoadedScheduleMatchesAnySchedule(t *testing.T) {
 	probe := SchedulerProbe{
 		entryReader: staticEntryReader{
-			dags: []*core.DAG{
+			dags: []*ir.DAG{
 				{
 					Name: "scheduled",
-					Schedule: []core.Schedule{
+					Schedule: []ir.Schedule{
 						{Expression: "0 10 * * *"},
 						{Expression: "5 10 * * *"},
 					},
@@ -33,7 +33,7 @@ func TestSchedulerProbeHasLoadedScheduleMatchesAnySchedule(t *testing.T) {
 }
 
 type staticEntryReader struct {
-	dags []*core.DAG
+	dags []*ir.DAG
 }
 
 func (s staticEntryReader) Init(context.Context) error {
@@ -44,10 +44,14 @@ func (s staticEntryReader) Start(context.Context) {}
 
 func (s staticEntryReader) Stop() {}
 
-func (s staticEntryReader) DAGs() []*core.DAG {
-	return s.dags
+func (s staticEntryReader) Entries() []scheduler.DAGEntry {
+	entries := make([]scheduler.DAGEntry, 0, len(s.dags))
+	for _, dag := range s.dags {
+		entries = append(entries, scheduler.DAGEntry{DefinitionID: dag.SuspendFlagName(), DAG: dag})
+	}
+	return entries
 }
 
-func (s staticEntryReader) DAGStore() exec.DAGStore {
+func (s staticEntryReader) Events() <-chan scheduler.DAGChangeEvent {
 	return nil
 }

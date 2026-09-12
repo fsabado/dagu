@@ -1,3 +1,4 @@
+import { KILN_DARK, KILN_LIGHT, registerKilnThemes } from '@/lib/monaco-theme';
 import { cn } from '@/lib/utils';
 import MonacoEditor, { loader } from '@monaco-editor/react';
 import * as monaco from 'monaco-editor';
@@ -5,15 +6,26 @@ import { useEffect, useRef } from 'react';
 
 loader.config({ monaco });
 
+registerKilnThemes();
+
+export type MarkdownEditorInstance = monaco.editor.IStandaloneCodeEditor;
+
 type Props = {
   value: string;
   onChange?: (value?: string) => void;
   readOnly?: boolean;
   className?: string;
+  onEditorMount?: (editor: MarkdownEditorInstance) => void;
 };
 
-function MarkdownEditor({ value, onChange, readOnly = false, className }: Props) {
-  const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+function MarkdownEditor({
+  value,
+  onChange,
+  readOnly = false,
+  className,
+  onEditorMount,
+}: Props) {
+  const editorRef = useRef<MarkdownEditorInstance | null>(null);
 
   useEffect(() => {
     return () => {
@@ -24,8 +36,8 @@ function MarkdownEditor({ value, onChange, readOnly = false, className }: Props)
   useEffect(() => {
     if (editorRef.current) {
       const newTheme = document.documentElement.classList.contains('dark')
-        ? 'vs-dark'
-        : 'vs';
+        ? KILN_DARK
+        : KILN_LIGHT;
       monaco.editor.setTheme(newTheme);
     }
   }, []);
@@ -39,8 +51,8 @@ function MarkdownEditor({ value, onChange, readOnly = false, className }: Props)
         ) {
           if (editorRef.current) {
             const newTheme = document.documentElement.classList.contains('dark')
-              ? 'vs-dark'
-              : 'vs';
+              ? KILN_DARK
+              : KILN_LIGHT;
             monaco.editor.setTheme(newTheme);
           }
         }
@@ -55,13 +67,14 @@ function MarkdownEditor({ value, onChange, readOnly = false, className }: Props)
     return () => observer.disconnect();
   }, []);
 
-  const editorDidMount = (editor: monaco.editor.IStandaloneCodeEditor) => {
+  const editorDidMount = (editor: MarkdownEditorInstance) => {
     editorRef.current = editor;
     editor.onKeyDown((e) => {
       if (e.code === 'KeyF' && !e.ctrlKey && !e.metaKey && !e.altKey) {
         e.stopPropagation();
       }
     });
+    onEditorMount?.(editor);
   };
 
   const isDarkMode =
@@ -73,7 +86,7 @@ function MarkdownEditor({ value, onChange, readOnly = false, className }: Props)
       <MonacoEditor
         height="100%"
         language="markdown"
-        theme={isDarkMode ? 'vs-dark' : 'vs'}
+        theme={isDarkMode ? KILN_DARK : KILN_LIGHT}
         value={value}
         onChange={readOnly ? undefined : onChange}
         onMount={editorDidMount}

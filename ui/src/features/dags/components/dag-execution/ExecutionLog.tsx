@@ -13,14 +13,19 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ReloadButton } from '@/components/ui/reload-button';
 import { Switch } from '@/components/ui/switch';
-import { TOKEN_KEY } from '../../../../contexts/AuthContext';
+import { downloadFromUrl } from '@/lib/download';
 import { useConfig } from '../../../../contexts/ConfigContext';
 import { useRemoteNode } from '../../../../contexts/RemoteNodeContext';
 import { useUserPreferences } from '../../../../contexts/UserPreference';
 import { useQuery } from '../../../../hooks/api';
 import { whenEnabled } from '../../../../hooks/queryUtils';
 import { useDAGRunLogsSSE } from '../../../../hooks/useDAGRunLogsSSE';
+import { AnsiLine } from '@/lib/ansi';
+import { parseSchedulerLogLine } from '@/lib/scheduler-log';
 import LoadingIndicator from '@/components/ui/loading-indicator';
+import { ActivityLine } from './ActivityLine';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 // Extended Log type with pagination fields
 interface LogWithPagination {
@@ -48,15 +53,6 @@ type Props = {
 };
 
 /**
- * Regular expression to match ANSI color codes for removal
- * Credit: https://github.com/chalk/ansi-regex/commit/02fa893d619d3da85411acc8fd4e2eea0e95a9d9 under MIT license
- */
-const ANSI_CODES_REGEX = [
-  '[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]+)*|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)',
-  '(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))',
-].join('|');
-
-/**
  * ExecutionLog displays the log output for a DAG run
  * Fetches log data from the API and refreshes every 30 seconds
  */
@@ -68,6 +64,9 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
   const [pageSize, setPageSize] = useState(1000);
   const [currentPage, setCurrentPage] = useState(1);
   const [jumpToLine, setJumpToLine] = useState<number | ''>('');
+  const [displayMode, setDisplayMode] = useState<'activity' | 'raw'>(
+    'activity'
+  );
 
   const isRunning = dagRun?.status === Status.Running;
   const [isLiveMode, setIsLiveMode] = useState(isRunning);
@@ -279,7 +278,6 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
   }
 
   const handleDownload = useCallback(async () => {
-    const token = localStorage.getItem(TOKEN_KEY);
     const endpoint = isSubDAGRun
       ? `${config.apiURL}/dag-runs/${dagRun?.rootDAGRunName}/${dagRun?.rootDAGRunId}/sub-dag-runs/${dagRun?.dagRunId}/log/download`
       : `${config.apiURL}/dag-runs/${name}/${dagRunId}/log/download`;
@@ -288,26 +286,10 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
     url.searchParams.set('remoteNode', remoteNode);
 
     try {
-      const response = await fetch(url.toString(), {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-
-      if (!response.ok) {
-        throw new Error(`Download failed: ${response.statusText}`);
-      }
-
-      const blob = await response.blob();
-      const filename =
-        response.headers
-          .get('Content-Disposition')
-          ?.match(/filename="(.+)"/)?.[1] ||
-        `${name}-${dagRunId}-scheduler.log`;
-
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = filename;
-      link.click();
-      URL.revokeObjectURL(link.href);
+      await downloadFromUrl(
+        url.toString(),
+        `${name}-${dagRunId}-scheduler.log`
+      );
     } catch (err) {
       console.error('Download failed:', err);
     }
@@ -328,7 +310,8 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
       return (
         <div className="w-full h-full flex items-center justify-center">
           <div className="text-error">
-            Error loading log data: {error.message || 'Unknown error'}
+            <I18nText text={'Error loading log data:'} />{' '}
+            {error.message || <I18nText text={'Unknown error'} />}
           </div>
         </div>
       );
@@ -336,8 +319,7 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
   }
 
   // Process log data
-  const content =
-    logData?.content.replace(new RegExp(ANSI_CODES_REGEX, 'g'), '') || '';
+  const content = logData?.content || '';
   const totalLines = logData?.totalLines || 0;
   const hasMore = logData?.hasMore || false;
   const isEstimate = logData?.isEstimate || false;
@@ -352,6 +334,8 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
     totalLines - lines.length <= 1 ? lines.length : totalLines;
 
   const totalPages = calculateTotalPages(effectiveTotalLines, pageSize);
+  const showNavigation = effectiveTotalLines > lines.length || hasMore;
+  const activityLines = lines.map(parseSchedulerLogLine);
 
   function getLineNumber(index: number): number {
     switch (viewMode) {
@@ -367,83 +351,121 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
   return (
     <div className="w-full h-full flex flex-col">
       {/* Controls for log navigation */}
-      <div className="flex flex-col gap-2 mb-2 p-4 bg-muted rounded">
+      <div className="mb-2 flex flex-col gap-2 rounded bg-muted p-3">
         <div className="flex flex-wrap items-center gap-2">
-          {/* Responsive button container */}
-          <div className="flex flex-wrap gap-1">
+          <div className="flex gap-1">
             <Button
               size="sm"
-              variant={viewMode === 'tail' ? 'primary' : 'default'}
-              onClick={() => handleViewModeChange('tail')}
-              disabled={isNavigating}
+              variant={displayMode === 'activity' ? 'primary' : 'default'}
+              onClick={() => setDisplayMode('activity')}
+              aria-pressed={displayMode === 'activity'}
             >
-              Show End
+              <I18nText text={'Activity'} />
             </Button>
             <Button
               size="sm"
-              variant={viewMode === 'head' ? 'primary' : 'default'}
-              onClick={() => handleViewModeChange('head')}
-              disabled={isNavigating}
+              variant={displayMode === 'raw' ? 'primary' : 'default'}
+              onClick={() => setDisplayMode('raw')}
+              aria-pressed={displayMode === 'raw'}
             >
-              Show Beginning
-            </Button>
-            <Button
-              size="sm"
-              variant={viewMode === 'page' ? 'primary' : 'default'}
-              onClick={() => handleViewModeChange('page')}
-              disabled={isNavigating}
-            >
-              Page View
+              <I18nText text={'Raw'} />
             </Button>
           </div>
 
-          <select
-            className="h-7 px-2 text-xs border border-border rounded-md bg-surface text-foreground flex-shrink-0 focus:outline-none focus:border-ring"
-            value={pageSize}
-            onChange={(e) => setPageSize(Number(e.target.value))}
-            disabled={isNavigating}
-          >
-            <option value="100">100 lines</option>
-            <option value="500">500 lines</option>
-            <option value="1000">1000 lines</option>
-            <option value="5000">5000 lines</option>
-            <option value="10000">10000 lines</option>
-          </select>
+          {showNavigation && (
+            <>
+              <div className="flex flex-wrap gap-1">
+                <Button
+                  size="sm"
+                  variant={viewMode === 'tail' ? 'primary' : 'default'}
+                  onClick={() => handleViewModeChange('tail')}
+                  disabled={isNavigating}
+                >
+                  <I18nText text={'Show End'} />
+                </Button>
+                <Button
+                  size="sm"
+                  variant={viewMode === 'head' ? 'primary' : 'default'}
+                  onClick={() => handleViewModeChange('head')}
+                  disabled={isNavigating}
+                >
+                  <I18nText text={'Show Beginning'} />
+                </Button>
+                <Button
+                  size="sm"
+                  variant={viewMode === 'page' ? 'primary' : 'default'}
+                  onClick={() => handleViewModeChange('page')}
+                  disabled={isNavigating}
+                >
+                  <I18nText text={'Page View'} />
+                </Button>
+              </div>
 
-          {/* Wrap toggle, Live mode toggle and reload button */}
-          <div className="flex items-center gap-2 ml-auto">
-            {/* Wrap toggle */}
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs text-muted-foreground">Wrap</span>
-              <Switch
-                checked={preferences.logWrap}
-                onCheckedChange={(checked) =>
-                  updatePreference('logWrap', checked)
-                }
-              />
-            </div>
+              <select
+                className="h-7 flex-shrink-0 rounded-md border border-border bg-surface px-2 text-xs text-foreground focus:border-ring focus:outline-none"
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                disabled={isNavigating}
+              >
+                <option value="100">
+                  <I18nText text={'100 lines'} />
+                </option>
+                <option value="500">
+                  <I18nText text={'500 lines'} />
+                </option>
+                <option value="1000">
+                  <I18nText text={'1000 lines'} />
+                </option>
+                <option value="5000">
+                  <I18nText text={'5000 lines'} />
+                </option>
+                <option value="10000">
+                  <I18nText text={'10000 lines'} />
+                </option>
+              </select>
+            </>
+          )}
+
+          <div className="ml-auto flex items-center gap-2">
+            {displayMode === 'raw' && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-muted-foreground">
+                  <I18nText text={'Wrap'} />
+                </span>
+                <Switch
+                  checked={preferences.logWrap}
+                  onCheckedChange={(checked) =>
+                    updatePreference('logWrap', checked)
+                  }
+                />
+              </div>
+            )}
 
             {/* Reload button */}
-            <ReloadButton
-              onReload={async () => {
-                if (mutate) {
-                  await mutate();
-                }
-              }}
-              isLoading={isNavigating || isLoading}
-              title="Reload logs"
-            />
+            <I18nProps>
+              <ReloadButton
+                onReload={async () => {
+                  if (mutate) {
+                    await mutate();
+                  }
+                }}
+                isLoading={isNavigating || isLoading}
+                title="Reload logs"
+              />
+            </I18nProps>
 
             {/* Download button */}
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleDownload}
-              disabled={isNavigating}
-              title="Download full log"
-            >
-              <Download className="h-4 w-4" />
-            </Button>
+            <I18nProps>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleDownload}
+                disabled={isNavigating}
+                title="Download full log"
+              >
+                <Download className="h-4 w-4" />
+              </Button>
+            </I18nProps>
 
             {/* Live mode toggle - only visible when DAG is running */}
             {isRunning && (
@@ -455,30 +477,45 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
                 <span
                   className={`inline-block w-2 h-2 rounded-full ${isLiveMode ? 'bg-white animate-pulse' : 'bg-muted-foreground'}`}
                 />
-                LIVE
+                <I18nText text={'LIVE'} />
               </Button>
             )}
           </div>
         </div>
 
-        {/* Stats line - full width on mobile */}
         <div className="text-xs text-muted-foreground flex items-center">
-          Showing {lines.length} of {effectiveTotalLines} lines{' '}
-          {isEstimate ? '(estimated)' : ''} {hasMore ? '(more available)' : ''}
+          {showNavigation ? (
+            <I18nText
+              text="Showing {visible} of {total} lines"
+              values={{ visible: lines.length, total: effectiveTotalLines }}
+            />
+          ) : (
+            <I18nText
+              text={
+                effectiveTotalLines === 1 ? '{count} line' : '{count} lines'
+              }
+              values={{ count: effectiveTotalLines }}
+            />
+          )}{' '}
+          {isEstimate ? <I18nText text={'(estimated)'} /> : ''}{' '}
+          {hasMore ? <I18nText text={'(more available)'} /> : ''}
         </div>
 
         {/* Page navigation controls */}
-        {viewMode === 'page' && totalLines > 0 && (
+        {showNavigation && viewMode === 'page' && totalLines > 0 && (
           <div className="flex items-center gap-2 mt-2">
             <Button
               size="sm"
               onClick={() => handlePageChange(Math.max(1, currentPage - 1))}
               disabled={currentPage <= 1 || isNavigating}
             >
-              Previous
+              <I18nText text={'Previous'} />
             </Button>
             <span className="text-xs">
-              Page {currentPage} of {totalPages}
+              <I18nText
+                text="Page {page} of {total}"
+                values={{ page: currentPage, total: totalPages }}
+              />
             </span>
             <Button
               size="sm"
@@ -487,56 +524,60 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
               }
               disabled={currentPage >= totalPages || isNavigating}
             >
-              Next
+              <I18nText text={'Next'} />
             </Button>
           </div>
         )}
 
-        {/* Jump to line controls */}
-        <div className="flex items-center gap-2 mt-2">
-          <span className="text-xs text-muted-foreground">Jump to line:</span>
-          <Input
-            type="number"
-            min={1}
-            max={effectiveTotalLines}
-            value={jumpToLine}
-            onChange={(e) =>
-              setJumpToLine(e.target.value === '' ? '' : Number(e.target.value))
-            }
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                if (
-                  !isNavigating &&
-                  jumpToLine !== '' &&
-                  (jumpToLine as number) >= 1 &&
-                  (jumpToLine as number) <= effectiveTotalLines
-                ) {
-                  handleJumpToLine();
-                }
+        {showNavigation && (
+          <div className="flex items-center gap-2 mt-2">
+            <span className="text-xs text-muted-foreground">
+              <I18nText text={'Jump to line:'} />
+            </span>
+            <Input
+              type="number"
+              min={1}
+              max={effectiveTotalLines}
+              value={jumpToLine}
+              onChange={(e) =>
+                setJumpToLine(
+                  e.target.value === '' ? '' : Number(e.target.value)
+                )
               }
-            }}
-            className="w-20 h-7 text-xs"
-            disabled={isNavigating}
-          />
-          <Button
-            size="sm"
-            onClick={handleJumpToLine}
-            disabled={
-              isNavigating ||
-              jumpToLine === '' ||
-              (jumpToLine as number) < 1 ||
-              (jumpToLine as number) > effectiveTotalLines
-            }
-          >
-            Go
-          </Button>
-        </div>
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  if (
+                    !isNavigating &&
+                    jumpToLine !== '' &&
+                    (jumpToLine as number) >= 1 &&
+                    (jumpToLine as number) <= effectiveTotalLines
+                  ) {
+                    handleJumpToLine();
+                  }
+                }
+              }}
+              className="w-20 h-7 text-xs"
+              disabled={isNavigating}
+            />
+            <Button
+              size="sm"
+              onClick={handleJumpToLine}
+              disabled={
+                isNavigating ||
+                jumpToLine === '' ||
+                (jumpToLine as number) < 1 ||
+                (jumpToLine as number) > effectiveTotalLines
+              }
+            >
+              <I18nText text={'Go'} />
+            </Button>
+          </div>
+        )}
       </div>
 
-      {/* Log content with overlay loading indicator when navigating */}
       <div
         ref={logContainerRef}
-        className={`flex-1 rounded-lg bg-muted pt-4 pr-4 pb-4 relative ${preferences.logWrap ? 'overflow-auto' : 'overflow-x-auto overflow-y-auto'}`}
+        className={`relative flex-1 overflow-auto rounded-lg ${displayMode === 'raw' ? `bg-muted pb-4 pr-4 pt-4 ${preferences.logWrap ? '' : 'overflow-x-auto'}` : 'border border-border bg-card'}`}
       >
         {isNavigating && (
           <div className="absolute inset-0 bg-black/20 flex items-center justify-center z-10 pointer-events-none">
@@ -545,25 +586,37 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
             </div>
           </div>
         )}
-        <pre
-          className={`h-full font-mono text-sm text-foreground log-content ${preferences.logWrap ? '' : 'min-w-max'}`}
-        >
-          {lines.map((line, index) => (
-            <div key={index} className="flex pr-2 py-0.5">
-              <span
-                className="text-muted-foreground mr-4 select-none w-14 text-right flex-shrink-0 self-start sticky left-0 bg-muted pl-4 pr-2 z-10"
-                data-line-number={getLineNumber(index)}
-              >
-                {getLineNumber(index)}
-              </span>
-              <span
-                className={`flex-grow select-text cursor-text ${preferences.logWrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'}`}
-              >
-                {line || ' '}
-              </span>
-            </div>
-          ))}
-        </pre>
+        {displayMode === 'activity' ? (
+          <div>
+            {activityLines.map((line, index) => (
+              <ActivityLine
+                key={index}
+                line={line}
+                lineNumber={getLineNumber(index)}
+              />
+            ))}
+          </div>
+        ) : (
+          <pre
+            className={`h-full font-mono text-sm text-foreground log-content ${preferences.logWrap ? '' : 'min-w-max'}`}
+          >
+            {lines.map((line, index) => (
+              <div key={index} className="flex pr-2 py-0.5">
+                <span
+                  className="text-muted-foreground mr-4 select-none w-14 text-right flex-shrink-0 self-start sticky left-0 bg-muted pl-4 pr-2 z-10"
+                  data-line-number={getLineNumber(index)}
+                >
+                  {getLineNumber(index)}
+                </span>
+                <span
+                  className={`flex-grow select-text cursor-text ${preferences.logWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
+                >
+                  {line ? <AnsiLine text={line} /> : ' '}
+                </span>
+              </div>
+            ))}
+          </pre>
+        )}
       </div>
     </div>
   );

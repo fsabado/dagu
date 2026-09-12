@@ -1,11 +1,19 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { fireEvent, render, screen } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import React from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConfigContext, type Config } from '@/contexts/ConfigContext';
+import { UserPreferencesProvider } from '@/contexts/UserPreference';
+import { I18nProvider } from '@/i18n/I18nProvider';
 import Layout from '../Layout';
 
 vi.mock('@/components/LicenseBanner', () => ({
@@ -16,52 +24,35 @@ vi.mock('@/components/UpdateBanner', () => ({
   UpdateBanner: () => null,
 }));
 
-vi.mock('@/features/agent', () => ({
-  useAgentChatContext: () => ({ toggleChat: vi.fn() }),
-  AgentChatPanel: ({ onClose }: { onClose?: () => void }) => (
-    <div data-testid="agent-sidebar">
-      <button type="button" onClick={onClose}>
-        Close Agent
-      </button>
-    </div>
-  ),
-}));
-
 vi.mock('../../menu', () => ({
-  mainListItems: ({
-    onAgentModeToggle,
-  }: {
-    onAgentModeToggle?: () => void;
-  }) => (
-    <div data-testid="sidebar-menu">
-      <button type="button" onClick={onAgentModeToggle}>
-        Open Agent
-      </button>
-    </div>
-  ),
+  mainListItems: () => <div data-testid="sidebar-menu" />,
 }));
 
 const config = {
   title: 'Dagu',
   navbarColor: '',
-  agentEnabled: true,
 } as Config;
 
 function renderLayout(path: string, configOverride?: Partial<Config>) {
   return render(
-    <MemoryRouter initialEntries={[path]}>
-      <ConfigContext.Provider value={{ ...config, ...configOverride }}>
-        <Layout>
-          <div>Page Content</div>
-        </Layout>
-      </ConfigContext.Provider>
-    </MemoryRouter>
+    <UserPreferencesProvider>
+      <I18nProvider>
+        <MemoryRouter initialEntries={[path]}>
+          <ConfigContext.Provider value={{ ...config, ...configOverride }}>
+            <Layout>
+              <div>Page Content</div>
+            </Layout>
+          </ConfigContext.Provider>
+        </MemoryRouter>
+      </I18nProvider>
+    </UserPreferencesProvider>
   );
 }
 
 describe('Layout', () => {
   beforeEach(() => {
     localStorage.clear();
+    document.documentElement.lang = 'en';
     Object.defineProperty(window, 'innerWidth', {
       configurable: true,
       value: 1024,
@@ -69,144 +60,101 @@ describe('Layout', () => {
     });
   });
 
-  it('keeps the app sidebar visible on the agent home page', () => {
-    renderLayout('/agent');
-
-    expect(screen.getByTestId('sidebar-menu')).toBeVisible();
-    expect(screen.getByText('Page Content')).toBeVisible();
-  });
-
   it('renders content home navigation and breadcrumbs for detail pages', () => {
     renderLayout(
       '/dag-runs/briefing_gmail_fetch_test/019df6cf-0127-7340-bd96-d51bc1453045'
     );
 
+    expect(screen.getByRole('link', { name: 'Content home' })).toHaveAttribute(
+      'href',
+      '/home'
+    );
+    const breadcrumbs = screen.getByRole('navigation', { name: 'breadcrumb' });
     expect(
-      screen.getByRole('link', { name: 'Content home' })
+      within(breadcrumbs).getByRole('link', { name: 'Home' })
     ).toHaveAttribute('href', '/home');
-    expect(screen.getByRole('link', { name: 'DAG Runs' })).toHaveAttribute(
-      'href',
-      '/dag-runs'
-    );
-    expect(screen.getByText('briefing_gmail_fetch_test')).toBeVisible();
     expect(
-      screen.getByText('019df6cf-0127-7340-bd96-d51bc1453045')
+      within(breadcrumbs).getByRole('link', { name: 'Executions' })
+    ).toHaveAttribute('href', '/dag-runs');
+    expect(
+      within(breadcrumbs).getByRole('link', { name: 'DAG Runs' })
+    ).toHaveAttribute('href', '/dag-runs');
+    expect(
+      within(breadcrumbs).getByRole('link', {
+        name: 'briefing_gmail_fetch_test',
+      })
+    ).toHaveAttribute('href', '/dag-runs?name=briefing_gmail_fetch_test');
+    expect(
+      within(breadcrumbs).getByRole('link', {
+        name: '019df6cf-0127-7340-bd96-d51bc1453045',
+      })
+    ).toHaveAttribute(
+      'href',
+      '/dag-runs/briefing_gmail_fetch_test/019df6cf-0127-7340-bd96-d51bc1453045'
+    );
+    expect(
+      within(breadcrumbs).getByRole('link', {
+        name: '019df6cf-0127-7340-bd96-d51bc1453045',
+      })
+    ).toHaveAttribute('aria-current', 'page');
+    expect(within(breadcrumbs).getAllByRole('link')).toHaveLength(5);
+  });
+
+  it('opens the mobile navigation as a keyboard-contained dialog', async () => {
+    renderLayout('/home');
+
+    const openButton = screen.getByRole('button', { name: 'Open menu' });
+    fireEvent.click(openButton);
+
+    const dialog = screen.getByRole('dialog', { name: 'Dagu' });
+    const closeButton = within(dialog).getByRole('button', {
+      name: 'Close menu',
+    });
+    expect(closeButton).toHaveFocus();
+    expect(
+      screen.getByText('Page Content').closest('[aria-hidden="true"]')
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Tab' });
+    expect(closeButton).toHaveFocus();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(openButton).toHaveFocus());
+  });
+
+  it('localizes mobile navigation controls', () => {
+    localStorage.setItem(
+      'user_preferences',
+      JSON.stringify({ locale: 'zh-CN' })
+    );
+    renderLayout('/home');
+
+    fireEvent.click(screen.getByRole('button', { name: '打开菜单' }));
+
+    expect(
+      within(screen.getByRole('dialog')).getByRole('button', {
+        name: '关闭菜单',
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('localizes Chinese breadcrumbs', () => {
+    localStorage.setItem(
+      'user_preferences',
+      JSON.stringify({ locale: 'zh-CN' })
+    );
+    renderLayout('/dag-runs/example/run-1');
+
+    const breadcrumbs = screen.getByRole('navigation', { name: '面包屑' });
+    expect(
+      within(breadcrumbs).getByRole('link', { name: '首页' })
     ).toBeVisible();
-  });
-
-  it('preserves nested agent page labels in breadcrumbs', () => {
-    renderLayout('/agent-souls/new');
-
-    expect(screen.getByRole('link', { name: 'Agent' })).toHaveAttribute(
-      'href',
-      '/agent'
-    );
-    expect(screen.getByRole('link', { name: 'Souls' })).toHaveAttribute(
-      'href',
-      '/agent-souls'
-    );
-    expect(screen.getByText('New Soul')).toBeVisible();
-  });
-
-  it('keeps workflow design fullscreen without the app sidebar', () => {
-    renderLayout('/design');
-
-    expect(screen.queryByTestId('sidebar-menu')).toBeNull();
     expect(
-      screen.queryByRole('link', { name: 'Content home' })
-    ).not.toBeInTheDocument();
-    expect(screen.getByText('Page Content')).toBeVisible();
-  });
-
-  it('switches the desktop sidebar into the agent panel without covering content', () => {
-    renderLayout('/cockpit');
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open Agent' }));
-
-    expect(screen.queryByTestId('sidebar-menu')).toBeNull();
-    expect(screen.getByTestId('agent-sidebar')).toBeVisible();
-    expect(localStorage.getItem('sidebarMode')).toBe('agent');
-    expect(
-      screen.getByRole('separator', { name: 'Resize agent panel' })
+      within(breadcrumbs).getByRole('link', { name: '执行记录' })
     ).toBeVisible();
-    expect(screen.getByText('Page Content')).toBeVisible();
-  });
-
-  it('restores the agent sidebar mode after a reload', () => {
-    localStorage.setItem('sidebarMode', 'agent');
-
-    renderLayout('/cockpit');
-
-    expect(screen.queryByTestId('sidebar-menu')).toBeNull();
-    expect(screen.getByTestId('agent-sidebar')).toBeVisible();
-  });
-
-  it('persists navigation mode when the agent panel is closed', () => {
-    localStorage.setItem('sidebarMode', 'agent');
-    renderLayout('/cockpit');
-
-    fireEvent.click(screen.getByRole('button', { name: 'Close Agent' }));
-
-    expect(screen.getByTestId('sidebar-menu')).toBeVisible();
-    expect(localStorage.getItem('sidebarMode')).toBe('navigation');
-  });
-
-  it('falls back to navigation for invalid or unavailable agent mode', () => {
-    localStorage.setItem('sidebarMode', 'unknown');
-    const { unmount } = renderLayout('/cockpit');
-
-    expect(screen.getByTestId('sidebar-menu')).toBeVisible();
-    expect(screen.queryByTestId('agent-sidebar')).toBeNull();
-
-    unmount();
-    localStorage.setItem('sidebarMode', 'agent');
-    renderLayout('/cockpit', { agentEnabled: false });
-
-    expect(screen.getByTestId('sidebar-menu')).toBeVisible();
-    expect(screen.queryByTestId('agent-sidebar')).toBeNull();
-    expect(localStorage.getItem('sidebarMode')).toBe('navigation');
-  });
-
-  it('resizes the agent sidebar from the divider', () => {
-    renderLayout('/cockpit');
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open Agent' }));
-    const sidebar = screen.getByTestId('app-sidebar');
-    const divider = screen.getByRole('separator', {
-      name: 'Resize agent panel',
-    });
-
-    expect(sidebar).toHaveStyle({ width: '420px' });
-
-    fireEvent.pointerDown(divider, { clientX: 420 });
-    fireEvent.pointerMove(document, { clientX: 520 });
-    fireEvent.pointerUp(document);
-
-    expect(sidebar).toHaveStyle({ width: '520px' });
-  });
-
-  it('reclamps the saved agent sidebar width when the viewport narrows', () => {
-    Object.defineProperty(window, 'innerWidth', {
-      configurable: true,
-      value: 1200,
-      writable: true,
-    });
-    localStorage.setItem('agentSidebarWidth', '720');
-    renderLayout('/cockpit');
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open Agent' }));
-    const sidebar = screen.getByTestId('app-sidebar');
-
-    expect(sidebar).toHaveStyle({ width: '720px' });
-
-    Object.defineProperty(window, 'innerWidth', {
-      configurable: true,
-      value: 700,
-      writable: true,
-    });
-    fireEvent.resize(window);
-
-    expect(sidebar).toHaveStyle({ width: '340px' });
-    expect(localStorage.getItem('agentSidebarWidth')).toBe('340');
+    expect(
+      within(breadcrumbs).getByRole('link', { name: 'DAG 运行' })
+    ).toBeVisible();
   });
 });

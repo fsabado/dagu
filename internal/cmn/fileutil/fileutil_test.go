@@ -53,6 +53,54 @@ func TestCreateFile(t *testing.T) {
 	})
 }
 
+func TestOpenOrCreateFileWithoutSync(t *testing.T) {
+	t.Parallel()
+
+	filePath := filepath.Join(t.TempDir(), "stream.log")
+	file, err := OpenOrCreateFileWithoutSync(filePath)
+	require.NoError(t, err)
+	defer func() {
+		_ = file.Close()
+	}()
+
+	_, err = file.WriteString("first")
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(filePath)
+	require.NoError(t, err)
+	assert.Equal(t, "first", string(data))
+
+	second, err := OpenOrCreateFileWithoutSync(filePath)
+	require.NoError(t, err)
+	defer func() {
+		_ = second.Close()
+	}()
+
+	_, err = second.WriteString("-second")
+	require.NoError(t, err)
+
+	data, err = os.ReadFile(filePath)
+	require.NoError(t, err)
+	assert.Equal(t, "first-second", string(data))
+}
+
+func TestOpenOrCreateFileForRandomWrite(t *testing.T) {
+	t.Parallel()
+
+	filePath := filepath.Join(t.TempDir(), "positioned.log")
+	require.NoError(t, os.WriteFile(filePath, []byte("abcdef"), 0o600))
+
+	file, err := OpenOrCreateFileForRandomWrite(filePath)
+	require.NoError(t, err)
+	_, err = file.WriteAt([]byte("XY"), 2)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	data, err := os.ReadFile(filePath)
+	require.NoError(t, err)
+	assert.Equal(t, "abXYef", string(data))
+}
+
 func TestResolvePath(t *testing.T) {
 	// Get current working directory for absolute path tests
 	cwd, err := os.Getwd()

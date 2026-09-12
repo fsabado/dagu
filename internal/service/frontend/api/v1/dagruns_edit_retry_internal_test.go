@@ -6,23 +6,26 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	openapiv1 "github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/cmn/collections"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
-	"github.com/dagucloud/dagu/internal/persis/file/dagrun"
-	persiststore "github.com/dagucloud/dagu/internal/persis/store"
-	"github.com/dagucloud/dagu/internal/persis/testutil"
-	profilepkg "github.com/dagucloud/dagu/internal/profile"
-	"github.com/dagucloud/dagu/internal/runtime/transform"
+	openapiv1 "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/collections"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	persiststore "github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
+	profilepkg "github.com/dagucloud/dagu/v2/internal/profile"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	runtestutil "github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,7 +33,7 @@ func TestPreviewEditRetryDAGRun_SelectsCompletedOutputSteps(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
-	seedEditRetrySourceAttempt(t, ctx, api.dagRunStore, dag, "source-run")
+	seedEditRetrySourceAttempt(t, ctx, api.dagRunRepository, dag, "source-run")
 
 	resp, err := api.PreviewEditRetryDAGRun(ctx, openapiv1.PreviewEditRetryDAGRunRequestObject{
 		Name:     dag.Name,
@@ -58,7 +61,7 @@ func TestPreviewEditRetryDAGRun_SelectsPreviousEditRetrySkippedSteps(t *testing.
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
-	seedEditRetrySkippedSourceAttempt(t, ctx, api.dagRunStore, dag, "source-run")
+	seedEditRetrySkippedSourceAttempt(t, ctx, api.dagRunRepository, dag, "source-run")
 
 	resp, err := api.PreviewEditRetryDAGRun(ctx, openapiv1.PreviewEditRetryDAGRunRequestObject{
 		Name:     dag.Name,
@@ -81,7 +84,7 @@ func TestPreviewEditRetryDAGRun_UsesPersistedParamsListInsteadOfRawPositionalPar
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAMLWithParams())
-	seedEditRetrySourceAttemptWithParams(t, ctx, api.dagRunStore, dag, "source-run")
+	seedEditRetrySourceAttemptWithParams(t, ctx, api.dagRunRepository, dag, "source-run")
 
 	resp, err := api.PreviewEditRetryDAGRun(ctx, openapiv1.PreviewEditRetryDAGRunRequestObject{
 		Name:     dag.Name,
@@ -103,7 +106,7 @@ func TestPreviewEditRetryDAGRun_ReturnsEmptyArraysOnValidationError(t *testing.T
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
-	seedEditRetrySourceAttempt(t, ctx, api.dagRunStore, dag, "source-run")
+	seedEditRetrySourceAttempt(t, ctx, api.dagRunRepository, dag, "source-run")
 
 	resp, err := api.PreviewEditRetryDAGRun(ctx, openapiv1.PreviewEditRetryDAGRunRequestObject{
 		Name:     dag.Name,
@@ -136,7 +139,7 @@ func TestEditRetryDAGRun_DispatchesSeededRetryWithSkippedOutputs(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
-	seedEditRetrySourceAttempt(t, ctx, api.dagRunStore, dag, "source-run")
+	seedEditRetrySourceAttempt(t, ctx, api.dagRunRepository, dag, "source-run")
 	recorder := &retryCoordinatorRecorder{}
 	api.coordinatorCli = recorder
 
@@ -157,28 +160,76 @@ func TestEditRetryDAGRun_DispatchesSeededRetryWithSkippedOutputs(t *testing.T) {
 	require.Equal(t, []string{"build"}, body.SkippedSteps)
 	require.Equal(t, []string{"consume", "notify"}, body.StartedSteps)
 
-	attempt, err := api.dagRunStore.FindAttempt(ctx, exec.NewDAGRunRef(dag.Name, "edit-run"))
+	attempt, err := api.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "edit-run"))
 	require.NoError(t, err)
 	status, err := attempt.ReadStatus(ctx)
 	require.NoError(t, err)
-	require.Equal(t, core.Queued, status.Status)
+	require.Equal(t, ir.Queued, status.Status)
 	require.Len(t, status.Nodes, 3)
-	require.Equal(t, core.NodeSkipped, status.Nodes[0].Status)
+	require.Equal(t, ir.NodeSkipped, status.Nodes[0].Status)
 	require.True(t, status.Nodes[0].SkippedByRetry)
 	require.NotNil(t, status.Nodes[0].OutputVariables)
 	raw, ok := status.Nodes[0].OutputVariables.Load("RESULT")
 	require.True(t, ok)
 	require.Equal(t, "RESULT=from-source", raw)
-	require.Equal(t, core.NodeNotStarted, status.Nodes[1].Status)
+	require.NotNil(t, status.Nodes[0].OutputValue)
+	require.Equal(t, "from-source", *status.Nodes[0].OutputValue)
+	require.NotNil(t, status.Nodes[0].OutputsValue)
+	require.JSONEq(t, `{"legacy":"from-source"}`, *status.Nodes[0].OutputsValue)
+	require.NotNil(t, status.Nodes[0].StepOutputsValue)
+	require.JSONEq(t, `{"artifact":"from-source"}`, *status.Nodes[0].StepOutputsValue)
+	require.Equal(t, ir.NodeNotStarted, status.Nodes[1].Status)
 
 	require.Len(t, recorder.dispatched, 1)
 	task := recorder.dispatched[0]
-	require.Equal(t, exec.DispatchOperationRetry, task.Operation)
+	require.Equal(t, dispatch.DispatchOperationRetry, task.Operation)
 	require.Equal(t, "edit-run", task.DAGRunID)
 	require.NotNil(t, task.PreviousStatus)
 	previousStatus := task.PreviousStatus
-	require.Equal(t, core.Queued, previousStatus.Status)
+	require.Equal(t, ir.Queued, previousStatus.Status)
 	require.True(t, previousStatus.Nodes[0].SkippedByRetry)
+}
+
+func TestEditRetryDAGRun_RejectsDistributedBuildWorkflow(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
+	seedEditRetrySourceAttempt(t, ctx, api.dagRunRepository, dag, "source-run")
+	recorder := &retryCoordinatorRecorder{}
+	api.coordinatorCli = recorder
+
+	resp, err := api.EditRetryDAGRun(ctx, openapiv1.EditRetryDAGRunRequestObject{
+		Name:     dag.Name,
+		DagRunId: "source-run",
+		Body: &openapiv1.EditRetryDAGRunJSONRequestBody{
+			DagRunId: ptrOf("edit-run"),
+			Spec:     editRetryBuildYAMLWithWorkerSelector(),
+		},
+	})
+	require.Nil(t, resp)
+	var apiErr *Error
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, http.StatusBadRequest, apiErr.HTTPStatus)
+	require.Contains(t, apiErr.Message, "build workflows require local execution")
+	require.Empty(t, recorder.dispatched)
+}
+
+func TestSkippedEditRetryNodeStatePreservesHumanTaskCompletion(t *testing.T) {
+	outputs := `{"decision":"approve"}`
+	source := &ir.Node{
+		HumanTaskInput:         json.RawMessage(`{"decision":"approve"}`),
+		HumanTaskCompletedBy:   "Alice",
+		HumanTaskCompletedByID: "user-1",
+		StepOutputsValue:       &outputs,
+	}
+
+	state := skippedEditRetryNodeState(source)
+
+	require.JSONEq(t, `{"decision":"approve"}`, string(state.HumanTaskInput))
+	require.Equal(t, "Alice", state.HumanTaskCompletedBy)
+	require.Equal(t, "user-1", state.HumanTaskCompletedByID)
+	require.NotNil(t, state.StepOutputsValue)
+	require.JSONEq(t, outputs, *state.StepOutputsValue)
 }
 
 func TestEditRetryDAGRun_InheritsRuntimeProfile(t *testing.T) {
@@ -193,7 +244,7 @@ func TestEditRetryDAGRun_InheritsRuntimeProfile(t *testing.T) {
 	require.NoError(t, profileStore.Create(ctx, prof))
 	api.profileStore = profileStore
 
-	seedEditRetrySourceAttemptWithProfileName(t, ctx, api.dagRunStore, dag, "source-run", "prod")
+	seedEditRetrySourceAttemptWithProfileName(t, ctx, api.dagRunRepository, dag, "source-run", "prod")
 	recorder := &retryCoordinatorRecorder{}
 	api.coordinatorCli = recorder
 
@@ -209,7 +260,7 @@ func TestEditRetryDAGRun_InheritsRuntimeProfile(t *testing.T) {
 	_, ok := resp.(openapiv1.EditRetryDAGRun200JSONResponse)
 	require.True(t, ok)
 
-	attempt, err := api.dagRunStore.FindAttempt(ctx, exec.NewDAGRunRef(dag.Name, "edit-run"))
+	attempt, err := api.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "edit-run"))
 	require.NoError(t, err)
 	status, err := attempt.ReadStatus(ctx)
 	require.NoError(t, err)
@@ -226,31 +277,34 @@ func TestEditRetryDAGRun_CopiesWorkDirAndRewritesSkippedOutputs(t *testing.T) {
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
 
-	attempt, err := api.dagRunStore.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), "source-run", exec.NewDAGRunAttemptOptions{})
+	attempt, err := api.dagRunRepository.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), "source-run", persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
-	sourceWorkDir := attempt.WorkDir()
+	sourceRef := ir.NewDAGRunRef(dag.Name, "source-run")
+	sourceWorkDir, err := api.dagRunRepository.MaterializeWorkDir(ctx, dagrun.WorkDirRef{DAGRun: sourceRef})
+	require.NoError(t, err)
 	sourceOutputPath := filepath.Join(sourceWorkDir, "result.txt")
 
-	status := transform.NewStatusBuilder(dag).Create(
+	status := ir.NewStatusBuilder(dag).Create(
 		"source-run",
-		core.Failed,
+		ir.Failed,
 		0,
 		time.Now().Add(-2*time.Minute),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithFinishedAt(time.Now().Add(-time.Minute)),
-		transform.WithError("consume failed"),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithFinishedAt(time.Now().Add(-time.Minute)),
+		ir.WithError("consume failed"),
 	)
 	require.Len(t, status.Nodes, 2)
-	status.Nodes[0].Status = core.NodeSucceeded
+	status.Nodes[0].Status = ir.NodeSucceeded
 	status.Nodes[0].OutputVariables = &collections.SyncMap{}
 	status.Nodes[0].OutputVariables.Store("RESULT", "RESULT="+sourceOutputPath)
-	status.Nodes[1].Status = core.NodeFailed
+	status.Nodes[1].Status = ir.NodeFailed
 	status.Nodes[1].Error = "consume failed"
 
 	require.NoError(t, attempt.Open(ctx))
 	require.NoError(t, os.WriteFile(sourceOutputPath, []byte("from-source-work-dir"), 0o600))
 	require.NoError(t, attempt.Write(ctx, status))
 	require.NoError(t, attempt.Close(ctx))
+	require.NoError(t, api.dagRunRepository.SnapshotWorkDir(ctx, dagrun.WorkDirRef{DAGRun: sourceRef}, sourceWorkDir))
 
 	recorder := &retryCoordinatorRecorder{}
 	api.coordinatorCli = recorder
@@ -266,9 +320,12 @@ func TestEditRetryDAGRun_CopiesWorkDirAndRewritesSkippedOutputs(t *testing.T) {
 	_, ok := resp.(openapiv1.EditRetryDAGRun200JSONResponse)
 	require.True(t, ok)
 
-	newAttempt, err := api.dagRunStore.FindAttempt(ctx, exec.NewDAGRunRef(dag.Name, "edit-run"))
+	newAttempt, err := api.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "edit-run"))
 	require.NoError(t, err)
-	newWorkDir := newAttempt.WorkDir()
+	newWorkDir, err := api.dagRunRepository.MaterializeWorkDir(ctx, dagrun.WorkDirRef{
+		DAGRun: ir.NewDAGRunRef(dag.Name, "edit-run"),
+	})
+	require.NoError(t, err)
 	require.NotEqual(t, sourceWorkDir, newWorkDir)
 
 	newStatus, err := newAttempt.ReadStatus(ctx)
@@ -288,7 +345,7 @@ func TestEditRetryDAGRun_ExplicitEmptySkipStepsRunsAllSteps(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
-	seedEditRetrySourceAttempt(t, ctx, api.dagRunStore, dag, "source-run")
+	seedEditRetrySourceAttempt(t, ctx, api.dagRunRepository, dag, "source-run")
 	recorder := &retryCoordinatorRecorder{}
 	api.coordinatorCli = recorder
 
@@ -315,15 +372,73 @@ func TestEditRetryDAGRun_ExplicitEmptySkipStepsRunsAllSteps(t *testing.T) {
 	previousStatus := recorder.dispatched[0].PreviousStatus
 	require.NotNil(t, previousStatus)
 	require.Len(t, previousStatus.Nodes, 3)
-	require.Equal(t, core.NodeNotStarted, previousStatus.Nodes[0].Status)
+	require.Equal(t, ir.NodeNotStarted, previousStatus.Nodes[0].Status)
 	require.False(t, previousStatus.Nodes[0].SkippedByRetry)
+}
+
+func TestPlanEditRetrySteps_IncludeDownstreamSkippedSidePrerequisite(t *testing.T) {
+	t.Parallel()
+
+	// Status after include-downstream retry of B: join E reran, side branch D
+	// stayed skipped and was marked SkippedByRetry so the runner would not
+	// block E.
+	status := &ir.DAGRunStatus{
+		Nodes: []*ir.Node{
+			{Step: ir.Step{Name: "A"}, Status: ir.NodeSucceeded},
+			{Step: ir.Step{Name: "B"}, Status: ir.NodeSucceeded},
+			{Step: ir.Step{Name: "D"}, Status: ir.NodeSkipped, SkippedByRetry: true},
+			{Step: ir.Step{Name: "E"}, Status: ir.NodeSucceeded},
+		},
+	}
+
+	t.Run("default edit-retry still plans", func(t *testing.T) {
+		t.Parallel()
+		dag := &ir.DAG{Steps: []ir.Step{
+			{Name: "A"},
+			{Name: "B", Depends: []string{"A"}},
+			{Name: "D", Depends: []string{"A"}},
+			{Name: "E", Depends: []string{"B", "D"}},
+		}}
+		plan := planEditRetrySteps(status, dag, nil)
+		require.Empty(t, plan.validationErrors)
+		require.Contains(t, plan.skippedSteps, "A")
+		require.Contains(t, plan.skippedSteps, "B")
+		require.Contains(t, plan.skippedSteps, "E")
+		// SkippedByRetry currently also means "reusable edit-retry skip", so D
+		// is preserved when the edited step does not require output.
+		require.Contains(t, plan.skippedSteps, "D")
+	})
+
+	t.Run("side branch with declared output is not reusable", func(t *testing.T) {
+		t.Parallel()
+		dag := &ir.DAG{Steps: []ir.Step{
+			{Name: "A"},
+			{Name: "B", Depends: []string{"A"}},
+			{Name: "D", Depends: []string{"A"}, Output: "SIDE"},
+			{Name: "E", Depends: []string{"B", "D"}},
+		}}
+		plan := planEditRetrySteps(status, dag, nil)
+		require.Empty(t, plan.validationErrors)
+		require.NotContains(t, plan.skippedSteps, "D")
+		require.Contains(t, plan.runnableSteps, "D")
+		require.Equal(t, []editRetryIneligibleStep{{
+			name:   "D",
+			reason: `previous output "SIDE" is not available`,
+		}}, plan.ineligible)
+
+		skip := []string{"D"}
+		rejected := planEditRetrySteps(status, dag, &skip)
+		require.Equal(t, []string{
+			`skipSteps contains ineligible step "D": previous output "SIDE" is not available`,
+		}, rejected.validationErrors)
+	})
 }
 
 func TestEditRetryDAGRun_RejectsIneligibleRequestedSkipStep(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	api, dag := setupEditRetryAPI(t, tmpDir, editRetrySourceYAML())
-	seedEditRetrySourceAttempt(t, ctx, api.dagRunStore, dag, "source-run")
+	seedEditRetrySourceAttempt(t, ctx, api.dagRunRepository, dag, "source-run")
 
 	resp, err := api.EditRetryDAGRun(ctx, openapiv1.EditRetryDAGRunRequestObject{
 		Name:     dag.Name,
@@ -372,15 +487,54 @@ steps:
 	require.Empty(t, dag.WorkingDir)
 }
 
-func setupEditRetryAPI(t *testing.T, tmpDir string, yamlContent string) (*API, *core.DAG) {
+func TestRescheduleDAGRunPreservesSnapshotWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	yamlWorkingDir := filepath.Join(tmpDir, "from-yaml")
+	snapshotWorkingDir := filepath.Join(tmpDir, "from-snapshot")
+	api, dag := setupEditRetryAPI(t, tmpDir, fmt.Sprintf(`
+name: reschedule_workdir
+working_dir: %q
+steps:
+  - name: run
+    run: echo ok
+`, yamlWorkingDir))
+	dag.WorkingDir = snapshotWorkingDir
+
+	attempt, err := api.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), "source-run", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	status := ir.NewStatusBuilder(dag).Create("source-run", ir.Succeeded, 0, time.Now(), ir.WithAttemptID(attempt.ID()))
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, status))
+	require.NoError(t, attempt.Close(ctx))
+
+	api.config.Queues.Enabled = true
+	api.queueStore = persiststore.NewQueueStore(testutil.NewMemoryBackend().Collection("queue"))
+	result, err := api.rescheduleDAGRun(ctx, dag.Name, "source-run", rescheduleDAGRunOptions{newDagRunID: "rescheduled-run"})
+	require.NoError(t, err)
+	require.True(t, result.queued)
+
+	rescheduled, err := api.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, result.newDagRunID))
+	require.NoError(t, err)
+	rescheduledDAG, err := rescheduled.ReadDAG(ctx)
+	require.NoError(t, err)
+	rescheduledDAG, err = spec.RebuildFromYAML(ctx, rescheduledDAG)
+	require.NoError(t, err)
+	require.Equal(t, snapshotWorkingDir, rescheduledDAG.WorkingDir)
+	require.True(t, rescheduledDAG.WorkingDirExplicit)
+}
+
+func setupEditRetryAPI(t *testing.T, tmpDir string, yamlContent string) (*API, *ir.DAG) {
 	t.Helper()
 
 	dag, err := spec.LoadYAML(context.Background(), []byte(yamlContent))
 	require.NoError(t, err)
 
-	dagRunStore := dagrun.New(filepath.Join(tmpDir, "dag-runs"))
+	dagRunRepository := runtestutil.NewFileDAGRunRepository(filepath.Join(tmpDir, "dag-runs"), persis.DAGRunRepositoryOptions{LatestStatusToday: true})
 	api := &API{
-		dagRunStore: dagRunStore,
+		dagRunRepository: dagRunRepository,
 		config: &config.Config{
 			Paths: config.PathsConfig{
 				LogDir:      filepath.Join(tmpDir, "logs"),
@@ -401,50 +555,53 @@ func setupEditRetryAPI(t *testing.T, tmpDir string, yamlContent string) (*API, *
 func seedEditRetrySourceAttempt(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	dag *core.DAG,
+	repository *persis.DAGRunRepository,
+	dag *ir.DAG,
 	dagRunID string,
 ) {
 	t.Helper()
-	seedEditRetrySourceAttemptWithProfileName(t, ctx, store, dag, dagRunID, "")
+	seedEditRetrySourceAttemptWithProfileName(t, ctx, repository, dag, dagRunID, "")
 }
 
 func seedEditRetrySourceAttemptWithProfileName(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	dag *core.DAG,
+	repository *persis.DAGRunRepository,
+	dag *ir.DAG,
 	dagRunID string,
 	profileName string,
 ) {
 	t.Helper()
-	attempt, err := store.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), dagRunID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := repository.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
-	opts := []transform.StatusOption{
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithFinishedAt(time.Now().Add(-time.Minute)),
-		transform.WithError("consume failed"),
+	opts := []ir.StatusOption{
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithFinishedAt(time.Now().Add(-time.Minute)),
+		ir.WithError("consume failed"),
 	}
 	if profileName != "" {
-		opts = append(opts, transform.WithRuntimeProfile(profileName, "", nil))
+		opts = append(opts, ir.WithRuntimeProfile(profileName, "", nil))
 	}
-	status := transform.NewStatusBuilder(dag).Create(
+	status := ir.NewStatusBuilder(dag).Create(
 		dagRunID,
-		core.Failed,
+		ir.Failed,
 		0,
 		time.Now().Add(-2*time.Minute),
 		opts...,
 	)
 	require.Len(t, status.Nodes, 2)
-	status.Nodes[0].Status = core.NodeSucceeded
-	status.Nodes[0].StartedAt = exec.FormatTime(time.Now().Add(-2 * time.Minute))
-	status.Nodes[0].FinishedAt = exec.FormatTime(time.Now().Add(-90 * time.Second))
+	status.Nodes[0].Status = ir.NodeSucceeded
+	status.Nodes[0].StartedAt = stringutil.FormatTime(time.Now().Add(-2 * time.Minute))
+	status.Nodes[0].FinishedAt = stringutil.FormatTime(time.Now().Add(-90 * time.Second))
 	status.Nodes[0].OutputVariables = &collections.SyncMap{}
 	status.Nodes[0].OutputVariables.Store("RESULT", "RESULT=from-source")
-	status.Nodes[1].Status = core.NodeFailed
-	status.Nodes[1].StartedAt = exec.FormatTime(time.Now().Add(-80 * time.Second))
-	status.Nodes[1].FinishedAt = exec.FormatTime(time.Now().Add(-70 * time.Second))
+	status.Nodes[0].OutputValue = ptrOf("from-source")
+	status.Nodes[0].OutputsValue = ptrOf(`{"legacy":"from-source"}`)
+	status.Nodes[0].StepOutputsValue = ptrOf(`{"artifact":"from-source"}`)
+	status.Nodes[1].Status = ir.NodeFailed
+	status.Nodes[1].StartedAt = stringutil.FormatTime(time.Now().Add(-80 * time.Second))
+	status.Nodes[1].FinishedAt = stringutil.FormatTime(time.Now().Add(-70 * time.Second))
 	status.Nodes[1].Error = "consume failed"
 
 	require.NoError(t, attempt.Open(ctx))
@@ -455,34 +612,34 @@ func seedEditRetrySourceAttemptWithProfileName(
 func seedEditRetrySkippedSourceAttempt(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	dag *core.DAG,
+	repository *persis.DAGRunRepository,
+	dag *ir.DAG,
 	dagRunID string,
 ) {
 	t.Helper()
 
-	attempt, err := store.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), dagRunID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := repository.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
-	status := transform.NewStatusBuilder(dag).Create(
+	status := ir.NewStatusBuilder(dag).Create(
 		dagRunID,
-		core.Failed,
+		ir.Failed,
 		0,
 		time.Now().Add(-2*time.Minute),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithFinishedAt(time.Now().Add(-time.Minute)),
-		transform.WithError("consume failed"),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithFinishedAt(time.Now().Add(-time.Minute)),
+		ir.WithError("consume failed"),
 	)
 	require.Len(t, status.Nodes, 2)
-	status.Nodes[0].Status = core.NodeSkipped
+	status.Nodes[0].Status = ir.NodeSkipped
 	status.Nodes[0].SkippedByRetry = true
-	status.Nodes[0].StartedAt = exec.FormatTime(time.Now().Add(-2 * time.Minute))
-	status.Nodes[0].FinishedAt = exec.FormatTime(time.Now().Add(-90 * time.Second))
+	status.Nodes[0].StartedAt = stringutil.FormatTime(time.Now().Add(-2 * time.Minute))
+	status.Nodes[0].FinishedAt = stringutil.FormatTime(time.Now().Add(-90 * time.Second))
 	status.Nodes[0].OutputVariables = &collections.SyncMap{}
 	status.Nodes[0].OutputVariables.Store("RESULT", "RESULT=from-source")
-	status.Nodes[1].Status = core.NodeFailed
-	status.Nodes[1].StartedAt = exec.FormatTime(time.Now().Add(-80 * time.Second))
-	status.Nodes[1].FinishedAt = exec.FormatTime(time.Now().Add(-70 * time.Second))
+	status.Nodes[1].Status = ir.NodeFailed
+	status.Nodes[1].StartedAt = stringutil.FormatTime(time.Now().Add(-80 * time.Second))
+	status.Nodes[1].FinishedAt = stringutil.FormatTime(time.Now().Add(-70 * time.Second))
 	status.Nodes[1].Error = "consume failed"
 
 	require.NoError(t, attempt.Open(ctx))
@@ -493,31 +650,31 @@ func seedEditRetrySkippedSourceAttempt(
 func seedEditRetrySourceAttemptWithParams(
 	t *testing.T,
 	ctx context.Context,
-	store exec.DAGRunStore,
-	dag *core.DAG,
+	repository *persis.DAGRunRepository,
+	dag *ir.DAG,
 	dagRunID string,
 ) {
 	t.Helper()
 
-	attempt, err := store.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), dagRunID, exec.NewDAGRunAttemptOptions{})
+	attempt, err := repository.CreateAttempt(ctx, dag, time.Now().Add(-2*time.Minute), dagRunID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 
-	status := transform.NewStatusBuilder(dag).Create(
+	status := ir.NewStatusBuilder(dag).Create(
 		dagRunID,
-		core.Failed,
+		ir.Failed,
 		0,
 		time.Now().Add(-2*time.Minute),
-		transform.WithAttemptID(attempt.ID()),
-		transform.WithFinishedAt(time.Now().Add(-time.Minute)),
-		transform.WithError("consume failed"),
+		ir.WithAttemptID(attempt.ID()),
+		ir.WithFinishedAt(time.Now().Add(-time.Minute)),
+		ir.WithError("consume failed"),
 	)
 	status.Params = "one two three"
 	status.ParamsList = []string{"problem=one two three"}
 	require.Len(t, status.Nodes, 2)
-	status.Nodes[0].Status = core.NodeSucceeded
+	status.Nodes[0].Status = ir.NodeSucceeded
 	status.Nodes[0].OutputVariables = &collections.SyncMap{}
 	status.Nodes[0].OutputVariables.Store("RESULT", "RESULT=from-source")
-	status.Nodes[1].Status = core.NodeFailed
+	status.Nodes[1].Status = ir.NodeFailed
 	status.Nodes[1].Error = "consume failed"
 
 	require.NoError(t, attempt.Open(ctx))
@@ -597,6 +754,27 @@ func editRetryEditedYAMLWithWorkerSelector() string {
 	return `
 name: edit_retry_test
 type: graph
+worker_selector:
+  region: apac
+steps:
+  - name: build
+    run: exit 99
+    output: RESULT
+  - name: consume
+    run: echo "$RESULT"
+    depends:
+      - build
+  - name: notify
+    run: echo done
+    depends:
+      - consume
+`
+}
+
+func editRetryBuildYAMLWithWorkerSelector() string {
+	return `
+name: edit_retry_test
+type: build
 worker_selector:
   region: apac
 steps:

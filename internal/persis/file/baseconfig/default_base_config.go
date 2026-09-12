@@ -51,12 +51,11 @@ max_output_size: 1048576  # 1MB (bytes)
 # Duration string: e.g. "6h", "24h", "2d12h". Empty = no catchup (missed runs discarded).
 catchup_window: "6h"
 
-# Retry the entire DAG after a terminal failure.
-# This absorbs transient infrastructure or dependency failures by default.
-# Override or disable per DAG if the workflow is intentionally non-idempotent.
-retry_policy:
-  limit: 3
-  interval_sec: 5
+# Retry the entire DAG after a terminal failure. Retries are opt-in because
+# workflows may have non-idempotent side effects.
+# retry_policy:
+#   limit: 3
+#   interval_sec: 5
 
 # -- Shell --
 # Shell interpreter for command steps.
@@ -191,6 +190,32 @@ retry_policy:
 #   username: ""
 #   password: ""
 #
+# # OAuth selects the provider's fixed SMTP host and STARTTLS port.
+# # Microsoft 365 client credentials:
+# smtp:
+#   username: alerts@contoso.com
+#   oauth:
+#     provider: microsoft
+#     tenant_id: ${AZURE_TENANT_ID}
+#     client_id: ${AZURE_CLIENT_ID}
+#     client_secret: ${AZURE_CLIENT_SECRET}
+#
+# # Google Workspace domain-wide delegation:
+# smtp:
+#   username: alerts@example.com
+#   oauth:
+#     provider: google_service_account
+#     service_account_json: ${GMAIL_SERVICE_ACCOUNT_JSON}
+#
+# # Consumer Gmail refresh token:
+# smtp:
+#   username: me@gmail.com
+#   oauth:
+#     provider: google_refresh
+#     client_id: ${GMAIL_CLIENT_ID}
+#     client_secret: ${GMAIL_CLIENT_SECRET}
+#     refresh_token: ${GMAIL_REFRESH_TOKEN}
+#
 # # Sent on DAG failure (when mail_on.failure is true).
 # error_mail:
 #   from: dagu@example.com
@@ -263,7 +288,7 @@ retry_policy:
 #   max_retries: 0
 
 # -- LLM Defaults --
-# Inherited by all chat and agent executor steps.
+# Inherited by all chat completion steps.
 # llm:
 #   provider: openai              # "openai", "anthropic", "gemini", "openrouter", "local".
 #   model: gpt-4o-mini

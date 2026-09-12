@@ -1,0 +1,26 @@
+working_dir: .
+steps:
+  - id: create
+    action: archive.create
+    with:
+      source: source.txt
+      destination: out.zip
+  - id: list
+    depends: create
+    action: archive.list
+    stdout: list.json
+    with:
+      source: out.zip
+  - id: extract
+    depends: list
+    action: archive.extract
+    with:
+      source: out.zip
+      destination: extracted
+  - id: preview_create
+    depends: extract
+    action: archive.create
+    with:
+      source: source.txt
+      destination: preview.zip
+      dry_run: true

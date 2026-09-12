@@ -5,76 +5,84 @@ package frontend
 
 import (
 	"context"
-	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
-	"maps"
 	"mime"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
 	"github.com/go-chi/httplog/v2"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/dagucloud/dagu/internal/agent"
-	"github.com/dagucloud/dagu/internal/agentoauth"
-	authmodel "github.com/dagucloud/dagu/internal/auth"
-	"github.com/dagucloud/dagu/internal/cmn/backoff"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/crypto"
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	cmnschema "github.com/dagucloud/dagu/internal/cmn/schema"
-	"github.com/dagucloud/dagu/internal/cmn/signalctx"
-	"github.com/dagucloud/dagu/internal/cmn/telemetry"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/gitsync"
-	"github.com/dagucloud/dagu/internal/license"
-	_ "github.com/dagucloud/dagu/internal/llm/allproviders" // Register LLM providers
-	"github.com/dagucloud/dagu/internal/remotenode"
-	"github.com/dagucloud/dagu/internal/runtime"
-	"github.com/dagucloud/dagu/internal/service/audit"
-	authservice "github.com/dagucloud/dagu/internal/service/auth"
-	"github.com/dagucloud/dagu/internal/service/chatbridge"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/eventstore"
-	"github.com/dagucloud/dagu/internal/service/frontend/api/pathutil"
-	apiv1 "github.com/dagucloud/dagu/internal/service/frontend/api/v1"
-	"github.com/dagucloud/dagu/internal/service/frontend/auth"
-	"github.com/dagucloud/dagu/internal/service/frontend/metrics"
-	"github.com/dagucloud/dagu/internal/service/frontend/sse"
-	"github.com/dagucloud/dagu/internal/service/frontend/terminal"
-	incidentservice "github.com/dagucloud/dagu/internal/service/incident"
-	dagumcp "github.com/dagucloud/dagu/internal/service/mcp"
-	notificationservice "github.com/dagucloud/dagu/internal/service/notification"
-	"github.com/dagucloud/dagu/internal/service/oidcprovision"
-	"github.com/dagucloud/dagu/internal/service/resource"
-	"github.com/dagucloud/dagu/internal/tunnel"
-	"github.com/dagucloud/dagu/internal/upgrade"
-	workspacepkg "github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	cmnschema "github.com/dagucloud/dagu/v2/internal/cmn/schema"
+	"github.com/dagucloud/dagu/v2/internal/cmn/signalctx"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/eventstore"
+	"github.com/dagucloud/dagu/v2/internal/gitsync"
+	"github.com/dagucloud/dagu/v2/internal/license"
+	_ "github.com/dagucloud/dagu/v2/internal/llm/allproviders" // Register LLM providers
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/remotenode"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
+	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
+	"github.com/dagucloud/dagu/v2/internal/service/authmapping"
+	"github.com/dagucloud/dagu/v2/internal/service/chatbridge"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/api/pathutil"
+	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/auth"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/metrics"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/sse"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/terminal"
+	incidentservice "github.com/dagucloud/dagu/v2/internal/service/incident"
+	dagumcp "github.com/dagucloud/dagu/v2/internal/service/mcp"
+	notificationservice "github.com/dagucloud/dagu/v2/internal/service/notification"
+	"github.com/dagucloud/dagu/v2/internal/service/oidcprovision"
+	"github.com/dagucloud/dagu/v2/internal/service/resource"
+	"github.com/dagucloud/dagu/v2/internal/service/trustedproxyprovision"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	"github.com/dagucloud/dagu/v2/internal/telemetry"
+	"github.com/dagucloud/dagu/v2/internal/tunnel"
+	"github.com/dagucloud/dagu/v2/internal/upgrade"
+	workspacepkg "github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 const (
 	serverShutdownTimeout = 10 * time.Second
 	httpShutdownBudget    = 5 * time.Second
+	httpWriteTimeout      = 60 * time.Second
 )
+
+var wikiSSETopicTypes = [...]sse.TopicType{
+	sse.TopicTypeWikiPage,
+	sse.TopicTypeWikiTree,
+	sse.TopicTypeLegacyDoc,
+	sse.TopicTypeLegacyDocTree,
+}
 
 type shutdownActions struct {
 	stopSync               func() error
@@ -91,35 +99,35 @@ type RouteRegistrar func(context.Context, chi.Router, string)
 
 // Server represents the HTTP server for the frontend application.
 type Server struct {
-	apiV1                 *apiv1.API
-	agentAPI              *agent.API
-	agentConfigStore      agent.ConfigStore
-	config                *config.Config
-	httpServer            *http.Server
-	funcsConfig           funcsConfig
-	builtinOIDCCfg        *auth.BuiltinOIDCConfig
-	authService           *authservice.Service
-	auditService          *audit.Service
-	auditStore            AuditStore
-	eventService          *eventstore.Service
-	incidentService       *incidentservice.Service
-	notificationService   *notificationservice.Service
-	incidentStateFile     MonitorStateFileFunc
-	notificationStateFile MonitorStateFileFunc
-	syncService           gitsync.Service
-	listener              net.Listener
-	appStream             *sse.AppStreamService
-	sseMultiplexer        *sse.Multiplexer
-	terminalManager       *terminal.Manager
-	metricsRegistry       *prometheus.Registry
-	tunnelAPIOpts         []apiv1.APIOption
-	tunnelService         *tunnel.Service
-	dagStore              exec.DAGStore
-	licenseManager        *license.Manager
-	remoteNodeResolver    *remotenode.Resolver
-	upgradeStore          upgrade.CacheStore
-	agentAPICallback      func(*agent.API)
-	routeRegistrars       []RouteRegistrar
+	apiV1                *apiv1.API
+	config               *config.Config
+	httpServer           *http.Server
+	funcsConfig          funcsConfig
+	builtinOIDCCfg       *auth.BuiltinOIDCConfig
+	trustedProxyCfg      *auth.TrustedProxyLoginConfig
+	authService          *authservice.Service
+	auditService         *audit.Service
+	auditStore           io.Closer
+	eventService         *eventstore.Service
+	incidentService      *incidentservice.Service
+	notificationService  *notificationservice.Service
+	incidentState        chatbridge.StateStore
+	newIncidentLease     func() chatbridge.Lease
+	notificationState    chatbridge.StateStore
+	newNotificationLease func() chatbridge.Lease
+	syncService          gitsync.Service
+	listener             net.Listener
+	appStream            *sse.AppStreamService
+	sseMultiplexer       *sse.Multiplexer
+	terminalManager      *terminal.Manager
+	metricsRegistry      *prometheus.Registry
+	tunnelAPIOpts        []apiv1.APIOption
+	tunnelService        *tunnel.Service
+	dagRepository        *persis.DAGRepository
+	licenseManager       *license.Manager
+	remoteNodeResolver   *remotenode.Resolver
+	upgradeStore         upgrade.CacheStore
+	routeRegistrars      []RouteRegistrar
 }
 
 // ServerOption is a functional option for configuring the Server.
@@ -138,15 +146,6 @@ func WithLicenseManager(m *license.Manager) ServerOption {
 		if m != nil {
 			s.licenseManager = m
 		}
-	}
-}
-
-// WithAgentAPICallback registers a callback that is invoked with the agent API
-// instance after the server creates it. This allows external consumers (e.g. the
-// Telegram bot) to receive the agent API without the server permanently exposing it.
-func WithAgentAPICallback(fn func(*agent.API)) ServerOption {
-	return func(s *Server) {
-		s.agentAPICallback = fn
 	}
 }
 
@@ -170,6 +169,102 @@ func WithAPIOption(opt apiv1.APIOption) ServerOption {
 	}
 }
 
+func toOIDCWorkspaceMappings(mappings map[string][]config.OIDCWorkspaceGrant) map[string][]oidcprovision.WorkspaceGrantConfig {
+	if len(mappings) == 0 {
+		return nil
+	}
+	result := make(map[string][]oidcprovision.WorkspaceGrantConfig, len(mappings))
+	for group, grants := range mappings {
+		converted := make([]oidcprovision.WorkspaceGrantConfig, len(grants))
+		for i, grant := range grants {
+			converted[i] = oidcprovision.WorkspaceGrantConfig{
+				Workspace: grant.Workspace,
+				Role:      grant.Role,
+			}
+		}
+		result[group] = converted
+	}
+	return result
+}
+
+func toOIDCPolicy(policy config.OIDCPolicy) oidcprovision.Policy {
+	return oidcprovision.Policy{
+		AutoSignup:     policy.AutoSignup,
+		AllowedDomains: policy.AllowedDomains,
+		Whitelist:      policy.Whitelist,
+		RoleMapping: oidcprovision.RoleMapperConfig{
+			GroupsClaim:            policy.RoleMapping.GroupsClaim,
+			GroupMappings:          policy.RoleMapping.GroupMappings,
+			WorkspaceMappings:      toOIDCWorkspaceMappings(policy.RoleMapping.WorkspaceMappings),
+			DefaultWorkspaceAccess: policy.RoleMapping.DefaultWorkspaceAccess,
+			RoleAttributePath:      policy.RoleMapping.RoleAttributePath,
+			RoleAttributeStrict:    policy.RoleMapping.RoleAttributeStrict,
+			SkipOrgRoleSync:        policy.RoleMapping.SkipOrgRoleSync,
+			DefaultRole:            authmodel.Role(policy.RoleMapping.DefaultRole),
+		},
+	}
+}
+
+func toConfigOIDCWorkspaceMappings(mappings map[string][]oidcprovision.WorkspaceGrantConfig) map[string][]config.OIDCWorkspaceGrant {
+	if len(mappings) == 0 {
+		return nil
+	}
+	result := make(map[string][]config.OIDCWorkspaceGrant, len(mappings))
+	for group, grants := range mappings {
+		converted := make([]config.OIDCWorkspaceGrant, len(grants))
+		for i, grant := range grants {
+			converted[i] = config.OIDCWorkspaceGrant{
+				Workspace: grant.Workspace,
+				Role:      grant.Role,
+			}
+		}
+		result[group] = converted
+	}
+	return result
+}
+
+func toConfigOIDCMapping(mapping oidcprovision.RoleMapperConfig) config.OIDCRoleMapping {
+	return config.OIDCRoleMapping{
+		GroupsClaim:            mapping.GroupsClaim,
+		GroupMappings:          mapping.GroupMappings,
+		WorkspaceMappings:      toConfigOIDCWorkspaceMappings(mapping.WorkspaceMappings),
+		DefaultWorkspaceAccess: mapping.DefaultWorkspaceAccess,
+		RoleAttributePath:      mapping.RoleAttributePath,
+		RoleAttributeStrict:    mapping.RoleAttributeStrict,
+		SkipOrgRoleSync:        mapping.SkipOrgRoleSync,
+		DefaultRole:            string(mapping.DefaultRole),
+	}
+}
+
+func toTrustedProxyGroupMappings(mappings map[string]string) map[string]authmodel.Role {
+	if len(mappings) == 0 {
+		return nil
+	}
+	result := make(map[string]authmodel.Role, len(mappings))
+	for group, role := range mappings {
+		result[group] = authmodel.Role(role)
+	}
+	return result
+}
+
+func toTrustedProxyWorkspaceMappings(mappings map[string][]config.TrustedProxyWorkspaceGrant) map[string][]authmapping.WorkspaceGrantConfig {
+	if len(mappings) == 0 {
+		return nil
+	}
+	result := make(map[string][]authmapping.WorkspaceGrantConfig, len(mappings))
+	for group, grants := range mappings {
+		converted := make([]authmapping.WorkspaceGrantConfig, len(grants))
+		for i, grant := range grants {
+			converted[i] = authmapping.WorkspaceGrantConfig{
+				Workspace: grant.Workspace,
+				Role:      authmodel.Role(grant.Role),
+			}
+		}
+		result[group] = converted
+	}
+	return result
+}
+
 // RegisterRoutes appends a route registrar that is applied before API routes
 // are mounted.
 func (srv *Server) RegisterRoutes(fn RouteRegistrar) {
@@ -178,123 +273,208 @@ func (srv *Server) RegisterRoutes(fn RouteRegistrar) {
 	}
 }
 
+// ServerConfig contains the dependencies used by the frontend server.
+type ServerConfig struct {
+	Context              context.Context
+	Config               *config.Config
+	DAGRepository        *persis.DAGRepository
+	DAGRunRepository     *persis.DAGRunRepository
+	ProcRepository       *persis.ProcRepository
+	QueueStore           queue.QueueStore
+	DAGRunManager        runtime.Manager
+	CoordinatorClient    coordinator.Client
+	ServiceRegistry      serviceregistry.ServiceRegistry
+	DAGRunLeaseStore     dispatch.DAGRunLeaseStore
+	WorkerHeartbeatStore dispatch.WorkerHeartbeatStore
+	SchedulerStateStore  schedulerstate.Store
+	Caches               []fileutil.CacheMetrics
+	LicenseManager       *license.Manager
+	ResourceService      *resource.Service
+	Stores               Stores
+}
+
 // NewServer constructs a Server from the provided configuration, stores, and services.
 // Returns an error if initialization fails (e.g., when builtin auth fails to initialize).
-func NewServer(ctx context.Context, cfg *config.Config, dr exec.DAGStore, drs exec.DAGRunStore, qs exec.QueueStore, ps exec.ProcStore, drm runtime.Manager, cc coordinator.Client, sr exec.ServiceRegistry, mr *prometheus.Registry, collector *telemetry.Collector, rs *resource.Service, stores StoreFactories, opts ...ServerOption) (*Server, error) {
+func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
+	ctx := setup.Context
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	cfg := setup.Config
+	dr := setup.DAGRepository
+	dagRunRepository := setup.DAGRunRepository
+	qs := setup.QueueStore
+	processes := setup.ProcRepository
+	drm := setup.DAGRunManager
+	cc := setup.CoordinatorClient
+	sr := setup.ServiceRegistry
+	rs := setup.ResourceService
+	stores := setup.Stores
+
+	collector := telemetry.NewCollector(config.Version, dr, dagRunRepository, qs, sr)
+	collector.SetWorkerHeartbeatStore(setup.WorkerHeartbeatStore)
+	for _, cache := range setup.Caches {
+		collector.RegisterCache(cache)
+	}
+	mr := telemetry.NewRegistry(collector)
+	if setup.LicenseManager != nil {
+		opts = append(opts, WithLicenseManager(setup.LicenseManager))
+	}
+	if setup.DAGRunLeaseStore != nil {
+		opts = append(opts, WithAPIOption(apiv1.WithDAGRunLeaseStore(setup.DAGRunLeaseStore)))
+	}
+	if setup.WorkerHeartbeatStore != nil {
+		opts = append(opts, WithAPIOption(apiv1.WithWorkerHeartbeatStore(setup.WorkerHeartbeatStore)))
+	}
+	opts = append(opts, WithAPIOption(apiv1.WithSchedulerStateStore(setup.SchedulerStateStore)))
 
 	remoteNodes := make([]string, 0, len(cfg.Server.RemoteNodes))
 	for _, n := range cfg.Server.RemoteNodes {
 		remoteNodes = append(remoteNodes, n.Name)
 	}
+	evaluatedBasePath, err := evaluateConfiguredBasePath(ctx, cfg.Server.BasePath)
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		apiOpts         []apiv1.APIOption
 		builtinOIDCCfg  *auth.BuiltinOIDCConfig
+		trustedProxyCfg = &auth.TrustedProxyLoginConfig{LoginBasePath: evaluatedBasePath}
 		oidcEnabled     bool
 		oidcButtonLabel string
 		setupRequired   bool
 	)
-	if stores.SnapshotStoreFactory != nil {
-		apiOpts = append(apiOpts, apiv1.WithSnapshotStoreFactory(stores.SnapshotStoreFactory))
+	if stores.WorkspaceBaseConfig != nil {
+		apiOpts = append(apiOpts, apiv1.WithWorkspaceBaseConfigProvider(stores.WorkspaceBaseConfig))
 	}
-	if stores.WorkspaceBaseConfigStoreFactory != nil {
-		apiOpts = append(apiOpts, apiv1.WithWorkspaceBaseConfigStoreFactory(stores.WorkspaceBaseConfigStoreFactory))
-	}
-	evaluatedBasePath := evaluateConfiguredBasePath(ctx, cfg.Server.BasePath)
 
-	auditSvc, auditStore, err := initAuditService(cfg, stores.AuditStoreFactory)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize audit service: %w", err)
+	var auditSvc *audit.Service
+	if stores.Audit != nil {
+		auditSvc = audit.New(stores.Audit)
 	}
-	eventSvc, err := initEventService(cfg, stores.EventStoreFactory)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize event service: %w", err)
+	var auditStore io.Closer
+	if closer, ok := stores.Audit.(io.Closer); ok {
+		auditStore = closer
 	}
+	eventSvc := stores.Event
 	syncSvc := initSyncService(ctx, cfg)
 	if syncSvc != nil {
 		apiOpts = append(apiOpts, apiv1.WithSyncService(syncSvc))
 	}
 
-	if cfg.Paths.BaseConfig != "" && stores.BaseConfigStoreFactory != nil {
-		baseConfigStore, bcErr := stores.BaseConfigStoreFactory(cfg.Paths.BaseConfig)
-		if bcErr != nil {
-			logger.Warn(ctx, "Failed to create base config store", tag.Error(bcErr))
-		} else {
-			apiOpts = append(apiOpts, apiv1.WithBaseConfigStore(baseConfigStore))
+	if stores.BaseConfig != nil {
+		apiOpts = append(apiOpts, apiv1.WithBaseConfigStore(stores.BaseConfig))
+	}
+
+	// Initialize the workspace store before OIDC provisioning so login-time
+	// mapping can report dormant grants without making workspace existence a
+	// prerequisite for authentication.
+	wsStore := stores.Workspace
+	var workspaceExists func(context.Context, string) (bool, error)
+	if wsStore != nil {
+		apiOpts = append(apiOpts, apiv1.WithWorkspaceStore(wsStore))
+		workspaceExists = func(ctx context.Context, name string) (bool, error) {
+			_, err := wsStore.GetByName(ctx, name)
+			switch {
+			case err == nil:
+				return true, nil
+			case errors.Is(err, workspacepkg.ErrWorkspaceNotFound):
+				return false, nil
+			default:
+				return false, err
+			}
 		}
-	}
-
-	cacheLimits := cfg.Cache.Limits()
-	memoryCache := fileutil.NewCache[string]("agent_memory", cacheLimits.DAG.Limit, cacheLimits.DAG.TTL)
-	memoryCache.StartEviction(ctx)
-	if collector != nil {
-		collector.RegisterCache(memoryCache)
-	}
-	var agentStores agent.RuntimeStores
-	if stores.AgentStoresFactory != nil {
-		agentStores = stores.AgentStoresFactory(ctx, cfg, AgentStoresOptions{
-			MemoryCache:      memoryCache,
-			SeedReferences:   true,
-			SeedExampleSouls: true,
-		})
-	}
-	agentConfigStore := agentStores.ConfigStore
-	agentModelStore := agentStores.ModelStore
-	agentSoulStore := agentStores.SoulStore
-	memoryStore := agentStores.MemoryStore
-	referencesDir := agentStores.ReferencesDir
-	agentOAuthManager := agentStores.OAuthManager
-
-	var docStore agent.DocStore
-	if stores.DocStoreFactory != nil {
-		docStore = stores.DocStoreFactory(cfg)
 	}
 
 	var authSvc *authservice.Service
 	if cfg.Server.Auth.Mode == config.AuthModeBuiltin {
-		if stores.BuiltinAuthFactory == nil {
+		if stores.AuthService == nil || stores.UserStore == nil {
 			return nil, errors.New("builtin auth persistence is not configured")
 		}
-		result, isSetupRequired, err := stores.BuiltinAuthFactory(ctx, cfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize builtin auth service: %w", err)
+		authSvc = stores.AuthService
+		setupRequired = stores.AuthSetupRequired
+		apiOpts = append(apiOpts, apiv1.WithAuthService(stores.AuthService))
+
+		trustedProxy := cfg.Server.Auth.Proxy
+		if trustedProxy.Enabled {
+			trustedProvisionSvc, err := trustedproxyprovision.New(stores.UserStore, trustedproxyprovision.Config{
+				UsersDir:        cfg.Paths.UsersDir,
+				Source:          trustedProxy.Source,
+				AutoSignup:      trustedProxy.AutoSignup,
+				SkipOrgRoleSync: trustedProxy.RoleMapping.SkipOrgRoleSync,
+				WorkspaceExists: workspaceExists,
+				RoleMapping: authmapping.Config{
+					DefaultRole:            authmodel.Role(trustedProxy.RoleMapping.DefaultRole),
+					GroupMappings:          toTrustedProxyGroupMappings(trustedProxy.RoleMapping.GroupMappings),
+					WorkspaceMappings:      toTrustedProxyWorkspaceMappings(trustedProxy.RoleMapping.WorkspaceMappings),
+					DefaultWorkspaceAccess: trustedProxy.RoleMapping.DefaultWorkspaceAccess,
+					Strict:                 trustedProxy.RoleMapping.RequireMapping,
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create proxy authentication provisioning service: %w", err)
+			}
+			trustedProxyCfg = &auth.TrustedProxyLoginConfig{
+				Enabled:        true,
+				UserHeader:     trustedProxy.Headers.User,
+				GroupsHeader:   trustedProxy.Headers.Groups,
+				GroupsRequired: len(trustedProxy.RoleMapping.GroupMappings) > 0 || len(trustedProxy.RoleMapping.WorkspaceMappings) > 0,
+				Provision:      trustedProvisionSvc,
+				AuthService:    stores.AuthService,
+				InitialSetupComplete: func(ctx context.Context) (bool, error) {
+					count, err := stores.AuthService.CountUsers(ctx)
+					return count > 0, err
+				},
+				LoginBasePath: evaluatedBasePath,
+			}
+			logger.Info(ctx, "Proxy authentication enabled",
+				slog.Bool("autoSignup", trustedProxy.AutoSignup),
+				slog.String("defaultRole", trustedProxy.RoleMapping.DefaultRole),
+				slog.Bool("skipOrgRoleSync", trustedProxy.RoleMapping.SkipOrgRoleSync))
 		}
-		authSvc = result.AuthService
-		setupRequired = isSetupRequired
-		apiOpts = append(apiOpts, apiv1.WithAuthService(result.AuthService))
 
 		oidcCfg := cfg.Server.Auth.OIDC
 		if oidcCfg.IsConfigured() {
 			oidcEnabled = true
 			oidcButtonLabel = oidcCfg.ButtonLabel
+			configPolicy := oidcCfg.Policy()
+			policy := toOIDCPolicy(configPolicy)
+			loader := config.NewOIDCPolicyLoader(
+				cfg.Paths.ConfigFilesUsed,
+				configPolicy,
+			)
 
 			provisionCfg := oidcprovision.Config{
 				Issuer:         oidcCfg.Issuer,
-				AutoSignup:     oidcCfg.AutoSignup,
-				DefaultRole:    authmodel.Role(oidcCfg.RoleMapping.DefaultRole),
-				AllowedDomains: oidcCfg.AllowedDomains,
-				Whitelist:      oidcCfg.Whitelist,
-				RoleMapping: oidcprovision.RoleMapperConfig{
-					GroupsClaim:         oidcCfg.RoleMapping.GroupsClaim,
-					GroupMappings:       oidcCfg.RoleMapping.GroupMappings,
-					RoleAttributePath:   oidcCfg.RoleMapping.RoleAttributePath,
-					RoleAttributeStrict: oidcCfg.RoleMapping.RoleAttributeStrict,
-					SkipOrgRoleSync:     oidcCfg.RoleMapping.SkipOrgRoleSync,
-					DefaultRole:         authmodel.Role(oidcCfg.RoleMapping.DefaultRole),
+				AutoSignup:     policy.AutoSignup,
+				DefaultRole:    policy.RoleMapping.DefaultRole,
+				AllowedDomains: policy.AllowedDomains,
+				Whitelist:      policy.Whitelist,
+				RoleMapping:    policy.RoleMapping,
+				LoadPolicy: func(context.Context) (oidcprovision.Policy, error) {
+					policy, err := loader.Load()
+					if err != nil {
+						return oidcprovision.Policy{}, err
+					}
+					return toOIDCPolicy(policy), nil
 				},
 			}
-			provisionSvc, err := oidcprovision.New(result.UserStore, provisionCfg)
+			provisionCfg.WorkspaceExists = workspaceExists
+			provisionSvc, err := oidcprovision.New(stores.UserStore, provisionCfg)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create OIDC provisioning service: %w", err)
 			}
+			apiOpts = append(apiOpts, apiv1.WithOIDCRoleMapping(
+				func() config.OIDCRoleMapping {
+					return toConfigOIDCMapping(provisionSvc.RoleMapping())
+				},
+			))
 
 			builtinOIDCCfg, err = auth.InitBuiltinOIDCConfig(
 				ctx,
 				oidcCfg,
-				result.AuthService,
+				stores.AuthService,
 				provisionSvc,
 				evaluatedBasePath,
 			)
@@ -309,32 +489,16 @@ func NewServer(ctx context.Context, cfg *config.Config, dr exec.DAGStore, drs ex
 		}
 	}
 
-	// Initialize remote node store and resolver
 	var (
 		remoteNodeResolver *remotenode.Resolver
-		encryptor          *crypto.Encryptor
 		licenseChecker     license.Checker
 	)
-	encKey, encErr := crypto.ResolveKey(cfg.Paths.DataDir)
-	if encErr != nil {
-		logger.Warn(ctx, "Failed to resolve encryption key for encrypted stores", tag.Error(encErr))
-	}
-	if encErr == nil {
-		encryptor, encErr = crypto.NewEncryptor(encKey)
-		if encErr != nil {
-			logger.Warn(ctx, "Failed to create encryptor for encrypted stores", tag.Error(encErr))
-		} else if stores.RemoteNodeStoreFactory != nil {
-			rnStore, rnErr := stores.RemoteNodeStoreFactory(cfg, encryptor)
-			if rnErr != nil {
-				logger.Warn(ctx, "Failed to create remote node store", tag.Error(rnErr))
-			} else {
-				remoteNodeResolver = remotenode.NewResolver(cfg.Server.RemoteNodes, rnStore)
-				apiOpts = append(apiOpts,
-					apiv1.WithRemoteNodeResolver(remoteNodeResolver),
-					apiv1.WithRemoteNodeStore(rnStore),
-				)
-			}
-		}
+	if stores.RemoteNode != nil {
+		remoteNodeResolver = remotenode.NewResolver(cfg.Server.RemoteNodes, stores.RemoteNode)
+		apiOpts = append(apiOpts,
+			apiv1.WithRemoteNodeResolver(remoteNodeResolver),
+			apiv1.WithRemoteNodeStore(stores.RemoteNode),
+		)
 	}
 	if remoteNodeResolver == nil {
 		// Fallback: resolver with config nodes only (no store)
@@ -347,133 +511,76 @@ func NewServer(ctx context.Context, cfg *config.Config, dr exec.DAGStore, drs ex
 		remoteNodes = names
 	}
 
-	if agentStores.SecretStore != nil {
-		apiOpts = append(apiOpts, apiv1.WithSecretStore(agentStores.SecretStore))
+	if stores.Secret != nil {
+		apiOpts = append(apiOpts, apiv1.WithSecretStore(stores.Secret))
 	}
-	if agentStores.ProfileStore != nil {
-		apiOpts = append(apiOpts, apiv1.WithProfileStore(agentStores.ProfileStore))
-	}
-	if agentOAuthManager != nil {
-		apiOpts = append(apiOpts, apiv1.WithAgentOAuthManager(agentOAuthManager))
+	if stores.Profile != nil {
+		apiOpts = append(apiOpts, apiv1.WithProfileStore(stores.Profile))
 	}
 
-	if stores.DAGSettingsStoreFactory != nil {
-		store, err := stores.DAGSettingsStoreFactory(cfg)
-		if err != nil {
-			logger.Warn(ctx, "Failed to create DAG settings store", tag.Error(err))
-		} else {
-			apiOpts = append(apiOpts, apiv1.WithDAGSettingsStore(store))
-		}
+	if stores.DAGSettings != nil {
+		apiOpts = append(apiOpts, apiv1.WithDAGSettingsStore(stores.DAGSettings))
 	}
 
-	if stores.ViewStoreFactory != nil {
-		store, err := stores.ViewStoreFactory(cfg)
-		if err != nil {
-			logger.Warn(ctx, "Failed to create view store", tag.Error(err))
-		} else {
-			apiOpts = append(apiOpts, apiv1.WithViewStore(store))
-		}
+	if stores.Wiki != nil {
+		apiOpts = append(apiOpts, apiv1.WithWikiStore(stores.Wiki))
+	}
+
+	if stores.View != nil {
+		apiOpts = append(apiOpts, apiv1.WithViewStore(stores.View))
 	}
 
 	var notificationSvc *notificationservice.Service
-	if encryptor != nil && stores.NotificationStoreFactory != nil {
-		store, err := stores.NotificationStoreFactory(cfg, encryptor)
-		if err != nil {
-			logger.Warn(ctx, "Failed to create notification settings store", tag.Error(err))
-		} else {
-			notificationSvc = notificationservice.New(
-				store,
-				dr,
-				notificationservice.WithPublicURL(cfg.Server.PublicURL),
-			)
-			apiOpts = append(apiOpts, apiv1.WithNotificationService(notificationSvc))
-		}
-	} else if encryptor == nil {
-		logger.Warn(ctx, "Notification settings store is disabled because encrypted storage is not available")
+	if stores.Notification != nil && eventSvc != nil && stores.NotificationState != nil {
+		notificationSvc = notificationservice.New(
+			stores.Notification,
+			dr,
+			notificationservice.WithPublicURL(cfg.Server.PublicURL),
+		)
+		apiOpts = append(apiOpts, apiv1.WithNotificationService(notificationSvc))
+	} else if stores.Notification != nil {
+		slog.Default().Warn("Notification delivery is unavailable because the event or state store is disabled")
 	}
 
 	var incidentSvc *incidentservice.Service
-	if encryptor != nil && stores.IncidentStoreFactory != nil {
-		store, err := stores.IncidentStoreFactory(cfg, encryptor)
-		if err != nil {
-			logger.Warn(ctx, "Failed to create incident settings store", tag.Error(err))
-		} else {
-			incidentSvc = incidentservice.New(
-				store,
-				incidentservice.WithIncidentsEnabled(func() bool {
-					return license.HasActiveLicense(licenseChecker)
-				}),
-				incidentservice.WithPublicURL(cfg.Server.PublicURL),
-			)
-			apiOpts = append(apiOpts, apiv1.WithIncidentService(incidentSvc))
-		}
-	} else if encryptor == nil {
-		logger.Warn(ctx, "Incident settings store is disabled because encrypted storage is not available")
+	if stores.Incident != nil {
+		incidentSvc = incidentservice.New(
+			stores.Incident,
+			incidentservice.WithIncidentsEnabled(func() bool {
+				return license.HasActiveLicense(licenseChecker)
+			}),
+			incidentservice.WithPublicURL(cfg.Server.PublicURL),
+		)
+		apiOpts = append(apiOpts, apiv1.WithIncidentService(incidentSvc))
 	}
 
-	// Initialize workspace store
-	var wsStore workspacepkg.Store
-	if stores.WorkspaceStoreFactory != nil {
-		var wsErr error
-		wsStore, wsErr = stores.WorkspaceStoreFactory(cfg)
-		if wsErr != nil {
-			logger.Warn(ctx, "Failed to create workspace store", tag.Error(wsErr))
-		} else {
-			apiOpts = append(apiOpts, apiv1.WithWorkspaceStore(wsStore))
-		}
-	}
-
-	auditEnabled := func() bool {
-		if auditSvc == nil {
-			return false
-		}
-		if licenseChecker == nil {
-			return true
-		}
-		return licenseChecker.IsFeatureEnabled(license.FeatureAudit)
-	}
-
-	var agentAPI *agent.API
-	if agentConfigStore != nil {
-		agentAPI, err = initAgentAPI(ctx, agentConfigStore, agentModelStore, agentSoulStore, agentOAuthManager, cfg, referencesDir, dr, drs, auditSvc, auditEnabled, eventSvc, memoryStore, docStore, wsStore, newRemoteNodeAdapter(remoteNodeResolver), stores.AgentSessionStoreFactory)
-		if err != nil {
-			logger.Warn(ctx, "Failed to initialize agent API", tag.Error(err))
-		}
-	}
-
-	var (
-		upgradeStore      upgrade.CacheStore
-		updateInfoChecker UpdateChecker
-	)
-	if cfg.Server.CheckUpdates && stores.UpgradeCheckStoreFactory != nil {
-		upgradeStore, err = stores.UpgradeCheckStoreFactory(cfg)
-		if err != nil {
-			logger.Warn(ctx, "Failed to create upgrade check store", tag.Error(err))
-		} else {
-			updateInfoChecker = &updateChecker{store: upgradeStore}
-		}
+	upgradeStore := stores.Upgrade
+	var updateInfoChecker UpdateChecker
+	if upgradeStore != nil {
+		updateInfoChecker = &updateChecker{store: upgradeStore}
 	}
 
 	// Note: SSO/OIDC gating is applied after opts are processed (see below)
 
 	srv := &Server{
-		config:                cfg,
-		agentAPI:              agentAPI,
-		agentConfigStore:      agentConfigStore,
-		builtinOIDCCfg:        builtinOIDCCfg,
-		authService:           authSvc,
-		auditService:          auditSvc,
-		auditStore:            auditStore,
-		eventService:          eventSvc,
-		incidentService:       incidentSvc,
-		notificationService:   notificationSvc,
-		incidentStateFile:     stores.IncidentMonitorStateFileFunc,
-		notificationStateFile: stores.NotificationMonitorStateFileFunc,
-		syncService:           syncSvc,
-		metricsRegistry:       mr,
-		dagStore:              dr,
-		remoteNodeResolver:    remoteNodeResolver,
-		upgradeStore:          upgradeStore,
+		config:               cfg,
+		builtinOIDCCfg:       builtinOIDCCfg,
+		trustedProxyCfg:      trustedProxyCfg,
+		authService:          authSvc,
+		auditService:         auditSvc,
+		auditStore:           auditStore,
+		eventService:         eventSvc,
+		incidentService:      incidentSvc,
+		notificationService:  notificationSvc,
+		incidentState:        stores.IncidentState,
+		newIncidentLease:     stores.NewIncidentLease,
+		notificationState:    stores.NotificationState,
+		newNotificationLease: stores.NewNotificationLease,
+		syncService:          syncSvc,
+		metricsRegistry:      mr,
+		dagRepository:        dr,
+		remoteNodeResolver:   remoteNodeResolver,
+		upgradeStore:         upgradeStore,
 		funcsConfig: funcsConfig{
 			NavbarColor:           cfg.UI.NavbarColor,
 			NavbarTitle:           cfg.UI.NavbarTitle,
@@ -488,12 +595,13 @@ func NewServer(ctx context.Context, cfg *config.Config, dr exec.DAGStore, drs ex
 			AuthMode:              cfg.Server.Auth.Mode,
 			OIDCEnabled:           oidcEnabled,
 			OIDCButtonLabel:       oidcButtonLabel,
+			ProxyEnabled:          cfg.Server.Auth.Proxy.Enabled,
+			ProxyButtonLabel:      cfg.Server.Auth.Proxy.ButtonLabel,
 			TerminalEnabled:       cfg.Server.Terminal.Enabled && authSvc != nil,
 			GitSyncEnabled:        cfg.GitSync.Enabled,
 			WorkspaceStore:        wsStore,
 			SetupRequiredChecker:  &setupChecker{authSvc: authSvc, fallback: setupRequired},
 			UpdateChecker:         updateInfoChecker,
-			AgentEnabledChecker:   agentConfigStore,
 		},
 	}
 
@@ -525,11 +633,6 @@ func NewServer(ctx context.Context, cfg *config.Config, dr exec.DAGStore, drs ex
 
 	srv.funcsConfig.APIBasePath = srv.config.Server.APIBasePath
 
-	// Notify callback with the agent API instance (if both are set).
-	if srv.agentAPICallback != nil && srv.agentAPI != nil {
-		srv.agentAPICallback(srv.agentAPI)
-	}
-
 	// Populate license checker and manager in funcsConfig after opts
 	if srv.licenseManager != nil {
 		licenseChecker = srv.licenseManager.Checker()
@@ -538,10 +641,16 @@ func NewServer(ctx context.Context, cfg *config.Config, dr exec.DAGStore, drs ex
 		if srv.builtinOIDCCfg != nil {
 			srv.builtinOIDCCfg.LicenseChecker = licenseChecker
 		}
+		if srv.trustedProxyCfg != nil {
+			srv.trustedProxyCfg.LicenseChecker = licenseChecker
+		}
 	}
 
 	if srv.licenseManager != nil && srv.builtinOIDCCfg != nil && !srv.licenseManager.Checker().IsFeatureEnabled(license.FeatureSSO) {
 		logger.Warn(ctx, "SSO (OIDC) is configured but currently unavailable because the active license does not enable it")
+	}
+	if srv.licenseManager != nil && srv.trustedProxyCfg != nil && srv.trustedProxyCfg.Enabled && !srv.licenseManager.Checker().IsFeatureEnabled(license.FeatureSSO) {
+		logger.Warn(ctx, "Proxy authentication is configured but currently unavailable because the active license does not enable it")
 	}
 
 	if srv.auditService != nil {
@@ -557,41 +666,20 @@ func NewServer(ctx context.Context, cfg *config.Config, dr exec.DAGStore, drs ex
 		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAGsList)
 		srv.sseMultiplexer.WakeTopic(sse.TopicTypeDAG, fileName)
 	}))
-	apiOpts = append(apiOpts, apiv1.WithDocMutationNotifier(func() {
+	apiOpts = append(apiOpts, apiv1.WithWikiMutationNotifier(func() {
 		if srv.sseMultiplexer == nil {
 			return
 		}
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDocTree)
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDoc)
+		srv.wakeWikiTopics()
 	}))
-
 	// Pass license manager to API
 	if srv.licenseManager != nil {
 		apiOpts = append(apiOpts, apiv1.WithLicenseManager(srv.licenseManager))
 	}
 
 	allAPIOptions := append(apiOpts, srv.tunnelAPIOpts...)
-	if srv.agentConfigStore != nil {
-		allAPIOptions = append(allAPIOptions, apiv1.WithAgentConfigStore(srv.agentConfigStore))
-	}
-	if agentModelStore != nil {
-		allAPIOptions = append(allAPIOptions, apiv1.WithAgentModelStore(agentModelStore))
-	}
 
-	if memoryStore != nil {
-		allAPIOptions = append(allAPIOptions, apiv1.WithAgentMemoryStore(memoryStore))
-	}
-	if agentSoulStore != nil {
-		allAPIOptions = append(allAPIOptions, apiv1.WithAgentSoulStore(agentSoulStore))
-	}
-	if docStore != nil {
-		allAPIOptions = append(allAPIOptions, apiv1.WithDocStore(docStore))
-	}
-	if srv.agentAPI != nil {
-		allAPIOptions = append(allAPIOptions, apiv1.WithAgentAPI(srv.agentAPI))
-	}
-
-	srv.apiV1 = apiv1.New(dr, drs, qs, ps, drm, cfg, cc, sr, mr, rs, allAPIOptions...)
+	srv.apiV1 = apiv1.New(dr, dagRunRepository, qs, processes, drm, cfg, cc, sr, mr, rs, allAPIOptions...)
 
 	return srv, nil
 }
@@ -638,22 +726,6 @@ func (s *setupChecker) IsSetupRequired(ctx context.Context) bool {
 	return true
 }
 
-// initAuditService creates the configured audit store and service.
-func initAuditService(cfg *config.Config, factory AuditStoreFactory) (*audit.Service, AuditStore, error) {
-	if factory == nil {
-		return nil, nil, nil
-	}
-	store, err := factory(cfg)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create audit store: %w", err)
-	}
-	if store == nil {
-		return nil, nil, nil
-	}
-
-	return audit.New(store), store, nil
-}
-
 // initSyncService creates and returns a Git sync service if enabled.
 func initSyncService(ctx context.Context, cfg *config.Config) gitsync.Service {
 	if !cfg.GitSync.Enabled {
@@ -661,7 +733,7 @@ func initSyncService(ctx context.Context, cfg *config.Config) gitsync.Service {
 	}
 
 	syncCfg := gitsync.NewConfigFromGlobal(cfg.GitSync)
-	svc := gitsync.NewService(syncCfg, cfg.Paths.DAGsDir, cfg.Paths.DataDir, cfg.Paths.BaseConfig)
+	svc := gitsync.NewService(syncCfg, cfg.Paths.DAGsDir, cfg.Paths.WikiDir, cfg.Paths.DataDir)
 
 	if syncCfg.AutoSync.Enabled {
 		if err := svc.Start(ctx); err != nil {
@@ -679,110 +751,6 @@ func initSyncService(ctx context.Context, cfg *config.Config) gitsync.Service {
 		slog.String("branch", syncCfg.Branch))
 
 	return svc
-}
-
-// initAgentAPI creates and returns an agent API.
-// The API uses the config store to check enabled status and resolve providers via the model store.
-func initAgentAPI(ctx context.Context, configStore agent.ConfigStore, modelStore agent.ModelStore, soulStore agent.SoulStore, oauthManager *agentoauth.Manager, cfg *config.Config, referencesDir string, dagStore exec.DAGStore, dagRunStore exec.DAGRunStore, auditSvc *audit.Service, auditEnabled func() bool, eventSvc *eventstore.Service, memoryStore agent.MemoryStore, docStore agent.DocStore, workspaceStore workspacepkg.Store, remoteResolver agent.RemoteContextResolver, sessionFactory AgentSessionStoreFactory) (*agent.API, error) {
-	var sessStore agent.SessionStore
-	if sessionFactory != nil {
-		var err error
-		sessStore, err = sessionFactory(cfg)
-		if err != nil {
-			logger.Warn(ctx, "Failed to create session store, persistence disabled", tag.Error(err))
-		}
-	}
-	paths := &cfg.Paths
-
-	hooks := agent.NewHooks()
-	hooks.OnBeforeToolExec(newAgentPolicyHook(configStore, auditSvc, auditEnabled))
-	if auditSvc != nil {
-		hooks.OnAfterToolExec(newAgentAuditHook(auditSvc, auditEnabled))
-	}
-
-	api := agent.NewAPI(agent.APIConfig{
-		ConfigStore:           configStore,
-		ModelStore:            modelStore,
-		SoulStore:             soulStore,
-		WorkingDir:            paths.DAGsDir,
-		Logger:                slog.Default(),
-		SessionStore:          sessStore,
-		DAGStore:              dagStore,
-		DAGRunStore:           dagRunStore,
-		Hooks:                 hooks,
-		EventService:          eventSvc,
-		MemoryStore:           memoryStore,
-		DocStore:              docStore,
-		WorkspaceStore:        workspaceStore,
-		OAuthManager:          oauthManager,
-		RemoteContextResolver: remoteResolver,
-		Environment: agent.EnvironmentInfo{
-			DAGsDir:        paths.DAGsDir,
-			DocsDir:        paths.DocsDir,
-			LogDir:         paths.LogDir,
-			DataDir:        paths.DataDir,
-			SessionsDir:    paths.SessionsDir,
-			ConfigFile:     paths.ConfigFileUsed,
-			WorkingDir:     paths.DAGsDir,
-			BaseConfigFile: paths.BaseConfig,
-			ReferencesDir:  referencesDir,
-		},
-	})
-
-	api.StartCleanup(ctx)
-
-	logger.Info(ctx, "Agent API initialized")
-
-	return api, nil
-}
-
-func initEventService(cfg *config.Config, factory EventStoreFactory) (*eventstore.Service, error) {
-	if factory == nil {
-		return nil, nil
-	}
-	store, err := factory(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if store == nil {
-		return nil, nil
-	}
-	return eventstore.New(store), nil
-}
-
-// newAgentAuditHook returns a hook that logs agent tool executions to the audit service.
-func newAgentAuditHook(auditSvc *audit.Service, auditEnabled func() bool) agent.AfterToolExecHookFunc {
-	return func(_ context.Context, info agent.ToolExecInfo, result agent.ToolOut) {
-		if info.Audit == nil || !isAuditEnabled(auditSvc, auditEnabled) {
-			return // tool opted out of audit
-		}
-
-		details := make(map[string]any)
-		if info.Audit.DetailExtractor != nil {
-			details = info.Audit.DetailExtractor(info.Input)
-		}
-		maps.Copy(details, result.AuditDetails)
-		if result.IsError {
-			details["failed"] = true
-		}
-		details["session_id"] = info.SessionID
-
-		detailsJSON, _ := json.Marshal(details)
-		entry := audit.NewEntry(audit.CategoryAgent, info.Audit.Action, info.User.UserID, info.User.Username).
-			WithDetails(string(detailsJSON)).
-			WithIPAddress(info.User.IPAddress)
-		_ = auditSvc.Log(context.Background(), entry)
-	}
-}
-
-func isAuditEnabled(auditSvc *audit.Service, auditEnabled func() bool) bool {
-	if auditSvc == nil {
-		return false
-	}
-	if auditEnabled == nil {
-		return true
-	}
-	return auditEnabled()
 }
 
 // sanitizedRequestLogger wraps httplog's RequestLogger with URL sanitization
@@ -860,8 +828,11 @@ func skipPathsMiddleware(mw func(http.Handler) http.Handler, skip map[string]str
 func (srv *Server) Serve(ctx context.Context) error {
 	r := chi.NewMux()
 	apiV1BasePath := srv.configureAPIPath(ctx)
+	ipAccessPolicy, err := newIPAccessPolicy(srv.config.Server.IPAccess)
+	if err != nil {
+		return fmt.Errorf("configure IP access: %w", err)
+	}
 	r.Use(auth.PreserveRawRemoteAddr)
-	r.Use(middleware.RealIP)
 	r.Use(middleware.Compress(5))
 	if srv.config.Server.AccessLog != config.AccessLogNone {
 		logLevel := slog.LevelInfo
@@ -869,10 +840,13 @@ func (srv *Server) Serve(ctx context.Context) error {
 			logLevel = slog.LevelDebug
 		}
 		requestLogger := httplog.NewLogger("http", httplog.Options{
-			LogLevel:         logLevel,
-			JSON:             srv.config.Core.LogFormat == "json",
-			Concise:          true,
-			RequestHeaders:   srv.config.Core.Debug,
+			LogLevel:       logLevel,
+			JSON:           srv.config.Core.LogFormat == "json",
+			Concise:        true,
+			RequestHeaders: srv.config.Core.Debug,
+			HideRequestHeaders: trustedProxyRequestHeaders(
+				srv.config.Server.Auth.Proxy,
+			),
 			MessageFieldName: "msg",
 			ResponseHeaders:  false,
 			QuietDownRoutes: []string{
@@ -890,19 +864,12 @@ func (srv *Server) Serve(ctx context.Context) error {
 	}
 	r.Use(middleware.Recoverer)
 	r.Use(securityHeadersMiddleware(srv.config.Server.TLS != nil))
-	corsOrigins := srv.config.Server.CORSAllowedOrigins
-	allowCredentials := len(corsOrigins) > 0 && !slices.Contains(corsOrigins, "*")
-	if !allowCredentials {
-		corsOrigins = []string{"*"}
-	}
-	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   corsOrigins,
-		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "Authorization", "Content-Encoding", "Accept", "MCP-Protocol-Version", "Mcp-Session-Id", "Last-Event-ID"},
-		ExposedHeaders:   []string{"Mcp-Session-Id"},
-		AllowCredentials: allowCredentials,
-		MaxAge:           300,
-	}))
+	r.Use(ipAccessPolicy.middleware)
+	r.Use(corsPolicy{
+		allowedOrigins: srv.config.Server.CORSAllowedOrigins,
+		publicURL:      srv.config.Server.PublicURL,
+		setupPath:      path.Join(apiV1BasePath, "auth/setup"),
+	}.middleware)
 	r.Use(middleware.RedirectSlashes)
 
 	if err := srv.setupRoutes(ctx, r); err != nil {
@@ -919,10 +886,6 @@ func (srv *Server) Serve(ctx context.Context) error {
 		srv.setupTerminalRoute(ctx, r, apiV1BasePath)
 	}
 
-	if srv.agentAPI != nil && srv.agentConfigStore != nil {
-		srv.setupAgentRoutes(ctx, r, apiV1BasePath)
-	}
-
 	srv.setupSSERoute(ctx, r, apiV1BasePath)
 	srv.setupMCPRoute(ctx, r)
 
@@ -935,14 +898,15 @@ func (srv *Server) Serve(ctx context.Context) error {
 		Addr:              addr,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      httpWriteTimeout,
+	}
+
+	if err := srv.startMonitors(ctx); err != nil {
+		return err
 	}
 
 	metrics.StartUptime(ctx)
 	logger.Info(ctx, "Server is starting", tag.Addr(addr))
-
-	srv.startNotificationMonitor(ctx)
-	srv.startIncidentMonitor(ctx)
 	srv.startPeriodicUpdateCheck(ctx)
 
 	go srv.startServer(ctx)
@@ -951,46 +915,86 @@ func (srv *Server) Serve(ctx context.Context) error {
 	return nil
 }
 
-func (srv *Server) startNotificationMonitor(ctx context.Context) {
+func trustedProxyRequestHeaders(cfg config.AuthTrustedProxy) []string {
+	if !cfg.Enabled {
+		return nil
+	}
+	headers := make([]string, 0, 2)
+	if cfg.Headers.User != "" {
+		headers = append(headers, cfg.Headers.User)
+	}
+	if cfg.Headers.Groups != "" {
+		headers = append(headers, cfg.Headers.Groups)
+	}
+	return headers
+}
+
+func (srv *Server) startMonitors(ctx context.Context) error {
+	notificationMonitor := srv.newNotificationMonitor()
+	incidentMonitor := srv.newIncidentMonitor()
+
+	if notificationMonitor != nil {
+		if err := notificationMonitor.Bootstrap(ctx); err != nil {
+			return fmt.Errorf("bootstrap notification monitor: %w", err)
+		}
+	}
+
+	if incidentMonitor != nil {
+		if err := incidentMonitor.Bootstrap(ctx); err != nil {
+			return fmt.Errorf("bootstrap incident monitor: %w", err)
+		}
+	}
+
+	if notificationMonitor != nil {
+		go notificationMonitor.Run(ctx)
+	}
+
+	if incidentMonitor != nil {
+		go incidentMonitor.Run(ctx)
+	}
+	return nil
+}
+
+func (srv *Server) newNotificationMonitor() *chatbridge.NotificationMonitor {
 	if srv.notificationService == nil || srv.eventService == nil {
-		return
+		return nil
 	}
-	if srv.notificationStateFile == nil {
-		return
+	if srv.notificationState == nil {
+		return nil
 	}
-	stateFile := srv.notificationStateFile(srv.config)
-	if stateFile == "" {
-		return
+	var lease chatbridge.Lease
+	if srv.newNotificationLease != nil {
+		lease = srv.newNotificationLease()
 	}
-	monitor := chatbridge.NewNotificationMonitor(
+	return chatbridge.NewNotificationMonitor(
 		srv.eventService,
-		stateFile,
+		srv.notificationState,
+		lease,
 		srv.notificationService,
 		slog.Default(),
 		chatbridge.DefaultNotificationMonitorConfig(),
 	)
-	go monitor.Run(ctx)
 }
 
-func (srv *Server) startIncidentMonitor(ctx context.Context) {
+func (srv *Server) newIncidentMonitor() *chatbridge.NotificationMonitor {
 	if srv.incidentService == nil || srv.eventService == nil {
-		return
+		return nil
 	}
-	if srv.incidentStateFile == nil {
-		return
+	if srv.incidentState == nil {
+		return nil
 	}
-	stateFile := srv.incidentStateFile(srv.config)
-	if stateFile == "" {
-		return
+	var lease chatbridge.Lease
+	if srv.newIncidentLease != nil {
+		lease = srv.newIncidentLease()
 	}
-	monitor := chatbridge.NewNotificationMonitor(
+	return chatbridge.NewNotificationMonitor(
 		srv.eventService,
-		stateFile,
+		srv.incidentState,
+		lease,
 		srv.incidentService,
 		slog.Default(),
 		incidentMonitorConfig(),
 	)
-	go monitor.Run(ctx)
 }
 
 func incidentMonitorConfig() chatbridge.NotificationMonitorConfig {
@@ -1000,6 +1004,7 @@ func incidentMonitorConfig() chatbridge.NotificationMonitorConfig {
 	cfg.InterestedEventTypes = []eventstore.EventType{
 		eventstore.TypeDAGRunFailed,
 		eventstore.TypeDAGRunSucceeded,
+		eventstore.TypeDAGRunPartiallySucceeded,
 	}
 	return cfg
 }
@@ -1046,12 +1051,13 @@ func ensureLeadingSlash(p string) string {
 }
 
 func (srv *Server) setupRoutes(ctx context.Context, r *chi.Mux) error {
+	basePath := srv.funcsConfig.BasePath
+	srv.setupTrustedProxyRoute(r, basePath)
 	if srv.config.Server.Headless {
 		logger.Info(ctx, "Headless mode enabled: UI is disabled, but API remains active")
 		return nil
 	}
 
-	basePath := srv.funcsConfig.BasePath
 	srv.setupAssetRoutes(r, basePath)
 	srv.setupOIDCRoutes(r, basePath)
 
@@ -1066,14 +1072,21 @@ func (srv *Server) setupRoutes(ctx context.Context, r *chi.Mux) error {
 	return nil
 }
 
-func evaluateConfiguredBasePath(ctx context.Context, basePath string) string {
+func evaluateConfiguredBasePath(ctx context.Context, basePath string) (string, error) {
 	resolver := cmnvalue.NewResolver(cmnvalue.StaticScope{}, cmnvalue.RuntimeScope{})
 	evaluated, err := resolver.String(ctx, basePath, cmnvalue.ServerBasePathField("server.base_path"))
 	if err != nil {
-		logger.Warn(ctx, "Failed to evaluate server base path", tag.Path(basePath), tag.Error(err))
-		return basePath
+		return "", fmt.Errorf("evaluate server base path: %w", err)
 	}
-	return evaluated
+	if strings.ContainsAny(evaluated, "?#\\") || strings.IndexFunc(evaluated, unicode.IsControl) >= 0 {
+		return "", fmt.Errorf("evaluate server base path: result must be a local URL path")
+	}
+
+	cleaned := path.Clean("/" + strings.TrimLeft(strings.TrimSpace(evaluated), "/"))
+	if cleaned == "/" {
+		return "", nil
+	}
+	return cleaned, nil
 }
 
 func publicURLWithBasePath(publicURL, basePath string) string {
@@ -1089,15 +1102,20 @@ func publicURLWithBasePath(publicURL, basePath string) string {
 }
 
 func (srv *Server) setupAssetRoutes(r *chi.Mux, basePath string) {
+	srv.setupAssetRoutesWithFS(r, basePath, assetsFS)
+}
+
+func (srv *Server) setupAssetRoutesWithFS(r *chi.Mux, basePath string, assetFS fs.FS) {
 	assetsPath := ensureLeadingSlash(path.Join(strings.TrimRight(basePath, "/"), "assets/*"))
 
-	fileServer := http.FileServer(http.FS(assetsFS))
+	fileServer := http.FileServer(http.FS(assetFS))
 	if basePath != "" && basePath != "/" {
 		fileServer = http.StripPrefix(strings.TrimRight(basePath, "/"), fileServer)
 	}
 
 	r.Get(assetsPath, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", cacheControlForAsset(r.URL.Path))
+		isCurrentVersion := r.URL.Query().Get("v") == currentAssetVersion()
+		w.Header().Set("Cache-Control", cacheControlForAsset(r.URL.Path, isCurrentVersion))
 
 		// Serve schemas from shared package instead of embedded assets
 		if strings.HasSuffix(r.URL.Path, "dag.schema.json") {
@@ -1118,13 +1136,16 @@ func (srv *Server) setupAssetRoutes(r *chi.Mux, basePath string) {
 	})
 }
 
-func cacheControlForAsset(assetPath string) string {
+func cacheControlForAsset(assetPath string, isCurrentVersion bool) string {
 	base := path.Base(assetPath)
 	lowerBase := strings.ToLower(base)
+	if lowerBase == "bundle.js" && isCurrentVersion {
+		return "max-age=31536000, immutable"
+	}
 	if hasContentHashSuffix(lowerBase, ".worker.js") {
 		return "max-age=31536000, immutable"
 	}
-	if strings.HasSuffix(lowerBase, ".bundle.js") && !strings.EqualFold(base, "bundle.js") {
+	if strings.HasSuffix(lowerBase, ".bundle.js") && lowerBase != "bundle.js" {
 		return "max-age=31536000, immutable"
 	}
 	if strings.HasSuffix(lowerBase, ".js") {
@@ -1154,6 +1175,13 @@ func hasContentHashSuffix(base, suffix string) bool {
 	return true
 }
 
+func (srv *Server) setupTrustedProxyRoute(r *chi.Mux, basePath string) {
+	r.Handle(
+		pathutil.BuildPublicEndpointPath(basePath, "proxy-login"),
+		auth.TrustedProxyLoginHandler(srv.trustedProxyCfg),
+	)
+}
+
 func (srv *Server) setupOIDCRoutes(r *chi.Mux, basePath string) {
 	if srv.builtinOIDCCfg == nil {
 		return
@@ -1165,7 +1193,7 @@ func (srv *Server) setupOIDCRoutes(r *chi.Mux, basePath string) {
 func (srv *Server) setupAPIRoutes(ctx context.Context, r *chi.Mux, apiV1BasePath string) error {
 	var setupErr error
 	r.Route(apiV1BasePath, func(r chi.Router) {
-		if err := srv.apiV1.ConfigureRoutes(ctx, r); err != nil {
+		if err := srv.apiV1.ConfigureRoutes(ctx, r, httpWriteTimeout); err != nil {
 			logger.Error(ctx, "Failed to configure API routes", tag.Error(err))
 			setupErr = err
 		}
@@ -1197,11 +1225,10 @@ func (srv *Server) setupTerminalRoute(ctx context.Context, r *chi.Mux, apiV1Base
 
 func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath string) {
 	appStream, err := sse.NewAppStreamService(sse.AppStreamConfig{
-		Paths:             srv.config.Paths,
-		HeartbeatInterval: srv.config.Server.SSE.HeartbeatInterval,
+		Paths: srv.config.Paths,
 	})
 	if err != nil {
-		logger.Warn(ctx, "Failed to start app SSE stream", tag.Error(err))
+		logger.Warn(ctx, "Failed to start SSE invalidation stream", tag.Error(err))
 	} else {
 		srv.appStream = appStream
 	}
@@ -1225,7 +1252,6 @@ func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath 
 	}
 
 	multiplexHandler := sse.NewMultiplexHandler(srv.sseMultiplexer, srv.remoteNodeResolver)
-	appHandler := sse.NewAppHandler(srv.appStream, srv.remoteNodeResolver)
 
 	authOpts := srv.buildStreamAuthOptions("restricted")
 
@@ -1235,7 +1261,6 @@ func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath 
 		r.Use(auth.Middleware(authOpts))
 		r.Use(srv.injectDefaultStreamUserMiddleware())
 
-		r.Get("/app", appHandler.HandleStream)
 		r.Get("/stream", multiplexHandler.HandleStream)
 		r.Post("/stream/topics", multiplexHandler.HandleTopicMutation)
 	})
@@ -1264,7 +1289,7 @@ func (srv *Server) startAppStreamInvalidationBridge(ctx context.Context) {
 			}
 		}
 	}()
-	logger.Info(ctx, "App SSE stream configured for multiplexed invalidation")
+	logger.Info(ctx, "SSE invalidation stream configured for multiplexed topics")
 }
 
 func (srv *Server) wakeMultiplexedTopicsForAppEvent(event sse.AppEvent) {
@@ -1273,18 +1298,12 @@ func (srv *Server) wakeMultiplexedTopicsForAppEvent(event sse.AppEvent) {
 	}
 
 	switch event.Type {
-	case sse.AppEventTypeConnected:
-		return
 	case sse.AppEventTypeDAGChanged:
 		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAGsList)
 		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAG)
 		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAGHistory)
-	case sse.AppEventTypeRunChanged:
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAGRuns)
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeQueues)
+	case sse.AppEventTypeScheduler:
 		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAGsList)
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAG)
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAGHistory)
 	case sse.AppEventTypeQueue:
 		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeQueues)
 		if event.QueueName != "" {
@@ -1292,9 +1311,8 @@ func (srv *Server) wakeMultiplexedTopicsForAppEvent(event sse.AppEvent) {
 		} else {
 			srv.sseMultiplexer.WakeTopicType(sse.TopicTypeQueueItems)
 		}
-	case sse.AppEventTypeDoc:
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDocTree)
-		srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDoc)
+	case sse.AppEventTypeWiki:
+		srv.wakeWikiTopics()
 	case sse.AppEventTypeReset:
 		srv.wakeAllMultiplexedFileBackedTopics()
 	}
@@ -1309,8 +1327,13 @@ func (srv *Server) wakeAllMultiplexedFileBackedTopics() {
 	srv.sseMultiplexer.WakeTopicType(sse.TopicTypeQueueItems)
 	srv.sseMultiplexer.WakeTopicType(sse.TopicTypeQueues)
 	srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDAGsList)
-	srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDoc)
-	srv.sseMultiplexer.WakeTopicType(sse.TopicTypeDocTree)
+	srv.wakeWikiTopics()
+}
+
+func (srv *Server) wakeWikiTopics() {
+	for _, topicType := range wikiSSETopicTypes {
+		srv.sseMultiplexer.WakeTopicType(topicType)
+	}
 }
 
 func (srv *Server) setupMCPRoute(ctx context.Context, r *chi.Mux) {
@@ -1357,16 +1380,20 @@ func (srv *Server) registerDedicatedSSEFetchers(registrar *sse.Multiplexer) {
 	registrar.RegisterFetcher(sse.TopicTypeDAGRuns, srv.apiV1.GetDAGRunsListData)
 	registrar.RegisterFetcher(sse.TopicTypeQueues, srv.apiV1.GetQueuesListData)
 	registrar.RegisterFetcher(sse.TopicTypeDAGsList, srv.apiV1.GetDAGsListData)
-	registrar.RegisterFetcher(sse.TopicTypeDoc, srv.apiV1.GetDocContentData)
-	registrar.RegisterFetcher(sse.TopicTypeDocTree, srv.apiV1.GetDocTreeData)
+	for _, topicType := range []sse.TopicType{sse.TopicTypeWikiPage, sse.TopicTypeLegacyDoc} {
+		registrar.RegisterFetcher(topicType, srv.apiV1.GetWikiPageContentData)
+	}
+	for _, topicType := range []sse.TopicType{sse.TopicTypeWikiTree, sse.TopicTypeLegacyDocTree} {
+		registrar.RegisterFetcher(topicType, srv.apiV1.GetWikiPageTreeData)
+	}
 
 	appStreamAvailable := srv.appStream != nil
 	if appStreamAvailable {
-		// Document topics are invalidated by API doc mutations and file watcher
-		// events. They should not keep polling while those wakeups are available.
-		registrar.SetRefreshMode(sse.TopicTypeDoc, sse.TopicRefreshModeOnDemand)
-		registrar.SetRefreshMode(sse.TopicTypeDocTree, sse.TopicRefreshModeOnDemand)
-		registrar.SetPublishOnWake(sse.TopicTypeDocTree, true)
+		for _, topicType := range wikiSSETopicTypes {
+			registrar.SetRefreshMode(topicType, sse.TopicRefreshModeOnDemand)
+		}
+		registrar.SetPublishOnWake(sse.TopicTypeWikiTree, true)
+		registrar.SetPublishOnWake(sse.TopicTypeLegacyDocTree, true)
 	}
 
 	// Run-driven topics have an event-store invalidation path. Keeping them on
@@ -1388,155 +1415,6 @@ func (srv *Server) registerDedicatedSSEFetchers(registrar *sse.Multiplexer) {
 		}
 		registrar.SetPublishOnWake(sse.TopicTypeDAGRuns, true)
 		registrar.SetPublishOnWake(sse.TopicTypeQueues, true)
-	}
-}
-
-func (srv *Server) setupAgentRoutes(ctx context.Context, r *chi.Mux, apiV1BasePath string) {
-	authMiddleware := srv.buildAgentAuthMiddleware(ctx)
-	// Only the SSE stream endpoint is registered as a manual route.
-	// All other agent endpoints are served through the OpenAPI handler.
-	streamPath := path.Join(apiV1BasePath, "agent/sessions/{id}/stream")
-	r.With(srv.agentAPI.EnabledMiddleware(), authMiddleware).Get(
-		streamPath, srv.handleAgentStream(apiV1BasePath),
-	)
-	logger.Info(ctx, "Agent SSE stream route configured")
-}
-
-// handleAgentStream returns a handler that checks for remoteNode and either
-// proxies the SSE stream to the remote node or delegates to the local handler.
-func (srv *Server) handleAgentStream(apiV1BasePath string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		remoteNodeName := r.URL.Query().Get("remoteNode")
-		if remoteNodeName == "" || remoteNodeName == "local" {
-			srv.agentAPI.HandleStream(w, r)
-			return
-		}
-		srv.proxyAgentStream(w, r, remoteNodeName, apiV1BasePath)
-	}
-}
-
-// proxyAgentStream proxies the agent SSE stream to a remote node.
-// It follows the same streaming pattern as sse/proxy.go:proxyToRemoteNode.
-func (srv *Server) proxyAgentStream(w http.ResponseWriter, r *http.Request, nodeName, apiV1BasePath string) {
-	if srv.remoteNodeResolver == nil {
-		http.Error(w, "remote node resolution not available", http.StatusServiceUnavailable)
-		return
-	}
-
-	node, err := srv.remoteNodeResolver.GetByName(r.Context(), nodeName)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("unknown remote node: %s", nodeName), http.StatusBadRequest)
-		return
-	}
-
-	q := make(url.Values)
-	if token := r.URL.Query().Get("token"); token != "" {
-		q.Set("token", token)
-	}
-	remoteURL, err := buildAgentStreamRemoteURL(node.APIBaseURL, r.URL.Path, apiV1BasePath, q)
-	if err != nil {
-		http.Error(w, "failed to create proxy request", http.StatusInternalServerError)
-		return
-	}
-
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, remoteURL, nil) //nolint:gosec // remoteURL is built from a validated remote-node base URL.
-	if err != nil {
-		http.Error(w, "failed to create proxy request", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	node.ApplyAuth(req)
-
-	client := &http.Client{
-		// Timeout: 0 is safe for SSE because the request is created with
-		// r.Context() which is cancelled when the client disconnects.
-		Timeout: 0,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: node.SkipTLSVerify, //nolint:gosec
-				MinVersion:         tls.VersionTLS12,
-			},
-			MaxIdleConns:       10,
-			IdleConnTimeout:    90 * time.Second,
-			DisableCompression: true,
-		},
-	}
-
-	resp, err := doAgentStreamRequest(client, req)
-	if err != nil {
-		if r.Context().Err() != nil {
-			return // Client disconnected
-		}
-		http.Error(w, "failed to connect to remote node", http.StatusBadGateway)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf("remote node returned status: %d", resp.StatusCode), resp.StatusCode)
-		return
-	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
-
-	// Set SSE headers and clear the write deadline to prevent the server's
-	// WriteTimeout (60s) from killing this long-lived SSE connection.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Time{})
-
-	// Stream chunks from remote to client.
-	buf := make([]byte, 4096)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return // defer resp.Body.Close() handles cleanup
-			}
-			flusher.Flush()
-		}
-		if readErr != nil {
-			return
-		}
-	}
-}
-
-// buildAgentStreamRemoteURL constructs the SSE stream URL for a remote node.
-func buildAgentStreamRemoteURL(baseURL, requestPath, apiV1BasePath string, query url.Values) (string, error) {
-	suffix, ok := strings.CutPrefix(requestPath, apiV1BasePath)
-	if !ok {
-		return "", fmt.Errorf("invalid URL path: %s", requestPath)
-	}
-	u, err := remotenode.ParseAPIBaseURL(baseURL)
-	if err != nil {
-		return "", err
-	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(suffix, "/")
-	u.RawPath = ""
-	u.RawQuery = query.Encode()
-	return u.String(), nil
-}
-
-func doAgentStreamRequest(client *http.Client, req *http.Request) (*http.Response, error) {
-	return client.Do(req) //nolint:gosec // request URL is constrained by buildAgentStreamRemoteURL.
-}
-
-func (srv *Server) buildAgentAuthMiddleware(_ context.Context) func(http.Handler) http.Handler {
-	authOptions := srv.buildStreamAuthOptions("Dagu Agent")
-
-	return func(next http.Handler) http.Handler {
-		return srv.injectDefaultStreamUserMiddleware()(auth.QueryTokenMiddleware()(
-			auth.ClientIPMiddleware()(
-				auth.Middleware(authOptions)(next),
-			),
-		))
 	}
 }
 
@@ -1564,7 +1442,7 @@ func (srv *Server) injectDefaultStreamUserMiddleware() func(http.Handler) http.H
 	}
 }
 
-// buildStreamAuthOptions builds auth options for streaming endpoints (SSE, Agent SSE).
+// buildStreamAuthOptions builds auth options for streaming endpoints.
 // In basic auth mode, auth is disabled because EventSource/WebSocket cannot send
 // Basic auth headers. This matches the pre-existing behavior.
 func (srv *Server) buildStreamAuthOptions(realm string) auth.Options {

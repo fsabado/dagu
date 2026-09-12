@@ -15,40 +15,43 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/api/v1"
-	"github.com/dagucloud/dagu/internal/agent"
-	"github.com/dagucloud/dagu/internal/agentoauth"
-	"github.com/dagucloud/dagu/internal/agentsnapshot"
-	"github.com/dagucloud/dagu/internal/auth"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	cmnvalue "github.com/dagucloud/dagu/internal/cmn/value"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/baseconfig"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/dagsettings"
-	incidentmodel "github.com/dagucloud/dagu/internal/incident"
-	"github.com/dagucloud/dagu/internal/launcher"
-	"github.com/dagucloud/dagu/internal/license"
-	notificationmodel "github.com/dagucloud/dagu/internal/notification"
-	profilepkg "github.com/dagucloud/dagu/internal/profile"
-	"github.com/dagucloud/dagu/internal/remotenode"
-	"github.com/dagucloud/dagu/internal/runtime"
-	secretpkg "github.com/dagucloud/dagu/internal/secret"
-	"github.com/dagucloud/dagu/internal/service/audit"
-	authservice "github.com/dagucloud/dagu/internal/service/auth"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/eventstore"
-	"github.com/dagucloud/dagu/internal/service/frontend/api/pathutil"
-	frontendauth "github.com/dagucloud/dagu/internal/service/frontend/auth"
-	incidentservice "github.com/dagucloud/dagu/internal/service/incident"
-	notificationservice "github.com/dagucloud/dagu/internal/service/notification"
-	"github.com/dagucloud/dagu/internal/service/resource"
-	"github.com/dagucloud/dagu/internal/service/scheduler"
-	"github.com/dagucloud/dagu/internal/tunnel"
-	"github.com/dagucloud/dagu/internal/view"
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dagsettings"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/eventstore"
+	incidentmodel "github.com/dagucloud/dagu/v2/internal/incident"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/launcher"
+	"github.com/dagucloud/dagu/v2/internal/license"
+	notificationmodel "github.com/dagucloud/dagu/v2/internal/notification"
+	"github.com/dagucloud/dagu/v2/internal/opencodehost"
+	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	profilepkg "github.com/dagucloud/dagu/v2/internal/profile"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/remotenode"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
+	secretpkg "github.com/dagucloud/dagu/v2/internal/secret"
+	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/api/pathutil"
+	frontendauth "github.com/dagucloud/dagu/v2/internal/service/frontend/auth"
+	incidentservice "github.com/dagucloud/dagu/v2/internal/service/incident"
+	notificationservice "github.com/dagucloud/dagu/v2/internal/service/notification"
+	"github.com/dagucloud/dagu/v2/internal/service/resource"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	"github.com/dagucloud/dagu/v2/internal/tunnel"
+	"github.com/dagucloud/dagu/v2/internal/view"
+	"github.com/dagucloud/dagu/v2/internal/wiki"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/go-chi/chi/v5"
@@ -59,21 +62,23 @@ import (
 
 var _ api.StrictServerInterface = (*API)(nil)
 
+var loadBaseOpenAPISpec = sync.OnceValues(api.GetSwagger)
+
 type API struct {
-	dagStore             exec.DAGStore
-	dagRunStore          exec.DAGRunStore
+	dagRepository        *persis.DAGRepository
+	dagRunRepository     *persis.DAGRunRepository
 	dagRunMgr            runtime.Manager
-	queueStore           exec.QueueStore
-	procStore            exec.ProcStore
-	dagRunLeaseStore     exec.DAGRunLeaseStore
-	workerHeartbeatStore exec.WorkerHeartbeatStore
+	queueStore           queue.QueueStore
+	procRepository       processRepository
+	dagRunLeaseStore     dispatch.DAGRunLeaseStore
+	workerHeartbeatStore dispatch.WorkerHeartbeatStore
 	remoteNodeResolver   *remotenode.Resolver
 	remoteNodeStore      remotenode.Store
 	logEncodingCharset   string
 	config               *config.Config
 	metricsRegistry      *prometheus.Registry
 	coordinatorCli       coordinator.Client
-	serviceRegistry      exec.ServiceRegistry
+	serviceRegistry      serviceregistry.ServiceRegistry
 	subCmdBuilder        *launcher.SubCmdBuilder
 	resourceService      *resource.Service
 	authService          AuthService
@@ -85,15 +90,10 @@ type API struct {
 	tunnelService        *tunnel.Service
 	defaultExecMode      config.ExecutionMode
 	dagWritesDisabled    bool // True when git sync read-only mode is active
-	agentConfigStore     agent.ConfigStore
-	agentModelStore      agent.ModelStore
-	agentMemoryStore     agent.MemoryStore
-	agentSoulStore       agent.SoulStore
-	agentOAuthManager    *agentoauth.Manager
-	agentAPI             *agent.API
-	docStore             agent.DocStore
-	baseConfigStore      baseconfig.Store
+	baseConfigStore      dagsettings.BaseConfigStore
 	dagSettingsStore     dagsettings.Store
+	wikiStore            wiki.PageStore
+	workspaceWikiMu      sync.RWMutex
 	secretStore          secretpkg.Store
 	profileStore         profilepkg.Store
 	viewStore            view.Store
@@ -101,14 +101,20 @@ type API struct {
 	apiKeyCreateMu       sync.Mutex
 	workspaceStore       workspace.Store
 	leaseStaleThreshold  time.Duration
-	schedulerStateStore  scheduler.WatermarkStore
+	schedulerStateStore  schedulerstate.Store
 	dagMutationNotifier  func(fileName string)
-	docMutationNotifier  func()
-	snapshotStoreFactory agentsnapshot.StoreFactory
-	baseConfigFactory    WorkspaceBaseConfigStoreFactory
+	wikiMutationNotifier func()
+	baseConfigProvider   dagsettings.BaseConfigProvider
+	oidcRoleMapping      func() config.OIDCRoleMapping
+	openCodeHost         *opencodehost.Host
 }
 
-type WorkspaceBaseConfigStoreFactory func(dagsDir, workspaceName string) (baseconfig.Store, error)
+type processRepository interface {
+	WithLock(ctx context.Context, groupName string, fn func() error) error
+	CountAliveByDAGName(ctx context.Context, groupName, dagName string) (int, error)
+	IsAttemptAlive(ctx context.Context, groupName string, dagRun ir.DAGRunRef, attemptID string) (bool, error)
+	ListAllAlive(ctx context.Context) (map[string][]ir.DAGRunRef, error)
+}
 
 type NotificationService interface {
 	GetByDAGName(ctx context.Context, dagName string) (*notificationmodel.Settings, error)
@@ -167,9 +173,10 @@ type AuthService interface {
 	RegenerateWebhookToken(ctx context.Context, dagName string) (*authservice.CreateWebhookResult, error)
 	EnableWebhookHMAC(ctx context.Context, dagName string, authMode auth.WebhookAuthMode, enforcementMode auth.WebhookHMACEnforcementMode) (*authservice.WebhookHMACSecretResult, error)
 	ConfigureWebhookHMAC(ctx context.Context, dagName string, authMode auth.WebhookAuthMode, enforcementMode auth.WebhookHMACEnforcementMode) (*auth.Webhook, error)
+	ConfigureWebhookProfiles(ctx context.Context, dagName string, allowedProfiles []string) (*auth.Webhook, error)
 	RegenerateWebhookHMACSecret(ctx context.Context, dagName string) (*authservice.WebhookHMACSecretResult, error)
 	DisableWebhookHMAC(ctx context.Context, dagName string) (*auth.Webhook, error)
-	AuthorizeWebhookRequest(ctx context.Context, dagName, token, signature string, body []byte) (*auth.Webhook, error)
+	AuthorizeWebhookRequest(ctx context.Context, input authservice.AuthorizeWebhookRequestInput) (*auth.Webhook, error)
 	ToggleWebhook(ctx context.Context, dagName string, enabled bool) (*auth.Webhook, error)
 	ValidateWebhookToken(ctx context.Context, dagName, token string) (*auth.Webhook, error)
 	HasWebhookStore() bool
@@ -229,21 +236,15 @@ func WithTunnelService(ts *tunnel.Service) APIOption {
 }
 
 // WithBaseConfigStore returns an APIOption that sets the API's base config store.
-func WithBaseConfigStore(store baseconfig.Store) APIOption {
+func WithBaseConfigStore(store dagsettings.BaseConfigStore) APIOption {
 	return func(a *API) {
 		a.baseConfigStore = store
 	}
 }
 
-func WithWorkspaceBaseConfigStoreFactory(factory WorkspaceBaseConfigStoreFactory) APIOption {
+func WithWorkspaceBaseConfigProvider(provider dagsettings.BaseConfigProvider) APIOption {
 	return func(a *API) {
-		a.baseConfigFactory = factory
-	}
-}
-
-func WithSnapshotStoreFactory(factory agentsnapshot.StoreFactory) APIOption {
-	return func(a *API) {
-		a.snapshotStoreFactory = factory
+		a.baseConfigProvider = provider
 	}
 }
 
@@ -275,38 +276,10 @@ func WithDAGSettingsStore(store dagsettings.Store) APIOption {
 	}
 }
 
-// WithAgentConfigStore returns an APIOption that sets the API's agent config store.
-func WithAgentConfigStore(store agent.ConfigStore) APIOption {
+// WithWikiStore returns an APIOption that sets the API's Wiki page store.
+func WithWikiStore(store wiki.PageStore) APIOption {
 	return func(a *API) {
-		a.agentConfigStore = store
-	}
-}
-
-// WithAgentModelStore returns an APIOption that sets the API's agent model store.
-func WithAgentModelStore(store agent.ModelStore) APIOption {
-	return func(a *API) {
-		a.agentModelStore = store
-	}
-}
-
-// WithAgentMemoryStore returns an APIOption that sets the API's agent memory store.
-func WithAgentMemoryStore(store agent.MemoryStore) APIOption {
-	return func(a *API) {
-		a.agentMemoryStore = store
-	}
-}
-
-// WithAgentSoulStore returns an APIOption that sets the API's agent soul store.
-func WithAgentSoulStore(store agent.SoulStore) APIOption {
-	return func(a *API) {
-		a.agentSoulStore = store
-	}
-}
-
-// WithAgentOAuthManager returns an APIOption that sets the API's agent OAuth manager.
-func WithAgentOAuthManager(manager *agentoauth.Manager) APIOption {
-	return func(a *API) {
-		a.agentOAuthManager = manager
+		a.wikiStore = store
 	}
 }
 
@@ -314,13 +287,6 @@ func WithAgentOAuthManager(manager *agentoauth.Manager) APIOption {
 func WithLicenseManager(m *license.Manager) APIOption {
 	return func(a *API) {
 		a.licenseManager = m
-	}
-}
-
-// WithDocStore returns an APIOption that sets the API's doc store.
-func WithDocStore(store agent.DocStore) APIOption {
-	return func(a *API) {
-		a.docStore = store
 	}
 }
 
@@ -345,8 +311,15 @@ func WithWorkspaceStore(s workspace.Store) APIOption {
 	}
 }
 
+// WithOIDCRoleMapping sets the source used for current OIDC policy metadata.
+func WithOIDCRoleMapping(load func() config.OIDCRoleMapping) APIOption {
+	return func(a *API) {
+		a.oidcRoleMapping = load
+	}
+}
+
 // WithSchedulerStateStore sets the scheduler state store used for next-run projections.
-func WithSchedulerStateStore(store scheduler.WatermarkStore) APIOption {
+func WithSchedulerStateStore(store schedulerstate.Store) APIOption {
 	return func(a *API) {
 		a.schedulerStateStore = store
 	}
@@ -360,16 +333,16 @@ func WithDAGMutationNotifier(fn func(fileName string)) APIOption {
 	}
 }
 
-// WithDocMutationNotifier returns an APIOption that is called after successful
-// document mutations that should invalidate live document views.
-func WithDocMutationNotifier(fn func()) APIOption {
+// WithWikiMutationNotifier returns an APIOption that is called after successful
+// Wiki page mutations that should invalidate live Wiki views.
+func WithWikiMutationNotifier(fn func()) APIOption {
 	return func(a *API) {
-		a.docMutationNotifier = fn
+		a.wikiMutationNotifier = fn
 	}
 }
 
 // WithDAGRunLeaseStore sets the shared distributed run lease store.
-func WithDAGRunLeaseStore(store exec.DAGRunLeaseStore) APIOption {
+func WithDAGRunLeaseStore(store dispatch.DAGRunLeaseStore) APIOption {
 	return func(a *API) {
 		a.dagRunLeaseStore = store
 	}
@@ -377,9 +350,16 @@ func WithDAGRunLeaseStore(store exec.DAGRunLeaseStore) APIOption {
 
 // WithWorkerHeartbeatStore sets the shared worker heartbeat store used for
 // conservative distributed run auto-repair on single-run reads.
-func WithWorkerHeartbeatStore(store exec.WorkerHeartbeatStore) APIOption {
+func WithWorkerHeartbeatStore(store dispatch.WorkerHeartbeatStore) APIOption {
 	return func(a *API) {
 		a.workerHeartbeatStore = store
+	}
+}
+
+// WithOpenCodeHost enables the process-owned managed OpenCode service for local launches.
+func WithOpenCodeHost(host *opencodehost.Host) APIOption {
+	return func(a *API) {
+		a.openCodeHost = host
 	}
 }
 
@@ -391,35 +371,28 @@ func WithLeaseStaleThreshold(threshold time.Duration) APIOption {
 	}
 }
 
-// WithAgentAPI returns an APIOption that sets the API's agent API instance.
-func WithAgentAPI(a *agent.API) APIOption {
-	return func(api *API) {
-		api.agentAPI = a
-	}
-}
-
 // New constructs an API configured with the provided stores, runtime manager,
 // configuration, coordinator client, service registry, Prometheus registry,
 // and resource service. It builds the remote node map and base path, then
 // applies any supplied APIOption functions to customize the instance.
 func New(
-	dr exec.DAGStore,
-	drs exec.DAGRunStore,
-	qs exec.QueueStore,
-	ps exec.ProcStore,
+	dr *persis.DAGRepository,
+	dagRunRepository *persis.DAGRunRepository,
+	qs queue.QueueStore,
+	processes *persis.ProcRepository,
 	drm runtime.Manager,
 	cfg *config.Config,
 	cc coordinator.Client,
-	sr exec.ServiceRegistry,
+	sr serviceregistry.ServiceRegistry,
 	mr *prometheus.Registry,
 	rs *resource.Service,
 	opts ...APIOption,
 ) *API {
 	a := &API{
-		dagStore:            dr,
-		dagRunStore:         drs,
+		dagRepository:       dr,
+		dagRunRepository:    dagRunRepository,
 		queueStore:          qs,
-		procStore:           ps,
+		procRepository:      processes,
 		dagRunMgr:           drm,
 		logEncodingCharset:  cfg.UI.LogEncodingCharset,
 		subCmdBuilder:       launcher.NewSubCmdBuilder(cfg),
@@ -429,7 +402,7 @@ func New(
 		metricsRegistry:     mr,
 		resourceService:     rs,
 		defaultExecMode:     cfg.DefaultExecMode,
-		leaseStaleThreshold: exec.DefaultStaleLeaseThreshold,
+		leaseStaleThreshold: dagrun.DefaultStaleLeaseThreshold,
 	}
 
 	for _, opt := range opts {
@@ -445,8 +418,8 @@ func New(
 }
 
 func (a *API) requireValidBaseConfigWiring() {
-	if a.baseConfigStore != nil && a.baseConfigFactory == nil {
-		panic("api: workspace base config store factory must be configured when base config store is configured")
+	if a.baseConfigStore != nil && a.baseConfigProvider == nil {
+		panic("api: workspace base config provider must be configured when base config store is configured")
 	}
 }
 
@@ -456,9 +429,9 @@ func (a *API) notifyDAGMutation(fileName string) {
 	}
 }
 
-func (a *API) notifyDocMutation() {
-	if a.docMutationNotifier != nil {
-		a.docMutationNotifier()
+func (a *API) notifyWikiMutation() {
+	if a.wikiMutationNotifier != nil {
+		a.wikiMutationNotifier()
 	}
 }
 
@@ -469,16 +442,12 @@ func (a *API) webhookMaxPayloadSize() int {
 	return a.config.Webhooks.MaxPayloadSize
 }
 
-func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router) error {
+func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router, writeTimeout time.Duration) error {
 	swagger, err := a.loadOpenAPISpec(ctx)
 	if err != nil {
 		return err
 	}
 	mountedAPIPath := a.evaluateMountedAPIPath(ctx)
-
-	if a.config.Server.StrictValidation {
-		r.Use(a.createValidatorMiddleware(swagger))
-	}
 
 	authOptions, err := a.buildAuthOptions(mountedAPIPath)
 	if err != nil {
@@ -493,10 +462,18 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router) error {
 		r.Use(frontendauth.LoginRateLimitMiddleware(loginPath))
 		r.Use(frontendauth.Middleware(authOptions))
 		r.Use(a.restAuditSubjectMiddleware())
+		r.Use(a.syncProxyAuthorization(mountedAPIPath))
+		r.Use(humanTaskInputMiddleware(mountedAPIPath))
+		if a.config.Server.StrictValidation {
+			r.Use(a.createValidatorMiddleware(swagger))
+		}
 		r.Use(WithRemoteNode(a.remoteNodeResolver, mountedAPIPath))
 		r.Use(WebhookRequestContextMiddleware(a.webhookMaxPayloadSize()))
 
-		middlewares := []api.StrictMiddlewareFunc{validateDAGFileNameMiddleware}
+		middlewares := []api.StrictMiddlewareFunc{
+			validateDAGFileNameMiddleware,
+			resetSyncWriteDeadline(writeTimeout),
+		}
 		options := api.StrictHTTPServerOptions{
 			ResponseErrorHandlerFunc: a.handleError,
 		}
@@ -505,6 +482,21 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router) error {
 	})
 
 	return nil
+}
+
+// TODO: Remove this workaround with the deprecated ExecuteDAGSync API.
+func resetSyncWriteDeadline(timeout time.Duration) api.StrictMiddlewareFunc {
+	return func(next api.StrictHandlerFunc, operationID string) api.StrictHandlerFunc {
+		if operationID != "ExecuteDAGSync" {
+			return next
+		}
+
+		return func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
+			response, err := next(ctx, w, r, request)
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
+			return response, err
+		}
+	}
 }
 
 func (a *API) restAuditSeedMiddleware() func(http.Handler) http.Handler {
@@ -645,7 +637,7 @@ func validateDAGFileNameFromRequest(request any) error {
 		return nil
 	}
 
-	if err := core.ValidateDAGName(fileName.String()); err != nil {
+	if err := ir.ValidateDAGName(fileName.String()); err != nil {
 		return &Error{
 			HTTPStatus: http.StatusBadRequest,
 			Code:       api.ErrorCodeBadRequest,
@@ -673,15 +665,17 @@ func (a *API) evaluateMountedAPIPath(ctx context.Context) string {
 }
 
 func (a *API) loadOpenAPISpec(ctx context.Context) (*openapi3.T, error) {
-	swagger, err := api.GetSwagger()
+	base, err := loadBaseOpenAPISpec()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get swagger: %w", err)
 	}
 
+	// The parsed schema is shared; each API owns its mounted server definition.
+	swagger := *base
 	swagger.Servers = openapi3.Servers{
 		&openapi3.Server{URL: a.evaluateMountedAPIPath(ctx)},
 	}
-	return swagger, nil
+	return &swagger, nil
 }
 
 func (a *API) createValidatorMiddleware(swagger *openapi3.T) func(http.Handler) http.Handler {
@@ -778,19 +772,21 @@ func (a *API) handleError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 func (a *API) resolveError(err error) (api.ErrorCode, string, int) {
-	var apiErr *Error
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*Error](err); ok {
 		return apiErr.Code, apiErr.Message, apiErr.HTTPStatus
 	}
 
-	if errors.Is(err, exec.ErrDAGNotFound) {
+	if errors.Is(err, persis.ErrDAGNotFound) {
 		return api.ErrorCodeNotFound, "DAG not found", http.StatusNotFound
 	}
-	if errors.Is(err, exec.ErrDAGRunIDNotFound) {
+	if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 		return api.ErrorCodeNotFound, "dag-run ID not found", http.StatusNotFound
 	}
-	if errors.Is(err, exec.ErrDAGAlreadyExists) {
+	if errors.Is(err, persis.ErrDAGAlreadyExists) {
 		return api.ErrorCodeAlreadyExists, "DAG already exists", http.StatusConflict
+	}
+	if errors.Is(err, persis.ErrDAGReadOnly) {
+		return api.ErrorCodeForbidden, "DAG definition is read-only because it is managed through an external file symlink", http.StatusForbidden
 	}
 
 	return api.ErrorCodeInternalError, "An unexpected error occurred", http.StatusInternalServerError
@@ -975,6 +971,14 @@ func (a *API) logAudit(ctx context.Context, category audit.Category, action stri
 	a.LogAudit(ctx, category, action, details)
 }
 
+func triggerActorFromContext(ctx context.Context) string {
+	user, ok := auth.UserFromContext(ctx)
+	if !ok || user == nil {
+		return ""
+	}
+	return user.Username
+}
+
 // LogAudit logs an audit entry with source/correlation context when present.
 func (a *API) LogAudit(ctx context.Context, category audit.Category, action string, details any) {
 	if !a.isAuditLicensed() {
@@ -1124,69 +1128,6 @@ func (a *API) withEventContext(ctx context.Context) context.Context {
 	})
 }
 
-func (a *API) updateDAGRunStatus(ctx context.Context, ref exec.DAGRunRef, status exec.DAGRunStatus) error {
-	updateStatus := func() error {
-		if a != nil && a.dagRunStore != nil {
-			var (
-				attempt exec.DAGRunAttempt
-				err     error
-			)
-			if ref.ID == status.DAGRunID {
-				attempt, err = a.dagRunStore.FindAttempt(ctx, ref)
-			} else {
-				attempt, err = a.dagRunStore.FindSubAttempt(ctx, ref, status.DAGRunID)
-			}
-			if err != nil {
-				return err
-			}
-			latest, err := attempt.ReadStatus(ctx)
-			if err != nil {
-				return err
-			}
-			if latest != nil && latest.Status == status.Status {
-				return a.dagRunMgr.UpdateStatus(ctx, ref, status)
-			}
-		}
-		return a.dagRunMgr.UpdateStatus(a.withEventContext(ctx), ref, status)
-	}
-
-	err := updateStatus()
-	if err == nil || !isTransientDAGRunStatusUpdateError(err) {
-		return err
-	}
-
-	const (
-		retryWindow   = 3 * time.Second
-		retryInterval = 50 * time.Millisecond
-	)
-	deadline := time.Now().Add(retryWindow)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(retryInterval):
-		}
-
-		err = updateStatus()
-		if err == nil || !isTransientDAGRunStatusUpdateError(err) {
-			return err
-		}
-	}
-
-	return err
-}
-
-func isTransientDAGRunStatusUpdateError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "used by another process") ||
-		strings.Contains(msg, "cannot access the file") ||
-		strings.Contains(msg, "access is denied") ||
-		strings.Contains(msg, "sharing violation")
-}
-
 // ptrOf returns a pointer to v, or nil if v is the zero value for its type.
 func ptrOf[T any](v T) *T {
 	if reflect.ValueOf(v).IsZero() {
@@ -1204,7 +1145,7 @@ func valueOf[T any](ptr *T) T {
 }
 
 // toPagination converts a paginated result to an API pagination object.
-func toPagination[T any](paginatedResult exec.PaginatedResult[T]) api.Pagination {
+func toPagination[T any](paginatedResult pagination.PaginatedResult[T]) api.Pagination {
 	return api.Pagination{
 		CurrentPage:  paginatedResult.CurrentPage,
 		NextPage:     paginatedResult.NextPage,

@@ -16,11 +16,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/fileutil"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 // Error definitions for directory structure validation
@@ -30,16 +31,25 @@ var (
 
 const (
 	// SubDAGRunsDir is the name of the directory where status files for sub dag-runs are stored.
-	SubDAGRunsDir = "children"
+	SubDAGRunsDir = "sub"
 
-	// SubDAGRunDirPrefix is the prefix for sub dag-run directories.
-	SubDAGRunDirPrefix = "child_"
+	// LegacySubDAGRunsDir is the previous directory where status files for sub dag-runs were stored.
+	LegacySubDAGRunsDir = "children"
+
+	// LegacySubDAGRunDirPrefix is the previous prefix for sub dag-run directories.
+	LegacySubDAGRunDirPrefix = "child_"
 
 	// DAGRunDirPrefix is the prefix for dag-run directories.
 	DAGRunDirPrefix = "dag-run_"
 
 	// AttemptDirPrefix is the prefix for attempt directories.
-	AttemptDirPrefix = "attempt_"
+	AttemptDirPrefix = "a_"
+
+	// LegacyAttemptDirPrefix is the previous prefix for attempt directories.
+	LegacyAttemptDirPrefix = "attempt_"
+
+	// SubDAGWorkDirPrefix is the prefix for sub dag-run working directories.
+	SubDAGWorkDirPrefix = "w_"
 )
 
 // JSONLStatusFile is the name of the status file for each dag-run.
@@ -53,7 +63,7 @@ const JSONLStatusFile = "status.jsonl"
 // without reading status.jsonl.
 type DAGRunSummary struct {
 	LatestAttemptDir     string
-	Status               core.Status
+	Status               ir.Status
 	StartedAtUnix        int64
 	FinishedAtUnix       int64
 	Labels               []string
@@ -64,7 +74,8 @@ type DAGRunSummary struct {
 	Params               string
 	QueuedAt             string
 	ScheduleTime         string
-	TriggerType          core.TriggerType
+	TriggerType          ir.TriggerType
+	TriggerActor         string
 	CreatedAt            int64
 	AttemptID            string
 	AutoRetryCount       int
@@ -75,7 +86,7 @@ type DAGRunSummary struct {
 	AutoRetryBackoff     float64
 	AutoRetryMaxInterval time.Duration
 	ProcGroup            string
-	SuspendFlagName      string
+	DefinitionID         string
 	ArchiveDir           string
 }
 
@@ -97,15 +108,11 @@ func NewDAGRun(dir string) (*DAGRun, error) {
 func newDAGRun(dir, artifactDir string) (*DAGRun, error) {
 	// Determine if the run is a sub dag-run or a regular dag-run.
 	parentDir := filepath.Dir(dir)
-	if filepath.Base(parentDir) == SubDAGRunsDir {
-		matches := reSubDAGRunDir.FindStringSubmatch(filepath.Base(dir))
-		if len(matches) != 2 {
-			return nil, ErrInvalidDAGRunsDir
-		}
+	if dagRunID, ok := subDAGRunIDFromDir(filepath.Base(parentDir), filepath.Base(dir)); ok {
 		return &DAGRun{
 			baseDir:     dir,
 			artifactDir: artifactDir,
-			dagRunID:    matches[1],
+			dagRunID:    dagRunID,
 		}, nil
 	}
 
@@ -128,7 +135,7 @@ func newDAGRun(dir, artifactDir string) (*DAGRun, error) {
 // CreateAttempt creates a new Attempt for the dag-run with the given timestamp.
 // It creates a new Attempt directory and initializes a record within it.
 // If attemptID is provided, it uses that ID instead of generating a new one.
-func (dr DAGRun) CreateAttempt(_ context.Context, ts exec.TimeInUTC, cache *fileutil.Cache[*exec.DAGRunStatus], attemptID string, opts ...AttemptOption) (*Attempt, error) {
+func (dr DAGRun) CreateAttempt(_ context.Context, ts persis.TimeInUTC, cache *fileutil.Cache[*ir.DAGRunStatus], attemptID string) (*Attempt, error) {
 	attID := attemptID
 	if attID == "" {
 		var err error
@@ -137,7 +144,7 @@ func (dr DAGRun) CreateAttempt(_ context.Context, ts exec.TimeInUTC, cache *file
 			return nil, err
 		}
 	}
-	dir := filepath.Join(dr.baseDir, AttemptDirPrefix+formatAttemptTimestamp(ts)+"_"+attID)
+	dir := filepath.Join(dr.baseDir, attemptDirName(ts, attID))
 	// Error if the directory already exists
 	if _, err := os.Stat(dir); err == nil {
 		return nil, fmt.Errorf("run directory already exists: %s", dir)
@@ -145,13 +152,15 @@ func (dr DAGRun) CreateAttempt(_ context.Context, ts exec.TimeInUTC, cache *file
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create the run directory: %w", err)
 	}
-	return NewAttempt(filepath.Join(dir, JSONLStatusFile), cache, opts...)
+	return NewAttempt(filepath.Join(dir, JSONLStatusFile), cache)
 }
 
 // CreateSubDAGRun creates a new sub dag-run with the given timestamp and dag-run ID.
 func (dr DAGRun) CreateSubDAGRun(_ context.Context, dagRunID string) (*DAGRun, error) {
-	dirName := SubDAGRunDirPrefix + dagRunID
-	dir := filepath.Join(dr.baseDir, SubDAGRunsDir, dirName)
+	if err := ir.ValidateDAGRunID(dagRunID); err != nil {
+		return nil, fmt.Errorf("invalid sub dag-run ID: %w", err)
+	}
+	dir := filepath.Join(dr.baseDir, SubDAGRunsDir, dagRunID)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create sub dag-run directory: %w", err)
 	}
@@ -160,51 +169,60 @@ func (dr DAGRun) CreateSubDAGRun(_ context.Context, dagRunID string) (*DAGRun, e
 
 // FindSubDAGRun searches for a sub dag-run by its run ID.
 func (dr DAGRun) FindSubDAGRun(_ context.Context, dagRunID string) (*DAGRun, error) {
-	globPattern := filepath.Join(dr.baseDir, SubDAGRunsDir, SubDAGRunDirPrefix+dagRunID)
-	matches, err := filepath.Glob(globPattern)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list sub dag-runs: %w", err)
+	if err := ir.ValidateDAGRunID(dagRunID); err != nil {
+		return nil, fmt.Errorf("invalid sub dag-run ID: %w", err)
 	}
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("no matching sub dag-run found for ID %s (glob=%s): %w", dagRunID, globPattern, exec.ErrDAGRunIDNotFound)
+	for _, dir := range []string{
+		filepath.Join(dr.baseDir, SubDAGRunsDir, dagRunID),
+		filepath.Join(dr.baseDir, LegacySubDAGRunsDir, LegacySubDAGRunDirPrefix+dagRunID),
+	} {
+		info, err := fileutil.Stat(dir)
+		if err == nil && info.IsDir() {
+			return newDAGRun(dir, dr.artifactDir)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to read sub dag-run %s: %w", dir, err)
+		}
 	}
-	// Sort the matches by timestamp
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i] > matches[j]
-	})
-	return newDAGRun(matches[0], dr.artifactDir)
+	return nil, fmt.Errorf("no matching sub dag-run found for ID %s: %w", dagRunID, dagrun.ErrDAGRunIDNotFound)
 }
 
 func (dr DAGRun) ListSubDAGRuns(ctx context.Context) ([]*DAGRun, error) {
-	subDir := filepath.Join(dr.baseDir, SubDAGRunsDir)
-	entries, err := os.ReadDir(subDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []*DAGRun{}, nil
-		}
-		return nil, fmt.Errorf("failed to read sub dag-runs directory: %w", err)
-	}
-
 	var dagRuns []*DAGRun
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		// check if the directory name matches the sub dag-run directory pattern
-		if !reSubDAGRunDir.MatchString(entry.Name()) {
-			continue
-		}
-
-		subDAGRun, err := newDAGRun(filepath.Join(subDir, entry.Name()), dr.artifactDir)
+	seen := make(map[string]struct{})
+	for _, dirName := range []string{SubDAGRunsDir, LegacySubDAGRunsDir} {
+		subDir := filepath.Join(dr.baseDir, dirName)
+		entries, err := os.ReadDir(subDir)
 		if err != nil {
-			logger.Error(ctx, "Failed to read sub dag-run data",
-				tag.Error(err),
-				tag.RunID(dr.dagRunID),
-				tag.Dir(entry.Name()))
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to read sub dag-runs directory: %w", err)
 		}
-		dagRuns = append(dagRuns, subDAGRun)
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			dagRunID, ok := subDAGRunIDFromDir(dirName, entry.Name())
+			if !ok {
+				continue
+			}
+			if _, ok := seen[dagRunID]; ok {
+				continue
+			}
+
+			subDAGRun, err := newDAGRun(filepath.Join(subDir, entry.Name()), dr.artifactDir)
+			if err != nil {
+				logger.Error(ctx, "Failed to read sub dag-run data",
+					tag.Error(err),
+					tag.RunID(dr.dagRunID),
+					tag.Dir(entry.Name()))
+				continue
+			}
+			seen[dagRunID] = struct{}{}
+			dagRuns = append(dagRuns, subDAGRun)
+		}
 	}
 	return dagRuns, nil
 }
@@ -212,8 +230,8 @@ func (dr DAGRun) ListSubDAGRuns(ctx context.Context) ([]*DAGRun, error) {
 // LatestAttempt returns the most recent Attempt for the dag-run.
 // It searches through all run directories and returns the first valid Attempt found.
 // It skips hidden attempts (dequeued ones).
-func (dr DAGRun) LatestAttempt(ctx context.Context, cache *fileutil.Cache[*exec.DAGRunStatus]) (*Attempt, error) {
-	attDirs, err := listDirsSorted(dr.baseDir, true, reAttemptDir)
+func (dr DAGRun) LatestAttempt(ctx context.Context, cache *fileutil.Cache[*ir.DAGRunStatus]) (*Attempt, error) {
+	attDirs, err := dr.listAttemptDirs()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list run directories: %w", err)
 	}
@@ -234,12 +252,12 @@ func (dr DAGRun) LatestAttempt(ctx context.Context, cache *fileutil.Cache[*exec.
 			return att, nil
 		}
 	}
-	return nil, exec.ErrNoStatusData
+	return nil, dagrun.ErrNoStatusData
 }
 
 // AttemptByDir constructs an Attempt directly from a known attempt directory name,
 // skipping the directory listing and sorting done by LatestAttempt.
-func (dr DAGRun) AttemptByDir(attemptDir string, cache *fileutil.Cache[*exec.DAGRunStatus]) (*Attempt, error) {
+func (dr DAGRun) AttemptByDir(attemptDir string, cache *fileutil.Cache[*ir.DAGRunStatus]) (*Attempt, error) {
 	return NewAttempt(filepath.Join(dr.baseDir, attemptDir, JSONLStatusFile), cache)
 }
 
@@ -301,11 +319,8 @@ func (dr DAGRun) removeLogFiles(ctx context.Context) error {
 	}
 
 	// Remove all log files.
-	for _, file := range deleteFiles {
-		if file == "" {
-			continue
-		}
-		if err := fileutil.Remove(file); err != nil {
+	for file := range uniquePaths(deleteFiles) {
+		if err := fileutil.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
 			logger.Error(ctx, "Failed to remove log file",
 				tag.Error(err),
 				tag.RunID(dr.dagRunID),
@@ -332,17 +347,34 @@ func (dr DAGRun) removeLogFiles(ctx context.Context) error {
 		parentDirs[filepath.Dir(validDir)] = struct{}{}
 	}
 
-	// Remove parent dirs if they are empty.
+	// Remove deepest directories first so their ancestors can become empty.
+	dirs := make([]string, 0, len(parentDirs))
 	for p := range parentDirs {
+		dirs = append(dirs, p)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i]) > len(dirs[j])
+	})
+	for _, p := range dirs {
 		_ = fileutil.Remove(p)
 	}
 
 	return nil
 }
 
+func uniquePaths(paths []string) map[string]struct{} {
+	unique := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path != "" {
+			unique[path] = struct{}{}
+		}
+	}
+	return unique
+}
+
 // listAttemptDirs lists all attempt directories including hidden ones.
 func (dr DAGRun) listAttemptDirs() ([]string, error) {
-	entries, err := os.ReadDir(dr.baseDir)
+	entries, err := fileutil.ReadDir(dr.baseDir)
 	// If the directory does not exist, return nil
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -356,23 +388,14 @@ func (dr DAGRun) listAttemptDirs() ([]string, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		// Trim the dot prefix if it is a hidden directory
-		name := strings.TrimPrefix(entry.Name(), ".")
-		if reAttemptDir.MatchString(name) {
+		if IsAttemptDirName(entry.Name()) {
 			dirs = append(dirs, entry.Name())
 		}
 	}
 
-	// Sort in reverse order (newest first) based on timestamp
+	// Sort current-format attempts before legacy attempts.
 	sort.Slice(dirs, func(i, j int) bool {
-		// Extract timestamps for comparison
-		// Remove dot prefix if present for comparison
-		nameI := strings.TrimPrefix(dirs[i], ".")
-		nameJ := strings.TrimPrefix(dirs[j], ".")
-
-		// Compare timestamps (the format ensures lexical sort = chronological sort)
-		// Reverse order: newer (larger) timestamps come first
-		return nameI > nameJ
+		return attemptDirNewer(dirs[i], dirs[j])
 	})
 	return dirs, nil
 }
@@ -406,12 +429,7 @@ func (dr DAGRun) listLogFiles(ctx context.Context) ([]string, error) {
 			continue
 		}
 		logFiles = append(logFiles, status.Log)
-		for _, n := range status.Nodes {
-			logFiles = append(logFiles, n.Stdout, n.Stderr)
-		}
-		for _, n := range []*exec.Node{
-			status.OnSuccess, status.OnExit, status.OnFailure, status.OnAbort,
-		} {
+		for _, n := range status.NodesInRunOrder() {
 			if n == nil {
 				continue
 			}
@@ -484,15 +502,58 @@ func (dr DAGRun) validatedArtifactDir(dir string) (string, bool) {
 	return cleanDir, true
 }
 
-// Regular expressions for parsing directory names
-var reDAGRunDir = regexp.MustCompile(`^` + DAGRunDirPrefix + `(\d{8}_\d{6}Z)_(.*)$`)         // Matches dag-run directory names
-var reAttemptDir = regexp.MustCompile(`^` + AttemptDirPrefix + `(\d{8}_\d{6}_\d{3}Z)_(.*)$`) // Matches attempt directory names
-var reSubDAGRunDir = regexp.MustCompile(`^` + SubDAGRunDirPrefix + `(.*)$`)                  // Matches sub dag-run directory names
+var reDAGRunDir = regexp.MustCompile(`^` + DAGRunDirPrefix + `(\d{8}_\d{6}Z)_(.*)$`)
+var reAttemptDir = regexp.MustCompile(`^(?:` + regexp.QuoteMeta(AttemptDirPrefix) + `|` + regexp.QuoteMeta(LegacyAttemptDirPrefix) + `)(\d{8}_\d{6}_\d{3}Z)_(.*)$`)
 
-// formatDAGRunTimestamp formats a models.TimeInUTC instance into a string representation (without milliseconds).
+func attemptDirName(ts persis.TimeInUTC, attemptID string) string {
+	return AttemptDirPrefix + formatAttemptTimestamp(ts) + "_" + attemptID
+}
+
+func attemptIDFromDir(name string) (string, bool) {
+	matches := reAttemptDir.FindStringSubmatch(strings.TrimPrefix(name, "."))
+	if len(matches) != 3 {
+		return "", false
+	}
+	return matches[2], true
+}
+
+func IsAttemptDirName(name string) bool {
+	_, ok := attemptIDFromDir(name)
+	return ok
+}
+
+func attemptDirNewer(a, b string) bool {
+	a = strings.TrimPrefix(a, ".")
+	b = strings.TrimPrefix(b, ".")
+	if aCurrent, bCurrent := strings.HasPrefix(a, AttemptDirPrefix), strings.HasPrefix(b, AttemptDirPrefix); aCurrent != bCurrent {
+		return aCurrent
+	}
+	return a > b
+}
+
+func attemptDirOlder(a, b string) bool {
+	return attemptDirNewer(b, a)
+}
+
+func subDAGRunIDFromDir(parentDirName, dirName string) (string, bool) {
+	switch parentDirName {
+	case SubDAGRunsDir:
+		if dirName == "" || strings.HasPrefix(dirName, ".") {
+			return "", false
+		}
+		return dirName, true
+	case LegacySubDAGRunsDir:
+		dagRunID, ok := strings.CutPrefix(dirName, LegacySubDAGRunDirPrefix)
+		return dagRunID, ok && dagRunID != ""
+	default:
+		return "", false
+	}
+}
+
+// formatDAGRunTimestamp formats a UTC timestamp without milliseconds.
 // The format is "YYYYMMDD_HHMMSSZ".
 // This is used for generating 'run' directory names.
-func formatDAGRunTimestamp(t exec.TimeInUTC) string {
+func formatDAGRunTimestamp(t persis.TimeInUTC) string {
 	return t.Format(dateTimeFormatUTC)
 }
 
@@ -509,9 +570,9 @@ func parseDAGRunTimestamp(s string) (time.Time, error) {
 // dateTimeFormatUTC is the format for run timestamps.
 const dateTimeFormatUTC = "20060102_150405Z"
 
-// formatAttemptTimestamp formats a models.TimeInUTC instance into a string representation with milliseconds.
+// formatAttemptTimestamp formats a UTC timestamp with milliseconds.
 // The format is "YYYYMMDD_HHMMSS_mmmZ" where "mmm" is the milliseconds part.
-func formatAttemptTimestamp(t exec.TimeInUTC) string {
+func formatAttemptTimestamp(t persis.TimeInUTC) string {
 	const format = "20060102_150405"
 	mill := t.UnixMilli()
 	return t.Format(format) + "_" + fmt.Sprintf("%03d", mill%1000) + "Z"

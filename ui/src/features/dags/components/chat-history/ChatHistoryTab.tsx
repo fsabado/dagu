@@ -6,8 +6,12 @@ import { isActiveNodeStatus } from '@/lib/status-utils';
 import { Loader2 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { StepMessagesTable } from './StepMessagesTable';
+import { I18nText } from '@/i18n/I18nText';
 
 type DAGRunDetails = components['schemas']['DAGRunDetails'];
+
+/** Executor types whose steps persist an LLM transcript. */
+const LLM_STEP_TYPES = ['chat', 'agent'];
 
 interface ChatHistoryTabProps {
   dagRun: DAGRunDetails;
@@ -17,15 +21,13 @@ export function ChatHistoryTab({ dagRun }: ChatHistoryTabProps) {
   // Find all LLM-backed steps that persist message history.
   const historySteps = useMemo(() => {
     return (
-      dagRun.nodes?.filter(
-        (node) =>
-          node.step.executorConfig?.type === 'chat' ||
-          node.step.executorConfig?.type === 'agent'
+      dagRun.nodes?.filter((node) =>
+        LLM_STEP_TYPES.includes(node.step.executorConfig?.type ?? '')
       ) || []
     );
   }, [dagRun.nodes]);
 
-  // Determine default selected step: last finished chat/agent step
+  // Determine default selected step: last finished chat step
   const defaultStep = useMemo(() => {
     const finishedStatuses = [
       NodeStatus.Success,
@@ -90,7 +92,7 @@ export function ChatHistoryTab({ dagRun }: ChatHistoryTabProps) {
   if (historySteps.length === 0) {
     return (
       <div className="text-xs text-muted-foreground p-2">
-        No chat or agent steps in this DAG run
+        <I18nText text={"No chat steps in this DAG run"} />
       </div>
     );
   }
@@ -100,7 +102,7 @@ export function ChatHistoryTab({ dagRun }: ChatHistoryTabProps) {
       {/* Step selector dropdown */}
       <div className="flex items-center gap-2 text-xs">
         <label htmlFor="chat-step-select" className="text-muted-foreground">
-          Step:
+          <I18nText text={"Step:"} />
         </label>
         <select
           id="chat-step-select"

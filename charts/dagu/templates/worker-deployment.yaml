@@ -1,13 +1,27 @@
+{{- if eq .Values.deploymentMode "distributed" }}
 {{- range $poolName, $pool := .Values.workerPools }}
 {{- $dataSizeLimit := dig "dataVolume" "sizeLimit" "" $pool }}
-{{- if not (regexMatch "^[a-z][a-z0-9-]*$" $poolName) }}
-{{- fail (printf "invalid workerPool name %q: must match ^[a-z][a-z0-9-]*$" $poolName) }}
+{{- $resources := default (dict) $pool.resources }}
+{{- $nodeSelector := default $.Values.nodeSelector $pool.nodeSelector }}
+{{- $tolerations := default $.Values.tolerations $pool.tolerations }}
+{{- $affinity := default $.Values.affinity $pool.affinity }}
+{{- $priorityClassName := default $.Values.priorityClassName $pool.priorityClassName }}
+{{- $podAnnotations := deepCopy $.Values.podAnnotations }}
+{{- $_ := set $podAnnotations "checksum/config" (include "dagu.distributedConfigChecksum" $) }}
+{{- if $.Values.serviceAccount.create }}
+{{- $_ = set $podAnnotations "checksum/service-account" ($.Values.serviceAccount.annotations | toJson | sha256sum) }}
+{{- end }}
+{{- if not (regexMatch "^[a-z]([a-z0-9-]*[a-z0-9])?$" $poolName) }}
+{{- fail (printf "invalid workerPool name %q: use lowercase letters, numbers, and internal hyphens" $poolName) }}
+{{- end }}
+{{- if gt (len $poolName) 54 }}
+{{- fail (printf "invalid workerPool name %q: must not exceed 54 characters" $poolName) }}
 {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "dagu.fullname" $ }}-worker-{{ $poolName }}
+  name: {{ include "dagu.componentName" (dict "root" $ "component" (printf "worker-%s" $poolName)) }}
   labels:
     {{- include "dagu.labels" $ | nindent 4 }}
     app.kubernetes.io/component: worker
@@ -21,6 +35,8 @@ spec:
       dagu.sh/worker-pool: {{ $poolName }}
   template:
     metadata:
+      annotations:
+        {{- toYaml $podAnnotations | nindent 8 }}
       labels:
         {{- include "dagu.labels" $ | nindent 8 }}
         app.kubernetes.io/component: worker
@@ -29,13 +45,18 @@ spec:
       # Disable Kubernetes Service env var injection to avoid overriding
       # dagu config values (e.g., scheduler.port) with Service URLs
       enableServiceLinks: false
+      serviceAccountName: {{ include "dagu.serviceAccountName" $ }}
       {{- with $.Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: worker
-          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag }}"
+          image: {{ include "dagu.image" $ | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           args:
             - dagu
@@ -43,7 +64,9 @@ spec:
             - --config
             - /etc/dagu/dagu.yaml
             - --worker.coordinators
-            - "{{ include "dagu.fullname" $ }}-coordinator.{{ $.Release.Namespace }}.svc.cluster.local:50055"
+            - "{{ include "dagu.componentName" (dict "root" $ "component" "coordinator") }}:50055"
+            - --worker.max-active-runs
+            - {{ $.Values.worker.maxActiveRuns | quote }}
             {{- if $pool.labels }}
             - --worker.labels
             - {{ include "dagu.workerLabels" $pool.labels | quote }}
@@ -67,6 +90,9 @@ spec:
               mountPath: /data
             - name: config
               mountPath: /etc/dagu
+{{- with $.Values.extraVolumeMounts }}
+{{ toYaml . | nindent 12 }}
+{{- end }}
           livenessProbe:
             httpGet:
               path: /health
@@ -80,18 +106,21 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:
-            {{- toYaml $pool.resources | nindent 12 }}
-      {{- with $pool.nodeSelector }}
+            {{- toYaml $resources | nindent 12 }}
+      {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with $pool.tolerations }}
+      {{- with $tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with $pool.affinity }}
+      {{- with $affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $priorityClassName }}
+      priorityClassName: {{ . | quote }}
       {{- end }}
       volumes:
         - name: data
@@ -103,5 +132,9 @@ spec:
           {{- end }}
         - name: config
           configMap:
-            name: {{ include "dagu.fullname" $ }}-config
+            name: {{ include "dagu.componentName" (dict "root" $ "component" "config") }}
+{{- with $.Values.extraVolumes }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}
 {{- end }}

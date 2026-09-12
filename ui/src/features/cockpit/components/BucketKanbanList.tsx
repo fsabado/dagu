@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { components } from '@/api/v1/schema';
+import { components, ViewColumn } from '@/api/v1/schema';
 import DAGRunDetailsModal from '@/features/dag-runs/components/dag-run-details/DAGRunDetailsModal';
 import type { KanbanFilters } from '../hooks/useDateKanbanData';
 import { useInfiniteBuckets } from '../hooks/useInfiniteBuckets';
 import { ArtifactListModal } from './ArtifactListModal';
 import { BucketKanbanSection } from './BucketKanbanSection';
+import { I18nText } from '@/i18n/I18nText';
 
 type DAGRunSummary = components['schemas']['DAGRunSummary'];
 
@@ -15,6 +16,7 @@ interface Props {
   intervalDays: number;
   filters: KanbanFilters;
   resetKey?: string;
+  visibleColumns?: readonly ViewColumn[];
 }
 
 /**
@@ -27,6 +29,7 @@ export function BucketKanbanList({
   intervalDays,
   filters,
   resetKey,
+  visibleColumns,
 }: Props): React.ReactElement {
   const { buckets, hasMore, loadNext } = useInfiniteBuckets(
     intervalDays,
@@ -102,6 +105,7 @@ export function BucketKanbanList({
             toStr={bucket.toStr}
             isLive={bucket.isLive}
             filters={filters}
+            visibleColumns={visibleColumns}
             onCardClick={handleCardClick}
             onArtifactsClick={handleArtifactsClick}
           />
@@ -113,7 +117,7 @@ export function BucketKanbanList({
               onClick={triggerLoadNext}
               className="rounded border border-border px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground"
             >
-              Load older
+              <I18nText text={"Load older"} />
             </button>
             <div ref={sentinelRef} className="h-1 w-full shrink-0" />
           </div>

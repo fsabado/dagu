@@ -7,17 +7,17 @@ import (
 	"context"
 	"errors"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/proto/convert"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	coordinatorv1 "github.com/dagucloud/dagu/proto/coordinator/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/proto/convert"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
 type captureCoordinatorClientForTest struct {
 	coordinator.Client
-	status *exec.DAGRunStatus
+	status *ir.DAGRunStatus
 	err    error
 }
 
@@ -26,28 +26,33 @@ func (c *captureCoordinatorClientForTest) ReportStatus(_ context.Context, req *c
 	return &coordinatorv1.ReportStatusResponse{Accepted: true}, nil
 }
 
-func (c *captureCoordinatorClientForTest) ReportStatusTo(ctx context.Context, _ exec.HostInfo, req *coordinatorv1.ReportStatusRequest) (*coordinatorv1.ReportStatusResponse, error) {
+func (c *captureCoordinatorClientForTest) ReportStatusTo(ctx context.Context, _ serviceregistry.HostInfo, req *coordinatorv1.ReportStatusRequest) (*coordinatorv1.ReportStatusResponse, error) {
 	return c.ReportStatus(ctx, req)
 }
 
 type captureStatusPusherForTest struct {
-	status *exec.DAGRunStatus
+	status *ir.DAGRunStatus
 }
 
-func (p *captureStatusPusherForTest) Push(_ context.Context, status exec.DAGRunStatus) error {
+func (p *captureStatusPusherForTest) Push(_ context.Context, status ir.DAGRunStatus) error {
 	copied := status
 	p.status = &copied
 	return nil
 }
 
 // ReportTaskLoadFailureStatusForTest returns the status emitted for a task load failure.
-func ReportTaskLoadFailureStatusForTest(ctx context.Context, task *coordinatorv1.Task, root, parent exec.DAGRunRef, loadErr error, profileName string) (*exec.DAGRunStatus, error) {
+func ReportTaskLoadFailureStatusForTest(ctx context.Context, task *coordinatorv1.Task, root, parent ir.DAGRunRef, loadErr error, profileName string) (*ir.DAGRunStatus, error) {
 	client := &captureCoordinatorClientForTest{}
 	handler := &remoteTaskHandler{
 		workerID:          "worker-test",
 		coordinatorClient: client,
 	}
-	handler.reportTaskLoadFailure(ctx, task, root, parent, exec.HostInfo{}, loadErr, profileName)
+	handler.reportTaskLoadFailure(ctx, remoteRun{
+		task:        task,
+		root:        root,
+		parent:      parent,
+		profileName: profileName,
+	}, loadErr)
 	if client.err != nil {
 		return nil, client.err
 	}
@@ -58,10 +63,16 @@ func ReportTaskLoadFailureStatusForTest(ctx context.Context, task *coordinatorv1
 }
 
 // ReportTaskInitFailureStatusForTest returns the status emitted for a task init failure.
-func ReportTaskInitFailureStatusForTest(ctx context.Context, task *coordinatorv1.Task, root, parent exec.DAGRunRef, initErr error, profileName string) (*exec.DAGRunStatus, error) {
+func ReportTaskInitFailureStatusForTest(ctx context.Context, task *coordinatorv1.Task, root, parent ir.DAGRunRef, initErr error, profileName string) (*ir.DAGRunStatus, error) {
 	pusher := &captureStatusPusherForTest{}
 	handler := &remoteTaskHandler{}
-	handler.reportTaskInitFailure(ctx, task, root, parent, pusher, initErr, profileName)
+	handler.reportTaskInitFailure(ctx, remoteRun{
+		task:        task,
+		root:        root,
+		parent:      parent,
+		profileName: profileName,
+		handlers:    runHandlers{status: pusher},
+	}, initErr)
 	if pusher.status == nil {
 		return nil, errors.New("init failure status was not reported")
 	}
@@ -69,10 +80,14 @@ func ReportTaskInitFailureStatusForTest(ctx context.Context, task *coordinatorv1
 }
 
 // LoadRemoteTaskDAGForTest loads the DAG definition for a remote task.
-func LoadRemoteTaskDAGForTest(ctx context.Context, cfg *config.Config, task *coordinatorv1.Task) (*core.DAG, func(), error) {
+func LoadRemoteTaskDAGForTest(ctx context.Context, cfg *config.Config, task *coordinatorv1.Task) (*ir.DAG, func(), error) {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
 	handler := &remoteTaskHandler{config: cfg}
-	return handler.loadDAG(ctx, task)
+	loaded, err := handler.loadDAG(ctx, task)
+	if err != nil {
+		return nil, nil, err
+	}
+	return loaded.dag, loaded.cleanup, nil
 }

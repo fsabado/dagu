@@ -63,8 +63,25 @@ func IsFile(path string) bool {
 // OpenOrCreateFile opens or creates the named file for appending with synchronous I/O and sets permissions to 0600.
 // It returns the opened *os.File or a non-nil error if the operation fails.
 func OpenOrCreateFile(filepath string) (*os.File, error) {
-	flags := os.O_CREATE | os.O_WRONLY | os.O_APPEND | os.O_SYNC
+	return openOrCreateFile(filepath, os.O_SYNC)
+}
 
+// OpenOrCreateFileWithoutSync opens or creates the named file for appending using OS buffering and sets permissions to 0600.
+// Writes are visible to readers, but callers must call Sync when durable persistence is required.
+func OpenOrCreateFileWithoutSync(filepath string) (*os.File, error) {
+	return openOrCreateFile(filepath, 0)
+}
+
+// OpenOrCreateFileForRandomWrite opens or creates a file for writes at explicit offsets.
+func OpenOrCreateFileForRandomWrite(filepath string) (*os.File, error) {
+	return openFileWithFlags(filepath, os.O_CREATE|os.O_WRONLY)
+}
+
+func openOrCreateFile(filepath string, extraFlags int) (*os.File, error) {
+	return openFileWithFlags(filepath, os.O_CREATE|os.O_WRONLY|os.O_APPEND|extraFlags)
+}
+
+func openFileWithFlags(filepath string, flags int) (*os.File, error) {
 	var file *os.File
 	err := retryWindowsFileOp(func() error {
 		opened, err := os.OpenFile(filepath, flags, 0600) // nolint:gosec
@@ -274,47 +291,98 @@ func CreateTempDAGFile(subDir, dagName string, yamlData []byte, extraDocs ...[]b
 	return tempFileName, nil
 }
 
-// WriteFileAtomic writes data to a file atomically using a temp file and rename.
-// This ensures the file is never left in a partial state.
-// Uses os.CreateTemp with a unique filename to prevent race conditions with
-// concurrent writers to the same file.
+// WriteFileAtomic durably replaces filePath with data. Once it returns nil,
+// the destination contains the complete new contents after a process or host
+// crash, provided the underlying filesystem honors fsync.
 func WriteFileAtomic(filePath string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(filePath)
 	base := filepath.Base(filePath)
 
-	// Create temp file in the same directory to ensure atomic rename works
-	// (rename across filesystems would fail)
-	tempFile, err := os.CreateTemp(dir, base+".tmp.*")
+	tempPath, err := writeSyncedTempFile(dir, base, data, perm)
 	if err != nil {
-		return fmt.Errorf("failed to create temp file in %s: %w", dir, err)
-	}
-	tempPath := tempFile.Name()
-
-	// Clean up temp file on any error
-	cleanup := func() { _ = os.Remove(tempPath) }
-
-	if _, err := tempFile.Write(data); err != nil {
-		_ = tempFile.Close()
-		cleanup()
-		return fmt.Errorf("failed to write temp file %s: %w", tempPath, err)
-	}
-
-	if err := tempFile.Chmod(perm); err != nil {
-		_ = tempFile.Close()
-		cleanup()
-		return fmt.Errorf("failed to set permissions on temp file %s: %w", tempPath, err)
-	}
-
-	if err := tempFile.Close(); err != nil {
-		cleanup()
-		return fmt.Errorf("failed to close temp file %s: %w", tempPath, err)
+		return err
 	}
 
 	if err := ReplaceFile(tempPath, filePath); err != nil {
-		cleanup()
+		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to rename %s to %s: %w", tempPath, filePath, err)
 	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("failed to sync directory %s: %w", dir, err)
+	}
 	return nil
+}
+
+// ReplaceFileDurable replaces target with source and persists the directory entry change.
+func ReplaceFileDurable(source, target string) error {
+	if err := ReplaceFile(source, target); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(target))
+}
+
+// SyncDir persists directory entry changes where the platform requires it.
+func SyncDir(path string) error {
+	return syncDir(path)
+}
+
+// WriteFileAtomicExclusive durably creates filePath without replacing an
+// existing file. It returns an error satisfying fs.ErrExist when the
+// destination already exists.
+func WriteFileAtomicExclusive(filePath string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(filePath)
+	base := filepath.Base(filePath)
+
+	tempPath, err := writeSyncedTempFile(dir, base, data, perm)
+	if err != nil {
+		return err
+	}
+	if err := installFileNoReplace(tempPath, filePath); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to install %s as %s: %w", tempPath, filePath, err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("failed to sync directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+// RemoveFileDurable removes path and persists the directory entry change.
+func RemoveFileDurable(path string) error {
+	if err := Remove(path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+func writeSyncedTempFile(dir, base string, data []byte, perm os.FileMode) (string, error) {
+	tempFile, err := os.CreateTemp(dir, base+".tmp.*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file in %s: %w", dir, err)
+	}
+	tempPath := tempFile.Name()
+	cleanup := func() {
+		_ = tempFile.Close()
+		_ = os.Remove(tempPath)
+	}
+
+	if _, err := tempFile.Write(data); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed to write temp file %s: %w", tempPath, err)
+	}
+	if err := tempFile.Chmod(perm); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed to set permissions on temp file %s: %w", tempPath, err)
+	}
+	if err := tempFile.Sync(); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed to sync temp file %s: %w", tempPath, err)
+	}
+	if err := tempFile.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return "", fmt.Errorf("failed to close temp file %s: %w", tempPath, err)
+	}
+	return tempPath, nil
 }
 
 // WriteJSONAtomic marshals v to indented JSON and writes it atomically to filePath.

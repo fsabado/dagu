@@ -2,7 +2,7 @@
 
 Dagu is a self-contained workflow orchestration engine for running DAGs defined in YAML. It runs as a single binary without requiring an external database or message broker. It stores state locally by default and supports local, queued, and distributed execution modes.
 
-Use this compact reference when authoring, validating, or troubleshooting Dagu workflows with an AI agent. For the full human documentation, see https://docs.dagu.sh/.
+Use this compact reference with an AI agent when authoring, validating, or troubleshooting Dagu workflows, or when operating Dagu through its CLI. It summarizes repository-local workflow and CLI references.
 
 ---
 
@@ -13,23 +13,26 @@ Load only the reference file that matches the task.
 ## Default Approach
 
 - Prefer `type: graph` for new DAGs. It supports both sequential flow via `depends:` and parallel flow.
+- Use an Agent DAG (`type: agent`) only when the step order cannot be written down in advance and an LLM must choose it. It requires `llm:` and a `tasks:` list stating when the run is finished. The model may select multiple distinct, independent actions in one turn; Dagu runs them concurrently up to `max_active_steps` (`0` is unlimited, `1` is serial). Same-batch actions cannot consume sibling outputs, while failures do not cancel siblings. `set_task_status` and `ask_user` must be called alone.
+- Use `type: build` only for local regular-file pipelines whose unchanged transformations should be reused across runs.
 - Prefer `id` on every step. Omit `name` unless the display label must differ from the step ID.
-- Prefer `dagu enqueue` over `dagu start` for agent-run workflows.
 - Prefer `dagu schema ...` and `dagu validate ...` over guessing field names or shapes.
 - Prefer `action: template.render` when generating text files, prompts, or artifacts instead of assembling them with shell `echo` or heredocs.
 - Prefer `file.*` actions for local file operations such as stat, read, write, copy, move, delete, mkdir, and list instead of shelling out to `cp`, `mv`, `rm`, or `mkdir`.
+- Prefer `git.worktree.add` and `git.worktree.remove` when steps need isolated branches inside an existing local Git repository. Add an explicit remove step when the workflow should delete the worktree.
 - Prefer `stdout.artifact` / `stderr.artifact` when a command stream should become a DAG-run artifact, especially for large reports, JSON, Markdown, logs, or generated files.
 - Prefer `artifact.*` actions for explicit artifact reads/writes/lists. Use `DAG_RUN_ARTIFACTS_DIR` only when a tool truly needs a filesystem path inside the step.
 - Prefer string-form `output: VAR_NAME` for capturing small stdout values into flat variables.
 - Prefer object-form `output:` when downstream steps need structured values via `${step_id.output.*}`.
 - Prefer declared step `outputs:` with `$DAGU_OUTPUT_FILE` when a step must publish explicit values for `${steps.<step_id>.outputs.<name>}`.
+- Use `action: human.task` when an operator must provide typed input before downstream steps continue. Human task form outputs use `${steps.<step_id>.outputs.<name>}` without an authored `outputs:` field.
 - Prefer `stdout.outputs` or `action: outputs.write` when a DAG or remote action needs to return caller-visible values via `${step_id.outputs.*}`.
 - Prefer `state.*` actions for small persistent JSON state across DAG runs, such as cursors, checkpoints, and previous-value comparisons.
 - Prefer temporary files in the artifacts dir only when downstream steps need file paths; otherwise let commands write large artifact content to stdout and attach it with `stdout.artifact`.
 - Prefer scoped Dagu references for named values: `${consts.NAME}`, `${params.NAME}`, and `${env.NAME}`. Avoid unscoped braced names in examples unless the example is intentionally showing shell syntax.
-- Declare portable external CLI dependencies in top-level `tools` using aqua shorthand when the binary version affects reproducibility, for example `tools: ["jqlang/jq@jq-1.7.1"]`.
+- Declare portable external CLI dependencies in top-level `tools` using aqua shorthand when the binary version affects reproducibility, for example `tools: ["jqlang/jq@jq-1.7.1"]`. Append `#sha256:<64 hex>` to also pin the downloaded artifact content for the run platform, for example `jqlang/jq@jq-1.7.1#sha256:<hex>`.
 - For remote actions, put `tools` in the referenced action DAG file, not in `dagu-action.yaml`; caller DAG tools are not inherited across the action boundary.
-- Do not add `tools` for CLIs that intentionally depend on user or worker preconfiguration, login state, local profiles, plugins, or credentials, such as `gcloud` and AI agent CLIs.
+- Declare step-level `dependencies` when a run needs files from the DAG working directory. Use literal working-directory-relative paths or glob patterns; do not use value references.
 - Use remote action packages (`dagu-action.yaml`) when reusable logic needs helper files, its own DAG, versioning, or an input/output schema contract.
 
 ## High-Signal Rules
@@ -37,10 +40,14 @@ Load only the reference file that matches the task.
 - `output:` has two modes:
   - string form captures trimmed stdout into an env-scope variable such as `${env.VERSION}`
   - object form publishes structured step-scoped output for `${step_id.output.*}` access
-- Declared step `outputs:` publish explicit values through `${steps.<step_id>.outputs.<name>}`. Write values inside the running step to `$DAGU_OUTPUT_FILE`; Dagu captures them only after the command succeeds.
+- Value declarations in step `outputs:` publish explicit values through `${steps.<step_id>.outputs.<name>}`. Write those values to `$DAGU_OUTPUT_FILE`; Dagu captures them only after the command succeeds. Build path declarations publish the final materialization path after commit or reuse.
+- `human.task` is a processless root-DAG step with an explicit `id`, a required `with.prompt`, and an optional flat scalar form. A root DAG containing one can run locally or on a distributed worker. Every declared form property is a step output, published when submitted or defaulted, and available as `${steps.<step_id>.outputs.<name>}`.
 - `stdout.artifact` / `stderr.artifact` store command stdout/stderr directly as relative artifact paths, for example `stdout: {artifact: reports/report.md}`. Artifact outputs auto-enable artifacts unless `artifacts.enabled: false` is explicitly set, which is invalid.
 - `${step_id.stdout}` is a log file path, not stdout content.
 - Use `${context.*}` for run metadata in DAG YAML, for example `${context.dag.name}`, `${context.run.id}`, or `${context.paths.artifacts_dir}`. Unavailable context values remain unresolved text instead of becoming empty strings.
+- In a build step, `${inputs.<name>}` is the final input path and `${outputs.<name>}` is a fresh attempt staging path. Write file results only to the staging path; dependencies read the committed path as `${steps.<step_id>.outputs.<name>}`.
+- Do not read attempt-only `${step_id.stdout}`, `${step_id.stderr}`, or `${step_id.exit_code}` from potentially reusable producers. This also applies to `${step_id.output.<name>}` and `${step_id.outputs.<name>}`, including their whole-value `${step_id.output}` and `${step_id.outputs}` forms. Path-output steps cannot use `continue_on.mark_success`.
+- Build workflows are local-only. Path declarations are supported only on host command or shell steps without containers, and stream redirects cannot target declared build inputs or outputs.
 - Use `${consts.NAME}`, `${params.NAME}`, and `${env.NAME}` for Dagu-side named values. Use shell `$NAME` or `printenv NAME` only when the target shell or process should read the variable at execution time.
 - `consts:` must use list form with one key per item, for example `consts: [{service: api}]`. Const values are resolved while loading the DAG and can reference inherited or earlier consts.
 - `env:` should use list-of-maps when values depend on earlier env vars.
@@ -50,12 +57,14 @@ Load only the reference file that matches the task.
 - `parallel:` currently requires `action: dag.run` to a child DAG.
 - Sub-DAGs do not inherit parent env vars; pass what you need via `params:`.
 - For arbitrary text inside shell steps, prefer `printenv VAR_NAME` or `action: template.render` over Dagu interpolation such as `${env.VAR_NAME}`.
-- `harness.run` supports `provider: builtin`, Dagu CLI providers (`claude`, `codex`, `copilot`, `opencode`, `pi`), and custom top-level `harnesses:` entries. It can use top-level `container:` or step-level `container:`. A step-level container takes precedence for that step. Containerized harness runs support Dagu CLI providers and custom providers that pass the prompt as an argument or flag; they do not support `provider: builtin`, `with.stdin`, or custom `prompt_mode: stdin`.
+- `harness.run` supports built-in provider adapters (`aider`, `amp`, `claude`, `cline`, `codex`, `copilot`, `cursor`, `deepseek`, `droid`, `gemini`, `goose`, `kiro`, `opencode`, `pi`, `qwen`) and custom top-level `harnesses:` entries. Built-in OpenCode uses managed sessions on long-lived Dagu hosts by default; containers and unsupported options use the CLI path. It can use top-level `container:` or step-level `container:`.
 - Container runtime selection is service-level, not a DAG YAML field. Set `DAGU_CONTAINER_RUNTIME=podman` to use Podman, and set `DAGU_PODMAN_HOST` only when the Podman Docker-compatible socket is not the default.
 - DAG/action outputs are collected from string-form `output: VAR_NAME`, `stdout.outputs`, and `action: outputs.write`. Object-form `output:` stays step-scoped for `${step_id.output.*}` unless the workflow explicitly republishes values through `stdout.outputs` or `outputs.write`.
 - `state.get`, `state.set`, `state.delete`, `state.list`, and `state.diff` persist small JSON values across DAG runs. State scopes are `dag`, `root_dag`, `global`, and `custom`; use artifacts or external storage for large payloads.
+- Git worktree actions discover the repository from the step `working_dir`. Relative worktree paths resolve from the repository root, and the actions never fetch or push.
 - Remote action packages define `dagu-action.yaml` with `apiVersion: v1alpha1`, `name`, `dag`, and optional `inputs`/`outputs` JSON Schemas. `inputs` validates caller `with:` before the action DAG starts; `outputs` validates the final action output object after the action DAG returns.
 - Remote action manifests do not support `tools`. Declare external CLI tools in the action DAG itself so local and distributed workers prepare the right binaries for that action run.
+- `dependencies` snapshots files from the DAG working directory for both local and distributed execution. The materialized bundle is available through `DAG_RUN_WORK_DIR` and `${context.paths.work_dir}` and becomes the DAG process working directory.
 - In remote action examples, prefer `dag: workflow.yaml` for the action DAG filename. The `dag` field accepts any safe relative file path, but `workflow.yaml` avoids confusing the executable DAG with the `dagu-action.yaml` manifest.
 - Object-form `output:` with `decode: json` or `decode: yaml` can act as lightweight runtime validation. Malformed data or an unresolved `select:` path fails the step, so normal `retry_policy` applies.
 - Use DAG-level `shell` and `shell_args` only when every inherited `run:` step should use the same shell invocation. Use step-level `with.shell` and `with.shell_args` for a single step.
@@ -168,15 +177,43 @@ steps:
         reviewed: false
 ```
 
+## Example of Human Input
+
+```yaml
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Choose the deployment target
+      form:
+        type: object
+        properties:
+          environment:
+            type: string
+            enum: [staging, production]
+          note:
+            type: string
+            default: ""
+        required: [environment]
+
+  - id: deploy
+    depends: [review]
+    run: ./deploy --environment '${steps.review.outputs.environment}' --note '${steps.review.outputs.note}'
+```
+
+Complete the task from a local CLI context with `dagu human-task complete --run-id=<run-id> --step=review --input environment=production <dag-name>`. A form is optional for acknowledgement-only tasks. Human tasks cannot be used in sub-DAGs; a distributed root run is re-queued through the scheduler after completion.
+
 ## Reference Guide
 
 Load only the file you need:
 
-- `references/steptypes.md` when choosing an action or checking executor-specific caveats such as `dag.run`, `parallel`, `jq.filter`, `file.*`, `state.*`, or `template.render`
+- `references/steptypes.md` when choosing an action or checking action-specific behavior such as `human.task`, `dag.run`, `parallel`, `git.worktree.*`, `jq.filter`, `file.*`, `state.*`, or `template.render`
 - `references/dagu-action.md` when creating a reusable `dagu-action.yaml` package or checking action input/output schema behavior
-- `references/cli.md` when you need command flags or lookup commands such as `dagu schema`, `dagu config`, or `dagu history`
+- `references/cli.md` when choosing or using Dagu CLI commands, including workflow inspection, execution, and cleanup operations
 - `references/context.md` when using `${context.*}` metadata references or declared step `outputs:`
-- `references/codingagent.md` only when the DAG itself runs AI coding agents as steps
+- `references/build.md` when creating or troubleshooting a `type: build` file workflow, path references, reuse decisions, or `--no-reuse`
+- `references/file-dependencies.md` when a DAG needs scripts, configuration, or other files from its working directory
+- `references/harnesses.md` only when the DAG invokes external CLI harnesses through `harness.run`
 
 ---
 
@@ -259,6 +296,91 @@ steps:
 
 Dagu can drive Docker or Podman through a Docker-compatible API. Runtime selection is service-level, not a DAG YAML field. Set `DAGU_CONTAINER_RUNTIME=podman` for Podman. Set `DAGU_PODMAN_HOST` only when the Podman socket is not the default.
 
+## git.worktree.add / git.worktree.remove
+
+Create isolated working directories for branches in an existing local Git repository. The actions discover the repository from the step `working_dir`; they do not clone, fetch, or push.
+
+This example creates a generated branch, runs tests inside its worktree, and then removes the worktree explicitly:
+
+```yaml
+working_dir: ./repo
+
+steps:
+  - id: worktree
+    action: git.worktree.add
+
+  - id: test
+    depends: worktree
+    working_dir: "${steps.worktree.outputs.path}"
+    run: go test ./...
+
+  - id: remove_worktree
+    depends: test
+    action: git.worktree.remove
+    with:
+      path: "${steps.worktree.outputs.path}"
+```
+
+When `branch` is omitted, Dagu generates a stable branch name for that step and DAG run. The default path is `<repository-root>.worktrees/<branch>`.
+
+To create an explicit branch from a local commit, branch, `origin` remote-tracking branch, or tag:
+
+```yaml
+working_dir: ./repo
+
+steps:
+  - id: worktree
+    action: git.worktree.add
+    with:
+      branch: feature/api
+      create_branch: true
+      base: main
+      path: ../worktrees/feature-api
+```
+
+`git.worktree.add` fields:
+
+- `branch` - local branch to check out. Omit it to let Dagu generate one.
+- `path` - worktree directory. Relative paths resolve from the repository root.
+- `create_branch` - allow creation of an explicitly named branch. Defaults to `false`.
+- `base` - local commit, branch, remote-tracking branch, or tag used when creating the branch. Defaults to repository `HEAD`.
+
+The add action is idempotent. It reuses a matching registered worktree without resetting its branch or discarding local changes. Worktrees remain registered until an explicit remove action or an external Git command removes them.
+
+Use `git.worktree.remove` for explicit removal:
+
+```yaml
+working_dir: ./repo
+
+steps:
+  - id: worktree
+    action: git.worktree.add
+
+  - id: remove_worktree
+    depends: worktree
+    action: git.worktree.remove
+    with:
+      path: "${steps.worktree.outputs.path}"
+      branch: "${steps.worktree.outputs.branch}"
+      delete_branch: true
+```
+
+`git.worktree.remove` fields:
+
+- `branch` and `path` - provide either selector or both. When both resolve to a worktree, they must identify the same registration.
+- `force` - remove a dirty worktree. Defaults to `false`.
+- `delete_branch` - delete the local branch after removing the worktree. Requires `branch`.
+- `force_delete_branch` - allow deletion of an unmerged branch. Requires `delete_branch: true`.
+
+`force` and `force_delete_branch` protect different data: `force` permits removal of local worktree changes, while `force_delete_branch` permits deletion of unmerged commits.
+
+Both actions publish fixed outputs. Do not add `output`, `outputs`, or `stdout.outputs` to these steps. Read results through `${steps.<id>.outputs.<field>}`.
+
+- Add outputs: `path`, `branch`, `commit`, `worktree_created`, `branch_created`.
+- Remove outputs: `path`, `branch`, `worktree_removed`, `branch_deleted`.
+
+Dagu refuses to remove the primary working tree. Worktree mutations against the same repository are serialized, but Git changes made outside Dagu are not covered by that lock.
+
 ## dag.run
 
 Execute another DAG as a child DAG.
@@ -275,9 +397,66 @@ steps:
 
 Sub-DAGs do not inherit parent env vars. Pass values explicitly via `with.params`.
 
-## Declared Step Outputs
+## human.task
 
-Declare `outputs:` when a step should publish named values for later steps as `${steps.<step_id>.outputs.<name>}`.
+Pause a root DAG run until an operator completes a processless step. A human task does not execute a command and is distinct from an approval gate: completion always succeeds the step, with no reject or rewind operation.
+
+```yaml
+params:
+  RELEASE: v1.2.3
+
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Select a deployment window for ${params.RELEASE}
+      form:
+        type: object
+        title: Deployment review
+        properties:
+          window:
+            type: string
+            enum: [morning, evening]
+          ticket:
+            type: string
+            pattern: '^CHG-[0-9]+$'
+          notify:
+            type: boolean
+            default: true
+        required: [window, ticket]
+
+  - id: deploy
+    depends: [review]
+    run: ./deploy --window '${steps.review.outputs.window}' --ticket '${steps.review.outputs.ticket}'
+```
+
+`with.prompt` is required and supports normal Dagu value references. `with.form` is optional; omit it for an acknowledgement-only task that accepts no input.
+
+The form is a flat object JSON Schema:
+
+- `type` must be `object`.
+- Property names must start with a letter and contain only letters, digits, or `_`.
+- Property types are `string`, `integer`, `number`, and `boolean`.
+- Supported property constraints include `default`, `enum`, `oneOf` choices, `minimum`, `maximum`, `minLength`, `maxLength`, and `pattern`.
+- `additionalProperties` defaults to `false`. Set it explicitly to `true` only when undeclared completion fields are intended.
+
+Dagu derives outputs from form properties; do not add an `outputs:` field to the human task. Every declared property is a step output, published when submitted or defaulted, and available as `${steps.<step_id>.outputs.<name>}`.
+
+Human tasks require an explicit `id` and cannot be used in sub-DAGs, lifecycle handlers, or `foreach.steps`. A root DAG containing human tasks can run locally or on a distributed worker selected by its DAG-level `worker_selector`. Executor, retry, repeat, timeout, container, step-level worker selector, output capture, and approval fields are not supported on the same step.
+
+Complete a waiting task from a local CLI context:
+
+```sh
+dagu human-task complete --run-id=<run-id> --step=review --input window=morning --input ticket=CHG-123 <dag-name>
+```
+
+Use `--inputs-json` instead of repeated `--input` flags when input types must be preserved exactly.
+
+Completing the last waiting human task resumes a local run directly. A distributed run is re-queued, so its scheduler must be running.
+
+## Declared Value Outputs
+
+Declare value-form `outputs:` when a step should publish named values for later steps as `${steps.<step_id>.outputs.<name>}`. Build file outputs use `path` instead; see `references/build.md`.
 
 ```yaml
 steps:
@@ -470,7 +649,24 @@ steps:
       timeout: 30
 ```
 
-`with` fields: `method`, `url`, `timeout`, `headers`, `query`, `body`, `silent`, `debug`, `json`, `skip_tls_verify`.
+Upload files as multipart form data by mapping server field names to local paths. Relative paths resolve from the step working directory:
+
+```yaml
+steps:
+  - id: upload
+    action: http.request
+    with:
+      method: POST
+      url: https://api.example.com/uploads
+      form:
+        description: nightly-report
+      files:
+        document: ./report.pdf
+```
+
+Do not set the multipart `Content-Type` header manually. `body` cannot be combined with `form` or `files`.
+
+`with` fields: `method`, `url`, `timeout`, `headers`, `query`, `body`, `form`, `files`, `silent`, `debug`, `format`, `output`, `json`, `skip_tls_verify`.
 
 ## jq.filter
 
@@ -512,7 +708,7 @@ steps:
     output: RESULT
 ```
 
-`with.template` is required and is rendered as a template, not executed as shell. `with.output` writes rendered content to a file; top-level `output:` captures or publishes step output.
+Set exactly one of `with.template` or `with.template_ref`. `with.template` is literal template text. `with.template_ref` must be one complete canonical Dagu reference such as `${env.TEMPLATE}` or `${steps.fetch.outputs.template}`; it resolves once to a non-empty string, and references inside the resulting template remain literal. The selected text is rendered as a template, not executed as shell. `with.output` writes rendered content to a file; top-level `output:` captures or publishes step output.
 
 ## file.stat / file.read / file.write / file.copy / file.move / file.delete / file.mkdir / file.list
 
@@ -610,6 +806,25 @@ steps:
 
 Connection fields: `region`, `endpoint`, `access_key_id`, `secret_access_key`, `session_token`, `profile`, `force_path_style`.
 
+Custom endpoints may include a path prefix. Dagu preserves the prefix when constructing and signing S3 requests. For example, Supabase can be configured at the DAG level:
+
+```yaml
+s3:
+  endpoint: "${env.SUPABASE_API_URL}/storage/v1/s3"
+  region: "${env.SUPABASE_S3_REGION}"
+  access_key_id: "${env.SUPABASE_S3_ACCESS_KEY_ID}"
+  secret_access_key: "${env.SUPABASE_S3_SECRET_ACCESS_KEY}"
+  force_path_style: true
+
+steps:
+  - id: upload
+    action: s3.upload
+    with:
+      bucket: reports
+      key: daily/output.csv
+      source: /local/output.csv
+```
+
 ## mail.send
 
 Send email.
@@ -645,43 +860,19 @@ steps:
 
 `with` fields: `source`, `destination`, `format`, `compression_level`, `password`, `overwrite`, `strip_components`, `include`, `exclude`.
 
-## agent.run
-
-AI agent loop with tools.
-
-```yaml
-steps:
-  - id: research
-    action: agent.run
-    with:
-      task: "Begin research on ${params.TOPIC}"
-      model: claude-sonnet-4-20250514
-      tools:
-        enabled:
-          - web_search
-          - bash
-      skills:
-        - my-skill-id
-      max_iterations: 50
-      safe_mode: true
-```
-
-Use `with.task`, `with.prompt`, or `with.messages` for the user input.
-
 ## harness.run
 
-Run coding agents through Dagu's in-process agent, predefined external CLIs, or custom harness definitions.
+Invoke external coding-agent CLIs through built-in provider adapters or custom harness definitions.
 
 ```yaml
 harnesses:
-  gemini:
+  gemini-custom:
     binary: gemini
-    prefix_args: ["run"]
     prompt_mode: flag
     prompt_flag: --prompt
 
 harness:
-  provider: gemini
+  provider: gemini-custom
   model: gemini-2.5-pro
   fallback:
     - provider: claude
@@ -696,14 +887,15 @@ steps:
     output: RESULT
 ```
 
-`with.prompt` is required and becomes the harness prompt. `with.provider` can be `builtin`, a Dagu CLI provider (`claude`, `codex`, `copilot`, `opencode`, `pi`), or a top-level `harnesses:` entry. For `provider: builtin`, `with.stdin` is appended to the user message after a blank line. For host subprocess runs, `with.stdin` is piped to stdin as supplementary context.
+`with.prompt` is required and is passed to the selected provider according to its built-in adapter or custom harness definition. `with.provider` can be a built-in provider adapter (`aider`, `amp`, `claude`, `cline`, `codex`, `copilot`, `cursor`, `deepseek`, `droid`, `gemini`, `goose`, `kiro`, `opencode`, `pi`, `qwen`) or a top-level `harnesses:` entry. For host subprocess runs, each built-in adapter either pipes `with.stdin` to stdin or folds it into the prompt; see `references/harnesses.md` for the provider table.
 
 Harness behavior:
 
-- `provider: builtin` runs Dagu's in-process agent and accepts builtin agent fields, not pass-through CLI flags.
-- Dagu CLI providers and custom providers pass non-reserved `with` keys as CLI flags. Dagu CLI providers normalize `snake_case` keys to kebab-case flags.
+- Built-in provider adapters and custom providers pass non-reserved `with` keys as CLI flags. Built-in adapters normalize `snake_case` keys to kebab-case flags.
+- A non-null custom definition shadows a built-in provider with the same name. Deleting the custom definition exposes the built-in again.
 - `fallback` is an ordered list of provider configs. Nested fallback is not supported.
 - Provider value references must resolve to a concrete provider string before execution. Unresolved `${...}` provider values fail at runtime.
+- A harness step is named with `action: harness.run`. A top-level `harness:` config supplies defaults to those steps and does not set the type of any other step, so a step written with `run:`, `exec:`, or `script:` under one stays a local command.
 
 Container support:
 
@@ -711,7 +903,6 @@ Container support:
 - Use step-level `container:` when only that step needs a container, or when it needs a different container from the root-level container.
 - Step-level `container:` takes precedence for that step.
 - The selected provider binary must exist inside the container that runs the step.
-- `provider: builtin` cannot run in a container.
 - `with.stdin` and custom `prompt_mode: stdin` are rejected for containerized harness steps.
 - Do not set `container.name` for step-level image-mode harness steps. Use `container.exec` when the step must run inside an existing container.
 - Docker or Podman is selected by the Dagu service process, not by a DAG YAML field.
@@ -920,7 +1111,7 @@ Use immutable tags or commit SHAs for production. Local `source:` paths are usef
 
 Global flags on all commands: `--config/-c`, `--dagu-home`, `--quiet/-q`, `--cpu-profile`
 
-Advanced and deprecated flags below remain implemented in `internal/cmd/start.go`, `internal/cmd/enqueue.go`, `internal/cmd/exec.go`, and `internal/cmd/migrate.go`, so this reference keeps them documented even when they are mainly used by automation or backward-compatibility paths.
+Advanced and deprecated flags below remain implemented in `internal/cmd/start.go`, `internal/cmd/enqueue.go`, and `internal/cmd/exec.go`, so this reference keeps them documented even when they are mainly used by automation or backward-compatibility paths.
 
 ## Core Commands
 
@@ -941,6 +1132,7 @@ Flags:
 - `--labels` — Additional labels (comma-separated key=value or key-only)
 - `--tags` — Deprecated alias for `--labels`
 - `--default-working-dir` — Default working directory for DAGs without explicit workingDir
+- `--no-reuse` — Recompute reusable build steps while preserving staged, atomic publication
 - `--worker-id` — Worker ID executing this DAG run; auto-set in distributed mode and defaults to `local`
 - `--trigger-type` — Trigger source (`scheduler`, `manual`, `webhook`, `subdag`, `retry`, `catchup`); defaults to `manual`
 
@@ -961,6 +1153,7 @@ Flags:
 - `--labels` — Additional labels (comma-separated key=value or key-only)
 - `--tags` — Deprecated alias for `--labels`
 - `--default-working-dir` — Default working directory for DAGs without explicit workingDir
+- `--no-reuse` — Recompute reusable build steps when the queued run starts
 - `--trigger-type` — Trigger source (`scheduler`, `manual`, `webhook`, `subdag`, `retry`, `catchup`); defaults to `manual`
 
 ### dagu exec
@@ -999,12 +1192,38 @@ Stop and restart a DAG run: `dagu restart <dag-name> [--run-id/-r <id>]`
 Retry a previous DAG run using the same run ID.
 
 ```sh
-dagu retry <dag> --run-id/-r <id> [--step <name>] [--worker-id <id>]
+dagu retry <dag> --run-id/-r <id> [--step <name>] [--downstream] [--worker-id <id>]
+```
+
+`--step` retries only the selected step. Add `--downstream` to also reset every reachable descendant; unrelated branches keep their current status. `--downstream` requires `--step`.
+
+### dagu human-task complete
+
+Complete a waiting human task in a root DAG run. The run may be local or distributed, but the command operates on the local Dagu data store.
+
+```sh
+dagu human-task complete [flags] <root-dag-name>
+```
+
+Flags:
+
+- `--run-id/-r` — Root DAG-run ID containing the human task; required
+- `--step` — Human task step ID; required and matched against `id`, not the display name
+- `--input` — Form input in `key=value` form; repeatable and coerced using the form schema
+- `--inputs-json` — Typed form input as one JSON object
+
+`--input` and `--inputs-json` are mutually exclusive. Omit both for an acknowledgement-only task. Completing one of several waiting human tasks leaves the DAG run waiting; completing the last one starts the run resume automatically. Human tasks cannot be used in sub-DAGs. A distributed run is re-queued, so its scheduler must be running. The command only supports the local context.
+
+```sh
+dagu human-task complete --run-id=run-1 --step=review --input environment=production deploy
+dagu human-task complete --run-id=run-1 --step=review --inputs-json='{"environment":"production","notify":true}' deploy
 ```
 
 ### dagu dry
 
-Dry-run a DAG without executing commands: `dagu dry [--params/-p] [--name/-N] <dag> [-- params...]`
+Dry-run a DAG without executing commands: `dagu dry [--params/-p] [--name/-N] [--no-reuse] <dag> [-- params...]`
+
+For a build DAG, `--no-reuse` previews the decisions with manifest reuse disabled. Dry-run still creates no locks, staging files, manifests, or run history.
 
 ### dagu validate
 
@@ -1036,9 +1255,55 @@ Flags:
 
 Default: shows runs from the last 30 days, newest first.
 
+### dagu ls
+
+List DAG definitions.
+
+This command is local-only. If a remote CLI context is selected, use `--context local`.
+
+```sh
+dagu ls [flags] [pattern]
+```
+
+Flags:
+
+- `--next/-n` — Show next scheduled run time
+- `--last/-l` — Show last run status and time
+- `--history/-H` — Show a compact recent-history summary
+- `--sort-last/-t` — Sort by last run time, newest first
+- `--reverse/-r` — Reverse sort order
+
+### dagu rm
+
+Remove DAG run history and/or the DAG YAML definition. At least one of `--history` or `--definition` is required. Active runs are never deleted from history; definition deletion is refused while the DAG has alive processes. With `--definition`, identify the DAG by filename, stem, or configured path.
+
+```sh
+dagu rm [--history|-H] [--definition|-d] [-t <duration>] [-f] [--dry-run] <dag>
+```
+
+Flags:
+
+- `--history/-H` — Delete run history
+- `--definition/-d` — Delete the DAG YAML definition
+- `--older-than/-t` — With `--history`: delete runs older than a duration (e.g. `10d`, `24h`, `1w`). Omitted = delete all history
+- `--force/-f` — Skip confirmation prompt
+- `--dry-run` — Preview deletions without removing history or the definition
+
+### dagu ps
+
+List running DAG processes.
+
+```sh
+dagu ps [-d <dag-name>] [-r <run-id>]
+```
+
+`-r`/`--run-id` accepts a partial run ID and matches accordingly.
+
 ### dagu cleanup
 
 Remove old DAG run history. Active runs are never deleted.
+
+Deprecated: prefer `dagu rm --history`.
 
 ```sh
 dagu cleanup <dag-name> [--retention-days <n>] [--dry-run] [--yes/-y]
@@ -1058,7 +1323,7 @@ Examples:
 - `dagu schema dag steps` — Step definition structure
 - `dagu schema dag steps.container` — Container configuration
 - `dagu schema dag steps.retry_policy` — Retry policy fields
-- `dagu schema dag steps.agent` — Agent step configuration
+- `dagu schema dag steps.harness` — Harness step configuration
 - `dagu schema dag handler_on` — Lifecycle event hooks
 - `dagu schema config` — All config root-level fields
 - `dagu schema config auth` — Authentication configuration
@@ -1107,18 +1372,18 @@ Start gRPC coordinator: `dagu coordinator [--coordinator.host/-H <host>] [--coor
 
 ### dagu worker
 
-Start distributed worker: `dagu worker [--worker.id/-w <id>] [--worker.max-active-runs/-m <n>] [--worker.labels/-l <k=v,...>] [--worker.coordinators <addrs>] [--peer.*]`
+Start distributed worker: `dagu worker --worker.coordinators <host:port,...> [--worker.id/-w <id>] [--worker.max-active-runs/-m <n>] [--worker.labels/-l <k=v,...>] [--peer.*]`. Coordinator addresses are required. Every worker advertises immutable `os` and `arch` platform labels in addition to configured labels.
 
 ## Git Sync
 
-`dagu sync <subcommand>` — Git sync operations for DAG definitions.
+`dagu sync <subcommand>` — Git sync for workflows, Wiki content, and supporting files.
 
 | Subcommand | Description |
 | ---------- | ----------- |
-| `sync status` | Show sync status (repository, branch, per-DAG status) |
+| `sync status` | Show repository, branch, and per-item status |
 | `sync pull` | Pull changes from remote |
-| `sync publish [dag] [--message/-m] [--all] [--force/-f]` | Publish local changes to remote |
-| `sync discard <dag> [--yes/-y]` | Discard local changes, restore remote version |
+| `sync publish [item-id] [--message/-m] [--all] [--force/-f]` | Publish local changes to remote |
+| `sync discard <item-id> [--yes/-y]` | Discard local changes, restore remote version |
 | `sync forget <id>... [--yes/-y]` | Remove state entries for missing/untracked items |
 | `sync cleanup [--dry-run] [--yes/-y]` | Remove all missing entries from sync state |
 | `sync delete <id> [--message/-m] [--force] [--all-missing] [--dry-run] [--yes/-y]` | Delete from remote, local, and sync state |
@@ -1126,12 +1391,7 @@ Start distributed worker: `dagu worker [--worker.id/-w <id>] [--worker.max-activ
 
 ## Other Commands
 
-- `dagu agent [--model <model>] [--soul <soul>]` — Start an interactive Dagu agent chat using the current CLI context
-- `dagu agent -p <prompt> [--model <model>] [--soul <soul>]` — Send one non-interactive prompt to the Dagu agent
-- `dagu agent history [--limit <n>]` — List Dagu agent sessions
-- `dagu agent resume <session-id> [-p <prompt>] [--model <model>] [--soul <soul>]` — Resume interactively or send one non-interactive prompt to a Dagu agent session
 - `dagu example [id]` — Show built-in example DAGs
-- `dagu migrate history` — Migrate legacy DAG run history from the v1.16 layout to the v1.17+ format and archive the old data
 - `dagu version` — Show version
 - `dagu upgrade [--check] [--version/-v <ver>] [--dry-run] [--yes/-y]` — Self-update binary
 - `dagu license <activate|deactivate|check>` — Manage license
@@ -1153,7 +1413,7 @@ Use scoped references when Dagu should resolve a named value before execution.
 | `${consts.NAME}` | Top-level `consts:` value |
 | `${params.NAME}` | Runtime parameter value |
 | `${env.NAME}` | Value in Dagu's runtime environment scope for the current step |
-| `${steps.<step_id>.outputs.<name>}` | Declared step output written through `$DAGU_OUTPUT_FILE` |
+| `${steps.<step_id>.outputs.<name>}` | Declared value output, human-task form value, or committed build path output |
 
 Use shell `$NAME` or `printenv NAME` only when the target shell or process should read the variable at execution time.
 
@@ -1215,7 +1475,6 @@ Path metadata:
 | `${context.paths.log_file}` | DAG run log file path |
 | `${context.paths.work_dir}` | Per-run working directory when one exists |
 | `${context.paths.artifacts_dir}` | Artifact directory when artifacts are enabled |
-| `${context.paths.docs_dir}` | DAG docs directory when one is configured |
 | `${context.paths.step_stdout_file}` | Current step stdout log file |
 | `${context.paths.step_stderr_file}` | Current step stderr log file |
 | `${context.paths.step_output_file}` | Current step output file path |
@@ -1239,9 +1498,11 @@ steps:
 
 Use single quotes around context references when the shell should receive the resolved value as one argument.
 
-## Declared Step Outputs
+## Declared Value Outputs
 
-A step can declare outputs and write them during execution. Dagu reads the output file after the command succeeds and publishes the values as `${steps.<step_id>.outputs.<name>}`.
+A step can declare value outputs and write them during execution. Dagu reads the output file after the command succeeds and publishes the values as `${steps.<step_id>.outputs.<name>}`.
+
+Human task form outputs use the same reference namespace without an authored `outputs:` field. Every declared property is published when submitted or defaulted.
 
 ```yaml
 steps:
@@ -1280,52 +1541,193 @@ Rules:
 
 Declared step outputs are different from DAG or remote action outputs. To publish caller-visible DAG/action outputs, use `stdout.outputs` or `action: outputs.write`.
 
+In a `type: build` workflow, an `outputs:` entry may declare `path` instead of a value `type`. The owning step writes to `${outputs.<name>}`, and `${steps.<step_id>.outputs.<name>}` publishes the final path only after commit or reuse. See `references/build.md`.
+
 ---
 
-# Coding Agent Integration
+# Build Workflows
 
-Use `action: harness.run` to run AI coding agents as DAG steps. A harness step can run Dagu's in-process agent, an external CLI on the host, an external CLI in a step-level container, or an external CLI in the DAG-level shared container.
+Use `type: build` for local workflows that transform stable regular files and should reuse unchanged work across DAG runs. Build execution is materialization reuse, not a cache that restores a missing output: a missing or modified final output causes recomputation.
+
+## Minimal Pipeline
+
+```yaml
+type: build
+working_dir: /srv/build
+
+steps:
+  - id: compile
+    inputs:
+      - name: source
+        path: source.c
+    outputs:
+      - name: binary
+        path: app.bin
+    run: compiler "${inputs.source}" -o "${outputs.binary}"
+
+  - id: package
+    inputs:
+      - name: binary
+        path: app.bin
+    outputs:
+      - name: archive
+        path: app.tar
+    run: packager "${inputs.binary}" "${outputs.archive}"
+```
+
+The `package` step does not need `depends: compile`. Its canonical input path matches the `compile` output path, so Dagu infers the dependency. Keep explicit dependencies for ordering that is not represented by a file.
+
+## Declarations and References
+
+- Set a stable `working_dir`, or load the DAG from a file whose directory can anchor relative paths.
+- Each input requires `name` and `path`.
+- A path-backed output requires `name` and `path`. It cannot also declare a value `type`.
+- A step may declare at most one path-backed output.
+- Names must start with a letter and contain only letters, digits, or `_`.
+- Path declarations are supported only on host command and shell steps without DAG-level or step-level containers.
+- Output parent directories must already exist.
+
+| Reference | Meaning |
+| --- | --- |
+| `${inputs.<name>}` | Absolute final path of the owning step's declared input |
+| `${outputs.<name>}` | Fresh, initially absent staging path for the current executor attempt |
+| `${steps.<step_id>.outputs.<name>}` | Absolute final output path after commit or reuse |
+
+`${inputs.*}` and `${outputs.*}` are step-scoped. Use `${outputs.<name>}` only in command text, scripts, arguments, and executor environment where an attempt staging path exists. Path declarations may use stable parameters and environment values, but must resolve before execution; do not derive them from step outputs or command substitution.
+
+## Dependency and Path Rules
+
+- Matching canonical producer outputs and consumer inputs create inferred dependencies.
+- Each canonical output path must have exactly one producer.
+- A step cannot declare the same canonical path as both input and output.
+- Explicit and inferred dependencies must remain acyclic.
+- Inputs and outputs must be regular, non-symlink files. Inputs must exist when the step is evaluated.
+
+## Reuse and Publication Safety
+
+A reusable step has exactly one path-backed output and a stable host command or shell recipe. Steps with dynamic or scalar output surfaces, secrets, repeat, human tasks, approvals, parallel or foreach bodies, child DAGs, or containers execute normally instead of being reused.
+
+Dagu hashes the resolved recipe, declared input contents, and current output. A matching materialization produces a `reuse` decision and a succeeded node. Changed inputs, recipe, environment, tools, working directory, missing output, or modified output produce an `execute` decision.
+
+The default per-run scratch directory is normalized in the recipe digest, so a different run ID does not prevent reuse by itself. An authored working directory remains part of the recipe and changing it requires execution.
+
+Always write the result to `${outputs.<name>}`. Dagu verifies the staged file and input snapshots before atomically replacing the final output. Writing directly to the final output bypasses that contract. `stdout`, `stderr`, `stdout.artifact`, and `stderr.artifact` destinations cannot target any declared build input or output.
+
+Potentially reusable producers expose downstream data only through `${steps.<step_id>.outputs.<name>}`. Do not read `${step_id.stdout}`, `${step_id.stderr}`, or `${step_id.exit_code}` from them. This also applies to `${step_id.output.<name>}` and `${step_id.outputs.<name>}`, including their whole-value `${step_id.output}` and `${step_id.outputs}` forms, because reuse does not recreate attempt results. Path-output steps also cannot use `continue_on.mark_success`; failed attempts must not expose an old or missing final file as a successful publication.
+
+Each retry receives a new staging path. A failed, timed-out, or aborted attempt removes its staging file and leaves the previous final output and manifest unchanged.
+Crash recovery refuses to overwrite a final output that was externally replaced with content matching neither the previous nor the proposed materialization.
+
+## Execution Controls
+
+Build workflows are local-only. Distributed execution is rejected because workers do not share the required materialization fencing.
+
+Preview decisions without executing:
+
+```sh
+dagu dry workflow.yaml
+```
+
+Disable reuse for one run without disabling staging or commit safety:
+
+```sh
+dagu start --no-reuse workflow.yaml
+dagu enqueue --no-reuse workflow.yaml
+dagu dry --no-reuse workflow.yaml
+```
+
+In the Web UI, enable **Disable reuse for this run** in the Start or Enqueue dialog. REST and MCP `dagu_execute` clients can send `noReuse: true` for start or enqueue.
+
+---
+
+# External CLI Harnesses
+
+Use `action: harness.run` to invoke external coding agents from DAG steps. Dagu selects the configured provider; its executable must be installed on the host or available in the selected container.
 
 ## Supported Providers
 
-| Provider | Runtime | Invocation |
-|----------|---------|------------|
-| `builtin` | In-process Dagu agent | Uses Dagu's agent executor. It is not a CLI process. |
-| `claude` | `claude` | `claude -p "<prompt>" [flags]` |
-| `codex` | `codex` | `codex exec "<prompt>" [flags]` |
-| `copilot` | `copilot` | `copilot -p "<prompt>" [flags]` |
-| `opencode` | `opencode` | `opencode run "<prompt>" [flags]` |
-| `pi` | `pi` | `pi -p "<prompt>" [flags]` |
+| Provider | Binary | Invocation | Supplementary input |
+|----------|--------|------------|---------------------|
+| `aider` | `aider` | `aider --message "<prompt>" [flags]` | Folded into the prompt |
+| `amp` | `amp` | `amp -x "<prompt>" [flags]` | Piped to stdin |
+| `claude` | `claude` | `claude -p "<prompt>" [flags]` | Piped to stdin |
+| `cline` | `cline` | `cline [flags] "<prompt>"` | Piped to stdin |
+| `codex` | `codex` | `codex exec "<prompt>" [flags]` | Piped to stdin |
+| `copilot` | `copilot` | `copilot -p "<prompt>" [flags]` | Piped to stdin |
+| `cursor` | `cursor-agent` | `cursor-agent -p "<prompt>" [flags]` | Folded into the prompt |
+| `deepseek` | `dsh` | `dsh --profile headless [flags] "<prompt>"` | Folded into the prompt |
+| `droid` | `droid` | `droid exec "<prompt>" [flags]` | Folded into the prompt |
+| `gemini` | `gemini` | `gemini -p "<prompt>" [flags]` | Piped to stdin |
+| `goose` | `goose` | `goose run --text "<prompt>" [flags]` | Folded into the prompt |
+| `kiro` | `kiro-cli` | `kiro-cli chat --no-interactive "<prompt>" [flags]` | Piped to stdin |
+| `opencode` | `opencode` | Managed session or `opencode run "<prompt>" [flags]` | Piped to stdin on the CLI path |
+| `pi` | `pi` | `pi -p "<prompt>" [flags]` | Piped to stdin |
+| `qwen` | `qwen` | `qwen -p "<prompt>" [flags]` | Piped to stdin |
 
-The selected CLI provider's binary must be resolvable when it runs. Dagu CLI providers use `PATH`. Custom harnesses can use a binary name or an explicit path resolved from the step working directory.
+Codex defaults to `skip_git_repo_check: true`, so its default invocation includes `--skip-git-repo-check`. Set `skip_git_repo_check: false` or `skip-git-repo-check: false` to omit it.
+
+Cursor defaults to `output_format: text`, and Goose defaults to `quiet: true`. Explicit values in `with` override these defaults.
+
+The `deepseek` adapter targets the official DeepSeek Harness `dsh` CLI and its headless profile. It does not select DeepSeek as the model backend for another harness.
+
+Claude's `bare` flag skips keychain reads among other things, so a subscription login is invisible to the step and the run fails with `Not logged in`. Set it only when the credential comes from `ANTHROPIC_API_KEY` in the step environment.
+
+For host subprocess runs, built-in provider adapters resolve binaries through `PATH`. Host custom harnesses can use a binary name or an explicit path; relative paths with a path separator are resolved from the step working directory. For containerized runs, the binary is executed inside the selected container and must be valid there.
 
 ## Feature Reference
 
-- `with.prompt` is required. In `action: harness.run`, it becomes the step command and is preserved as prompt text, including multiline text.
-- `with.stdin` becomes the step script. `provider: builtin` appends it to the user message after a blank line. Host subprocess runs pass it to stdin. Containerized harness runs reject stdin.
-- `provider: builtin` runs Dagu's in-process agent. It accepts builtin agent fields such as `model`, `max_iterations`, `safe_mode`, `skills`, `tools`, `memory`, and `web_search`. It rejects pass-through CLI flags.
-- Dagu CLI providers are `claude`, `codex`, `copilot`, `opencode`, and `pi`. Non-reserved `with` keys become CLI flags.
-- Custom providers must be declared under top-level `harnesses:`. Custom names cannot collide with built-in provider names.
+- `with.prompt` is required and is passed to the selected provider according to its built-in adapter or custom harness definition. Multiline prompt text is preserved.
+- `with.stdin` is optional supplementary input for host subprocess runs. Each built-in adapter either pipes it to stdin or folds it into the prompt as shown above. Containerized harness runs reject it.
+- Built-in provider adapters are `aider`, `amp`, `claude`, `cline`, `codex`, `copilot`, `cursor`, `deepseek`, `droid`, `gemini`, `goose`, `kiro`, `opencode`, `pi`, and `qwen`. Non-reserved `with` keys become CLI flags.
+- Custom providers must be declared under top-level `harnesses:`. A non-null custom definition shadows a built-in provider with the same name; deleting the custom definition exposes the built-in again.
 - `fallback` is an ordered list of provider configs. Dagu tries the next config only when the previous attempt fails and the run context is still active. Fallback configs cannot contain another `fallback`.
 - `provider` may use value references only if they resolve to a concrete provider string before executor creation. If `${...}` remains unresolved at runtime, the harness fails with an unresolved provider template error.
 - `provider` and `fallback` are harness control keys. They are not passed as CLI flags.
 
+### Managed OpenCode Sessions
+
+Built-in `provider: opencode` steps use a managed OpenCode server session by default when they run from a standalone Dagu server, from `dagu start-all`, or on a distributed worker. The run page shows the agent timeline and lets an operator answer permission requests and questions. Each managed step has its own conversation by default; runs with multiple managed steps provide a step selector in the Agent tab. A waiting answer suspends the step durably; Dagu resumes the same OpenCode session on the host that owns it. The final assistant text becomes step stdout.
+
+Managed mode starts one process-local OpenCode server under the Dagu service identity. Install a compatible `opencode` executable for that service and authenticate it with `opencode auth login` (normally stored in `~/.local/share/opencode/auth.json`) or pass selected provider credentials through the service configuration:
+
+```yaml
+opencode:
+  executable: opencode
+  env_passthrough:
+    - OPENAI_API_KEY
+```
+
+The equivalent environment variables are `DAGU_OPENCODE_EXECUTABLE` and `DAGU_OPENCODE_ENV_PASSTHROUGH`. A DAG-level `tools:` or `secrets:` declaration affects step subprocesses and supplies only the CLI integration, not the long-lived managed server.
+
+Managed mode forces OpenCode sharing off and does not support `share`; explicit sharing uses the CLI integration and may publish the conversation at a public URL.
+
+Managed options are `agent`, `model`, `variant`, `session`, `fork`, `title`, `file`, `command`, and `format: default`. Set `managed: false` to force the one-shot CLI. Options outside that set, `share`, non-default formats, containers, standalone scheduler launches, embedded-engine runs, and direct Dagu CLI execution use the CLI integration. Set `managed: true` to require managed mode and fail clearly when the current execution topology or provider capabilities cannot support it. Automatic mode may fall back only before a managed session is created.
+
+“Allow for this Dagu session” applies only provider-proposed wildcard patterns to the current Dagu session generation; Dagu never grants OpenCode's process-wide `always` permission. Dagu-created and forked sessions are retained until the DAG run is cleaned up, which also removes their provider resources. Sessions supplied with `session:` remain externally owned and are retained.
+
+If the owning worker or OpenCode server disappears, the step remains waiting and the run page offers a clean-session restart. A clean restart discards the conversation and pending interaction, then submits the original prompt to a new session. A retry after a terminal session error also submits the original prompt in a new session generation. Previous Dagu-owned sessions remain available until DAG-run cleanup, and files already changed in the shared workspace are not reverted.
+
+OpenCode persists managed conversations in the Dagu service user's OpenCode data directory; run `opencode debug paths` as that user to locate it. Dagu stores the session reference and UI timeline with the DAG run. If OpenCode's session data is lost, Dagu remains running and marks the affected step unavailable. Use **Start clean session** to create a new conversation and submit the original prompt again.
+
+The managed server is a shared service-identity boundary for trusted workflows. Use separate Dagu workers or containerized CLI execution when workflows require isolation from one another. Managed compatibility is capability-checked at startup; OpenCode v1.18.11 is the currently tested release.
+
 ## How `with` Works
 
-Harness supports Dagu providers and named custom harness definitions:
+Harness supports built-in provider adapters and named custom harness definitions:
 
-- `with.provider` selects `builtin`, a Dagu CLI provider, or a custom `harnesses:` entry
+- `with.provider` selects a built-in provider adapter or a custom `harnesses:` entry
 - top-level `harnesses.<name>` defines how to invoke a custom harness CLI
 
-For Dagu CLI providers and custom providers, non-reserved `with` keys are passed directly as CLI flags:
+For built-in provider adapters and custom providers, non-reserved `with` keys are passed directly as CLI flags:
 
 - `key: "value"` → `--key value`
 - `key: true` → `--key`
 - `key: false` → omitted
 - `key: 123` → `--key 123`
-- Dagu CLI providers also normalize `snake_case` keys to kebab-case flags, so `max_turns` becomes `--max-turns`
+- Arrays repeat the flag once per item
+- Built-in provider adapters also normalize `snake_case` keys to kebab-case flags, so `max_turns` becomes `--max-turns`
 
-Reserved keys are `prompt`, `stdin`, `provider`, and `fallback`.
+Reserved keys are `prompt`, `stdin`, `provider`, `fallback`, and `managed`.
 
 ## Custom Harness Registry
 
@@ -1333,9 +1735,8 @@ Define reusable custom harness adapters once at the DAG level:
 
 ```yaml
 harnesses:
-  gemini:
+  gemini-custom:
     binary: gemini
-    prefix_args: ["run"]
     prompt_mode: flag
     prompt_flag: --prompt
     option_flags:
@@ -1346,7 +1747,7 @@ steps:
     action: harness.run
     with:
       prompt: "Review the current branch"
-      provider: gemini
+      provider: gemini-custom
       model: gemini-2.5-pro
 ```
 
@@ -1368,7 +1769,6 @@ Use top-level `harness:` to define shared defaults for every harness step in the
 harness:
   provider: claude
   model: sonnet
-  bare: true
   fallback:
     - provider: codex
       full-auto: true
@@ -1405,13 +1805,15 @@ Merge rules:
 - Step-level `with` overlays it
 - Step-level `with.fallback` replaces DAG-level `fallback`
 - Step-level `with.fallback: []` disables inherited fallback
-- New DAGs should use `action: harness.run`; legacy `type: harness` inference exists only for backward compatibility.
+- New DAGs should use `action: harness.run`. Legacy step-level `type: harness` remains loadable for backward compatibility.
+- A top-level `harness:` config only supplies defaults. It does not set the type of a step that does not name one, so shell `run:` steps can sit alongside harness steps in the same DAG.
+- A step that named its prompt with a bare `command:`, relying on the removed inference, is rejected while loading. Port it to `action: harness.run` with `with.prompt`, and `with.stdin` where it used `script:`.
 
 ## Containerized Harness Steps
 
 `container:` is optional for `harness.run`. It can be defined at the DAG root or on a specific harness step.
 
-Use root-level `container:` when all compatible steps should run in the same DAG-level container. Dagu starts or attaches to that container for the run. A harness step without its own `container:` executes the provider CLI inside that shared container.
+Use root-level `container:` when all compatible steps should run in the same DAG-level container. Image-mode root containers create a shared container for the run; `container.exec` uses an existing container. A harness step without its own `container:` executes the provider CLI inside that shared container.
 
 ```yaml
 container:
@@ -1455,9 +1857,8 @@ steps:
 Container rules:
 
 - The selected provider binary must exist inside the container that runs the step.
-- Dagu CLI providers and custom providers with `prompt_mode: arg` or `prompt_mode: flag` can run in a container.
-- `provider: builtin` cannot run in a container because it is an in-process provider.
-- `with.stdin` is not supported in a container.
+- Built-in provider adapters and custom providers with `prompt_mode: arg` or `prompt_mode: flag` can run in a container.
+- `with.stdin` is not supported in a container. Step-level container plus `with.stdin` is rejected during DAG validation; root shared-container stdin is rejected when the harness step runs.
 - Custom providers with `prompt_mode: stdin` are not supported in a container.
 - A step-level image-mode container creates a container for the step. Dagu uses the provider binary as the container entrypoint and passes provider arguments as the command.
 - Do not set `container.name` for image-mode harness steps. Use `container.exec` when the step must execute inside an existing container.
@@ -1469,28 +1870,41 @@ Container rules:
 - Provider flags still belong under `with:`. For example, Codex `sandbox: workspace-write` configures Codex inside the outer container boundary.
 - Docker or Podman is selected by the Dagu service process. This is not configured in the DAG YAML.
 
-## Pattern 1: Single Agent Step
+## Pattern 1: Checkout a Repository and Run a Harness
 
 ```yaml
-params:
-  - PROMPT: "Explain the main function in this project"
+name: review-repository
+type: graph
 
-harness:
-  provider: claude
-  model: sonnet
-  bare: true
+params:
+  - REPOSITORY: https://github.com/dagucloud/dagu.git
+  - REF: main
+  - PROMPT: "Review this repository and identify the highest-impact improvement."
 
 steps:
-  - id: run_agent
+  - id: checkout
+    action: git.checkout
+    with:
+      repository: "${params.REPOSITORY}"
+      ref: "${params.REF}"
+      path: "${context.paths.work_dir}/repo"
+
+  - id: review
+    depends: [checkout]
+    working_dir: "${context.paths.work_dir}/repo"
     action: harness.run
     with:
+      provider: opencode
+      model: openrouter/deepseek/deepseek-v4-flash
       prompt: "${params.PROMPT}"
-    output: RESULT
+    timeout_sec: 600
 ```
 
-## Pattern 2: Multi-Agent Pipeline
+`git.checkout` clones the repository when the target is absent and refreshes an existing checkout otherwise. The per-run work directory gives concurrent DAG runs separate checkouts, keeps the workspace available for retries, and removes it when the DAG run is cleaned up.
 
-Chain agents, passing output between steps via env-scope `output:` variables or `${step_id.stdout}` file references.
+## Pattern 2: Multiple Harness Steps
+
+Chain harness steps that invoke external CLIs, passing output between steps via env-scope `output:` variables or `${step_id.stdout}` file references.
 
 ```yaml
 type: graph
@@ -1505,7 +1919,6 @@ steps:
       prompt: "Research every approach to: ${params.topic}. List all approaches with pros, cons, and when to use each."
       provider: claude
       model: sonnet
-      bare: true
     output: RESEARCH
 
   - id: review
@@ -1535,12 +1948,11 @@ steps:
         ${env.REVIEW}
       provider: claude
       model: sonnet
-      bare: true
     depends: [review]
     output: REFINED
 ```
 
-`with.prompt` is the prompt. For host subprocess runs, Dagu CLI providers and custom `arg`/`flag` harnesses receive `with.stdin` on stdin as supplementary context. For host subprocess custom `stdin` harnesses, stdin receives the prompt, then a blank line, then `with.stdin` when both are present.
+`with.prompt` is the prompt. For host subprocess runs, built-in adapters handle `with.stdin` according to the provider table. Custom `arg`/`flag` harnesses receive it on stdin. For custom `stdin` harnesses, stdin receives the prompt, then a blank line, then `with.stdin` when both are present.
 
 ## Pattern 3: Parameterized
 
@@ -1577,7 +1989,6 @@ steps:
       max-budget-usd: 2.00
       permission-mode: auto
       allowed-tools: "Bash,Read,Edit"
-      bare: true
     timeout_sec: 300
     output: RESULT
 ```
@@ -1624,7 +2035,7 @@ steps:
     with:
       prompt: "Refactor the database layer"
       provider: opencode
-      format: json
+      model: openrouter/deepseek/deepseek-v4-flash
     timeout_sec: 300
 ```
 
@@ -1642,14 +2053,26 @@ steps:
     timeout_sec: 300
 ```
 
+### DeepSeek Harness
+
+```yaml
+steps:
+  - id: task
+    action: harness.run
+    with:
+      prompt: "Review the current branch and fix the failing tests"
+      provider: deepseek
+    timeout_sec: 300
+```
+
 ## Notes
 
 1. **Model names** — Look up current model names from each provider's documentation. Do not rely on hardcoded names; they change frequently.
 2. **Prompt as a parameter** — Expose the prompt via `params:` so users can customize from UI/CLI without editing the DAG.
-3. **Timeouts** — Set `timeout_sec:` (300-600s+) on agent steps. Agent CLIs can run for minutes.
+3. **Timeouts** — Set `timeout_sec:` (300-600s+) on harness steps. External CLI providers can run for minutes.
 4. **Retry on transient failures** — Add `retry_policy: { limit: 3, interval_sec: 30 }` to handle rate limits and network errors.
 5. **Working directory** — Use `working_dir:` on the step. The CLI operates relative to this directory.
-6. **Output capture** — Use string-form `output: VAR_NAME` for small flat values, declared `outputs:` for explicit `${steps.<step_id>.outputs.<name>}` values, object-form `output:` for structured `${step_id.output.*}` access, and `stdout.artifact` / `stderr.artifact` when large agent output, reports, JSON, Markdown, or logs should be stored as DAG-run artifacts. Use `${step_id.stdout}` only when a downstream step needs the stdout log file path.
-7. **Exit codes** — 0 = success, 1 = provider error, 124 = step timed out or cancelled.
+6. **Output capture** — Use string-form `output: VAR_NAME` for small flat values, declared `outputs:` for explicit `${steps.<step_id>.outputs.<name>}` values, object-form `output:` for structured `${step_id.output.*}` access, and `stdout.artifact` / `stderr.artifact` when large provider output, reports, JSON, Markdown, or logs should be stored as DAG-run artifacts. Use `${step_id.stdout}` only when a downstream step needs the stdout log file path.
+7. **Exit codes** — `0` means success. Provider process or container failures keep the provider's exit code when available; setup and internal errors use `1`; timeout and cancellation paths use `124`.
 8. **Failure output** — Recent stderr is included in the error message on failure. When failed stdout exists, Dagu also includes a recent stdout tail and writes that tail to stderr.
-9. **Fallback behavior** — If the primary harness config fails and the context is still active, fallback entries are tried in order. Failed-attempt stdout is discarded; stderr remains visible in logs.
+9. **Fallback behavior** — If the primary harness config fails and the context is still active, fallback entries are tried in order. Failed-attempt stdout is not emitted to step stdout; its recent tail may be written to stderr and included in failure diagnostics. Stderr from failed attempts remains visible in logs.

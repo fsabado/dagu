@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -106,6 +106,19 @@ func TestMiddleware_APIKeyValidation(t *testing.T) {
 	assert.Equal(t, "apikey:key-id-1", handler.user.ID)
 	assert.Equal(t, "apikey:test-key", handler.user.Username)
 	assert.Equal(t, auth.RoleManager, handler.user.Role)
+}
+
+func TestMiddleware_IgnoresTrustedProxyIdentityHeaders(t *testing.T) {
+	middleware := Middleware(Options{AuthRequired: true, JWTValidator: newMockTokenValidator()})
+	handler := &testHandler{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+	req.Header.Set("X-Proxy-User", "forged-user")
+	req.Header.Set("X-Proxy-Groups", "admins")
+	resp := httptest.NewRecorder()
+	middleware(handler).ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusUnauthorized, resp.Code)
+	assert.Nil(t, handler.user)
 }
 
 func TestMiddleware_APIKeyRequiredSurface(t *testing.T) {

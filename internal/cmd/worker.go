@@ -8,11 +8,10 @@ import (
 	"log/slog"
 	"os"
 
-	cmdprocess "github.com/dagucloud/dagu/internal/cmd/process"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/internal/service/coordinator"
-	"github.com/dagucloud/dagu/internal/service/worker"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/worker"
 	"github.com/spf13/cobra"
 )
 
@@ -105,12 +104,14 @@ func runWorker(ctx *Context, _ []string) error {
 		ctx.Config,
 	)
 
+	stores := ctx.runtimeStores()
 	handlerCfg := worker.RemoteTaskHandlerConfig{
-		WorkerID:           workerID,
-		CoordinatorClient:  coordinatorCli,
-		PeerConfig:         ctx.Config.Core.Peer,
-		Config:             ctx.Config,
-		AgentStoresFactory: cmdprocess.NewRuntimeAgentStores,
+		WorkerID:          workerID,
+		CoordinatorClient: coordinatorCli,
+		PeerConfig:        ctx.Config.Core.Peer,
+		Config:            ctx.Config,
+		SecretStore:       stores.SecretStore,
+		ProfileStore:      stores.ProfileStore,
 	}
 	w.SetHandler(worker.NewRemoteTaskHandler(handlerCfg))
 	logger.Info(ctx, "Using remote task handler")
@@ -141,5 +142,5 @@ func runWorker(ctx *Context, _ []string) error {
 
 // createCoordinatorClient creates the worker coordinator client.
 func createCoordinatorClient(ctx *Context) (coordinator.Client, error) {
-	return cmdprocess.NewWorkerCoordinatorClient(ctx.Context, ctx.Config)
+	return worker.NewCoordinatorClient(ctx.Context, ctx.Config)
 }

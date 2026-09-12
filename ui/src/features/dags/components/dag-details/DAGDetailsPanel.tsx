@@ -7,7 +7,6 @@ import { Maximize2, X } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { components } from '../../../../api/v1/schema';
-import { usePageContext } from '../../../../contexts/PageContext';
 import {
   RemoteNodeProvider,
   useRemoteNode,
@@ -27,6 +26,8 @@ import LoadingIndicator from '@/components/ui/loading-indicator';
 import { DAGContext } from '../../contexts/DAGContext';
 import { RootDAGRunContext } from '../../contexts/RootDAGRunContext';
 import DAGDetailsContent from './DAGDetailsContent';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
 
 function formatDuration(startDate: string, endDate: string): string {
   if (!startDate || !endDate) {
@@ -61,7 +62,6 @@ function DAGDetailsPanel({
   onNavigate,
 }: Props): React.ReactElement | null {
   const navigate = useNavigate();
-  const { setContext } = usePageContext();
   const remoteNode = useRemoteNode();
 
   const [currentDAGRun, setCurrentDAGRun] = useState<
@@ -70,19 +70,6 @@ function DAGDetailsPanel({
   const [trackedDagRunId, setTrackedDagRunId] = useState<string>();
   const [activeTab, setActiveTab] = useState('status');
   const [notFound, setNotFound] = useState(false);
-
-  // Set page context for agent chat
-  useEffect(() => {
-    if (fileName) {
-      setContext({
-        dagFile: fileName,
-        source: 'dag-details-panel',
-      });
-    }
-    return () => {
-      setContext(null);
-    };
-  }, [fileName, setContext]);
 
   const dagSSE = useDAGSSE(fileName, !!fileName, remoteNode);
   // Fetch DAG details — SWR is the single source of truth, refreshed by live invalidations
@@ -228,9 +215,9 @@ function DAGDetailsPanel({
   if (notFound) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-4 text-muted-foreground">
-        <p className="text-sm">DAG not found or has been deleted.</p>
+        <p className="text-sm"><I18nText text={"DAG not found or has been deleted."} /></p>
         <Button variant="outline" size="sm" onClick={onClose}>
-          Close Tab
+          <I18nText text={"Close Tab"} />
         </Button>
       </div>
     );
@@ -270,33 +257,32 @@ function DAGDetailsPanel({
             <div className="px-2 pt-2 w-full flex flex-col h-full overflow-hidden">
               <div className="flex justify-between items-center mb-2 flex-shrink-0 pr-4">
                 <p className="text-xs text-muted-foreground">
-                  Use{' '}
+                  <I18nText text={"Use"} />{' '}
                   <kbd className="px-1 py-0.5 bg-muted rounded text-xs font-mono">
                     ↑
                   </kbd>{' '}
                   <kbd className="px-1 py-0.5 bg-muted rounded text-xs font-mono">
                     ↓
                   </kbd>{' '}
-                  to navigate DAGs
+                  <I18nText text={"to navigate DAGs"} />
                 </p>
                 <div className="flex gap-2">
-                  <Button
+                  <I18nProps><Button
                     size="icon"
                     onClick={handleFullscreenClick}
                     title="Open in fullscreen (F) - Cmd/Ctrl+Click to open in new tab"
                   >
                     <Maximize2 className="h-4 w-4" />
-                  </Button>
-                  <Button size="icon" onClick={onClose} title="Close (Esc)">
+                  </Button></I18nProps>
+                  <I18nProps><Button size="icon" onClick={onClose} title="Close (Esc)">
                     <X className="h-4 w-4" />
-                  </Button>
+                  </Button></I18nProps>
                 </div>
               </div>
 
               <div className={contentClassName}>
                 <DAGDetailsContent
                   fileName={fileName}
-                  filePath={data.filePath}
                   dag={data.dag}
                   currentDAGRun={displayDAGRun}
                   refreshFn={refreshFn}

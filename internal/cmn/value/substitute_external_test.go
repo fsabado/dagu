@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,6 +39,18 @@ func TestBuildShellCommandDoesNotDuplicateCommandFlag(t *testing.T) {
 	cmd := value.BuildShellCommandForTest("pwsh -NoProfile -Command", "echo hello")
 
 	assert.Equal(t, []string{"-NoProfile", "-NonInteractive", "-Command", "echo hello"}, cmd.Args[1:])
+}
+
+func TestBuildShellCommandDoesNotDuplicatePowerShellAliasFlag(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("pwsh -NoProfile -C", "echo hello")
+
+	assert.Equal(t, []string{"-NoProfile", "-NonInteractive", "-C", "echo hello"}, cmd.Args[1:])
+}
+
+func TestBuildShellCommandUsesNixShellCommandFlag(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("nix-shell", "echo hello")
+
+	assert.Equal(t, []string{"--run", "echo hello"}, cmd.Args[1:])
 }
 
 func TestBuildShellCommandKeepsExistingShellPathWithSpaces(t *testing.T) {

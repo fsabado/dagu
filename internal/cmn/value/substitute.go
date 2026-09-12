@@ -10,18 +10,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 )
 
 func substituteCommandTimeout() time.Duration {
 	if runtime.GOOS == "windows" {
-		return 10 * time.Second
+		// Cold-start of powershell.exe (JIT + antivirus scan) can exceed 10s
+		// on a fresh machine before process caches warm up.
+		return 30 * time.Second
 	}
 	return 2 * time.Second
 }
@@ -36,15 +37,8 @@ func buildShellCommandContext(ctx context.Context, shell, cmdStr string) *exec.C
 		return exec.CommandContext(ctx, "sh", "-c", cmdStr) //nolint:gosec
 	}
 
-	shell, shellArgs := splitShellCommand(shell)
-	switch strings.ToLower(filepath.Base(shell)) {
-	case "powershell.exe", "powershell", "pwsh.exe", "pwsh":
-		return exec.CommandContext(ctx, shell, appendPowerShellCommandArgs(shellArgs, cmdStr)...) //nolint:gosec
-	case "cmd.exe", "cmd":
-		return exec.CommandContext(ctx, shell, appendShellCommandArgs(shellArgs, "/c", cmdStr)...) //nolint:gosec
-	default:
-		return exec.CommandContext(ctx, shell, appendShellCommandArgs(shellArgs, "-c", cmdStr)...) //nolint:gosec
-	}
+	name, args := splitShellCommand(shell)
+	return exec.CommandContext(ctx, name, buildShellArgsForCommand(name, args, cmdStr)...) //nolint:gosec
 }
 
 func splitShellCommand(shell string) (string, []string) {
@@ -61,7 +55,7 @@ func splitShellCommand(shell string) (string, []string) {
 
 func appendPowerShellCommandArgs(args []string, cmdStr string) []string {
 	result := append([]string(nil), args...)
-	commandFlagIndex := shellArgIndex(result, "-Command")
+	commandFlagIndex := shellArgIndex(result, "-Command", "-C")
 	if commandFlagIndex < 0 {
 		commandFlagIndex = len(result)
 	}
@@ -75,7 +69,10 @@ func appendPowerShellCommandArgs(args []string, cmdStr string) []string {
 		prefix = append(prefix, "-NonInteractive")
 	}
 	result = append(prefix, suffix...)
-	return appendShellCommandArgs(result, "-Command", cmdStr)
+	if !hasShellArg(result, "-Command", "-C") {
+		result = append(result, "-Command")
+	}
+	return append(result, cmdStr)
 }
 
 func appendShellCommandArgs(args []string, flag, cmdStr string) []string {
@@ -86,17 +83,19 @@ func appendShellCommandArgs(args []string, flag, cmdStr string) []string {
 	return append(result, cmdStr)
 }
 
-func shellArgIndex(args []string, flag string) int {
+func shellArgIndex(args []string, flags ...string) int {
 	for i, arg := range args {
-		if strings.EqualFold(arg, flag) {
-			return i
+		for _, flag := range flags {
+			if strings.EqualFold(arg, flag) {
+				return i
+			}
 		}
 	}
 	return -1
 }
 
-func hasShellArg(args []string, flag string) bool {
-	return shellArgIndex(args, flag) >= 0
+func hasShellArg(args []string, flags ...string) bool {
+	return shellArgIndex(args, flags...) >= 0
 }
 
 // runCommandWithContext executes cmdStr in a shell using the EnvScope from context,
@@ -105,7 +104,15 @@ func runCommandWithContext(ctx context.Context, cmdStr string) (string, error) {
 	commandCtx, cancel, timeout := withCommandTimeout(ctx, substituteCommandTimeout())
 	defer cancel()
 
-	cmd := buildShellCommandContext(commandCtx, shellCommandFromContext(ctx), cmdStr)
+	var cmd *exec.Cmd
+	if shell, ok := commandSubstitutionShellFromContext(ctx); ok {
+		cmd = buildShellCommandArgsContext(commandCtx, shell, cmdStr)
+	} else {
+		cmd = buildShellCommandContext(commandCtx, shellCommandFromContext(ctx), cmdStr)
+	}
+	if dir, ok := commandSubstitutionWorkingDirFromContext(ctx); ok {
+		cmd.Dir = dir
+	}
 
 	if scope := GetEnvScope(ctx); scope != nil {
 		cmd.Env = scope.ToSlice()
@@ -132,6 +139,23 @@ func runCommandWithContext(ctx context.Context, cmdStr string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+func buildShellCommandArgsContext(ctx context.Context, shell []string, cmdStr string) *exec.Cmd {
+	if len(shell) == 0 {
+		return buildShellCommandContext(ctx, "", cmdStr)
+	}
+
+	name := shell[0]
+	args := append([]string(nil), shell[1:]...)
+	return exec.CommandContext(ctx, name, buildShellArgsForCommand(name, args, cmdStr)...) //nolint:gosec
+}
+
+func buildShellArgsForCommand(name string, args []string, cmdStr string) []string {
+	if cmdutil.IsPowerShell(name) {
+		return appendPowerShellCommandArgs(args, cmdStr)
+	}
+	return appendShellCommandArgs(args, cmdutil.ShellCommandFlag(name), cmdStr)
+}
+
 func shellCommandFromContext(ctx context.Context) string {
 	if cfg := config.GetConfig(ctx); cfg != nil && cfg.Core.DefaultShell != "" {
 		return cmdutil.GetShellCommand(cfg.Core.DefaultShell)
@@ -144,6 +168,28 @@ func shellCommandFromContext(ctx context.Context) string {
 	}
 
 	return cmdutil.GetShellCommand("")
+}
+
+func commandSubstitutionShellFromContext(ctx context.Context) ([]string, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	shell, ok := ctx.Value(commandSubstitutionShellKey{}).([]string)
+	if !ok || len(shell) == 0 {
+		return nil, false
+	}
+	return append([]string(nil), shell...), true
+}
+
+func commandSubstitutionWorkingDirFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	dir, ok := ctx.Value(commandSubstitutionWorkingDirKey{}).(string)
+	if !ok || strings.TrimSpace(dir) == "" {
+		return "", false
+	}
+	return dir, true
 }
 
 func withCommandTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, time.Duration) {
@@ -244,6 +290,25 @@ type shellCommandSubstitutionRead struct {
 	cmd string
 	end int
 	ok  bool
+}
+
+type commandSubstitutionShellKey struct{}
+type commandSubstitutionWorkingDirKey struct{}
+
+// WithCommandSubstitutionShell sets the shell used by command substitutions.
+func WithCommandSubstitutionShell(ctx context.Context, shell []string) context.Context {
+	if ctx == nil || len(shell) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, commandSubstitutionShellKey{}, append([]string(nil), shell...))
+}
+
+// WithCommandSubstitutionWorkingDir sets the working directory used by command substitutions.
+func WithCommandSubstitutionWorkingDir(ctx context.Context, dir string) context.Context {
+	if ctx == nil || strings.TrimSpace(dir) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, commandSubstitutionWorkingDirKey{}, dir)
 }
 
 func readShellCommandSubstitution(runes []rune, start int) (shellCommandSubstitutionRead, error) {

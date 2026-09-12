@@ -15,7 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/dagucloud/dagu/internal/workspace"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
 type ProviderType string
@@ -169,7 +169,7 @@ type Store interface {
 
 	SaveState(ctx context.Context, state *IncidentState) error
 	GetState(ctx context.Context, providerID, dedupKey string) (*IncidentState, error)
-	ListOpenStatesByDAG(ctx context.Context, dagName string) ([]*IncidentState, error)
+	ListOpenStates(ctx context.Context) ([]*IncidentState, error)
 	DeleteState(ctx context.Context, providerID, dedupKey string) error
 }
 

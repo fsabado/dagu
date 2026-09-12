@@ -2,12 +2,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import React from 'react';
-import { components } from '@/api/v1/schema';
+import { components, DAGRunConditionStatus, Status } from '@/api/v1/schema';
 import { Checkbox } from '@/components/ui/checkbox';
 import { useConfig } from '@/contexts/ConfigContext';
+import {
+  humanizeIdentifier,
+  runtimeConditionLabel,
+  RuntimeCondition,
+} from '@/features/dag-runs/components/common/runtimeConditions';
 import dayjs from '@/lib/dayjs';
 import { cn } from '@/lib/utils';
 import StatusChip from '@/components/ui/status-chip';
+import { I18nText } from '@/i18n/I18nText';
+import { I18nProps } from '@/i18n/I18nProps';
+import { useI18n } from '@/i18n/I18nProvider';
 
 type QueueDAGRun = components['schemas']['DAGRunSummary'];
 
@@ -23,6 +31,49 @@ interface QueueRunsTableProps {
   showQueuedAt?: boolean;
 }
 
+const QUEUED_CONDITION_FALLBACK_PRIORITY = [
+  'QueueReady',
+  'RunRecordReady',
+  'ConcurrencyReady',
+  'WorkerReady',
+  'WorkerAssignmentReady',
+  'StartObserved',
+];
+
+function queuedConditionFallbackRank(condition: RuntimeCondition): number {
+  const index = QUEUED_CONDITION_FALLBACK_PRIORITY.indexOf(condition.type);
+  return index === -1 ? QUEUED_CONDITION_FALLBACK_PRIORITY.length : index;
+}
+
+function compareQueuedConditionFallback(
+  left: RuntimeCondition,
+  right: RuntimeCondition
+): number {
+  return (
+    queuedConditionFallbackRank(left) - queuedConditionFallbackRank(right) ||
+    left.type.localeCompare(right.type) ||
+    left.status.localeCompare(right.status) ||
+    (left.reason ?? '').localeCompare(right.reason ?? '') ||
+    (left.checkedAt ?? '').localeCompare(right.checkedAt ?? '')
+  );
+}
+
+function getQueuedConditionSummary(
+  conditions: RuntimeCondition[] | undefined
+): RuntimeCondition | undefined {
+  const runnable = conditions?.find(
+    (condition) =>
+      condition.type === 'Runnable' &&
+      condition.status !== DAGRunConditionStatus.True
+  );
+  return (
+    runnable ??
+    conditions
+      ?.filter((condition) => condition.status !== DAGRunConditionStatus.True)
+      .sort(compareQueuedConditionFallback)[0]
+  );
+}
+
 function QueueRunsTable({
   items,
   onDAGRunClick,
@@ -34,6 +85,7 @@ function QueueRunsTable({
   onToggleAll,
   showQueuedAt = false,
 }: QueueRunsTableProps) {
+  const { ts } = useI18n();
   const config = useConfig();
 
   const formatDateTime = React.useCallback(
@@ -59,34 +111,40 @@ function QueueRunsTable({
             {selectable && (
               <th className="w-10 py-1 px-2 align-middle">
                 <div className="flex h-8 w-8 items-center justify-center">
-                  <Checkbox
-                    aria-label="Select all loaded queue items"
-                    checked={headerCheckboxState}
-                    disabled={disableSelection || items.length === 0}
-                    onCheckedChange={(checked) =>
-                      onToggleAll?.(Boolean(checked))
-                    }
-                  />
+                  <I18nProps>
+                    <Checkbox
+                      aria-label="Select all loaded queue items"
+                      checked={headerCheckboxState}
+                      disabled={disableSelection || items.length === 0}
+                      onCheckedChange={(checked) =>
+                        onToggleAll?.(Boolean(checked))
+                      }
+                    />
+                  </I18nProps>
                 </div>
               </th>
             )}
             <th className="text-left py-1 px-2 font-medium text-muted-foreground">
-              DAG
+              <I18nText text={'DAG'} />
             </th>
             <th className="text-left py-1 px-2 font-medium text-muted-foreground">
-              Status
+              <I18nText text={'Status'} />
             </th>
             <th className="text-left py-1 px-2 font-medium text-muted-foreground">
-              Timing
+              <I18nText text={'Timing'} />
             </th>
             <th className="text-left py-1 px-2 font-medium text-muted-foreground">
-              Run ID
+              <I18nText text={'Run ID'} />
             </th>
           </tr>
         </thead>
         <tbody className="divide-y divide-border/50">
           {items.map((dagRun) => {
             const selected = selectable && Boolean(isSelected?.(dagRun));
+            const queuedConditionSummary =
+              dagRun.status === Status.Queued
+                ? getQueuedConditionSummary(dagRun.conditions)
+                : undefined;
 
             return (
               <tr
@@ -113,7 +171,10 @@ function QueueRunsTable({
                   >
                     <div className="flex h-8 w-8 items-center justify-center">
                       <Checkbox
-                        aria-label={`Select ${dagRun.name} ${dagRun.dagRunId}`}
+                        aria-label={ts('Select {name} {runId}', {
+                          name: dagRun.name,
+                          runId: dagRun.dagRunId,
+                        })}
                         checked={selected}
                         disabled={disableSelection}
                         onCheckedChange={() => onToggleSelection?.(dagRun)}
@@ -134,19 +195,44 @@ function QueueRunsTable({
                     {dagRun.scheduleTime && (
                       <span>
                         <span className="text-muted-foreground/80">
-                          Scheduled{' '}
+                          <I18nText text={'Scheduled'} />{' '}
                         </span>
                         {formatDateTime(dagRun.scheduleTime)}
                       </span>
                     )}
                     <span>
                       <span className="text-muted-foreground/80">
-                        {showQueuedAt ? 'Queued ' : 'Started '}
+                        {showQueuedAt ? (
+                          <I18nText text={'Queued '} />
+                        ) : (
+                          <I18nText text={'Started '} />
+                        )}
                       </span>
                       {formatDateTime(
                         showQueuedAt ? dagRun.queuedAt : dagRun.startedAt
                       )}
                     </span>
+                    {queuedConditionSummary && (
+                      <span className="max-w-[28rem] whitespace-normal break-words leading-snug">
+                        <span className="font-medium text-foreground">
+                          {runtimeConditionLabel(queuedConditionSummary)}
+                        </span>
+                        <span className="text-muted-foreground/90">: </span>
+                        <span className="text-muted-foreground/90">
+                          {queuedConditionSummary.message}
+                        </span>
+                        {queuedConditionSummary.reason && (
+                          <span className="ml-1 text-muted-foreground/80">
+                            <I18nText text={'Reason:'} />{' '}
+                            {humanizeIdentifier(queuedConditionSummary.reason)}
+                          </span>
+                        )}
+                        <span className="ml-1 text-muted-foreground/70">
+                          <I18nText text={'Checked'} />{' '}
+                          {formatDateTime(queuedConditionSummary.checkedAt)}
+                        </span>
+                      </span>
+                    )}
                   </div>
                 </td>
                 <td className="py-1.5 px-2 text-xs text-muted-foreground font-mono">

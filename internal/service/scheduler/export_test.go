@@ -6,9 +6,7 @@ package scheduler
 import (
 	"context"
 
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 )
 
 // TestHooks exposes selected internal scheduler hooks to external tests only.
@@ -18,31 +16,33 @@ type TestHooks struct {
 
 func NewWithHooksForTest(
 	cfg *config.Config,
-	er EntryReader,
-	drm runtime.Manager,
-	dagRunStore exec.DAGRunStore,
-	queueStore exec.QueueStore,
-	procStore exec.ProcStore,
-	reg exec.ServiceRegistry,
-	coordinatorCli exec.Dispatcher,
-	watermarkStore WatermarkStore,
+	deps Dependencies,
 	hooks TestHooks,
 ) (*Scheduler, error) {
 	return newScheduler(
 		cfg,
-		er,
-		drm,
-		dagRunStore,
-		queueStore,
-		procStore,
-		reg,
-		coordinatorCli,
-		watermarkStore,
+		deps.EntryReader,
+		deps.DAGRunManager,
+		deps.DAGRepository,
+		deps.DAGRunRepository,
+		deps.QueueStore,
+		deps.ProcRepository,
+		deps.ServiceRegistry,
+		deps.CoordinatorClient,
+		deps.SchedulerStateStore,
 		schedulerHooks{onLockWait: hooks.OnLockWait},
-		schedulerOptions{},
+		nil,
 	)
 }
 
 func (s *RetryScanner) ScanForTest(ctx context.Context) error {
 	return s.scan(ctx)
+}
+
+func LocalLaunchFailedForTest(err error) bool {
+	return localLaunchFailed(err)
+}
+
+func NewStartupExecutionErrorForTest(err error) error {
+	return newStartupExecutionError(err)
 }

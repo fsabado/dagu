@@ -152,11 +152,9 @@ Protected Dagu-managed root run environment names:
 - `DAG_NAME`
 - `DAG_RUN_ID`
 - `DAG_RUN_LOG_FILE`
-- `DAG_DOCS_DIR`
 - `DAG_RUN_WORK_DIR`
 - `DAG_RUN_ARTIFACTS_DIR`
 - `DAG_PARAMS_JSON`
-- `DAGU_PARAMS_JSON`
 
 Initial current-step Dagu-managed environment names include:
 
@@ -200,8 +198,6 @@ Secret-reserved Dagu-managed environment names include every name starting with
 - `DAG_RUN_STEP_STDERR_FILE`
 - `DAG_RUN_STATUS`
 - `DAG_WAITING_STEPS`
-- `DAGU_PARAMS_JSON`
-- `DAG_DOCS_DIR`
 - `DAG_PARAMS_JSON`
 - `DAG_RUN_WORK_DIR`
 - `DAG_RUN_ARTIFACTS_DIR`
@@ -347,7 +343,7 @@ environment references.
 | `steps[].env` values | Dagu expands while constructing the step environment scope. | Not allowed. |
 | Selected root or step `container.env` values | Dagu expands while constructing the selected container environment scope. | Not allowed. |
 | `dotenv[]` path strings | Dagu expands before loading dotenv files. | Allowed. |
-| `params[].eval` | Dagu expands before dynamic evaluation runs. | Allowed. |
+| `params[].eval`, `preconditions[].eval`, and `steps[].preconditions[].eval` | Dagu expands before dynamic evaluation runs. | Allowed. |
 | `params[].default`, runtime parameter overrides, `secrets[].key`, and `secrets[].options` | Dagu does not expand unqualified environment syntax. | Not applicable. |
 | `shell`, `shell_args[]`, root `working_dir`, `steps[].working_dir`, `preconditions[].condition`, `steps[].preconditions[].condition`, and `steps[].repeat_policy.condition` | Dagu expands against the current environment scope before the field is used. | Not allowed unless the owning field spec explicitly defines a host-process fallback. |
 | `steps[].run` command form, script form, and array entries | Dagu preserves unqualified environment syntax for the selected shell or script interpreter. | Not allowed during Dagu value resolution. |
@@ -538,6 +534,11 @@ Secret-sensitive values:
 - `dagu validate` must report passive notices for unresolved namespaced value
   references, such as `${env.NAME}` and `${steps.step_id.outputs.name}`, in
   inspected value-resolved fields.
+
+- An unresolved `${env.NAME}` is a runtime-only notice, because the operator
+  supplies the value when the workflow runs. `dagu validate` records it and
+  exposes it through the inspection API, and prints it only under
+  `--show-unresolved`.
 
 - `dagu validate` must report passive notices for unresolved unqualified
   `$NAME` and `${NAME}` references in `env` declarations.

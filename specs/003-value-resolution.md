@@ -40,7 +40,7 @@ A workflow author can tell, for each field covered here, whether Dagu will:
 
 - use the field exactly as written
 - resolve Dagu value references
-- run `params[].eval`
+- run a dynamic-evaluated field such as `params[].eval` or precondition `eval`
 - leave shell syntax for a later runtime such as `/bin/sh`
 
 ## Motivation
@@ -84,7 +84,11 @@ Dagu uses three evaluation types.
 | --- | --- |
 | Literal | Dagu uses the value exactly as written. It does not resolve `${...}` and does not run dynamic evaluation. |
 | Value-resolved | Dagu resolves Dagu-owned references such as `${params.name}`. It does not run dynamic evaluation. |
-| Dynamic-evaluated | Dagu runs the dynamic evaluation pipeline. In this spec, only `params[].eval` uses this type. |
+| Dynamic-evaluated | Dagu runs the dynamic evaluation pipeline. In this spec, `params[].eval` and precondition `eval` fields use this type. |
+
+No value-resolved field in this spec set runs Dagu command substitution after
+value resolution. Shell-backed fields may still hand `$()` or backtick text to a
+later shell or script interpreter.
 
 Unqualified environment expansion is a separate field-level ownership decision.
 A value-resolved field always resolves Dagu-owned references defined by this
@@ -229,13 +233,15 @@ Dagu-owned references are supported only in value-resolved fields and dynamic-ev
 | `env` | Value-resolved | Run setup before step execution | Root environment values in map form, array-of-map form, or `KEY=value` list form resolve Dagu-owned references. |
 | `dotenv[]` | Value-resolved | Before dotenv files are loaded | Each dotenv path string resolves Dagu-owned references. |
 | `shell`, `shell_args[]`, `working_dir` | Value-resolved | Before the root field is used | Root shell command, shell args, and working directory resolve Dagu-owned references. |
-| `preconditions[].condition` | Value-resolved | Before checking the precondition | Root precondition condition strings resolve Dagu-owned references. |
+| `preconditions[].condition` | Value-resolved | Before checking the precondition | Root precondition condition strings resolve Dagu-owned references. Value-match conditions treat `$()` and backtick text as ordinary text. Command-check conditions may hand shell syntax to the selected shell. |
+| `preconditions[].eval` | Dynamic-evaluated | Before checking the precondition | Root precondition eval strings are allowed only with `expected`. Dagu resolves Dagu-owned references, then runs dynamic evaluation as defined by Spec 011. |
 | `container` | Value-resolved | Before root container settings are used | Root container string form resolves Dagu-owned references. In object form, `exec`, `image`, `name`, `user`, `working_dir`, `network`, `volumes[]`, `ports[]`, `env` values, `command[]`, and `shell[]` resolve Dagu-owned references. |
 | `steps[].run` | Value-resolved | Step start | The string `run` value and each array-form `run` entry resolve Dagu-owned references. Dagu leaves shell syntax for the selected shell or script interpreter. |
 | `steps[].with` | Value-resolved | Step start | Nested string values under the step `with` object resolve Dagu-owned references unless a more specific row or owning action or executor spec defines another evaluation mode. This includes action inputs and run-step shell settings. |
 | `steps[].working_dir` | Value-resolved | Step start | Step working directory resolves Dagu-owned references. |
 | `steps[].env` | Value-resolved | Step start | Step environment values in map form, array-of-map form, or `KEY=value` list form resolve Dagu-owned references. |
-| `steps[].preconditions[].condition` | Value-resolved | Before checking the step precondition | Step precondition condition strings resolve Dagu-owned references. |
+| `steps[].preconditions[].condition` | Value-resolved | Before checking the step precondition | Step precondition condition strings resolve Dagu-owned references. Value-match conditions treat `$()` and backtick text as ordinary text. Command-check conditions may hand shell syntax to the selected shell. |
+| `steps[].preconditions[].eval` | Dynamic-evaluated | Before checking the step precondition | Step precondition eval strings are allowed only with `expected`. Dagu resolves Dagu-owned references, then runs dynamic evaluation as defined by Spec 011. |
 | `steps[].retry_policy.limit` and `steps[].retry_policy.interval_sec` string forms | Value-resolved | Before the retry policy uses the value | Step retry policy string numeric fields resolve Dagu-owned references. Other retry policy fields remain literal unless an owning spec opts in. |
 | `steps[].repeat_policy.condition` | Value-resolved | Before checking the repeat policy | Repeat condition strings resolve Dagu-owned references. |
 | `steps[].repeat_policy.limit`, `steps[].repeat_policy.interval_sec`, and `steps[].repeat_policy.max_interval_sec` string forms | Value-resolved | Before the repeat policy uses the value | Step repeat policy string numeric fields resolve Dagu-owned references. Other repeat policy fields remain literal unless an owning spec opts in. |
@@ -248,7 +254,9 @@ Dagu-owned references are supported only in value-resolved fields and dynamic-ev
 | `steps[].output.*` | Value-resolved | Output publication | Literal string values and `path` strings under structured step `output` entries resolve Dagu-owned references. |
 | `steps[].container` | Value-resolved | Step start | Step container string form resolves Dagu-owned references. In object form, `exec`, `image`, `name`, `user`, `working_dir`, `network`, `volumes[]`, `ports[]`, `env` values, `command[]`, and `shell[]` resolve Dagu-owned references. |
 | `steps[].messages[].content` | Value-resolved | Step start | Message content strings resolve Dagu-owned references. |
-| LLM prompt and endpoint text fields | Value-resolved | Step start | For LLM-capable steps, `steps[].llm.system`, `steps[].llm.base_url`, and array-form `steps[].llm.model[].base_url` resolve Dagu-owned references. When a step inherits root LLM settings, inherited `llm.system`, `llm.base_url`, and array-form `llm.model[].base_url` follow the same rule. |
+| LLM prompt, selection, and endpoint text fields | Value-resolved | Step start | For LLM-capable steps, `steps[].llm.system`, `steps[].llm.provider`, string-form `steps[].llm.model`, `steps[].llm.base_url`, and array-form `steps[].llm.model[].provider`, `steps[].llm.model[].name`, and `steps[].llm.model[].base_url` resolve Dagu-owned references. A provider name that carries a reference is checked against the supported provider list after resolution, at step start rather than at load time. When a step inherits root LLM settings, the inherited fields follow the same rule. |
+| `worker_selector` (map form) | Value-resolved | DAG build, after base-config composition | Root worker selector keys and values resolve Dagu-owned references, including references to base-config env entries. The string form `worker_selector: local` stays literal. |
+| `steps[].worker_selector` | Value-resolved | Before the sub-DAG run or enqueue request is created | Step worker selector keys and values resolve Dagu-owned references. Parallel children resolve with the item context available as `${ITEM}`. |
 | `secrets[]` | Literal | Secret resolution | Secret names, provider names, provider keys, and provider options are literal strings. |
 
 Explicitly literal or excluded field surfaces:
@@ -260,8 +268,9 @@ Explicitly literal or excluded field surfaces:
 | Step identity, graph, and action-selection fields, such as `steps[].id`, `steps[].name`, `steps[].description`, `steps[].depends`, and `steps[].action` | Dagu does not resolve value references in these fields. A value reference cannot select a step, dependency, or action. |
 | `steps[].foreach.as`, `steps[].foreach.max_concurrent`, and body step identity or dependency fields | Dagu does not resolve value references in these fields. A value reference cannot select an item alias, concurrency limit, body step, or body dependency. |
 | Step output declaration contracts, such as `steps[].outputs[].name` and `steps[].outputs[].type` | Dagu does not resolve value references in declaration metadata. Published output values are separate runtime data. |
-| Step control fields not listed in the value-resolution matrix, such as `steps[].timeout_sec`, `steps[].continue_on`, `steps[].worker_selector`, `steps[].mail_on_error`, and `steps[].signal_on_stop` | Dagu does not resolve value references in these fields unless an owning spec later opts in. |
-| LLM selection and credential fields, such as provider names, model names, API key names, and tool-name lists | This spec does not opt these fields into value resolution. They remain literal unless an LLM-owning spec explicitly opts in. |
+| Step control fields not listed in the value-resolution matrix, such as `steps[].timeout_sec`, `steps[].continue_on`, `steps[].mail_on_error`, and `steps[].signal_on_stop` | Dagu does not resolve value references in these fields unless an owning spec later opts in. |
+| LLM API key names, `steps[].llm.api_key_name` and `steps[].llm.model[].api_key_name` | This spec does not opt these fields into value resolution. The LLM step owns their meaning: the field names an environment variable, and the plain, `$`-prefixed, and braced forms all read that variable. A reference that resolves to a name rather than a key is not supported. |
+| LLM tool-name lists, such as `steps[].llm.tools[]` | This spec does not opt these fields into value resolution. They remain literal unless an LLM-owning spec explicitly opts in. A value reference cannot select a tool DAG. |
 | Template body fields owned by a template action or executor | Dagu does not resolve value references in template body text unless the template-owning spec explicitly opts in. Template data fields that are otherwise covered by `steps[].with` keep the `steps[].with` behavior. |
 | Root executor, provider, and tool configuration fields not listed in the value-resolution matrix, such as `ssh`, `kubernetes`, and `tools` | This spec does not opt these fields into value resolution. They remain literal unless an owning executor, provider, or tool spec explicitly opts in. |
 
@@ -269,7 +278,8 @@ Explicitly literal or excluded field surfaces:
 - Handler step surfaces are `handler_on.init`, `handler_on.success`, `handler_on.failure`, `handler_on.abort`, `handler_on.exit`, and `handler_on.wait`.
 
 - For value-resolved fields, Dagu resolves Dagu-owned references.
-- Dagu does not run dynamic evaluation or command substitution in value-resolved fields.
+- Dagu does not run dynamic evaluation in value-resolved fields.
+- Dagu does not run command substitution in value-resolved fields.
 
 - For `steps[].run`, unqualified `$NAME` and `${NAME}` are shell syntax.
 - Dagu preserves that shell syntax for the selected shell.
@@ -290,10 +300,15 @@ Explicitly literal or excluded field surfaces:
 
 Dagu command substitution is intentionally narrow.
 
-- The only field in this spec authorized to execute command substitution is `params[].eval`.
-- In `params[].eval`, Dagu executes command substitutions written in backtick form or `$()` form as defined by Spec 011.
-- Outside `params[].eval`, Dagu leaves backtick text and `$()` text unchanged.
-- The presence of `$()` or backticks outside `params[].eval` is not a validation error by itself.
+- The only fields in this spec authorized to execute command substitution as
+  dynamic evaluation are `params[].eval`, `preconditions[].eval`, and
+  `steps[].preconditions[].eval`.
+- In those fields, Dagu executes command substitutions written in backtick form or `$()` form as defined by Spec 011.
+- Outside dynamic-evaluated fields, Dagu leaves backtick text and `$()` text
+  unchanged during value resolution.
+- The presence of `$()` or backticks outside dynamic-evaluated fields is not a validation error by itself.
+- A later shell, script interpreter, or command runtime may still interpret
+  preserved `$()` or backtick text after Dagu starts that runtime.
 
 For `steps[].run`, Dagu leaves shell syntax in the resolved run text.
 Examples are `$NAME`, `${NAME}`, `$()`, and backticks.
@@ -322,6 +337,20 @@ Rules:
 - Dagu does not topologically sort parameter declarations and does not retry preserved parameter references after later declarations are processed.
 - If parameter declarations form a reference cycle, at least one reference in that cycle cannot resolve under the source-order rule and follows the unresolved-reference rules.
 
+### Precondition Evaluation
+
+`preconditions[].eval` computes the value compared to `expected`.
+
+Rules:
+
+- `eval` is valid only on a precondition entry that also has `expected`.
+- `eval` and `condition` are mutually exclusive in the same precondition entry.
+- Dagu resolves Dagu-owned references in `eval`, then runs dynamic evaluation.
+- The evaluated value is used only for the current precondition comparison.
+- The evaluated value is not stored as a parameter, step output, run log, event, or artifact.
+- If `eval` fails, checking the precondition is an evaluation error.
+- `eval` has no `default` fallback.
+
 ### Unresolved Supported References
 
 A supported reference can be valid syntax but have no value when Dagu evaluates the field.
@@ -332,7 +361,23 @@ This rule applies only to unescaped supported reference forms.
 Escaped supported-looking text and unsupported braced text must not produce passive notices.
 
 The notice must identify the owning field and the original reference text.
-The notice must not be shown as a normal validation warning.
+
+Each notice must carry a class.
+A notice is a defect when the spec statically cannot resolve the reference. This
+includes a reference that names a step, output, context field, or const the spec
+does not define, and a reference in a field whose owning spec does not provide
+the required lookup scope.
+A notice is runtime-only when the reference is well-formed and its availability
+depends on runtime values or lifecycle scope.
+
+A runtime-only notice must not be shown as a normal validation warning, because
+its availability is a runtime concern rather than a change to the spec.
+`dagu validate` must keep runtime-only notices out of its default output and
+must report them under `--show-unresolved`.
+A defect names something no run can resolve, so `dagu validate` must report it
+by default and may present it at warning level.
+Neither class changes the exit code: a notice is still not a validation error.
+Inspection surfaces that render notices must let a reader tell the two apart.
 Current inspection surfaces are `dagu validate`, the DAG spec inspection API response, and the Web UI spec editor.
 Normal run execution must stay silent.
 Dagu must not write these notices to run logs, workflow events, status files, history files, artifacts, or DAG-run detail responses.

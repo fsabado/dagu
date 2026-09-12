@@ -7,64 +7,13 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/cmn/buildenv"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/core/spec"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestRebuildDAGFromYAML_PreservesJSONSerializedFields(t *testing.T) {
-	t.Parallel()
-
-	// Create a DAG with JSON-serialized fields (typically inherited from base.yaml)
-	dag := &core.DAG{
-		Name:           "test-dag",
-		Queue:          "Default",
-		WorkerSelector: map[string]string{"env": "prod"},
-		MaxActiveRuns:  5,
-		MaxActiveSteps: 3,
-		LogDir:         "/custom/logs",
-		Labels:         core.NewLabels([]string{"important", "production"}),
-		Location:       "/path/to/dag.yaml",
-		YamlData:       []byte("steps:\n  - name: test\n    command: echo hello"),
-	}
-
-	result, err := rebuildDAGFromYAML(context.Background(), dag)
-	require.NoError(t, err)
-
-	// Verify JSON-serialized fields are preserved
-	assert.Equal(t, "Default", result.Queue)
-	assert.Equal(t, map[string]string{"env": "prod"}, result.WorkerSelector)
-	assert.Equal(t, 5, result.MaxActiveRuns)
-	assert.Equal(t, 3, result.MaxActiveSteps)
-	assert.Equal(t, "/custom/logs", result.LogDir)
-	assert.Equal(t, []string{"important", "production"}, result.Labels.Strings())
-	assert.Equal(t, "/path/to/dag.yaml", result.Location)
-
-	// Verify the original DAG pointer is returned (not a new DAG)
-	assert.Same(t, dag, result)
-}
-
-func TestRebuildDAGFromYAML_EmptyYAML(t *testing.T) {
-	t.Parallel()
-
-	dag := &core.DAG{
-		Name:     "test-dag",
-		Queue:    "Default",
-		YamlData: nil,
-	}
-
-	result, err := rebuildDAGFromYAML(context.Background(), dag)
-	require.NoError(t, err)
-
-	assert.Same(t, dag, result)
-	assert.Equal(t, "Default", result.Queue)
-}
 
 func TestQuoteParamValues(t *testing.T) {
 	t.Parallel()
@@ -72,7 +21,7 @@ func TestQuoteParamValues(t *testing.T) {
 	tests := []struct {
 		name      string
 		input     []string
-		paramDefs []core.ParamDef
+		paramDefs []ir.ParamDef
 		expect    []string
 	}{
 		{
@@ -113,13 +62,13 @@ func TestQuoteParamValues(t *testing.T) {
 		{
 			name:      "positional params stored with numeric placeholders",
 			input:     []string{"1=hello world", "2=42"},
-			paramDefs: []core.ParamDef{{Name: ""}, {Name: ""}},
+			paramDefs: []ir.ParamDef{{Name: ""}, {Name: ""}},
 			expect:    []string{`"hello world"`, `"42"`},
 		},
 		{
 			name:      "numeric named params stay named",
 			input:     []string{"1=hello"},
-			paramDefs: []core.ParamDef{{Name: "1"}},
+			paramDefs: []ir.ParamDef{{Name: "1"}},
 			expect:    []string{`1="hello"`},
 		},
 	}
@@ -136,12 +85,12 @@ func TestQuoteParamValues(t *testing.T) {
 func TestRestoreDAGFromStatus_ParamsWithSpaces(t *testing.T) {
 	t.Parallel()
 
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:     "test-dag",
 		YamlData: []byte("params:\n  - topic: \"\"\nsteps:\n  - name: test\n    command: echo $topic"),
 	}
 
-	status := &exec.DAGRunStatus{
+	status := &ir.DAGRunStatus{
 		ParamsList: []string{"topic=hello world"},
 	}
 
@@ -156,15 +105,15 @@ func TestRestoreDAGFromStatus_ParamsWithSpaces(t *testing.T) {
 func TestRestoreDAGFromStatus_PositionalParamsRemainOverrides(t *testing.T) {
 	t.Parallel()
 
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:     "test-dag",
 		YamlData: []byte("params: \"default\"\nsteps:\n  - name: test\n    command: echo $1"),
-		ParamDefs: []core.ParamDef{
+		ParamDefs: []ir.ParamDef{
 			{Name: ""},
 		},
 	}
 
-	status := &exec.DAGRunStatus{
+	status := &ir.DAGRunStatus{
 		ParamsList: []string{"1=override"},
 	}
 
@@ -177,7 +126,7 @@ func TestRestoreDAGFromStatus_PreservesExplicitWorkingDirFromYAML(t *testing.T) 
 	t.Parallel()
 
 	workDir := t.TempDir()
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "test-dag",
 		WorkingDir: workDir,
 		YamlData: fmt.Appendf(nil, `
@@ -187,7 +136,7 @@ steps:
     run: pwd
 `, workDir),
 	}
-	status := &exec.DAGRunStatus{}
+	status := &ir.DAGRunStatus{}
 
 	result, err := restoreDAGFromStatus(context.Background(), dag, status)
 	require.NoError(t, err)
@@ -199,7 +148,7 @@ func TestRestoreDAGFromStatus_PreservesBaseConfigWorkingDirAsExplicit(t *testing
 	t.Parallel()
 
 	workDir := t.TempDir()
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "test-dag",
 		WorkingDir: workDir,
 		YamlData: []byte(`
@@ -209,7 +158,7 @@ steps:
 `),
 		BaseConfigData: fmt.Appendf(nil, "working_dir: %q\n", workDir),
 	}
-	status := &exec.DAGRunStatus{}
+	status := &ir.DAGRunStatus{}
 
 	result, err := restoreDAGFromStatus(context.Background(), dag, status)
 	require.NoError(t, err)
@@ -221,7 +170,7 @@ func TestRestoreDAGFromStatus_PrefersPersistedRunWorkingDir(t *testing.T) {
 	t.Parallel()
 
 	persistedWorkDir := t.TempDir()
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name:       "test-dag",
 		WorkingDir: "/changed-work-dir",
 		YamlData: []byte(`
@@ -231,7 +180,7 @@ steps:
     run: pwd
 `),
 	}
-	status := &exec.DAGRunStatus{WorkingDir: persistedWorkDir}
+	status := &ir.DAGRunStatus{WorkingDir: persistedWorkDir}
 
 	result, err := restoreDAGFromStatus(context.Background(), dag, status)
 	require.NoError(t, err)
@@ -239,78 +188,8 @@ steps:
 	assert.True(t, result.WorkingDirExplicit)
 }
 
-func TestRebuildDAGFromYAML_RebuildEnvFromYAML(t *testing.T) {
-	t.Parallel()
-
-	dag := &core.DAG{
-		Name:     "test-dag",
-		Queue:    "Default",
-		Location: "/path/to/dag.yaml",
-		YamlData: []byte("env:\n  - MY_VAR: my_value\nsteps:\n  - name: test\n    command: echo $MY_VAR"),
-	}
-
-	result, err := rebuildDAGFromYAML(context.Background(), dag)
-	require.NoError(t, err)
-
-	assert.Equal(t, "Default", result.Queue)
-	assert.Contains(t, result.Env, "MY_VAR=my_value")
-}
-
-func TestRebuildDAGFromYAML_ReappliesBaseConfigContent(t *testing.T) {
-	t.Parallel()
-
-	dag := &core.DAG{
-		Name: "test-dag",
-		YamlData: []byte(`
-steps:
-  - name: test
-    run: echo hello
-`),
-		BaseConfigData: []byte(`
-env:
-  - BASE_ONLY: "from-base-config"
-`),
-	}
-
-	result, err := rebuildDAGFromYAML(context.Background(), dag)
-	require.NoError(t, err)
-	assert.Contains(t, result.Env, "BASE_ONLY=from-base-config")
-}
-
-func TestRebuildDAGFromYAML_UsesTransportedBuildEnv(t *testing.T) {
-	extraEnv, cleanup, err := buildenv.Prepare([]string{
-		"HOST_VALUE=from-transport-host",
-		"BACKTICK_VALUE=from-transport-backtick",
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, cleanup()) })
-
-	for _, entry := range extraEnv {
-		key, value, ok := strings.Cut(entry, "=")
-		require.True(t, ok)
-		t.Setenv(key, value)
-	}
-
-	dag := &core.DAG{
-		Name: "test-dag",
-		YamlData: []byte(`
-env:
-  - HOST_VALUE: "${MISSING_NON_WHITELISTED_ENV}"
-  - BACKTICK_VALUE: "` + "`command_that_does_not_exist_12345`" + `"
-steps:
-  - name: test
-    run: echo hello
-`),
-	}
-
-	result, err := rebuildDAGFromYAML(context.Background(), dag)
-	require.NoError(t, err)
-	assert.Contains(t, result.Env, "HOST_VALUE=from-transport-host")
-	assert.Contains(t, result.Env, "BACKTICK_VALUE=from-transport-backtick")
-}
-
 func TestRestoreDAGFromStatus_RestoresRegistryAuthsFromYAML(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "test-dag",
 		YamlData: []byte(`
 registry_auths:
@@ -322,7 +201,7 @@ steps:
     run: echo hello
 `),
 	}
-	status := &exec.DAGRunStatus{}
+	status := &ir.DAGRunStatus{}
 
 	result, err := restoreDAGFromStatus(context.Background(), dag, status)
 	require.NoError(t, err)
@@ -332,7 +211,7 @@ steps:
 }
 
 func TestRestoreDAGFromStatus_RestoresRegistryAuthsFromBaseConfig(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "test-dag",
 		YamlData: []byte(`
 steps:
@@ -346,7 +225,7 @@ registry_auths:
     password: ${REGISTRY_PASSWORD}
 `),
 	}
-	status := &exec.DAGRunStatus{}
+	status := &ir.DAGRunStatus{}
 
 	result, err := restoreDAGFromStatus(context.Background(), dag, status)
 	require.NoError(t, err)
@@ -356,7 +235,7 @@ registry_auths:
 }
 
 func TestRestoreDAGFromStatus_RestoresHarnessConfigFromBaseConfig(t *testing.T) {
-	dag := &core.DAG{
+	dag := &ir.DAG{
 		Name: "test-dag",
 		YamlData: []byte(`
 steps:
@@ -371,7 +250,7 @@ harness:
   provider: passthrough
 `),
 	}
-	status := &exec.DAGRunStatus{}
+	status := &ir.DAGRunStatus{}
 
 	result, err := restoreDAGFromStatus(context.Background(), dag, status)
 	require.NoError(t, err)

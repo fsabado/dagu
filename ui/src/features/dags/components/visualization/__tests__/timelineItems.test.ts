@@ -6,6 +6,7 @@ import {
   components,
   NodeStatus,
   NodeStatusLabel,
+  RepeatMode,
   Status,
   StatusLabel,
 } from '@/api/v1/schema';
@@ -21,6 +22,7 @@ type SubDAGRun = components['schemas']['SubDAGRun'];
 type SubDAGRunDetail = components['schemas']['SubDAGRunDetail'];
 
 const nowMs = Date.parse('2026-01-01T00:02:00Z');
+const repeatPolicy = { repeat: RepeatMode.While };
 
 function node(overrides: Partial<Node> = {}): Node {
   const { step: stepOverrides, ...nodeOverrides } = overrides;
@@ -149,24 +151,204 @@ describe('timelineItems', () => {
     ).toEqual(['step']);
   });
 
-  it('does not fetch or build child rows for repeat-policy-only sub-runs', () => {
+  it('expands the first repeat-policy child before any run is archived', () => {
     const run = dagRun({
       nodes: [
         node({
-          step: { name: 'repeat-child', call: 'child-dag' },
-          subRunsRepeated: [subRun('repeat-run-1')],
+          step: { name: 'repeat-child', call: 'child-dag', repeatPolicy },
+          subRuns: [subRun('repeat-run-1')],
         }),
       ],
     });
 
-    expect(hasTimelineSubRuns(run)).toBe(false);
+    expect(hasTimelineSubRuns(run)).toBe(true);
     expect(
       buildTimelineRows({
         dagRun: run,
         subRunDetails: [subRunDetail('repeat-run-1')],
         nowMs,
-      }).map((row) => row.kind)
-    ).toEqual(['step']);
+      }).map((row) => [row.kind, row.label, row.dagRunId])
+    ).toEqual([
+      ['step', 'repeat-child', undefined],
+      ['subdag', '#01', 'repeat-run-1'],
+    ]);
+  });
+
+  it('expands repeat-policy children in archive-then-current order with numbered labels', () => {
+    const run = dagRun({
+      nodes: [
+        node({
+          step: { name: 'repeat-child', call: 'child-dag', repeatPolicy },
+          subRunsRepeated: [subRun('repeat-run-1'), subRun('repeat-run-2')],
+          subRuns: [subRun('repeat-run-3')],
+        }),
+      ],
+    });
+
+    expect(hasTimelineSubRuns(run)).toBe(true);
+
+    const rows = buildTimelineRows({
+      dagRun: run,
+      subRunDetails: [
+        subRunDetail('repeat-run-1', {
+          startedAt: '2026-01-01T00:00:01Z',
+          finishedAt: '2026-01-01T00:00:03Z',
+          status: Status.Failed,
+          statusLabel: StatusLabel.failed,
+        }),
+        subRunDetail('repeat-run-2', {
+          startedAt: '2026-01-01T00:00:04Z',
+          finishedAt: '2026-01-01T00:00:06Z',
+        }),
+        subRunDetail('repeat-run-3', {
+          startedAt: '2026-01-01T00:00:07Z',
+          finishedAt: '2026-01-01T00:00:09Z',
+          status: Status.Running,
+          statusLabel: StatusLabel.running,
+        }),
+      ],
+      nowMs,
+    });
+
+    expect(rows.map((row) => [row.kind, row.label, row.dagRunId])).toEqual([
+      ['step', 'repeat-child', undefined],
+      ['subdag', '#01', 'repeat-run-1'],
+      ['subdag', '#02', 'repeat-run-2'],
+      ['subdag', '#03', 'repeat-run-3'],
+    ]);
+    expect(rows[1]).toMatchObject({
+      kind: 'subdag',
+      startMs: Date.parse('2026-01-01T00:00:01Z'),
+      endMs: Date.parse('2026-01-01T00:00:03Z'),
+      status: Status.Failed,
+      statusSource: 'dagrun',
+      dagName: 'child-dag',
+      parentStepName: 'repeat-child',
+      depth: 1,
+    });
+    expect(rows[3]).toMatchObject({
+      kind: 'subdag',
+      startMs: Date.parse('2026-01-01T00:00:07Z'),
+      endMs: Date.parse('2026-01-01T00:00:09Z'),
+      status: Status.Running,
+      dagRunId: 'repeat-run-3',
+    });
+  });
+
+  it('keeps parallel expansion on subRuns only even when subRunsRepeated is present', () => {
+    const run = dagRun({
+      nodes: [
+        node({
+          step: {
+            name: 'parallel-call',
+            call: 'child-dag',
+            parallel: { items: ['a', 'b'] },
+          },
+          subRuns: [subRun('parallel-run-1'), subRun('parallel-run-2')],
+          // Archived parallel batches must not appear on the timeline.
+          subRunsRepeated: [
+            subRun('archived-batch-1'),
+            subRun('archived-batch-2'),
+          ],
+        }),
+      ],
+    });
+
+    expect(hasTimelineSubRuns(run)).toBe(true);
+
+    const rows = buildTimelineRows({
+      dagRun: run,
+      subRunDetails: [
+        subRunDetail('archived-batch-1'),
+        subRunDetail('archived-batch-2'),
+        subRunDetail('parallel-run-1'),
+        subRunDetail('parallel-run-2'),
+      ],
+      nowMs,
+    });
+
+    expect(rows.map((row) => [row.kind, row.label, row.dagRunId])).toEqual([
+      ['step', 'parallel-call', undefined],
+      ['subdag', '#01', 'parallel-run-1'],
+      ['subdag', '#02', 'parallel-run-2'],
+    ]);
+  });
+
+  it('retains ordinary and parallel behavior alongside repeat expansion in one DAG run', () => {
+    const run = dagRun({
+      nodes: [
+        node({
+          step: { name: 'ordinary-call', call: 'child-dag' },
+          startedAt: '2026-01-01T00:00:00Z',
+          finishedAt: '2026-01-01T00:00:05Z',
+          subRuns: [subRun('ordinary-run')],
+        }),
+        node({
+          step: {
+            name: 'parallel-call',
+            call: 'child-dag',
+            parallel: { items: ['a', 'b'] },
+          },
+          startedAt: '2026-01-01T00:00:10Z',
+          finishedAt: '2026-01-01T00:00:20Z',
+          subRuns: [subRun('parallel-run-1'), subRun('parallel-run-2')],
+        }),
+        node({
+          step: { name: 'repeat-child', call: 'child-dag', repeatPolicy },
+          startedAt: '2026-01-01T00:00:30Z',
+          finishedAt: '2026-01-01T00:00:50Z',
+          subRunsRepeated: [subRun('repeat-run-1')],
+          subRuns: [subRun('repeat-run-2')],
+        }),
+      ],
+    });
+
+    expect(hasTimelineSubRuns(run)).toBe(true);
+
+    const rows = buildTimelineRows({
+      dagRun: run,
+      subRunDetails: [
+        subRunDetail('ordinary-run'),
+        subRunDetail('parallel-run-1'),
+        subRunDetail('parallel-run-2'),
+        subRunDetail('repeat-run-1'),
+        subRunDetail('repeat-run-2'),
+      ],
+      nowMs,
+    });
+
+    expect(rows.map((row) => [row.kind, row.label, row.dagRunId])).toEqual([
+      ['step', 'ordinary-call', undefined],
+      ['step', 'parallel-call', undefined],
+      ['subdag', '#01', 'parallel-run-1'],
+      ['subdag', '#02', 'parallel-run-2'],
+      ['step', 'repeat-child', undefined],
+      ['subdag', '#01', 'repeat-run-1'],
+      ['subdag', '#02', 'repeat-run-2'],
+    ]);
+  });
+
+  it('omits repeat child rows when matching timing details are missing', () => {
+    const run = dagRun({
+      nodes: [
+        node({
+          step: { name: 'repeat-child', call: 'child-dag', repeatPolicy },
+          subRunsRepeated: [subRun('repeat-run-1')],
+          subRuns: [subRun('repeat-run-2')],
+        }),
+      ],
+    });
+
+    const rows = buildTimelineRows({
+      dagRun: run,
+      subRunDetails: [subRunDetail('repeat-run-2')],
+      nowMs,
+    });
+
+    expect(rows.map((row) => [row.kind, row.label, row.dagRunId])).toEqual([
+      ['step', 'repeat-child', undefined],
+      ['subdag', '#02', 'repeat-run-2'],
+    ]);
   });
 
   it('builds parallel child rows only when matching timing details exist', () => {

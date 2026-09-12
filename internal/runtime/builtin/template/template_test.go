@@ -11,20 +11,70 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/dagucloud/dagu/internal/core"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestValidateTemplateRequiresScriptMessage(t *testing.T) {
-	err := validateTemplate(core.Step{})
+	err := validateTemplate(ir.Step{})
 	require.Error(t, err)
 	assert.Equal(t, "field 'script': script field is required", err.Error())
 	assert.NotContains(t, err.Error(), "executor")
 }
 
+func TestValidateTemplateAcceptsScopedTemplateReference(t *testing.T) {
+	t.Parallel()
+
+	err := validateTemplate(ir.Step{
+		ExecutorConfig: ir.ExecutorConfig{
+			Config: map[string]any{"template_ref": "${env.TEMPLATE}"},
+		},
+	})
+	require.NoError(t, err)
+}
+
+func TestValidateTemplateRejectsAmbiguousTemplateReference(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		step ir.Step
+		err  string
+	}{
+		{
+			name: "script and reference",
+			step: ir.Step{
+				Script: "literal",
+				ExecutorConfig: ir.ExecutorConfig{
+					Config: map[string]any{"template_ref": "${env.TEMPLATE}"},
+				},
+			},
+			err: "cannot use both script and with.template_ref",
+		},
+		{
+			name: "invalid reference",
+			step: ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{
+					Config: map[string]any{"template_ref": "TEMPLATE"},
+				},
+			},
+			err: "must be one complete scoped value reference",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateTemplate(tt.step)
+			require.ErrorContains(t, err, tt.err)
+		})
+	}
+}
+
 func TestNewTemplateRequiresScriptMessage(t *testing.T) {
-	_, err := newTemplate(context.Background(), core.Step{})
+	_, err := newTemplate(context.Background(), ir.Step{})
 	require.Error(t, err)
 	assert.Equal(t, "field 'script': script field is required", err.Error())
 	assert.NotContains(t, err.Error(), "executor")

@@ -9,10 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/internal/core"
-	"github.com/dagucloud/dagu/internal/core/exec"
-	"github.com/dagucloud/dagu/internal/output"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/output"
 	"golang.org/x/term"
 )
 
@@ -20,7 +19,7 @@ import (
 // It polls the coordinator for status updates and renders a progress display
 // similar to the local SimpleProgressDisplay.
 type RemoteProgressDisplay struct {
-	dag          *core.DAG
+	dag          *ir.DAG
 	dagRunID     string
 	startTime    time.Time
 	total        int
@@ -31,7 +30,7 @@ type RemoteProgressDisplay struct {
 	mu                      sync.Mutex
 	completed               int
 	spinnerIndex            int
-	lastStatus              *exec.DAGRunStatus
+	lastStatus              *ir.DAGRunStatus
 	workerID                string
 	headerUpdatedWithWorker bool
 	stopped                 bool
@@ -40,7 +39,7 @@ type RemoteProgressDisplay struct {
 }
 
 // NewRemoteProgressDisplay creates a new remote progress display.
-func NewRemoteProgressDisplay(dag *core.DAG, dagRunID string) *RemoteProgressDisplay {
+func NewRemoteProgressDisplay(dag *ir.DAG, dagRunID string) *RemoteProgressDisplay {
 	total := 0
 	if dag != nil {
 		total = len(dag.Steps)
@@ -96,7 +95,7 @@ func (p *RemoteProgressDisplay) animationLoop() {
 }
 
 // Update updates the display with new status from coordinator.
-func (p *RemoteProgressDisplay) Update(status *exec.DAGRunStatus) {
+func (p *RemoteProgressDisplay) Update(status *ir.DAGRunStatus) {
 	if status == nil {
 		return
 	}
@@ -144,7 +143,7 @@ func (p *RemoteProgressDisplay) Stop() {
 }
 
 // GetLastStatus returns the last known status.
-func (p *RemoteProgressDisplay) GetLastStatus() *exec.DAGRunStatus {
+func (p *RemoteProgressDisplay) GetLastStatus() *ir.DAGRunStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.lastStatus
@@ -155,7 +154,7 @@ func (p *RemoteProgressDisplay) SetCancelled() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.lastStatus != nil {
-		p.lastStatus.Status = core.Aborted
+		p.lastStatus.Status = ir.Aborted
 	}
 }
 
@@ -278,7 +277,7 @@ func (p *RemoteProgressDisplay) render() {
 	fmt.Fprintf(os.Stderr, "\r%s %d%% (%d/%d steps) %s%s   ", spinner, percent, completed, p.total, p.gray(elapsed), p.gray(workerInfo))
 }
 
-func (p *RemoteProgressDisplay) printFinal(status *exec.DAGRunStatus) {
+func (p *RemoteProgressDisplay) printFinal(status *ir.DAGRunStatus) {
 	p.mu.Lock()
 	completed, percent := p.completedAndPercent()
 	workerID := p.workerID
@@ -289,7 +288,7 @@ func (p *RemoteProgressDisplay) printFinal(status *exec.DAGRunStatus) {
 
 	icon := "✓"
 	statusText := "completed"
-	if status != nil && (status.Status == core.Failed || status.Status == core.Aborted) {
+	if status != nil && (status.Status == ir.Failed || status.Status == ir.Aborted) {
 		icon = "✗"
 		statusText = output.StatusText(status.Status)
 	}

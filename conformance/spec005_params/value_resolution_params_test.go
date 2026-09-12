@@ -6,7 +6,7 @@ package spec005_params_test
 import (
 	"testing"
 
-	"github.com/dagucloud/dagu/conformance/harness"
+	"github.com/dagucloud/dagu/v2/conformance/harness"
 )
 
 const spec005RuntimeParams = "environment=prod"
@@ -80,6 +80,11 @@ func TestValidate(t *testing.T) {
 			file:        "runtime_resolution.yaml",
 			stderrParts: []string{"${params.environment}", "was left unchanged", "steps[0].run"},
 		},
+		{
+			name:        "root params payload preserves and reports notice",
+			file:        "root_params_payload_unavailable.yaml",
+			stderrParts: []string{"${params}", "was left unchanged", "steps[0].run"},
+		},
 	}
 	for _, tc := range noticeCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -87,7 +92,9 @@ func TestValidate(t *testing.T) {
 
 			dagu := harness.NewRunner(t)
 
-			result := dagu.Run("validate", tc.file)
+			// A caller can pass these at start time, so validation stays quiet
+			// about them by default.
+			result := dagu.Run("validate", "--show-unresolved", tc.file)
 			result.ExpectExitCode(0)
 			result.ExpectStdout("")
 			result.ExpectStderrContains(tc.stderrParts...)
@@ -208,6 +215,22 @@ func spec005StartCases() []spec005StartCase {
 				"enabled=true\n" +
 				"replicas=3\n" +
 				"ratio=1.25\n",
+		},
+		{
+			name:           "root params payload resolves to params json",
+			args:           []string{"start", "--params", "environment=prod tag=v1", "root_params_payload.yaml"},
+			file:           "root_params_payload.yaml",
+			outputFile:     "params-payload.txt",
+			outputContains: []string{`"environment":"prod"`, `"tag":"v1"`},
+		},
+		{
+			name:          "root params payload preserves when unavailable",
+			args:          []string{"start", "root_params_payload_unavailable.yaml"},
+			file:          "root_params_payload_unavailable.yaml",
+			outputFile:    "params-payload-unavailable.txt",
+			outputContent: "${params}\n",
+			missingParam:  "params",
+			missingOutput: new("${params}\n"),
 		},
 		{
 			name:          "params reference in consts stays literal at runtime",

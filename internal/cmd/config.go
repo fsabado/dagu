@@ -40,8 +40,9 @@ func runConfig(ctx *Context, _ []string) error {
 		{"Config file", paths.ConfigFileUsed},
 		{"Base config", paths.BaseConfig},
 		{"DAGs directory", paths.DAGsDir},
-		{"Docs directory", paths.DocsDir},
+		{"Wiki directory", paths.WikiDir},
 		{"DAG runs", paths.DAGRunsDir},
+		{"DAG-run work directory", paths.DAGRunWorkDir},
 		{"Data directory", paths.DataDir},
 		{"Tools directory", paths.ToolsDir},
 		{"Log directory", paths.LogDir},
@@ -50,7 +51,6 @@ func runConfig(ctx *Context, _ []string) error {
 		{"Queue", paths.QueueDir},
 		{"Processes", paths.ProcDir},
 		{"Service registry", paths.ServiceRegistryDir},
-		{"Sessions", paths.SessionsDir},
 		{"Executable", paths.Executable},
 	}
 

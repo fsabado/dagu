@@ -14,13 +14,15 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dagucloud/dagu/internal/cmn/buildenv"
-	"github.com/dagucloud/dagu/internal/cmn/cmdutil"
-	"github.com/dagucloud/dagu/internal/cmn/config"
-	"github.com/dagucloud/dagu/internal/cmn/logger"
-	"github.com/dagucloud/dagu/internal/cmn/procutil"
-	"github.com/dagucloud/dagu/internal/core"
-	exec1 "github.com/dagucloud/dagu/internal/core/exec"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/buildenv"
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // CommandError wraps a command execution error with captured output.
@@ -104,21 +106,23 @@ func (b *SubCmdBuilder) filteredEnv(extra ...string) []string {
 	if len(env) == 0 {
 		env = os.Environ()
 	}
+	env = filterExecutionEnv(env)
 	env = append(env, extra...)
 	return env
 }
 
 func (b *SubCmdBuilder) parentEnv(extra ...string) []string {
-	env := filteredParentEnv()
+	env := filterExecutionEnv(os.Environ())
 	env = append(env, extra...)
 	return env
 }
 
-func filteredParentEnv() []string {
-	env := os.Environ()
+func filterExecutionEnv(env []string) []string {
 	filtered := env[:0]
 	for _, entry := range env {
-		if strings.HasPrefix(entry, exec1.EnvKeyQueueDispatchRetry+"=") {
+		if strings.HasPrefix(entry, runenv.EnvKeyQueueDispatchRetry+"=") ||
+			strings.HasPrefix(entry, runenv.EnvKeyDAGDefinitionID+"=") ||
+			strings.HasPrefix(entry, runenv.EnvKeyParallelItem+"=") {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -127,7 +131,7 @@ func filteredParentEnv() []string {
 }
 
 // Start creates a start command spec.
-func (b *SubCmdBuilder) Start(dag *core.DAG, opts StartOptions) CmdSpec {
+func (b *SubCmdBuilder) Start(dag *ir.DAG, opts StartOptions) CmdSpec {
 	args := []string{"start"}
 
 	if opts.Params != "" {
@@ -146,8 +150,14 @@ func (b *SubCmdBuilder) Start(dag *core.DAG, opts StartOptions) CmdSpec {
 	if opts.FromRunID != "" {
 		args = append(args, fmt.Sprintf("--from-run-id=%s", opts.FromRunID))
 	}
+	if opts.SourceFile != nil {
+		args = append(args, fmt.Sprintf("--source-file=%s", *opts.SourceFile))
+	}
 	if opts.TriggerType != "" {
 		args = append(args, fmt.Sprintf("--trigger-type=%s", opts.TriggerType))
+	}
+	if opts.TriggerActor != "" {
+		args = append(args, fmt.Sprintf("--trigger-actor=%s", opts.TriggerActor))
 	}
 	if labels := effectiveLabels(opts.Labels, opts.Tags); labels != "" {
 		args = append(args, fmt.Sprintf("--labels=%s", labels))
@@ -157,6 +167,9 @@ func (b *SubCmdBuilder) Start(dag *core.DAG, opts StartOptions) CmdSpec {
 	}
 	if opts.ProfileName != "" {
 		args = append(args, fmt.Sprintf("--profile=%s", opts.ProfileName))
+	}
+	if opts.NoReuse {
+		args = append(args, "--no-reuse")
 	}
 	if b.configFile != "" {
 		args = append(args, "--config", b.configFile)
@@ -168,15 +181,16 @@ func (b *SubCmdBuilder) Start(dag *core.DAG, opts StartOptions) CmdSpec {
 	args = append(args, target)
 
 	return CmdSpec{
-		Executable: b.executable,
-		Args:       args,
-		Env:        b.parentEnv(),
-		BuildEnv:   append([]string{}, dag.Env...),
+		Executable:      b.executable,
+		Args:            args,
+		Env:             b.parentEnv(definitionIDEnv(opts.DefinitionID)...),
+		BuildEnv:        append([]string{}, dag.Env...),
+		RuntimeResolved: dag.RuntimeResolved,
 	}
 }
 
 // Enqueue creates an enqueue command spec.
-func (b *SubCmdBuilder) Enqueue(dag *core.DAG, opts EnqueueOptions) CmdSpec {
+func (b *SubCmdBuilder) Enqueue(dag *ir.DAG, opts EnqueueOptions) CmdSpec {
 	args := []string{"enqueue"}
 
 	if opts.Params != "" {
@@ -200,6 +214,9 @@ func (b *SubCmdBuilder) Enqueue(dag *core.DAG, opts EnqueueOptions) CmdSpec {
 	if opts.TriggerType != "" {
 		args = append(args, fmt.Sprintf("--trigger-type=%s", opts.TriggerType))
 	}
+	if opts.TriggerActor != "" {
+		args = append(args, fmt.Sprintf("--trigger-actor=%s", opts.TriggerActor))
+	}
 	if labels := effectiveLabels(opts.Labels, opts.Tags); labels != "" {
 		args = append(args, fmt.Sprintf("--labels=%s", labels))
 	}
@@ -209,20 +226,24 @@ func (b *SubCmdBuilder) Enqueue(dag *core.DAG, opts EnqueueOptions) CmdSpec {
 	if opts.ProfileName != "" {
 		args = append(args, fmt.Sprintf("--profile=%s", opts.ProfileName))
 	}
+	if opts.NoReuse {
+		args = append(args, "--no-reuse")
+	}
 	args = append(args, dag.Location)
 
 	return CmdSpec{
-		Executable: b.executable,
-		Args:       args,
-		Env:        b.filteredEnv(),
-		BuildEnv:   append([]string{}, dag.Env...),
-		Stdout:     os.Stdout,
-		Stderr:     os.Stderr,
+		Executable:      b.executable,
+		Args:            args,
+		Env:             b.filteredEnv(definitionIDEnv(opts.DefinitionID)...),
+		BuildEnv:        append([]string{}, dag.Env...),
+		RuntimeResolved: dag.RuntimeResolved,
+		Stdout:          os.Stdout,
+		Stderr:          os.Stderr,
 	}
 }
 
 // Dequeue creates a dequeue command spec.
-func (b *SubCmdBuilder) Dequeue(dag *core.DAG, dagRun exec1.DAGRunRef) CmdSpec {
+func (b *SubCmdBuilder) Dequeue(dag *ir.DAG, dagRun ir.DAGRunRef) CmdSpec {
 	queueName := dag.ProcGroup()
 	args := []string{"dequeue", queueName, fmt.Sprintf("--dag-run=%s", dagRun.String())}
 
@@ -240,7 +261,7 @@ func (b *SubCmdBuilder) Dequeue(dag *core.DAG, dagRun exec1.DAGRunRef) CmdSpec {
 }
 
 // Restart creates a restart command spec.
-func (b *SubCmdBuilder) Restart(dag *core.DAG, opts RestartOptions) CmdSpec {
+func (b *SubCmdBuilder) Restart(dag *ir.DAG, opts RestartOptions) CmdSpec {
 	args := []string{"restart"}
 
 	if opts.Quiet {
@@ -255,19 +276,32 @@ func (b *SubCmdBuilder) Restart(dag *core.DAG, opts RestartOptions) CmdSpec {
 	args = append(args, dag.Location)
 
 	return CmdSpec{
-		Executable: b.executable,
-		Args:       args,
-		Env:        b.parentEnv(),
-		BuildEnv:   append([]string{}, dag.Env...),
+		Executable:      b.executable,
+		Args:            args,
+		Env:             b.parentEnv(definitionIDEnv(opts.DefinitionID)...),
+		BuildEnv:        append([]string{}, dag.Env...),
+		RuntimeResolved: dag.RuntimeResolved,
 	}
 }
 
 // Retry creates a retry command spec.
-func (b *SubCmdBuilder) Retry(dag *core.DAG, dagRunID string, stepName string) CmdSpec {
-	args := []string{"retry", fmt.Sprintf("--run-id=%s", dagRunID), "-q"}
+func (b *SubCmdBuilder) Retry(dag *ir.DAG, opts RetryOptions) CmdSpec {
+	args := []string{"retry", fmt.Sprintf("--run-id=%s", opts.DAGRunID), "-q"}
 
-	if stepName != "" {
-		args = append(args, fmt.Sprintf("--step=%s", stepName))
+	if opts.Step != "" {
+		args = append(args, fmt.Sprintf("--step=%s", opts.Step))
+	}
+	if opts.IncludeDownstream && opts.Step != "" {
+		args = append(args, "--downstream")
+	}
+	if !opts.Root.Zero() {
+		args = append(args, fmt.Sprintf("--root=%s", opts.Root.String()))
+	}
+	if opts.TriggerActor != "" {
+		args = append(args, fmt.Sprintf("--trigger-actor=%s", opts.TriggerActor))
+	}
+	if path := opts.RetryPath.Encode(); path != "" {
+		args = append(args, "--retry-path="+path)
 	}
 
 	if b.configFile != "" {
@@ -275,29 +309,28 @@ func (b *SubCmdBuilder) Retry(dag *core.DAG, dagRunID string, stepName string) C
 	}
 	args = append(args, dag.Name)
 
-	return CmdSpec{
-		Executable: b.executable,
-		Args:       args,
-		Env:        b.parentEnv(),
-		BuildEnv:   append([]string{}, dag.Env...),
+	spec := CmdSpec{
+		Executable:      b.executable,
+		Args:            args,
+		Env:             b.parentEnv(),
+		BuildEnv:        append([]string{}, dag.Env...),
+		RuntimeResolved: dag.RuntimeResolved,
 	}
-}
-
-// QueueDispatchRetry creates a retry command spec for a scheduler-consumed queued run.
-func (b *SubCmdBuilder) QueueDispatchRetry(dag *core.DAG, dagRunID string, stepName string) CmdSpec {
-	spec := b.Retry(dag, dagRunID, stepName)
-	spec.Env = append(spec.Env, exec1.EnvKeyQueueDispatchRetry+"=1")
+	if opts.QueueDispatch {
+		spec.Env = append(spec.Env, runenv.EnvKeyQueueDispatchRetry+"=1")
+	}
 	return spec
 }
 
 // CmdSpec describes a command to be executed with all its configuration.
 type CmdSpec struct {
-	Executable string
-	Args       []string
-	Env        []string
-	BuildEnv   []string
-	Stdout     io.Writer
-	Stderr     io.Writer
+	Executable      string
+	Args            []string
+	Env             []string
+	BuildEnv        []string
+	RuntimeResolved bool
+	Stdout          io.Writer
+	Stderr          io.Writer
 }
 
 // StartOptions contains options for initiating a dag-run.
@@ -306,14 +339,18 @@ type StartOptions struct {
 	Quiet    bool   // Whether to run in quiet mode
 	DAGRunID string // ID for the dag-run
 
-	NameOverride string // Optional DAG name override
-	FromRunID    string // Historic dag-run ID to use as a template
-	Target       string // Optional CLI argument override (DAG name or file path)
-	TriggerType  string // How this DAG run was initiated (scheduler, manual, webhook, subdag)
-	Labels       string // Additional labels (comma-separated)
-	Tags         string // Deprecated: use Labels.
-	ScheduleTime string // RFC 3339 timestamp of when this run was scheduled
-	ProfileName  string // Runtime profile name
+	NameOverride string  // Optional DAG name override
+	FromRunID    string  // Historic dag-run ID to use as a template
+	Target       string  // Optional CLI argument override (DAG name or file path)
+	SourceFile   *string // Optional source provenance override, including an explicit empty value
+	TriggerType  string  // How this DAG run was initiated (scheduler, manual, webhook, subdag)
+	TriggerActor string  // Attributable actor that initiated the DAG run
+	Labels       string  // Additional labels (comma-separated)
+	Tags         string  // Deprecated: use Labels.
+	ScheduleTime string  // RFC 3339 timestamp of when this run was scheduled
+	ProfileName  string  // Runtime profile name
+	DefinitionID string  // Stable DAG definition identity
+	NoReuse      bool    // Disable build materialization reuse
 }
 
 // EnqueueOptions contains options for enqueuing a dag-run.
@@ -324,16 +361,38 @@ type EnqueueOptions struct {
 	Queue        string // Queue name to enqueue to
 	NameOverride string // Optional DAG name override
 	TriggerType  string // How this DAG run was initiated (scheduler, manual, webhook, subdag)
+	TriggerActor string // Attributable actor that initiated the DAG run
 	Labels       string // Additional labels (comma-separated)
 	Tags         string // Deprecated: use Labels.
 	ScheduleTime string // RFC 3339 timestamp of when this run was scheduled
 	ProfileName  string // Runtime profile name
+	DefinitionID string // Stable DAG definition identity
+	NoReuse      bool   // Disable build materialization reuse
+}
+
+func definitionIDEnv(id string) []string {
+	if id == "" {
+		return nil
+	}
+	return []string{runenv.EnvKeyDAGDefinitionID + "=" + id}
+}
+
+// RetryOptions contains options for retrying a dag-run.
+type RetryOptions struct {
+	DAGRunID          string
+	Step              string
+	IncludeDownstream bool
+	Root              ir.DAGRunRef
+	RetryPath         dagrun.RetryPath
+	TriggerActor      string
+	QueueDispatch     bool
 }
 
 // RestartOptions contains options for restarting a dag-run.
 type RestartOptions struct {
 	Quiet        bool   // Whether to run in quiet mode
 	ScheduleTime string // RFC 3339 timestamp of when this run was scheduled
+	DefinitionID string // Stable DAG definition identity
 }
 
 // Run executes the command and waits for it to complete.
@@ -438,7 +497,7 @@ func newCommand(ctx context.Context, spec CmdSpec, withContext bool) (*exec.Cmd,
 	if spec.Env != nil {
 		env = append([]string{}, spec.Env...)
 	}
-	extraEnv, cleanup, err := buildenv.Prepare(spec.BuildEnv)
+	extraEnv, cleanup, err := buildenv.Prepare(buildenv.NewSnapshot(spec.BuildEnv, spec.RuntimeResolved))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to prepare presolved build env transport: %w", err)
 	}

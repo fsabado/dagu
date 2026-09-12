@@ -6,7 +6,7 @@ syntax = "proto3";
 package coordinator.v1;
 
 // protolint:disable:next MAX_LINE_LENGTH
-option go_package = "github.com/dagucloud/dagu/proto/coordinator/v1;coordinatorv1";
+option go_package = "github.com/dagucloud/dagu/v2/proto/coordinator/v1;coordinatorv1";
 
 
 // Service definition for Coordinator Service.
@@ -21,6 +21,10 @@ service CoordinatorService {
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
   // AckTaskClaim is called by workers after accepting a claimed task.
   rpc AckTaskClaim (AckTaskClaimRequest) returns (AckTaskClaimResponse);
+  // ClaimAgentSessionCleanup reserves provider cleanup for its owning worker.
+  rpc ClaimAgentSessionCleanup (ClaimAgentSessionCleanupRequest) returns (ClaimAgentSessionCleanupResponse);
+  // CompleteAgentSessionCleanup completes or releases a provider cleanup claim.
+  rpc CompleteAgentSessionCleanup (CompleteAgentSessionCleanupRequest) returns (CompleteAgentSessionCleanupResponse);
   // RunHeartbeat is called by workers to refresh leases for tasks owned by a
   // specific coordinator instance.
   rpc RunHeartbeat (RunHeartbeatRequest) returns (RunHeartbeatResponse);
@@ -74,6 +78,9 @@ service CoordinatorService {
   // ResolveSecretReference resolves or checks a Dagu-managed secret registry ref.
   // Used by workers that cannot read the coordinator's secret store.
   rpc ResolveSecretReference (ResolveSecretReferenceRequest) returns (ResolveSecretReferenceResponse);
+
+  // ResolveRuntimeProfile resolves inherited and selected runtime profile layers.
+  rpc ResolveRuntimeProfile (ResolveRuntimeProfileRequest) returns (ResolveRuntimeProfileResponse);
 }
 
 // Request message for polling a task.
@@ -114,7 +121,7 @@ message Task {
   string definition = 11; // Optional: DAG definition (YAML) for local DAGs
   string worker_id = 12; // ID of the worker that will execute this task
   // Previous status for OPERATION_RETRY.
-  // When set, workers can retry without needing local DAGRunStore access.
+  // When set, workers can retry without needing local DAG-run persistence.
   DAGRunStatusProto previous_status = 13;
   // Attempt ID created by coordinator. Workers use this to create attempts with the same ID.
   string attempt_id = 14;
@@ -138,8 +145,6 @@ message Task {
   string claim_token = 24;
   // Original DAG file path for provenance-aware reschedule-from-file behavior.
   string source_file = 25;
-  // Opaque execution-scoped agent settings snapshot for distributed workers.
-  bytes agent_snapshot = 26;
   // Content-addressed workspace bundle for action sub-DAGs.
   string workspace_bundle_digest = 27;
   int64 workspace_bundle_size = 28;
@@ -148,6 +153,18 @@ message Task {
   string workspace_bundle_resolved_ref = 31;
   // Runtime profile name. Workers resolve values at attempt start.
   string profile_name = 32;
+  // Internal persisted child DAG route for a targeted step retry.
+  string retry_path = 33;
+  // Attributable actor that initiated the DAG run.
+  string trigger_actor = 34;
+  // Stable identity of the persisted DAG definition.
+  string definition_id = 35;
+  // Value bound to ITEM for a parallel child run.
+  string parallel_item = 36;
+  // Exact worker required to resume a host-owned agent session.
+  string target_worker_id = 37;
+  // When true, a targeted step retry also resets reachable descendants.
+  bool include_downstream = 38;
 }
 
 enum Operation {
@@ -205,11 +222,39 @@ message HeartbeatResponse {
 message AckTaskClaimRequest {
   string worker_id = 1;
   string claim_token = 2;
+  string attempt_key = 3;
 }
 
 message AckTaskClaimResponse {
   bool accepted = 1;
   string error = 2;
+}
+
+message ClaimAgentSessionCleanupRequest {
+  string worker_id = 1;
+}
+
+message ClaimAgentSessionCleanupResponse {
+  bool found = 1;
+  string job_id = 2;
+  string claim_token = 3;
+  string provider = 4;
+  string session_id = 5;
+  string directory = 6;
+  string owner_coordinator_id = 7;
+  string owner_coordinator_host = 8;
+  int32 owner_coordinator_port = 9;
+}
+
+message CompleteAgentSessionCleanupRequest {
+  string worker_id = 1;
+  string job_id = 2;
+  string claim_token = 3;
+  string error = 4;
+}
+
+message CompleteAgentSessionCleanupResponse {
+  // No fields.
 }
 
 message RunHeartbeatRequest {
@@ -251,6 +296,8 @@ message ReportStatusRequest {
   string worker_id = 1;
   DAGRunStatusProto status = 2;
   string owner_coordinator_id = 3;
+  string source_file = 4;
+  string labels = 5;
 }
 
 // Response message for reporting DAG run status.
@@ -283,6 +330,10 @@ message LogChunk {
   string attempt_id = 11;
   // Owner coordinator used to validate owner-bound log writes.
   string owner_coordinator_id = 12;
+  // Durable attempt identity used to fence log writes.
+  string attempt_key = 13;
+  // When present, data is written at this absolute byte position; otherwise it is appended.
+  optional uint64 byte_offset = 14;
 }
 
 // Type of log stream.
@@ -318,6 +369,8 @@ message ArtifactChunk {
   string attempt_id = 10;
   // Owner coordinator used to validate owner-bound artifact writes.
   string owner_coordinator_id = 11;
+  // Durable attempt identity used to fence artifact writes.
+  string attempt_key = 12;
 }
 
 // Response message for artifact streaming.
@@ -483,8 +536,34 @@ message ResolveSecretReferenceRequest {
   string worker_id = 5;   // Worker currently owning the dispatched attempt
   string attempt_key = 6; // Active distributed attempt lease key
   string attempt_id = 7;  // Attempt ID created by the coordinator
+  string dag_name = 8;    // Current DAG definition; empty keeps legacy root behavior
 }
 
 message ResolveSecretReferenceResponse {
   string value = 1; // Plaintext secret value; empty for check_only
+}
+
+message ResolveRuntimeProfileRequest {
+  string worker_id = 1;
+  string attempt_key = 2;
+  string attempt_id = 3;
+  string profile_name = 4;
+  string workspace = 5;
+  string dag_name = 6;
+}
+
+message RuntimeProfileEntry {
+  string key = 1;
+  string kind = 2;
+  string value = 3;
+}
+
+message RuntimeProfileLayer {
+  string name = 1;
+  repeated RuntimeProfileEntry entries = 2;
+}
+
+message ResolveRuntimeProfileResponse {
+  RuntimeProfileLayer defaults = 1;
+  RuntimeProfileLayer selected = 2;
 }

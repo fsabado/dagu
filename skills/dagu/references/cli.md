@@ -2,7 +2,7 @@
 
 Global flags on all commands: `--config/-c`, `--dagu-home`, `--quiet/-q`, `--cpu-profile`
 
-Advanced and deprecated flags below remain implemented in `internal/cmd/start.go`, `internal/cmd/enqueue.go`, `internal/cmd/exec.go`, and `internal/cmd/migrate.go`, so this reference keeps them documented even when they are mainly used by automation or backward-compatibility paths.
+Advanced and deprecated flags below remain implemented in `internal/cmd/start.go`, `internal/cmd/enqueue.go`, and `internal/cmd/exec.go`, so this reference keeps them documented even when they are mainly used by automation or backward-compatibility paths.
 
 ## Core Commands
 
@@ -23,6 +23,7 @@ Flags:
 - `--labels` — Additional labels (comma-separated key=value or key-only)
 - `--tags` — Deprecated alias for `--labels`
 - `--default-working-dir` — Default working directory for DAGs without explicit workingDir
+- `--no-reuse` — Recompute reusable build steps while preserving staged, atomic publication
 - `--worker-id` — Worker ID executing this DAG run; auto-set in distributed mode and defaults to `local`
 - `--trigger-type` — Trigger source (`scheduler`, `manual`, `webhook`, `subdag`, `retry`, `catchup`); defaults to `manual`
 
@@ -43,6 +44,7 @@ Flags:
 - `--labels` — Additional labels (comma-separated key=value or key-only)
 - `--tags` — Deprecated alias for `--labels`
 - `--default-working-dir` — Default working directory for DAGs without explicit workingDir
+- `--no-reuse` — Recompute reusable build steps when the queued run starts
 - `--trigger-type` — Trigger source (`scheduler`, `manual`, `webhook`, `subdag`, `retry`, `catchup`); defaults to `manual`
 
 ### dagu exec
@@ -81,12 +83,38 @@ Stop and restart a DAG run: `dagu restart <dag-name> [--run-id/-r <id>]`
 Retry a previous DAG run using the same run ID.
 
 ```sh
-dagu retry <dag> --run-id/-r <id> [--step <name>] [--worker-id <id>]
+dagu retry <dag> --run-id/-r <id> [--step <name>] [--downstream] [--worker-id <id>]
+```
+
+`--step` retries only the selected step. Add `--downstream` to also reset every reachable descendant; unrelated branches keep their current status. `--downstream` requires `--step`.
+
+### dagu human-task complete
+
+Complete a waiting human task in a root DAG run. The run may be local or distributed, but the command operates on the local Dagu data store.
+
+```sh
+dagu human-task complete [flags] <root-dag-name>
+```
+
+Flags:
+
+- `--run-id/-r` — Root DAG-run ID containing the human task; required
+- `--step` — Human task step ID; required and matched against `id`, not the display name
+- `--input` — Form input in `key=value` form; repeatable and coerced using the form schema
+- `--inputs-json` — Typed form input as one JSON object
+
+`--input` and `--inputs-json` are mutually exclusive. Omit both for an acknowledgement-only task. Completing one of several waiting human tasks leaves the DAG run waiting; completing the last one starts the run resume automatically. Human tasks cannot be used in sub-DAGs. A distributed run is re-queued, so its scheduler must be running. The command only supports the local context.
+
+```sh
+dagu human-task complete --run-id=run-1 --step=review --input environment=production deploy
+dagu human-task complete --run-id=run-1 --step=review --inputs-json='{"environment":"production","notify":true}' deploy
 ```
 
 ### dagu dry
 
-Dry-run a DAG without executing commands: `dagu dry [--params/-p] [--name/-N] <dag> [-- params...]`
+Dry-run a DAG without executing commands: `dagu dry [--params/-p] [--name/-N] [--no-reuse] <dag> [-- params...]`
+
+For a build DAG, `--no-reuse` previews the decisions with manifest reuse disabled. Dry-run still creates no locks, staging files, manifests, or run history.
 
 ### dagu validate
 
@@ -118,9 +146,55 @@ Flags:
 
 Default: shows runs from the last 30 days, newest first.
 
+### dagu ls
+
+List DAG definitions.
+
+This command is local-only. If a remote CLI context is selected, use `--context local`.
+
+```sh
+dagu ls [flags] [pattern]
+```
+
+Flags:
+
+- `--next/-n` — Show next scheduled run time
+- `--last/-l` — Show last run status and time
+- `--history/-H` — Show a compact recent-history summary
+- `--sort-last/-t` — Sort by last run time, newest first
+- `--reverse/-r` — Reverse sort order
+
+### dagu rm
+
+Remove DAG run history and/or the DAG YAML definition. At least one of `--history` or `--definition` is required. Active runs are never deleted from history; definition deletion is refused while the DAG has alive processes. With `--definition`, identify the DAG by filename, stem, or configured path.
+
+```sh
+dagu rm [--history|-H] [--definition|-d] [-t <duration>] [-f] [--dry-run] <dag>
+```
+
+Flags:
+
+- `--history/-H` — Delete run history
+- `--definition/-d` — Delete the DAG YAML definition
+- `--older-than/-t` — With `--history`: delete runs older than a duration (e.g. `10d`, `24h`, `1w`). Omitted = delete all history
+- `--force/-f` — Skip confirmation prompt
+- `--dry-run` — Preview deletions without removing history or the definition
+
+### dagu ps
+
+List running DAG processes.
+
+```sh
+dagu ps [-d <dag-name>] [-r <run-id>]
+```
+
+`-r`/`--run-id` accepts a partial run ID and matches accordingly.
+
 ### dagu cleanup
 
 Remove old DAG run history. Active runs are never deleted.
+
+Deprecated: prefer `dagu rm --history`.
 
 ```sh
 dagu cleanup <dag-name> [--retention-days <n>] [--dry-run] [--yes/-y]
@@ -140,7 +214,7 @@ Examples:
 - `dagu schema dag steps` — Step definition structure
 - `dagu schema dag steps.container` — Container configuration
 - `dagu schema dag steps.retry_policy` — Retry policy fields
-- `dagu schema dag steps.agent` — Agent step configuration
+- `dagu schema dag steps.harness` — Harness step configuration
 - `dagu schema dag handler_on` — Lifecycle event hooks
 - `dagu schema config` — All config root-level fields
 - `dagu schema config auth` — Authentication configuration
@@ -189,18 +263,18 @@ Start gRPC coordinator: `dagu coordinator [--coordinator.host/-H <host>] [--coor
 
 ### dagu worker
 
-Start distributed worker: `dagu worker [--worker.id/-w <id>] [--worker.max-active-runs/-m <n>] [--worker.labels/-l <k=v,...>] [--worker.coordinators <addrs>] [--peer.*]`
+Start distributed worker: `dagu worker --worker.coordinators <host:port,...> [--worker.id/-w <id>] [--worker.max-active-runs/-m <n>] [--worker.labels/-l <k=v,...>] [--peer.*]`. Coordinator addresses are required. Every worker advertises immutable `os` and `arch` platform labels in addition to configured labels.
 
 ## Git Sync
 
-`dagu sync <subcommand>` — Git sync operations for DAG definitions.
+`dagu sync <subcommand>` — Git sync for workflows, Wiki content, and supporting files.
 
 | Subcommand | Description |
 | ---------- | ----------- |
-| `sync status` | Show sync status (repository, branch, per-DAG status) |
+| `sync status` | Show repository, branch, and per-item status |
 | `sync pull` | Pull changes from remote |
-| `sync publish [dag] [--message/-m] [--all] [--force/-f]` | Publish local changes to remote |
-| `sync discard <dag> [--yes/-y]` | Discard local changes, restore remote version |
+| `sync publish [item-id] [--message/-m] [--all] [--force/-f]` | Publish local changes to remote |
+| `sync discard <item-id> [--yes/-y]` | Discard local changes, restore remote version |
 | `sync forget <id>... [--yes/-y]` | Remove state entries for missing/untracked items |
 | `sync cleanup [--dry-run] [--yes/-y]` | Remove all missing entries from sync state |
 | `sync delete <id> [--message/-m] [--force] [--all-missing] [--dry-run] [--yes/-y]` | Delete from remote, local, and sync state |
@@ -208,12 +282,7 @@ Start distributed worker: `dagu worker [--worker.id/-w <id>] [--worker.max-activ
 
 ## Other Commands
 
-- `dagu agent [--model <model>] [--soul <soul>]` — Start an interactive Dagu agent chat using the current CLI context
-- `dagu agent -p <prompt> [--model <model>] [--soul <soul>]` — Send one non-interactive prompt to the Dagu agent
-- `dagu agent history [--limit <n>]` — List Dagu agent sessions
-- `dagu agent resume <session-id> [-p <prompt>] [--model <model>] [--soul <soul>]` — Resume interactively or send one non-interactive prompt to a Dagu agent session
 - `dagu example [id]` — Show built-in example DAGs
-- `dagu migrate history` — Migrate legacy DAG run history from the v1.16 layout to the v1.17+ format and archive the old data
 - `dagu version` — Show version
 - `dagu upgrade [--check] [--version/-v <ver>] [--dry-run] [--yes/-y]` — Self-update binary
 - `dagu license <activate|deactivate|check>` — Manage license

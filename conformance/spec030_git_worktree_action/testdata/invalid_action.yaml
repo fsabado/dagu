@@ -1,0 +1,4 @@
+steps:
+  - action: git.worktree.move
+    with:
+      branch: topic

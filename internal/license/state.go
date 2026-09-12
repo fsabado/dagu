@@ -122,17 +122,28 @@ func (s *State) isInGracePeriod() bool {
 	if time.Now().Before(expiry) {
 		return false // not expired yet
 	}
-	return time.Now().Before(expiry.Add(s.graceDuration()))
+	return time.Now().Before(expiry.Add(graceDurationForClaims(s.claims)))
 }
 
-func (s *State) graceDuration() time.Duration {
-	if s.claims == nil || s.claims.GraceDays == nil {
+func (s *State) isPastGracePeriod() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.claims == nil || s.claims.ExpiresAt == nil {
+		return false
+	}
+	expiry := s.claims.ExpiresAt.Time
+	return !time.Now().Before(expiry.Add(graceDurationForClaims(s.claims)))
+}
+
+func graceDurationForClaims(claims *LicenseClaims) time.Duration {
+	if claims == nil || claims.GraceDays == nil {
 		return gracePeriod
 	}
-	if *s.claims.GraceDays <= 0 {
+	if *claims.GraceDays <= 0 {
 		return 0
 	}
-	return time.Duration(*s.claims.GraceDays) * 24 * time.Hour
+	return time.Duration(*claims.GraceDays) * 24 * time.Hour
 }
 
 // WarningCode returns the warning code from the license claims.
