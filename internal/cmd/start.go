@@ -21,6 +21,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/intake"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/queue"
@@ -50,11 +51,28 @@ A DAG definition is a blueprint that defines the DAG structure. This command cre
 instance with a unique DAG-run ID.
 
 Parameters after the "--" separator are passed as execution parameters (either positional or key=value pairs).
+With --params-stdin, piped or redirected stdin supplies the parameters
+(e.g. 'echo "P1=foo P2=bar" | dagu start --params-stdin my_dag'). Input is read
+until EOF, up to 1 MiB. Arguments after "--" and --params take precedence.
+Quote individual stdin values to preserve spaces; "" supplies an empty value.
+Empty or whitespace-only stdin uses DAG defaults.
+Without --params-stdin, stdin is left unread.
+--params-stdin cannot be combined with --from-run-id.
 Flags can override default settings such as DAG-run ID, DAG name, or suppress output.
 
+Use --only to run just the named steps (by name or ID) in a new DAG-run of the
+current definition; every other step is recorded as skipped. Add --outputs-from
+to carry the step outputs and work directory of a finished run into the skipped
+steps, so the selected steps can reference them. Add --output to set an output
+of a skipped step directly; it takes precedence over --outputs-from.
+
 Examples:
+  echo '"hello world"' | dagu start --params-stdin my_dag
   dagu start my_dag -- P1=foo P2=bar
   dagu start --name my_custom_name my_dag.yaml -- P1=foo P2=bar
+  dagu start --only build my_dag
+  dagu start --only test --only lint --outputs-from 20260101_120000 my_dag -- ENV=dev
+  dagu start --only fetch --output login.token=abc123 my_dag
 
 This command parses the DAG definition, resolves parameters, and initiates the DAG-run execution.
 `,
@@ -64,11 +82,28 @@ This command parses the DAG definition, resolves parameters, and initiates the D
 }
 
 // Command line flags for the start command
-var startFlags = []commandLineFlag{paramsFlag, nameFlag, dagRunIDFlag, fromRunIDFlag, parentDAGRunFlag, rootDAGRunFlag, labelsFlag, tagsFlag, defaultWorkingDirFlag, profileFlag, startWorkerIDFlag, attemptIDFlag, triggerTypeFlag, triggerActorFlag, scheduleTimeFlag, sourceFileFlag, noReuseFlag}
+var startFlags = []commandLineFlag{paramsFlag, paramsStdinFlag, nameFlag, dagRunIDFlag, fromRunIDFlag, parentDAGRunFlag, rootDAGRunFlag, labelsFlag, tagsFlag, defaultWorkingDirFlag, profileFlag, startWorkerIDFlag, attemptIDFlag, triggerTypeFlag, triggerActorFlag, scheduleTimeFlag, sourceFileFlag, noReuseFlag, onlyFlag, outputsFromFlag, outputFlag}
 
 var fromRunIDFlag = commandLineFlag{
 	name:  "from-run-id",
 	usage: "Historic dag-run ID to use as the template for a new run",
+}
+
+var onlyFlag = commandLineFlag{
+	name:          "only",
+	usage:         "Run only this step (name or ID) and record every other step as skipped; repeatable",
+	isStringArray: true,
+}
+
+var outputsFromFlag = commandLineFlag{
+	name:  "outputs-from",
+	usage: "Finished dag-run ID whose step outputs and work directory feed the steps selected by --only",
+}
+
+var outputFlag = commandLineFlag{
+	name:          "output",
+	usage:         "Output of a step skipped by --only, as <step>.<name>=<value>; repeatable",
+	isStringArray: true,
 }
 
 // startWorkerIDFlag identifies which worker executes this DAG run (for distributed execution tracking)
@@ -105,6 +140,10 @@ var sourceFileFlag = commandLineFlag{
 func runStart(ctx *Context, args []string) error {
 	if ctx.IsRemote() {
 		return remoteRunStart(ctx, args)
+	}
+	selection, err := selectedStepsParams(ctx)
+	if err != nil {
+		return err
 	}
 	fromRunID, err := ctx.StringParam("from-run-id")
 	if err != nil {
@@ -143,6 +182,9 @@ func runStart(ctx *Context, args []string) error {
 	if fromRunID != "" && isSubDAGRun {
 		return fmt.Errorf("--from-run-id cannot be combined with --parent or --root")
 	}
+	if len(selection.steps) > 0 && (isSubDAGRun || rootRef != "" || workerID != "local") {
+		return fmt.Errorf("--only cannot be combined with --parent, --root, or --worker-id")
+	}
 
 	var (
 		dag             *ir.DAG
@@ -154,7 +196,7 @@ func runStart(ctx *Context, args []string) error {
 		if len(args) == 0 {
 			return fmt.Errorf("DAG name or file must be provided when using --from-run-id")
 		}
-		if len(args) > 1 || ctx.Command.Flags().Changed("params") || ctx.Command.ArgsLenAtDash() != -1 {
+		if len(args) > 1 || ctx.Command.Flags().Changed("params") || ctx.Command.ArgsLenAtDash() != -1 || stdinParamsRequested(ctx) {
 			return fmt.Errorf("parameters cannot be provided when using --from-run-id")
 		}
 
@@ -183,7 +225,7 @@ func runStart(ctx *Context, args []string) error {
 		}
 
 		params = status.Params
-		dag, err = restoreDAGFromStatus(ctx.Context, snapshot, status)
+		dag, err = restoreDAGFromStatus(ctx.Context, snapshot, status, ctx.Persistence.DAGRunRepository)
 		if err != nil {
 			return fmt.Errorf("failed to restore DAG from status: %w", err)
 		}
@@ -209,7 +251,7 @@ func runStart(ctx *Context, args []string) error {
 			return err
 		}
 
-		if err := validateStartPositionalParamCount(ctx, args, dag); err != nil {
+		if err := validateStartPositionalParamCount(ctx, args, dag, params); err != nil {
 			return err
 		}
 	}
@@ -252,6 +294,14 @@ func runStart(ctx *Context, args []string) error {
 		}
 		opts.parent = parent
 		return handleSubDAGRun(ctx, dag, dagRunID, params, opts)
+	}
+
+	if len(selection.steps) > 0 {
+		logger.Info(ctx, "Executing selected steps",
+			slog.Any("steps", selection.steps),
+			slog.String("params", params),
+		)
+		return runSelectedSteps(ctx, dag, dagRunID, params, opts, selection)
 	}
 
 	if fromRunID != "" {
@@ -344,6 +394,8 @@ func getDAGRunInfo(ctx *Context) (dagRunID, rootDAGRun, parentDAGRun string, isS
 }
 
 // loadDAGWithParams loads the DAG and its parameters from command arguments.
+// Parameters come from args after "--", else the --params flag, else stdin
+// when --params-stdin is enabled.
 func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*ir.DAG, string, error) {
 	dagPath := args[0]
 
@@ -388,6 +440,9 @@ func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*ir.DAG, 
 	var params string
 
 	if ctx.Command.ArgsLenAtDash() != -1 && len(args) > 0 {
+		if stdinParamsRequested(ctx) {
+			logger.Warn(ctx, "Ignoring --params-stdin: params were provided after '--'")
+		}
 		dashArgs := args[ctx.Command.ArgsLenAtDash():]
 		loadOpts = append(loadOpts, spec.WithParams(quoteStartDashArgs(dashArgs)))
 		params = strings.Join(dashArgs, " ")
@@ -396,7 +451,28 @@ func loadDAGWithParams(ctx *Context, args []string, isSubDAGRun bool) (*ir.DAG, 
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to get parameters: %w", err)
 		}
-		loadOpts = append(loadOpts, spec.WithParams(stringutil.RemoveQuotes(params)))
+		switch {
+		case ctx.Command.Flags().Changed("params"):
+			if stdinParamsRequested(ctx) {
+				logger.Warn(ctx, "Ignoring --params-stdin: params were provided via --params")
+			}
+		default:
+			hasInput, err := stdinHasParamsInput(ctx)
+			if err != nil {
+				return nil, "", err
+			}
+			if hasInput {
+				params, err = readStdinParams()
+				if err != nil {
+					return nil, "", err
+				}
+			}
+		}
+		loadParams := params
+		if ctx.Command.Flags().Changed("params") {
+			loadParams = stringutil.RemoveQuotes(loadParams)
+		}
+		loadOpts = append(loadOpts, spec.WithParams(loadParams))
 	}
 
 	dag, err := spec.Load(ctx, dagPath, loadOpts...)
@@ -640,7 +716,9 @@ func dispatchToCoordinatorAndWait(ctx *Context, d *ir.DAG, dagRunID string, opts
 		slog.Any("worker-selector", d.WorkerSelector),
 	)
 
-	var taskOpts []executor.TaskOption
+	taskOpts := []executor.TaskOption{
+		executor.WithBaseConfig(executor.ResolveBaseConfig(d.BaseConfigData, ctx.Config.Paths.BaseConfig), d.BaseConfigWorkspace),
+	}
 	if len(d.WorkerSelector) > 0 {
 		taskOpts = append(taskOpts, executor.WithWorkerSelector(d.WorkerSelector))
 	}
@@ -660,15 +738,24 @@ func dispatchToCoordinatorAndWait(ctx *Context, d *ir.DAG, dagRunID string, opts
 		taskOpts = append(taskOpts, executor.WithTriggerActor(opts.triggerActor))
 	}
 
+	operation := dispatch.DispatchOperationStart
+	if opts.seed != nil {
+		operation = dispatch.DispatchOperationRetry
+		taskOpts = append(taskOpts, executor.WithPreviousStatus(opts.seed))
+	}
+
 	task := executor.CreateTask(
 		d.Name,
 		string(d.YamlData),
-		dispatch.DispatchOperationStart,
+		operation,
 		dagRunID,
 		taskOpts...,
 	)
 
 	if err := coordinatorCli.Dispatch(signalAwareCtx, dispatch.DispatchRequest{Task: task}); err != nil {
+		if opts.seed != nil {
+			intake.MarkSeedFailed(ctx, ctx.Persistence.DAGRunRepository, opts.seed, err)
+		}
 		return fmt.Errorf("failed to dispatch task: %w", err)
 	}
 
@@ -772,8 +859,8 @@ func waitForDAGCompletionWithProgress(ctx *Context, d *ir.DAG, dagRunID string, 
 					logger.Info(ctx, "DAG completed successfully", tag.RunID(dagRunID))
 					return nil
 				}
-				if dagStatus.Error != "" {
-					return fmt.Errorf("DAG run failed with status %s: %s", dagStatus.Status, dagStatus.Error)
+				if runError := dagStatus.ErrorText(); runError != "" {
+					return fmt.Errorf("DAG run failed with status %s: %s", dagStatus.Status, runError)
 				}
 				return fmt.Errorf("DAG run failed with status: %s", dagStatus.Status)
 			}

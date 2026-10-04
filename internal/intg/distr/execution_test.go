@@ -564,6 +564,21 @@ steps:
 	running := f.waitForStatus(ir.Running, executionStatusTimeout())
 	require.Equal(t, ir.Running, running.Status)
 	require.NotEmpty(t, running.Log)
+	defer func() {
+		if !t.Failed() {
+			return
+		}
+		current, err := f.latestStoredStatus()
+		t.Logf("Latest run status: %+v (error: %v)", current, err)
+		paths := []string{current.Log}
+		for _, suffix := range []string{"stdout", "stderr"} {
+			paths = append(paths, findLogFiles(t, f.logDir(), f.dagWrapper.Name, running.DAGRunID, "gated-step", suffix)...)
+		}
+		for _, path := range paths {
+			data, err := os.ReadFile(path)
+			t.Logf("Log %s: %q (error: %v)", path, data, err)
+		}
+	}()
 
 	f.requireEventuallyNoSchedulerError(
 		"small step logs should be visible on the coordinator while the step is running",
@@ -681,7 +696,7 @@ steps:
 		require.Equal(t, ir.Succeeded, status.Status)
 		require.NotEmpty(t, status.ArchiveDir)
 		require.DirExists(t, status.ArchiveDir)
-		assert.True(t, strings.HasPrefix(status.ArchiveDir, filepath.Join(f.artifactDir(), f.dagWrapper.Name)+string(os.PathSeparator)))
+		assertArtifactDirInTree(t, f, status.ArchiveDir)
 		assertArtifactContains(t, status.ArchiveDir, "reports/summary.md", "artifact from worker")
 	})
 
@@ -708,7 +723,7 @@ steps:
 		require.Equal(t, ir.Failed, status.Status)
 		require.NotEmpty(t, status.ArchiveDir)
 		require.DirExists(t, status.ArchiveDir)
-		assert.True(t, strings.HasPrefix(status.ArchiveDir, filepath.Join(f.artifactDir(), f.dagWrapper.Name)+string(os.PathSeparator)))
+		assertArtifactDirInTree(t, f, status.ArchiveDir)
 		assertArtifactContains(t, status.ArchiveDir, "reports/summary.md", "artifact from failed worker")
 	})
 
@@ -735,8 +750,10 @@ steps:
 		require.Equal(t, ir.Succeeded, status.Status)
 		require.NotEmpty(t, status.ArchiveDir)
 		require.DirExists(t, status.ArchiveDir)
-		assert.True(t, strings.HasPrefix(status.ArchiveDir, filepath.Join(f.artifactDir(), f.dagWrapper.Name)+string(os.PathSeparator)))
+		assertArtifactDirInTree(t, f, status.ArchiveDir)
 
+		// Also guards that per-run metadata is a sibling of the artifact
+		// directory, never a child, where a step could overwrite it.
 		entries, err := os.ReadDir(status.ArchiveDir)
 		require.NoError(t, err)
 		assert.Empty(t, entries)
@@ -982,7 +999,7 @@ steps:
 	f.waitForQueued()
 	f.startScheduler(30 * time.Second)
 	f.requireEventuallyNoSchedulerError(
-		"DAG should remain queued while no worker is available",
+		"DAG should remain queued while no matching worker is registered",
 		executionStatusTimeout(),
 		100*time.Millisecond,
 		func() bool {
@@ -991,7 +1008,7 @@ steps:
 				return false
 			}
 			for _, condition := range status.Conditions {
-				if condition.Type == "WorkerReady" && condition.Status == "False" && condition.Reason == "NoAvailableWorker" {
+				if condition.Type == "WorkerReady" && condition.Status == "False" && condition.Reason == "NoMatchingWorker" {
 					return true
 				}
 			}

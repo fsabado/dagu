@@ -9,11 +9,12 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/artifactpath"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
-	"github.com/dagucloud/dagu/v2/internal/cmn/logpath"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/intake"
@@ -348,11 +349,12 @@ func (r *Local) Retry(ctx context.Context, req executor.SubWorkflowRetryRequest)
 	defer cleanup()
 
 	opts := rtagent.Options{
-		RetryTarget:       retryTarget,
-		StepRetry:         req.StepName,
-		IncludeDownstream: req.IncludeDownstream,
-		TriggerType:       inProcessRetryTriggerType(retryTarget),
-		WorkDir:           workspaceDir,
+		RetryTarget:         retryTarget,
+		StepRetry:           req.StepName,
+		IncludeDownstream:   req.IncludeDownstream,
+		BypassPreconditions: req.BypassPreconditions,
+		TriggerType:         inProcessRetryTriggerType(retryTarget),
+		WorkDir:             workspaceDir,
 	}
 	if req.Workspace != nil {
 		opts.WorkspaceSeed = &executor.WorkspaceSeed{
@@ -486,7 +488,8 @@ func (r *Local) newAgent(
 	opts.TriggerActor = req.TriggerActor
 	opts.ParallelItem = req.ParallelItem
 	opts.RetryPath = req.RetryPath
-	opts.ExtraEnvs = append(inProcessExtraEnvs(rCtx, req), toolEnvs...)
+	opts.ExtraEnvs = append(inProcessExtraEnvs(req), toolEnvs...)
+	opts.InheritedEnvs = inheritedEnvForLocalRunner(rCtx.InheritedEnvs())
 	opts.WorkerID = r.workerID
 	opts.StatusPusher = r.statusPusher
 	opts.SubWorkflowRunnerFactory = r.subWorkflowRunnerFactory
@@ -634,6 +637,10 @@ func loadInProcessDAG(
 		dag.WorkingDir = req.DAG.WorkingDir
 	}
 	dag.SourceFile = req.DAG.SourceFile
+	if baseWorkspace := subWorkflowBaseWorkspace(req); baseWorkspace != nil ||
+		(dag.BaseConfigWorkspace != nil && *dag.BaseConfigWorkspace == "") {
+		dag.BaseConfigWorkspace = baseWorkspace
+	}
 	return dag, workspaceDir, cleanup, nil
 }
 
@@ -668,8 +675,14 @@ func inProcessLoadOptions(
 	return loadOpts
 }
 
-func inProcessExtraEnvs(rCtx runctx.Context, req executor.SubWorkflowRequest) []string {
-	envs := inheritedEnvForLocalRunner(rCtx.InheritedEnvs())
+// inProcessExtraEnvs returns the execution-scoped values a local child run
+// receives on top of its own declarations: the pass_env values the step opted
+// to share plus run-control markers. The parent run scope reaches the child
+// separately through Options.InheritedEnvs, where it sits below the child's
+// own params and declarations.
+func inProcessExtraEnvs(req executor.SubWorkflowRequest) []string {
+	var envs []string
+	envs = append(envs, req.PassedEnv...)
 	if req.ParallelItem != "" {
 		envs = append(envs, ir.ParallelItemVariable+"="+req.ParallelItem)
 	}
@@ -692,7 +705,7 @@ func inProcessArtifactDir(ctx context.Context, dag *ir.DAG, baseDir, runID strin
 		dagArtifactDir = dag.Artifacts.Dir
 	}
 
-	dir, err := logpath.GenerateDir(ctx, baseDir, dagArtifactDir, dag.Name, runID)
+	dir, err := artifactpath.NewRunDir(ctx, baseDir, dagArtifactDir, dag.Name, runID, time.Now())
 	if err != nil {
 		return "", fmt.Errorf("failed to generate child workflow artifact directory: %w", err)
 	}

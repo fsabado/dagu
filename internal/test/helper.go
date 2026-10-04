@@ -40,6 +40,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/queue"
 	runtimepkg "github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/runtime/agent"
+	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/frontend"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
@@ -236,7 +237,7 @@ func Setup(t *testing.T, opts ...HelperOption) Helper {
 	cfg.Paths.ProcDir = filepath.Join(dataDir, "proc")
 	cfg.Paths.ServiceRegistryDir = filepath.Join(dataDir, "service-registry")
 	cfg.Paths.UsersDir = filepath.Join(dataDir, "users")
-	cfg.Paths.SuspendFlagsDir = filepath.Join(tmpDir, "suspend-flags")
+	cfg.Paths.SuspendFlagsDir = filepath.Join(dataDir, "suspend-flags")
 	cfg.Paths.AdminLogsDir = filepath.Join(tmpDir, "admin-logs")
 	cfg.Paths.EventStoreDir = filepath.Join(cfg.Paths.AdminLogsDir, "events")
 	cfg.Coordinator.Enabled = false
@@ -286,6 +287,7 @@ func Setup(t *testing.T, opts ...HelperOption) Helper {
 	dagRepository, err := file.NewDAGRepository(cfg, file.WithDAGSkipExamples(true))
 	require.NoError(t, err)
 	dagRunRepository := file.NewDAGRunRepository(cfg)
+	artifactRepository := file.NewArtifactRepository(cfg)
 	procRepository := newProcRepository(cfg)
 	backend := file.NewBackend(cfg.Paths)
 	queueStore := store.NewQueueStore(backend.Collection(persis.CollectionQueue))
@@ -316,6 +318,7 @@ func Setup(t *testing.T, opts ...HelperOption) Helper {
 		DAGRunMgr:                 drm,
 		DAGRepository:             dagRepository,
 		DAGRunRepository:          dagRunRepository,
+		ArtifactRepository:        artifactRepository,
 		ProcRepository:            procRepository,
 		Backend:                   backend,
 		QueueStore:                queueStore,
@@ -526,6 +529,7 @@ type Helper struct {
 	LoggingOutput             *SyncBuffer
 	DAGRepository             *persis.DAGRepository
 	DAGRunRepository          *persis.DAGRunRepository
+	ArtifactRepository        *persis.ArtifactRepository
 	DAGRunMgr                 runtimepkg.Manager
 	ProcRepository            *persis.ProcRepository
 	Backend                   persis.Backend
@@ -804,20 +808,21 @@ func (d *DAG) Agent(opts ...AgentOption) *Agent {
 	helper.opts.DAGRunArtifactDir = d.Config.Paths.ArtifactDir
 	if helper.opts.SubWorkflowRunnerFactory == nil {
 		helper.opts.SubWorkflowRunnerFactory = coordinator.NewSubWorkflowRunnerFactory(coordinator.SubWorkflowRunnerConfig{
-			DAGRunMgr:         d.DAGRunMgr,
-			DAGRepository:     d.DAGRepository,
-			DAGRunRepository:  d.DAGRunRepository,
-			RunStateStore:     helper.opts.RunStateStore,
-			QueueStore:        d.QueueStore,
-			StateStore:        d.StateStore,
-			SecretStore:       helper.opts.SecretStore,
-			ProfileStore:      helper.opts.ProfileStore,
-			ServiceRegistry:   d.ServiceRegistry,
-			PeerConfig:        d.Config.Core.Peer,
-			DefaultExecMode:   d.Config.DefaultExecMode,
-			WorkerID:          "local",
-			DAGRunLogDir:      d.Config.Paths.LogDir,
-			DAGRunArtifactDir: d.Config.Paths.ArtifactDir,
+			DAGRunMgr:          d.DAGRunMgr,
+			DAGRepository:      d.DAGRepository,
+			DAGRunRepository:   d.DAGRunRepository,
+			RunStateStore:      helper.opts.RunStateStore,
+			QueueStore:         d.QueueStore,
+			StateStore:         d.StateStore,
+			SecretStore:        helper.opts.SecretStore,
+			ProfileStore:       helper.opts.ProfileStore,
+			ServiceRegistry:    d.ServiceRegistry,
+			PeerConfig:         d.Config.Core.Peer,
+			WorkspaceBundleDir: workspacebundle.StoreDir(d.Config.Paths.DataDir),
+			DefaultExecMode:    d.Config.DefaultExecMode,
+			WorkerID:           "local",
+			DAGRunLogDir:       d.Config.Paths.LogDir,
+			DAGRunArtifactDir:  d.Config.Paths.ArtifactDir,
 		})
 	}
 

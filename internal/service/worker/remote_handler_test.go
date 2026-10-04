@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,10 +29,13 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	"github.com/dagucloud/dagu/v2/internal/runctx"
 	dagruntime "github.com/dagucloud/dagu/v2/internal/runtime"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator/subflow"
 	"github.com/dagucloud/dagu/v2/internal/service/worker/coordreport"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/dagucloud/dagu/v2/internal/test"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
@@ -39,6 +43,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 var _ TaskHandler = (*remoteTaskHandler)(nil)
@@ -912,6 +917,54 @@ func TestCreateAgentEnv(t *testing.T) {
 func TestLoadDAG(t *testing.T) {
 	t.Parallel()
 
+	t.Run("LegacyWorkspace", func(t *testing.T) {
+		t.Parallel()
+		baseDir := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(baseDir, "ops"), 0750))
+		require.NoError(t, os.WriteFile(filepath.Join(baseDir, "ops", "base.yaml"), []byte("smtp:\n  host: ops.example\n"), 0600))
+		handler := &remoteTaskHandler{config: &config.Config{}}
+		loaded, err := handler.loadDAG(context.Background(), &coordinatorv1.Task{
+			Target: "child", Definition: "steps:\n  - run: echo child\n", BaseConfig: "{}",
+		})
+		require.NoError(t, err)
+		t.Cleanup(loaded.cleanup)
+		// Tasks predating workspace provenance still inherit it from their saved parent.
+		parent := &ir.DAG{YamlData: []byte("labels: [workspace=ops]"), LocalDAGs: map[string]*ir.DAG{"child": loaded.dag}}
+		refreshed, err := spec.RefreshBaseSMTP(parent, spec.WithWorkspaceBaseConfigDir(baseDir))
+		require.NoError(t, err)
+		child, err := spec.RebuildFromYAML(context.Background(), refreshed.LocalDAGs["child"])
+		require.NoError(t, err)
+		require.NotNil(t, child.SMTP)
+		assert.Equal(t, "ops.example", child.SMTP.Host)
+	})
+
+	t.Run("BaseSMTP", func(t *testing.T) {
+		t.Parallel()
+		basePath := filepath.Join(t.TempDir(), "base.yaml")
+		require.NoError(t, os.WriteFile(basePath, []byte("smtp:\n  host: worker.example\n"), 0600))
+		handler := &remoteTaskHandler{config: &config.Config{Paths: config.PathsConfig{BaseConfig: basePath}}}
+		for _, tc := range []struct{ base, host string }{
+			{"smtp:\n  host: sender.example\n", "sender.example"},
+			{"{}\n", ""},
+			{"", "worker.example"},
+		} {
+			baseWorkspace := "ops"
+			loaded, err := handler.loadDAG(context.Background(), &coordinatorv1.Task{
+				Target: "child", Definition: "steps:\n  - run: echo hello\n",
+				BaseConfig: tc.base, BaseConfigWorkspace: &baseWorkspace,
+			})
+			require.NoError(t, err)
+			t.Cleanup(loaded.cleanup)
+			assert.Equal(t, &baseWorkspace, loaded.dag.BaseConfigWorkspace)
+			if tc.host == "" {
+				assert.Nil(t, loaded.dag.SMTP)
+			} else {
+				require.NotNil(t, loaded.dag.SMTP)
+				assert.Equal(t, tc.host, loaded.dag.SMTP.Host)
+			}
+		}
+	})
+
 	t.Run("FromDefinition", func(t *testing.T) {
 		t.Parallel()
 
@@ -1165,6 +1218,123 @@ steps:
 	})
 }
 
+// A local parent can dispatch a targeted child retry to a worker. Exercise
+// that boundary with real worker execution so dropping retry options is visible.
+func TestChildRetryBypassesPreconditions(t *testing.T) {
+	th := test.Setup(t)
+	dag := th.DAG(t, `name: retry-child-preconditions
+type: graph
+steps:
+  - name: target
+    run: echo target-ran
+    output: RESULT
+    preconditions:
+      - condition: blocked
+        expected: ready
+  - name: downstream
+    depends: target
+    run: echo downstream-ran
+    preconditions:
+      - condition: blocked
+        expected: ready
+  - name: unrelated
+    run: echo unrelated
+    preconditions:
+      - condition: blocked
+        expected: ready
+handler_on:
+  exit:
+    run: echo handler
+    preconditions:
+      - condition: blocked
+        expected: ready
+`)
+	root := ir.NewDAGRunRef("parent", "parent-run")
+	previous := ir.NewStatusBuilder(dag.DAG).Create("child-run", ir.Succeeded, 0, time.Now(), ir.WithHierarchyRefs(root, root))
+	for _, node := range previous.Nodes {
+		node.Status = ir.NodeSkipped
+	}
+	var mu sync.Mutex
+	latest := &previous
+	client := newMockRemoteCoordinatorClient()
+	client.GetDAGRunStatusFunc = func(context.Context, string, string, *ir.DAGRunRef) (*dispatch.DAGRunStatusResult, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return &dispatch.DAGRunStatusResult{Found: true, Status: latest}, nil
+	}
+	client.ReportStatusFunc = func(_ context.Context, req *coordinatorv1.ReportStatusRequest) (*coordinatorv1.ReportStatusResponse, error) {
+		got, err := convert.ProtoToDAGRunStatus(req.Status)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		latest = got
+		mu.Unlock()
+		return &coordinatorv1.ReportStatusResponse{Accepted: true}, nil
+	}
+	handler := &remoteTaskHandler{
+		workerID: "test-worker", coordinatorClient: client,
+		dagRepository: th.DAGRepository, dagRunMgr: th.DAGRunMgr,
+		serviceRegistry: th.ServiceRegistry, config: th.Config,
+		peerConfig: config.Peer{Insecure: true},
+	}
+	client.DispatchFunc = func(ctx context.Context, task *dispatch.DispatchTask) error {
+		wire, err := convert.DispatchTaskToProto(task)
+		if err != nil {
+			return err
+		}
+		data, err := proto.Marshal(wire)
+		if err != nil {
+			return err
+		}
+		received := new(coordinatorv1.Task)
+		if err := proto.Unmarshal(data, received); err != nil {
+			return err
+		}
+		return handler.Handle(ctx, received)
+	}
+	runner := subflow.New(client, config.ExecutionModeLocal, subflow.WithPollInterval(time.Millisecond))
+	req := executor.SubWorkflowRetryRequest{
+		SubWorkflowRequest: executor.SubWorkflowRequest{
+			DAG: dag.DAG, RootDAGRun: root, ParentDAGRun: root,
+			RunID: previous.DAGRunID, WorkerSelector: map[string]string{"role": "worker"},
+		},
+		StepName: "target",
+	}
+	require.True(t, runner.ShouldRun(th.Context, req.SubWorkflowRequest))
+
+	// Reuse the reported attempt to verify that bypass does not leak into
+	// a later retry that omits the flag.
+	for _, tc := range []struct {
+		name                       string
+		bypass, downstream         bool
+		wantTarget, wantDownstream ir.NodeStatus
+	}{
+		{"default", false, false, ir.NodeSkipped, ir.NodeSkipped},
+		{"target", true, false, ir.NodeSucceeded, ir.NodeSkipped},
+		{"downstream", true, true, ir.NodeSucceeded, ir.NodeSucceeded},
+		{"default_again", false, true, ir.NodeSkipped, ir.NodeSkipped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req.BypassPreconditions = tc.bypass
+			req.IncludeDownstream = tc.downstream
+			_, err := runner.Retry(th.Context, req)
+			require.NoError(t, err)
+			mu.Lock()
+			defer mu.Unlock()
+			require.Len(t, latest.Nodes, 3)
+			require.Equal(t, tc.wantTarget, latest.Nodes[0].Status)
+			require.Equal(t, tc.wantDownstream, latest.Nodes[1].Status)
+			require.Equal(t, ir.NodeSkipped, latest.Nodes[2].Status)
+			require.NotNil(t, latest.OnExit)
+			require.Equal(t, ir.NodeSkipped, latest.OnExit.Status)
+			if tc.bypass {
+				require.Equal(t, "target-ran", test.StatusOutputValue(t, latest, "RESULT"))
+			}
+		})
+	}
+}
+
 func TestRetryTaskProfileNameUsesStoredStatus(t *testing.T) {
 	t.Parallel()
 
@@ -1303,6 +1473,35 @@ func TestRemoteHandler_UniqueLogDirs(t *testing.T) {
 	defer env2.cleanup()
 
 	assert.NotEqual(t, env1.logDir, env2.logDir, "different dagRunIDs should produce different log directories")
+}
+
+// The worker tracks tasks by attempt, not by run, so a retry dispatched while
+// the previous attempt is still finalising gives one worker two live tasks for
+// the same run. Sharing a staging directory would let the first to finish
+// delete the other's artifacts.
+func TestCreateAgentEnv_SameRunIDGetsSeparateStaging(t *testing.T) {
+	t.Parallel()
+
+	handler := &remoteTaskHandler{workerID: "staging-worker"}
+	dag := &ir.DAG{Name: "staged", Artifacts: &ir.ArtifactsConfig{Enabled: true}}
+	ctx := context.Background()
+
+	first, err := handler.createAgentEnv(ctx, dag, "run-shared")
+	require.NoError(t, err)
+	defer first.cleanup()
+
+	second, err := handler.createAgentEnv(ctx, dag, "run-shared")
+	require.NoError(t, err)
+	defer second.cleanup()
+
+	require.NotEmpty(t, first.artifactDir)
+	assert.NotEqual(t, first.artifactDir, second.artifactDir)
+
+	require.NoError(t, os.WriteFile(filepath.Join(first.artifactDir, "kept.txt"), []byte("x"), 0o600))
+	second.cleanup()
+
+	assert.FileExists(t, filepath.Join(first.artifactDir, "kept.txt"),
+		"cleaning up one attempt removed the other attempt's artifacts")
 }
 
 func TestHandle_OperationStart(t *testing.T) {
@@ -1650,6 +1849,7 @@ func TestLoadDAGSelectsInlineTargetFromWorkspace(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "input.txt"), []byte("input"), 0o600))
 	definition := []byte(`name: root
+labels: [workspace=ops]
 steps:
   - name: root-step
     run: echo root
@@ -1687,6 +1887,15 @@ steps:
 	require.NotNil(t, loaded.workspaceSeed)
 	require.Len(t, loaded.dag.Steps, 1)
 	assert.Equal(t, "child-step", loaded.dag.Steps[0].Name)
+	baseDir := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(baseDir, "ops"), 0750))
+	require.NoError(t, os.WriteFile(filepath.Join(baseDir, "ops", "base.yaml"), []byte("smtp:\n  host: ops.example\n"), 0600))
+	child, err := spec.RefreshBaseSMTP(loaded.dag, spec.WithWorkspaceBaseConfigDir(baseDir))
+	require.NoError(t, err)
+	child, err = spec.RebuildFromYAML(context.Background(), child)
+	require.NoError(t, err)
+	require.NotNil(t, child.SMTP)
+	assert.Equal(t, "ops.example", child.SMTP.Host)
 }
 
 func TestLoadDAG_CleanupErrorLogged(t *testing.T) {
@@ -2117,8 +2326,8 @@ func TestRemoteRunReporter_SchedulerWriterCloseUsesLiveStream(t *testing.T) {
 		require.NoError(t, logFile.Close())
 	}()
 
-	streamOpened := make(chan struct{}, 1)
-	closeEntered := make(chan struct{}, 1)
+	closeEntered := make(chan struct{})
+	var closeOnce sync.Once
 	unblockClose := make(chan struct{})
 	var unblockOnce sync.Once
 	unblock := func() {
@@ -2129,13 +2338,18 @@ func TestRemoteRunReporter_SchedulerWriterCloseUsesLiveStream(t *testing.T) {
 	defer unblock()
 
 	client := newMockRemoteCoordinatorClient()
-	client.StreamLogsFunc = func(context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
-		streamOpened <- struct{}{}
+	client.StreamLogsFunc = func(ctx context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
 		stream := newMockStreamLogsClient()
+		var closed atomic.Bool
 		stream.closeAndRecvFunc = func() (*coordinatorv1.StreamLogsResponse, error) {
-			closeEntered <- struct{}{}
-			<-unblockClose
-			return &coordinatorv1.StreamLogsResponse{}, nil
+			assert.False(t, closed.Swap(true), "each live stream should close once")
+			closeOnce.Do(func() { close(closeEntered) })
+			select {
+			case <-unblockClose:
+				return &coordinatorv1.StreamLogsResponse{}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		return stream, nil
 	}
@@ -2167,16 +2381,7 @@ func TestRemoteRunReporter_SchedulerWriterCloseUsesLiveStream(t *testing.T) {
 		t.Fatal("scheduler writer close did not close a live stream")
 	}
 
-	select {
-	case <-streamOpened:
-	default:
-		t.Fatal("remote scheduler writer did not open a live scheduler log stream")
-	}
-	select {
-	case <-closeEntered:
-		t.Fatal("remote scheduler writer closed a live scheduler log stream more than once")
-	default:
-	}
+	require.NoError(t, schedulerWriter.Close())
 }
 
 func TestRemoteRunReporter_MirrorsStepOutputIntoFinalSchedulerLog(t *testing.T) {

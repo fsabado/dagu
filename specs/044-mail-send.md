@@ -23,9 +23,14 @@ Workflow authors can send a notification using the DAG's SMTP configuration.
 recipient, subject, and message fields under `with`. Successful execution delivers
 a message with the configured subject and recipient.
 
+With `with.mailbox`, `mail.send` sends through that mail account instead, as
+[Spec 073](073-mailbox-actions.md) defines.
+
 ## Errors
 
-An empty recipient fails before connecting to SMTP. SMTP OAuth configuration
+An empty recipient fails before connecting to SMTP. An attachment that does not
+exist or cannot be read fails the step before connecting, with an error naming
+the attachment. An empty attachment file is attached as an empty file. SMTP OAuth configuration
 requires a username and cannot be combined with a password; invalid combinations
 fail `dagu validate` with a diagnostic identifying the conflict.
 

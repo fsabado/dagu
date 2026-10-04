@@ -305,7 +305,8 @@ export interface paths {
          * Validate a DAG specification
          * @description Validates a DAG YAML specification without persisting any changes.
          *
-         *     Returns a list of validation errors. When the spec can be partially parsed,
+         *     Returns separate lists of validation errors and non-fatal warnings.
+         *     When the spec can be partially parsed,
          *     the response may also include parsed DAG details built with error-tolerant loading.
          *
          */
@@ -532,6 +533,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dags/{fileName}/browser-cache": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Clear a DAG's browser replay cache
+         * @description Removes the recorded act operations that the DAG's browser steps replay on later runs, so the next run asks the model again. Only the cache on the node that serves the request is cleared; in distributed mode it is kept on the worker that ran the step. Operator or above.
+         */
+        delete: operations["clearDAGBrowserCache"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dags/search": {
         parameters: {
             query?: never;
@@ -624,6 +645,26 @@ export interface paths {
          * @description Returns cursor-based snippets for one matching Wiki page.
          */
         get: operations["searchWikiPageMatches"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent DAG-run artifacts
+         * @description Returns root DAG-runs that produced artifacts, newest first, each with its files. Child runs are reached through their root.
+         */
+        get: operations["listArtifacts"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1040,9 +1081,29 @@ export interface paths {
         put?: never;
         /**
          * Complete a waiting human task
-         * @description Validates typed input against the stored human-task form, completes the step atomically, and queues the same DAG-run when no manual steps remain waiting.
+         * @description Validates typed input against the stored human-task form, completes the step atomically, and queues the same DAG-run when no manual steps remain waiting or when the completion unblocks a step. A step counts as unblocked only when every dependency lets it run, it declares no build inputs, and no step in the run is failed, aborted, rejected, or retrying.
          */
         post: operations["completeHumanTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/human-tasks/{stepId}/push-back": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Push a waiting human task back to its rewind target
+         * @description Validates feedback against the stored push-back form of a human task that declares with.push_back, then atomically resets the rewind target and every step depending on it, including the task, with the feedback as push-back context. The push-back is stored before the same DAG-run is queued. The run is queued when no manual step remains waiting or when the rewind target can run and no step in the run is failed, aborted, rejected, or retrying. Repeating an identical push-back before the task opens again only retries the queue.
+         */
+        post: operations["pushBackHumanTask"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1060,7 +1121,7 @@ export interface paths {
         put?: never;
         /**
          * Queue a completed human-task checkpoint for resume
-         * @description Queues a retry for a completed human-task checkpoint without requiring the previously submitted form values.
+         * @description Queues a retry for a completed human-task checkpoint or a stored human-task push-back without requiring the previously submitted form values or feedback.
          */
         post: operations["resumeHumanTaskDAGRun"];
         delete?: never;
@@ -1129,6 +1190,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dag-runs/{name}/{dagRunId}/steps/log/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download step logs as ZIP of a DAG-run
+         * @description Downloads stdout and stderr for the steps and lifecycle handlers of this
+         *     DAG-run only. Logs from nested DAG-runs are not included.
+         *     Returns a streaming ZIP archive with no size limit. Each available log is
+         *     stored as <index>-<step-name>/stdout.log or stderr.log, in run order.
+         *     Missing files are skipped. Each file includes only the bytes present when
+         *     it is opened; subsequent log growth is excluded.
+         *
+         */
+        get: operations["downloadDAGRunStepLogs"];
+        put?: never;
+        /**
+         * Download step logs as ZIP of a DAG-run
+         * @description Browser form download of the same streaming ZIP returned by GET.
+         *     The optional token field supplies a bearer credential when the
+         *     Authorization header is absent. Normal authentication and run visibility
+         *     checks apply. Tokens in the URL are not accepted.
+         *
+         */
+        post: operations["downloadDAGRunStepLogsForm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dag-runs/{name}/{dagRunId}/steps/{stepName}/messages": {
         parameters: {
             query?: never;
@@ -1169,6 +1264,26 @@ export interface paths {
         patch: operations["updateDAGRunStepStatus"];
         trace?: never;
     };
+    "/dag-runs/{name}/{dagRunId}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resume work after a saved approval
+         * @description Retries resume admission for a root run without changing its approvals or inputs. Already queued or running resumes are not dispatched again.
+         */
+        post: operations["resumeDAGRun"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dag-runs/{name}/{dagRunId}/steps/{stepName}/approve": {
         parameters: {
             query?: never;
@@ -1180,7 +1295,7 @@ export interface paths {
         put?: never;
         /**
          * Approve a waiting step
-         * @description Approves a step that is in Waiting status, optionally providing input parameters that will be available as environment variables in subsequent steps
+         * @description Approves a waiting step and requests resume when work is ready. Approval and inputs remain saved if resume admission fails; use the run resume endpoint to retry without approving again.
          */
         post: operations["approveDAGRunStep"];
         delete?: never;
@@ -1443,6 +1558,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/log/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download step logs as ZIP of a sub DAG-run
+         * @description Downloads stdout and stderr for the steps and lifecycle handlers of this
+         *     sub DAG-run only. Logs from nested DAG-runs are not included.
+         *     Returns a streaming ZIP archive with no size limit. Each available log is
+         *     stored as <index>-<step-name>/stdout.log or stderr.log, in run order.
+         *     Missing files are skipped. Each file includes only the bytes present when
+         *     it is opened; subsequent log growth is excluded.
+         *
+         */
+        get: operations["downloadSubDAGRunStepLogs"];
+        put?: never;
+        /**
+         * Download step logs as ZIP of a sub DAG-run
+         * @description Browser form download of the same streaming ZIP returned by GET.
+         *     The optional token field supplies a bearer credential when the
+         *     Authorization header is absent. Normal authentication and run visibility
+         *     checks apply. Tokens in the URL are not accepted.
+         *
+         */
+        post: operations["downloadSubDAGRunStepLogsForm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/messages": {
         parameters: {
             query?: never;
@@ -1671,6 +1820,33 @@ export interface paths {
         get: operations["getSchedulerStatus"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/services/scheduler/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get scheduler pause state
+         * @description Returns whether scheduler-driven run creation is currently paused, and who paused it. Readable by any authenticated user so the reason a schedule stopped is visible to everyone.
+         */
+        get: operations["getSchedulerPauseState"];
+        put?: never;
+        /**
+         * Pause or resume the scheduler
+         * @description Pauses or resumes scheduler-driven run creation for every DAG at once. Admin only.
+         *
+         *     Pausing has the same effect as suspending every DAG by hand. Manual, webhook, and sub-DAG runs keep working. Queued scheduler-managed runs are aborted and dequeued, catch-up windows are discarded rather than deferred, and nothing replays on resume. One-off schedules stay pending and fire late once the scheduler resumes.
+         *
+         */
+        post: operations["updateSchedulerPauseState"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1939,6 +2115,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/notification-channels/{channelId}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test notification channel
+         * @description Sends a sample failure notification to one saved channel, including disabled channels. Does not require a workflow or change notification rules. Developer, manager, or admin only.
+         */
+        post: operations["testNotificationChannel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/incident-providers": {
         parameters: {
             query?: never;
@@ -2151,6 +2347,52 @@ export interface paths {
         put: operations["configureDAGWebhookProfileSelection"];
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dags/{fileName}/webhook/profile-tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create webhook profile token
+         * @description Creates an additional webhook token bound to one runtime profile.
+         *     Requests authenticated with it always run with that profile.
+         *     Returns the new token, which is only shown once. Not available when
+         *     the webhook auth mode is `hmac_only`. Admin only.
+         *
+         */
+        post: operations["createDAGWebhookProfileToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dags/{fileName}/webhook/profile-tokens/{tokenId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke webhook profile token
+         * @description Revokes a webhook profile token. The token becomes invalid
+         *     immediately. Admin only.
+         *
+         */
+        delete: operations["revokeDAGWebhookProfileToken"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3645,7 +3887,7 @@ export interface components {
             dagRunId: string;
             /** @description The approved step name */
             stepName: string;
-            /** @description Whether the DAG run was re-enqueued for execution */
+            /** @description Whether resume execution was accepted, directly or through a queue */
             resumed: boolean;
         };
         /** @description A single chat message in an LLM session */
@@ -3768,7 +4010,7 @@ export interface components {
             /** @description Optional step name to restart from when the approver pushes the step back. Must reference the step itself or an upstream dependency. */
             rewindTo?: string;
         };
-        /** @description Resolved human-task instructions and optional normalized input form */
+        /** @description Resolved human-task instructions with optional normalized input form and artifact references */
         HumanTaskConfig: {
             /** @description Instructions displayed to the operator. Run details contain the resolved, secret-masked snapshot. */
             prompt: string;
@@ -3776,8 +4018,20 @@ export interface components {
             form?: {
                 [key: string]: unknown;
             };
+            /** @description Artifact-relative paths in the current root DAG run */
+            artifacts?: string[];
+            pushBack?: components["schemas"]["HumanTaskPushBackConfig"];
         };
-        /** @description Typed human-task completion input. An empty object acknowledges a task without a form. */
+        /** @description Push-back configuration of a human task */
+        HumanTaskPushBackConfig: {
+            /** @description Name of the upstream step that runs again first after a push-back */
+            rewindTo: string;
+            /** @description Normalized flat JSON Schema for typed push-back feedback. Omitted when push-back accepts no input. */
+            form?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Typed human-task input: completion values or push-back feedback. An empty object supplies no values, which acknowledges a task without a form. */
         HumanTaskInput: {
             [key: string]: unknown;
         };
@@ -3790,6 +4044,24 @@ export interface components {
             /** @description Whether this request durably queued the DAG-run retry */
             queued: boolean;
             remainingWaitingSteps: number;
+            /** @description True when this request found the DAG-run waiting and ready to resume, whether it queued the resume or a concurrent request queued it first; false if the run keeps waiting or has already left waiting */
+            resumeRequested: boolean;
+        };
+        /** @description Result of pushing back one human task */
+        HumanTaskPushBackResponse: {
+            dagName: components["schemas"]["DAGName"];
+            dagRunId: components["schemas"]["DAGRunId"];
+            stepId: string;
+            /** @description Name of the step that runs again first */
+            rewindTo: string;
+            /** @description Push-back iteration the push-back recorded */
+            iteration: number;
+            /** @description Whether identical feedback had already pushed the task back and the task has not opened again since */
+            alreadyPushedBack: boolean;
+            /** @description Whether this request durably queued the DAG-run retry */
+            queued: boolean;
+            /** @description True when the DAG-run was ready to resume after the push-back, whether this request queued the resume or a concurrent request queued it first; false if the run keeps waiting */
+            resumeRequested: boolean;
         };
         /** @description Result of queueing a completed human-task retry */
         HumanTaskResumeResponse: {
@@ -3874,6 +4146,8 @@ export interface components {
             authMode: components["schemas"]["WebhookAuthMode"];
             hmac: components["schemas"]["WebhookHMACDetails"];
             profileSelection: components["schemas"]["WebhookProfileSelectionDetails"];
+            /** @description Additional tokens, each bound to one runtime profile. Remote nodes running versions without profile tokens omit the field. */
+            profileTokens?: components["schemas"]["WebhookProfileToken"][];
             /**
              * Format: date-time
              * @description When the webhook was created
@@ -3911,6 +4185,34 @@ export interface components {
         WebhookProfileSelectionDetails: {
             /** @description Runtime profile names accepted through X-Dagu-Profile. An empty list disables caller selection. */
             allowedProfiles: components["schemas"]["RuntimeProfileName"][];
+        };
+        /** @description Webhook token bound to one runtime profile (token not included) */
+        WebhookProfileToken: {
+            /** @description Unique identifier for the profile token */
+            id: string;
+            /** @description Label identifying the caller that holds the token */
+            name: string;
+            /** @description Leading characters of the token for identification */
+            tokenPrefix: string;
+            profile: components["schemas"]["RuntimeProfileName"];
+            /**
+             * Format: date-time
+             * @description When the profile token was created
+             */
+            createdAt: string;
+            /** @description User ID who created the profile token */
+            createdBy?: string;
+            /**
+             * Format: date-time
+             * @description When the profile token last authorized a request
+             */
+            lastUsedAt?: string;
+        };
+        /** @description Request to create a webhook profile token */
+        WebhookProfileTokenCreateRequest: {
+            /** @description Label identifying the caller that will hold the token */
+            name: string;
+            profile: components["schemas"]["RuntimeProfileName"];
         };
         /** @description Replacement runtime-profile allowlist for a webhook */
         WebhookProfileSelectionRequest: {
@@ -4312,6 +4614,11 @@ export interface components {
             /** @description Default runtime profile used when a DAG run does not provide an explicit profile override */
             profile?: components["schemas"]["RuntimeProfileName"];
         };
+        /** @description Browser steps whose replay cache was removed */
+        DAGBrowserCacheClearResult: {
+            /** @description Keys of the steps whose recorded act operations were removed: the requested step, or every cleared step with step names in their file-safe form. Empty when there was nothing to clear. */
+            steps: string[];
+        };
         /** @description Server-side DAG notification settings */
         DAGNotificationSettings: {
             /** @description Stable settings ID */
@@ -4572,10 +4879,12 @@ export interface components {
             currentPage: number;
             /** @description total number of pages */
             totalPages: number;
-            /** @description next page number */
+            /** @description next page number, clamped to totalPages on the last page */
             nextPage: number;
             /** @description previous page number */
             prevPage: number;
+            /** @description whether a page follows the current one */
+            hasNextPage: boolean;
         };
         /**
          * @description Unique identifier for the DAG-run. The special value 'latest' can be used to reference the most recent DAG-run.
@@ -4731,6 +5040,17 @@ export interface components {
             status: SchedulerInstanceStatus;
             /** @description RFC3339 timestamp when scheduler started */
             startedAt: string;
+        };
+        /** @description Cluster-wide scheduler pause state */
+        SchedulerPauseState: {
+            /** @description Whether scheduler-driven run creation is currently paused */
+            paused: boolean;
+            /** @description RFC3339 timestamp when the scheduler was paused */
+            pausedAt?: string;
+            /** @description User who paused the scheduler */
+            pausedBy?: string;
+            /** @description Operator-facing explanation shown while paused */
+            reason?: string;
         };
         /** @description Response containing status of all coordinator instances */
         CoordinatorStatusResponse: {
@@ -5002,6 +5322,16 @@ export interface components {
              */
             checkedAt: string;
         };
+        /** @description Operating system process executing a DAG-run on the host that served this response. Present only while the DAG-run is running on that host; absent for queued, waiting and finished DAG-runs, and for DAG-runs executed by a remote worker, because in those cases there is no local process to look at. The process may have exited since the status was recorded, so treat pid as valid only when the live process with that pid reports startedAtMs as its creation time. */
+        DAGRunProcess: {
+            /** @description Process ID of the process executing the DAG-run */
+            pid: number;
+            /**
+             * Format: int64
+             * @description Creation time of that process as a Unix timestamp in milliseconds, as reported by the host operating system. Compare it against the creation time of the live process with this pid before attributing anything to the DAG-run; operating systems reuse pids, and a pid alone cannot identify a process.
+             */
+            startedAtMs: number;
+        };
         /** @description Current status of a DAG-run */
         DAGRunSummary: {
             dagRunId: components["schemas"]["DAGRunId"];
@@ -5032,6 +5362,7 @@ export interface components {
             profileName?: components["schemas"]["RuntimeProfileName"];
             /** @description ID of the worker that executed this DAG-run ('local' for local execution) */
             workerId?: string;
+            process?: components["schemas"]["DAGRunProcess"];
             triggerType?: components["schemas"]["TriggerType"];
             /** @description Authenticated actor that initiated the DAG-run, when attribution is available */
             triggerActor?: string;
@@ -5065,6 +5396,8 @@ export interface components {
             onWait?: components["schemas"]["Node"];
             /** @description List of preconditions that must be met before the DAG-run can start */
             preconditions?: components["schemas"]["Condition"][];
+            /** @description Top-level error recorded for the DAG-run, such as a definition build failure that prevented the run from starting */
+            error?: string;
             /** @description Goal progress of an agent DAG-run. Absent for other DAG types. */
             agentTasks?: components["schemas"]["AgentTask"][];
             /** @description Ordered decision timeline of an agent DAG-run: what the agent ran, in what order, and when each task was satisfied. Absent for other DAG types. */
@@ -5075,6 +5408,37 @@ export interface components {
             sourceFileName?: components["schemas"]["DAGFileName"];
             /** @description Whether completed human-task input is durable but the same DAG-run still needs its retry queued */
             humanTaskResumePending?: boolean;
+            /** @description Whether a root run has a saved approval and ready work whose resume still needs to be accepted */
+            approvalResumePending?: boolean;
+        };
+        /** @description One file within a DAG-run's artifact directory */
+        ArtifactListFile: {
+            /** @description Path of the file relative to the DAG-run artifact directory */
+            path: string;
+            /**
+             * Format: int64
+             * @description Size of the file in bytes
+             */
+            size: number;
+        };
+        /** @description One root DAG-run and the artifact files it produced */
+        ArtifactListItem: {
+            name: components["schemas"]["DAGName"];
+            dagRunId: components["schemas"]["DAGRunId"];
+            /** @description RFC 3339 timestamp of when the DAG-run was created. This is what fromDate and toDate bound and what the listing is ordered by; for a run that waited in a queue it precedes startedAt. */
+            createdAt: string;
+            /** @description RFC 3339 timestamp of when the DAG-run started */
+            startedAt?: string;
+            /** @description Files in the run's artifact directory, sorted by path. With fileName set, only the matching files. At most 100 are returned; see filesTruncated. */
+            files: components["schemas"]["ArtifactListFile"][];
+            /** @description True when the run holds more files than were returned. Which files were returned is then not defined; the per-run artifact endpoint serves the full tree. */
+            filesTruncated: boolean;
+        };
+        /** @description Page of root DAG-runs that produced artifacts, newest first */
+        ArtifactListResponse: {
+            items: components["schemas"]["ArtifactListItem"][];
+            /** @description Opaque cursor for the next page; absent when the last page was returned */
+            nextCursor?: string;
         };
         /**
          * @description Artifact tree node type
@@ -5314,6 +5678,8 @@ export interface components {
             decision?: string;
             answers?: string[][];
             createdAt?: string;
+            /** @description RFC 3339 time after which an answer fails the step. Set for browser asks. */
+            expiresAt?: string;
             respondedAt?: string;
             respondedBy?: string;
             respondedById?: string;
@@ -5341,7 +5707,7 @@ export interface components {
             status?: string;
             files?: string[];
         };
-        /** @description One push-back event recorded for an approval step */
+        /** @description One push-back event recorded for an approval step or a human task */
         PushBackHistoryEntry: {
             /** @description Push-back iteration number */
             iteration: number;
@@ -5716,12 +6082,14 @@ export interface components {
         };
         /** @description Precondition that must be satisfied before running a step or DAG-run */
         Condition: {
-            /** @description Value or command text to evaluate. When `expected` is omitted, this runs as a command check. When `expected` is set, this is value-resolved and compared as data. */
+            /** @description Value or command text to evaluate. When `expected` and `expectedAny` are omitted, this runs as a command check. When either is set, this is value-resolved and compared as data. */
             condition?: string;
             /** @description Dynamic value expression to evaluate and compare with `expected`. Valid only when `expected` is set and `condition` is omitted. */
             eval?: string;
             /** @description Expected result for a value-match precondition. When set, Dagu compares the actual value from `condition` or `eval` instead of using command exit status. */
             expected?: string;
+            /** @description Alternative expected results for a value-match precondition, set instead of `expected`. The condition is met when any of them matches. Set on a step that a router lists under several routes. */
+            expectedAny?: string[];
             /** @description If true, inverts the condition result (run when condition does NOT match) */
             negate?: boolean;
             /** @description Error message if the condition is not met */
@@ -6587,6 +6955,21 @@ export interface components {
          * @enum {string}
          */
         ViewSortOrder: ViewSortOrder;
+        /**
+         * @description Date range mode applied by an Executions page view.
+         * @enum {string}
+         */
+        RunDateMode: RunDateMode;
+        /**
+         * @description Relative date preset applied by an Executions or Artifacts page view. 'all' applies no date bound and is accepted only for artifact views.
+         * @enum {string}
+         */
+        RunDatePreset: RunDatePreset;
+        /**
+         * @description Period granularity applied by an Executions page view.
+         * @enum {string}
+         */
+        RunSpecificPeriod: RunSpecificPeriod;
         ViewSpec: {
             /** @description Display name for the view. */
             name: string;
@@ -6602,6 +6985,21 @@ export interface components {
             labels?: string[];
             /** @description DAG name substring filter. Empty matches any. */
             dagName?: string;
+            /** @description Artifact file name filter: a glob when it contains wildcards, otherwise a substring. Empty matches any. */
+            fileName?: string;
+            /** @description DAG run ID filter. Empty matches any. */
+            dagRunId?: string;
+            /** @description Run status filter: 'all' or a status number. Empty matches any. */
+            runStatus?: string;
+            dateMode?: components["schemas"]["RunDateMode"];
+            datePreset?: components["schemas"]["RunDatePreset"];
+            specificPeriod?: components["schemas"]["RunSpecificPeriod"];
+            /** @description Date, month, or year value applied in specific mode. */
+            specificValue?: string;
+            /** @description Custom range start (YYYY-MM-DDTHH:mm). */
+            fromDate?: string;
+            /** @description Custom range end (YYYY-MM-DDTHH:mm). */
+            toDate?: string;
             /** @description Required number of days each row (bucket) groups. Rows scroll back in time by this unit. */
             intervalDays: number;
             /** @description Status columns to display, in left-to-right order. Omitted values use the default order with all columns visible. */
@@ -6626,6 +7024,8 @@ export interface components {
             workspace?: string;
             labels?: string[];
             dagName?: string;
+            /** @description Artifact file name filter. Empty matches any. */
+            fileName?: string;
             intervalDays: number;
             /** @description Visible status columns in left-to-right display order. */
             columns?: components["schemas"]["ViewColumn"][];
@@ -6635,6 +7035,19 @@ export interface components {
             sortOrder?: components["schemas"]["ViewSortOrder"];
             /** @description Whether the view only includes scheduled, unsuspended workflows. */
             activeOnly?: boolean;
+            /** @description DAG run ID filter. Empty matches any. */
+            dagRunId?: string;
+            /** @description Run status filter: 'all' or a status number. */
+            runStatus?: string;
+            dateMode?: components["schemas"]["RunDateMode"];
+            datePreset?: components["schemas"]["RunDatePreset"];
+            specificPeriod?: components["schemas"]["RunSpecificPeriod"];
+            /** @description Date, month, or year value applied in specific mode. */
+            specificValue?: string;
+            /** @description Custom range start (YYYY-MM-DDTHH:mm). */
+            fromDate?: string;
+            /** @description Custom range end (YYYY-MM-DDTHH:mm). */
+            toDate?: string;
             isDefault?: boolean;
             /** @description Username of the creator, for display only. */
             createdBy?: string;
@@ -6675,6 +7088,8 @@ export interface components {
         UserId: string;
         /** @description unique identifier of the API key */
         APIKeyId: string;
+        /** @description unique identifier of the webhook profile token */
+        WebhookProfileTokenId: string;
         /** @description number of items per page (default is 30, max is 100) */
         PerPage: number;
         /** @description Number of Wiki page entries per page (default 50, max 200) */
@@ -6683,6 +7098,14 @@ export interface components {
         Workspace: string;
         /** @description Optional Wiki page path prefix within the selected workspace */
         WikiPagePrefix: components["schemas"]["WikiPagePath"];
+        /** @description Filter by DAG names containing this value */
+        ArtifactDAGName: string;
+        /** @description Select files by path. A value containing glob metacharacters (* ? [ {) is matched as a glob against the path relative to the DAG-run artifact directory; any other value is matched as a case-insensitive substring of that path. A run is returned only if at least one file matches, and only the matching files are listed for it. */
+        ArtifactFileName: string;
+        /** @description Number of runs to return (default 100, max 500) */
+        ArtifactListLimit: number;
+        /** @description Opaque cursor returned by the previous artifact list response */
+        ArtifactListCursor: string;
         /** @description Opaque cursor returned by the previous search response */
         SearchCursor: string;
         /** @description Number of search results to return (default 20, max 50) */
@@ -7916,6 +8339,8 @@ export interface operations {
                         dag?: components["schemas"]["DAGDetails"];
                         /** @description List of validation errors */
                         errors: string[];
+                        /** @description Non-fatal spec warnings; these do not affect valid */
+                        warnings?: string[];
                     };
                 };
             };
@@ -7960,6 +8385,8 @@ export interface operations {
                         suspended: boolean;
                         /** @description List of errors encountered during the request */
                         errors: string[];
+                        /** @description Non-fatal spec warnings */
+                        warnings?: string[];
                         /** @description The DAG specification in YAML format */
                         spec?: string;
                         editorHints?: components["schemas"]["DAGEditorHints"];
@@ -8054,7 +8481,19 @@ export interface operations {
                     noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
-                    /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
+                    /** @description Run only these steps, by step name or ID, in a new DAG-run of the current definition. Every other step is recorded as skipped and does not run. Not supported for agent DAGs. */
+                    steps?: string[];
+                    outputsFromRunId?: components["schemas"]["DAGRunId"] & unknown;
+                    /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId. Requires steps. */
+                    outputs?: {
+                        [key: string]: {
+                            [key: string]: string;
+                        };
+                    };
+                    /**
+                     * @deprecated
+                     * @description Deprecated alias for `labels`; mutually exclusive with `labels`.
+                     */
                     tags?: components["schemas"]["Tags"];
                 };
             };
@@ -8135,7 +8574,10 @@ export interface operations {
                     noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
-                    /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
+                    /**
+                     * @deprecated
+                     * @description Deprecated alias for `labels`; mutually exclusive with `labels`.
+                     */
                     tags?: components["schemas"]["Tags"];
                     /** @description Maximum seconds to wait for DAG execution to complete (required) */
                     timeout: number;
@@ -8229,7 +8671,10 @@ export interface operations {
                     noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
-                    /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
+                    /**
+                     * @deprecated
+                     * @description Deprecated alias for `labels`; mutually exclusive with `labels`.
+                     */
                     tags?: components["schemas"]["Tags"];
                 };
             };
@@ -8381,6 +8826,8 @@ export interface operations {
                         spec: string;
                         /** @description List of errors in the spec */
                         errors: string[];
+                        /** @description Non-fatal spec warnings */
+                        warnings?: string[];
                         /** @description Passive value-reference notices produced while loading this spec. These notices are not persisted. */
                         valueReferenceNotices: components["schemas"]["ValueReferenceNotice"][];
                     };
@@ -8574,6 +9021,61 @@ export interface operations {
                         /** @description Errors encountered */
                         errors: string[];
                     };
+                };
+            };
+            /** @description DAG not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    clearDAGBrowserCache: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Clear only this step: its ID, or its name when the step has no ID. Omit to clear every step. */
+                step?: string;
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Replay cache cleared */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DAGBrowserCacheClearResult"];
+                };
+            };
+            /** @description Forbidden - insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description DAG not found */
@@ -8862,6 +9364,61 @@ export interface operations {
             };
         };
     };
+    listArtifacts: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
+                workspace?: components["parameters"]["Workspace"];
+                /** @description start datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                fromDate?: components["parameters"]["DateTimeFrom"];
+                /** @description end datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                toDate?: components["parameters"]["DateTimeTo"];
+                /** @description Filter by DAG names containing this value */
+                name?: components["parameters"]["ArtifactDAGName"];
+                /** @description Select files by path. A value containing glob metacharacters (* ? [ {) is matched as a glob against the path relative to the DAG-run artifact directory; any other value is matched as a case-insensitive substring of that path. A run is returned only if at least one file matches, and only the matching files are listed for it. */
+                fileName?: components["parameters"]["ArtifactFileName"];
+                /** @description Number of runs to return (default 100, max 500) */
+                limit?: components["parameters"]["ArtifactListLimit"];
+                /** @description Opaque cursor returned by the previous artifact list response */
+                cursor?: components["parameters"]["ArtifactListCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactListResponse"];
+                };
+            };
+            /** @description Invalid cursor, file name pattern, or pagination parameters */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getAllDAGLabels: {
         parameters: {
             query?: {
@@ -9028,7 +9585,19 @@ export interface operations {
                     noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
-                    /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
+                    /** @description Run only these steps, by step name or ID, in a new DAG-run of the current definition. Every other step is recorded as skipped and does not run. Not supported for agent DAGs. */
+                    steps?: string[];
+                    outputsFromRunId?: components["schemas"]["DAGRunId"] & unknown;
+                    /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId. Requires steps. */
+                    outputs?: {
+                        [key: string]: {
+                            [key: string]: string;
+                        };
+                    };
+                    /**
+                     * @deprecated
+                     * @description Deprecated alias for `labels`; mutually exclusive with `labels`.
+                     */
                     tags?: components["schemas"]["Tags"];
                 };
             };
@@ -9110,7 +9679,10 @@ export interface operations {
                     noReuse?: boolean;
                     /** @description Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set. */
                     labels?: components["schemas"]["Labels"];
-                    /** @description Deprecated alias for `labels`; mutually exclusive with `labels`. */
+                    /**
+                     * @deprecated
+                     * @description Deprecated alias for `labels`; mutually exclusive with `labels`.
+                     */
                     tags?: components["schemas"]["Tags"];
                 };
             };
@@ -9972,6 +10544,8 @@ export interface operations {
                     stepName?: string;
                     /** @description Optional. When true, retry the selected step and every reachable descendant. Requires stepName. Unrelated branches keep their existing status. */
                     includeDownstream?: boolean;
+                    /** @description Optional. When true, skip step precondition evaluation for the steps reset by this retry. Requires stepName. DAG-level preconditions and lifecycle handlers still apply. */
+                    bypassPreconditions?: boolean;
                     subDAGRunId?: components["schemas"]["DAGRunId"] & unknown;
                 };
             };
@@ -10084,6 +10658,97 @@ export interface operations {
             };
         };
     };
+    pushBackHumanTask: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Push-back iteration of the task the caller reviewed. When it differs from the task's current push-back iteration, the request fails with 409 and changes nothing. */
+                expectedIteration?: number;
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run; must not be the special 'latest' alias */
+                dagRunId: components["parameters"]["DAGRunConcreteId"];
+                /** @description explicit ID of the human-task step */
+                stepId: components["parameters"]["HumanTaskStepId"];
+            };
+            cookie?: never;
+        };
+        /** @description Typed feedback input. The JSON request body is limited to 16 MiB. */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HumanTaskInput"];
+            };
+        };
+        responses: {
+            /** @description Human task pushed back */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HumanTaskPushBackResponse"];
+                };
+            };
+            /** @description Malformed or invalid feedback, or the task does not declare push-back */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description DAG-run or human task not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Human task is not open, is at a different push-back iteration, was already pushed back with different feedback, or the run changed concurrently */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Feedback exceeds the 16 MiB request-body limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The push-back was stored, but the DAG-run retry could not be queued; retry the same request or the resume endpoint */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     resumeHumanTaskDAGRun: {
         parameters: {
             query?: {
@@ -10119,7 +10784,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description The DAG-run still has waiting steps or no recoverable human-task checkpoint */
+            /** @description Manual steps are still waiting and no step is ready to run, or the DAG-run has no recoverable human-task checkpoint */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10293,6 +10958,109 @@ export interface operations {
             };
         };
     };
+    downloadDAGRunStepLogs: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ZIP archive of step log files */
+            200: {
+                headers: {
+                    /** @description Attachment filename */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/zip": string;
+                };
+            };
+            /** @description DAG-run not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    downloadDAGRunStepLogsForm: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/x-www-form-urlencoded": {
+                    /** @description Bearer credential for browser form downloads */
+                    token?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description ZIP archive of step log files */
+            200: {
+                headers: {
+                    /** @description Attachment filename */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/zip": string;
+                };
+            };
+            /** @description DAG-run not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getDAGRunStepMessages: {
         parameters: {
             query?: {
@@ -10402,6 +11170,74 @@ export interface operations {
             };
         };
     };
+    resumeDAGRun: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resume accepted or already in progress */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        dagRunId: components["schemas"]["DAGRunId"];
+                        /** @description Whether execution has been accepted */
+                        resumed: boolean;
+                    };
+                };
+            };
+            /** @description DAG-run not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Run has no approved work ready to resume or its state changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Approval remains saved but resume admission failed; retry this endpoint */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     approveDAGRunStep: {
         parameters: {
             query?: {
@@ -10445,6 +11281,24 @@ export interface operations {
             };
             /** @description DAG-run or step not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Run state changed before resume admission */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Approval was saved but resume admission failed; use the run resume endpoint */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -11195,6 +12049,113 @@ export interface operations {
             };
         };
     };
+    downloadSubDAGRunStepLogs: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description ID of the sub DAG-run to download the step logs for */
+                subDAGRunId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ZIP archive of step log files */
+            200: {
+                headers: {
+                    /** @description Attachment filename */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/zip": string;
+                };
+            };
+            /** @description Sub DAG-run not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    downloadSubDAGRunStepLogsForm: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description ID of the sub DAG-run to download the step logs for */
+                subDAGRunId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/x-www-form-urlencoded": {
+                    /** @description Bearer credential for browser form downloads */
+                    token?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description ZIP archive of step log files */
+            200: {
+                headers: {
+                    /** @description Attachment filename */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/zip": string;
+                };
+            };
+            /** @description Sub DAG-run not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getSubDAGRunStepMessages: {
         parameters: {
             query?: {
@@ -11826,6 +12787,77 @@ export interface operations {
             };
         };
     };
+    getSchedulerPauseState: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchedulerPauseState"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateSchedulerPauseState: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Pause state to set for the scheduler */
+                    paused: boolean;
+                    /** @description Operator-facing explanation shown while paused */
+                    reason?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getCoordinatorStatus: {
         parameters: {
             query?: {
@@ -11926,7 +12958,7 @@ export interface operations {
                 remoteNode?: components["parameters"]["RemoteNode"];
             };
             header?: {
-                /** @description Bearer token for webhook authentication (e.g., 'Bearer dagu_wh_...'). Required only when the webhook auth mode includes token authentication. */
+                /** @description Bearer token for webhook authentication (e.g., 'Bearer dagu_wh_...'). Accepts the webhook's default token or one of its profile tokens. Required only when the webhook auth mode includes token authentication. */
                 Authorization?: string;
                 /** @description HMAC webhook signature in the format `sha256=<hex>`. Required only
                  *     when the webhook auth mode includes HMAC authentication with strict
@@ -11935,7 +12967,7 @@ export interface operations {
                  *     `x-dagu-profile:<profile>\n<raw-request-body>`.
                  *      */
                 "X-Dagu-Signature"?: string;
-                /** @description Runtime profile selected for this DAG run. The profile must be allowed by the webhook profile-selection policy. Omit the header to use the DAG's default profile resolution. */
+                /** @description Runtime profile selected for this DAG run. With the default token, the profile must be allowed by the webhook profile-selection policy; omit the header to use the DAG's default profile resolution. With a profile token, the run always uses the token's profile; the header may be omitted or must name that profile. */
                 "X-Dagu-Profile"?: components["schemas"]["RuntimeProfileName"];
             };
             path: {
@@ -11977,7 +13009,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Forbidden - webhook disabled or not configured */
+            /** @description Forbidden - webhook disabled or not configured, or the requested runtime profile is not allowed for the token */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -12639,6 +13671,58 @@ export interface operations {
             };
             /** @description Notification channel is used by a DAG */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    testNotificationChannel: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                channelId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Channel test delivery attempted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestDAGNotificationResponse"];
+                };
+            };
+            /** @description Forbidden - insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Notification channel not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -13454,6 +14538,127 @@ export interface operations {
                 };
             };
             /** @description No webhook or runtime profile found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createDAGWebhookProfileToken: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WebhookProfileTokenCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Profile token created successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookCreateResponse"];
+                };
+            };
+            /** @description Invalid name, unavailable runtime profile, unsupported auth mode, or token limit reached */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No webhook or runtime profile found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeDAGWebhookProfileToken: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+                /** @description unique identifier of the webhook profile token */
+                tokenId: components["parameters"]["WebhookProfileTokenId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Profile token revoked successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDetails"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No webhook or profile token found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -19087,9 +20292,30 @@ export enum ViewSortOrder {
     asc = "asc",
     desc = "desc"
 }
+export enum RunDateMode {
+    preset = "preset",
+    specific = "specific",
+    custom = "custom"
+}
+export enum RunDatePreset {
+    today = "today",
+    yesterday = "yesterday",
+    last7days = "last7days",
+    last30days = "last30days",
+    thisWeek = "thisWeek",
+    thisMonth = "thisMonth",
+    all = "all"
+}
+export enum RunSpecificPeriod {
+    date = "date",
+    month = "month",
+    year = "year"
+}
 export enum ViewSpecType {
     kanban = "kanban",
-    workflow = "workflow"
+    workflow = "workflow",
+    run = "run",
+    artifact = "artifact"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",

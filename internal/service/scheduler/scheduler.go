@@ -20,6 +20,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/signalctx"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dagsettings"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
@@ -49,6 +50,7 @@ type Clock func() time.Time
 type processRepository interface {
 	queueProcessRepository
 	zombieProcessRepository
+	queuedomain.RunProcesses
 	CountAliveByDAGName(ctx context.Context, groupName, dagName string) (int, error)
 }
 
@@ -66,6 +68,7 @@ type Scheduler struct {
 	entryReader         EntryReader
 	quit                chan any
 	running             atomic.Bool
+	dagRepository       *persis.DAGRepository
 	dagRunRepository    *persis.DAGRunRepository
 	queueStore          queuedomain.QueueStore
 	procRepository      processRepository
@@ -107,6 +110,7 @@ type Dependencies struct {
 	ServiceRegistry      serviceregistry.ServiceRegistry
 	CoordinatorClient    dispatch.Dispatcher
 	SchedulerStateStore  schedulerstate.Store
+	SchedulerPauseStore  schedulerstate.PauseStore
 	DAGRunLeaseStore     dispatch.DAGRunLeaseStore
 	DispatchTaskStore    dispatch.DispatchTaskStore
 	WorkerHeartbeatStore dispatch.WorkerHeartbeatStore
@@ -136,17 +140,13 @@ type startupState struct {
 
 // New constructs a Scheduler from its configuration and dependencies.
 func New(cfg *config.Config, deps Dependencies) (*Scheduler, error) {
-	entryReader := deps.EntryReader
-	if entryReader == nil && deps.DAGRepository != nil {
-		entryReader = NewFileEntryReader(cfg.Paths.DAGsDir, deps.DAGRepository, cfg.DAGDiscovery.Recursive)
-	}
 	var profileResolver DAGProfileResolver
 	if deps.DAGSettingsStore != nil {
 		profileResolver = NewDAGProfileResolver(deps.DAGSettingsStore, deps.ProfileStore)
 	}
 	scheduler, err := newScheduler(
 		cfg,
-		entryReader,
+		deps.EntryReader,
 		deps.DAGRunManager,
 		deps.DAGRepository,
 		deps.DAGRunRepository,
@@ -155,6 +155,7 @@ func New(cfg *config.Config, deps Dependencies) (*Scheduler, error) {
 		deps.ServiceRegistry,
 		deps.CoordinatorClient,
 		deps.SchedulerStateStore,
+		deps.SchedulerPauseStore,
 		schedulerHooks{},
 		profileResolver,
 	)
@@ -187,6 +188,7 @@ func newScheduler(
 	reg serviceregistry.ServiceRegistry,
 	coordinatorCli dispatch.Dispatcher,
 	stateStore schedulerstate.Store,
+	pauseStore schedulerstate.PauseStore,
 	hooks schedulerHooks,
 	profileResolver DAGProfileResolver,
 ) (*Scheduler, error) {
@@ -195,6 +197,9 @@ func newScheduler(
 	}
 	if dagRunRepository == nil {
 		return nil, fmt.Errorf("DAG-run repository is required")
+	}
+	if er == nil {
+		return nil, fmt.Errorf("DAG entry reader is required")
 	}
 	timeLoc := cfg.Core.Location
 	if timeLoc == nil {
@@ -221,7 +226,7 @@ func newScheduler(
 
 	// Resolve IsSuspended once at construction time.
 	eventCh := er.Events()
-	isSuspended := dagRepository.IsSuspended
+	isSuspended := newSuspensionChecker(pauseStore, dagRepository.IsSuspended)
 	processor := NewQueueProcessor(
 		queueStore,
 		dagRunRepository,
@@ -301,7 +306,10 @@ func newScheduler(
 		ProfileResolver: profileResolver,
 		QueuesEnabled:   queuesEnabled,
 		Enqueue:         enqueueFunc,
-		IsQueued:        isQueued,
+		HasGlobalQueue: func(dag *ir.DAG) bool {
+			return cfg.FindQueueConfig(dag.ProcGroup()) != nil
+		},
+		IsQueued: isQueued,
 		RunExists: func(ctx context.Context, dag *ir.DAG, runID string) (bool, error) {
 			_, err := dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, runID))
 			switch {
@@ -327,10 +335,12 @@ func newScheduler(
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize retry scanner: %w", err)
 	}
+	retryScanner.processes = procRepository
 
 	return &Scheduler{
 		quit:             make(chan any),
 		entryReader:      er,
+		dagRepository:    dagRepository,
 		dagRunRepository: dagRunRepository,
 		queueStore:       queueStore,
 		procRepository:   procRepository,
@@ -589,6 +599,24 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		return nil
 	}
 
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		s.startHeartbeat(ctx)
+	})
+
+	if err := s.dagRepository.MigrateSuspensionState(ctx); err != nil {
+		if errors.Is(err, context.Canceled) && s.stopping() {
+			return nil
+		}
+		return fmt.Errorf("migrate suspension state: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		if s.stopping() {
+			return nil
+		}
+		return err
+	}
+
 	s.updateServiceStatus(ctx, serviceregistry.ServiceStatusActive, "Failed to update status to active", "Updated scheduler status to active")
 	if err := s.BootstrapMonitors(ctx); err != nil {
 		return err
@@ -609,12 +637,6 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer signal.Stop(sig)
-
-	var wg sync.WaitGroup
-
-	wg.Go(func() {
-		s.startHeartbeat(ctx)
-	})
 
 	if err := s.entryReader.Init(ctx); err != nil {
 		logger.Error(ctx, "Failed to initialize entry reader", tag.Error(err))
@@ -819,9 +841,17 @@ func (s *Scheduler) cronLoop(ctx context.Context, sig chan os.Signal) {
 func (s *Scheduler) waitForTick(ctx context.Context, sig chan os.Signal, timer *time.Timer) bool {
 	select {
 	case <-ctx.Done():
+		signal.Stop(sig)
+		var received os.Signal
+		_ = errors.As(context.Cause(ctx), &received)
+		<-launcher.PropagateSignal(ctx, received)
 		return false
-	case <-sig:
+	case received := <-sig:
+		signalctx.AbsorbRepeatedTerminate(ctx)
+		signal.Stop(sig)
+		runsDone := launcher.PropagateSignal(ctx, received)
 		s.Stop(ctx)
+		<-runsDone
 		return false
 	case <-s.quit:
 		return false

@@ -16,7 +16,7 @@ Use dagu_read for current state, Wiki pages, and trusted reference resources.
 Use dagu_change with mode=preview before mode=apply when editing DAG YAML, DAG default profiles, or Wiki pages.
 Use dagu_execute for start, enqueue, retry, and stop. retry and stop are actions inside dagu_execute.
 MCP Apps hosts can render run-related dagu_read and dagu_execute results in Dagu's interactive run inspector.
-To follow a run to completion, pass wait=true to dagu_execute, or read the returned dagu://runs/... resource, or subscribe to it to receive a resource update notification when the run reaches a terminal state.`
+To follow a run to completion, pass wait=true to dagu_execute, or read the returned dagu://runs/... resource, or subscribe to it to receive a resource update notification when the run reaches a terminal state or stops at a waiting checkpoint.`
 
 type referenceResource struct {
 	topic       string
@@ -62,7 +62,8 @@ Authoring rules:
 - Build workflows are local-only. Distributed execution requests are rejected because materialization fencing is not shared across workers.
 - human.task defines a processless root-DAG operator step with an explicit id, required with.prompt, and optional flat scalar with.form JSON Schema. Omit form for acknowledgement-only tasks.
 - Human task form properties that are required or have defaults become ${steps.step_id.outputs.name} values after completion. Do not declare outputs on a human.task step; additionalProperties defaults to false.
-- Human tasks cannot run in sub-DAGs, lifecycle handlers, or foreach.steps, and they do not support reject or rewind. Root DAGs containing human tasks may run locally or on distributed workers selected by DAG-level worker_selector. The MCP tool surface does not expose human-task completion; completion uses the local dagu human-task complete command.
+- Optional with.push_back lets the operator send a human task back instead of completing it: rewind_to names a step the task depends on, and optional form is a flat feedback schema whose additionalProperties must stay false. A push-back re-runs that step and every step that depends on it, directly or transitively, with the feedback as push-back context (DAG_PUSHBACK, DAG_PUSHBACK_ITERATION, and one environment variable per feedback property), then opens the task again. Feedback is limited to 16 KiB as JSON. Human tasks have no reject operation.
+- Human tasks cannot run in sub-DAGs, lifecycle handlers, or foreach.steps. Root DAGs containing human tasks may run locally or on distributed workers selected by DAG-level worker_selector. The MCP tool surface does not expose human-task completion or push-back; they use the local dagu human-task complete and dagu human-task push-back commands.
 - type: agent lets the configured llm pick which step runs next instead of a dependency graph. It requires llm and a non-empty tasks list, where each task has a name and a description stating when it is finished. depends and router steps are rejected, and the reserved names __agent__ and ask_user cannot be used for steps.
 - Use context references for run metadata, such as ${context.dag.name}, ${context.run.id}, and ${context.paths.artifacts_dir}.
 - git.worktree.add creates or reuses a linked worktree in the local repository containing the step working_dir. Omit branch for a Dagu-generated branch, or set branch with create_branch: true and optional base to create a named branch.
@@ -70,7 +71,22 @@ Authoring rules:
 - git.worktree.remove accepts branch, path, or both. Set force only to discard worktree changes. Set delete_branch to remove a merged branch, and add force_delete_branch to remove an unmerged branch.
 - harness.run can use root-level container or step-level container. A step-level container takes precedence for that step.
 - Containerized harness runs support Dagu CLI providers and custom providers that pass the prompt as an argument or flag. They do not support provider=builtin, with.stdin, or custom prompt_mode=stdin.
-- Docker or Podman is selected by the Dagu service process through DAGU_CONTAINER_RUNTIME and optional DAGU_PODMAN_HOST, not by a DAG YAML runtime field.`,
+- Docker or Podman is selected by the Dagu service process through DAGU_CONTAINER_RUNTIME and optional DAGU_PODMAN_HOST, not by a DAG YAML runtime field.
+- chat.completion with a step-level output_schema answers through a forced respond tool whose parameters are the schema. The schema needs type: object and at least one property; unlisted properties are dropped, the rest is validated, and each listed property becomes ${steps.step_id.outputs.name}, so do not declare outputs on the step. web_search cannot be combined with it. Leave a field out of required when the input may lack it; a required field makes the model invent a value.
+- browser.extract and browser.run drive a local Chrome using the DAG-level llm block or with.llm, which replaces it. browser.run takes with.do, a list where each item sets one of goto, act, extract, expect, wait, screenshot, or ask, plus optional when and timeout.
+- Browser steps publish the top-level properties of each extract schema as ${steps.step_id.outputs.name}; do not declare outputs on the step. Pass secrets through with.variables and reference them as %name% in act instructions; never write a secret into an instruction. An instruction containing a declared secret value of four or more characters fails the step, and only such values are masked, so shorter secrets are neither caught nor masked. A %name% that is not a variable or an earlier ask.as fails validation.
+- Browser expect and when take a statement the model judges or a fixed check object with one of text, selector, or url; prefer fixed checks for repeatable results. A fixed when reads the page once unless within is set. allowed_domains matches exact hosts and *.example.com matches subdomains only; the browser runtime applies it to HTTP(S) requests, so list CDN hosts too, and Dagu fails the step when the page URL leaves it.
+- computer.extract and computer.run operate the desktop of a macOS or Windows worker's logged-in user session, using the DAG-level llm block or with.llm. computer.run takes with.do, a list where each item sets one of launch, act, extract, expect, wait, screenshot, or ask, plus optional when and timeout. Route computer DAGs to such workers with DAG-level worker_selector; other systems fail the step.
+- Computer steps use the provider's native computer-use tool for anthropic, openai, and gemini, and plain function tools with any vision model for other providers or with mode: generic. Pass secrets through with.variables as %name%; the model sees only the placeholder, which is typed as the value. Typed values can still appear in later screenshots. Extract schema properties become ${steps.step_id.outputs.name}. Successful acts are replayed from a per-host cache while the screens match; dagu computer check verifies the desktop and permissions. Steps wait until nobody has touched the desktop for with.idle (default 15s; 0 turns it off) before sending input.
+- mail.search and mail.organize read and organize a mailbox over IMAP, or through the Gmail API for a Google account signed in with OAuth. The mailbox field names an entry of the DAG-level or base-config mail_accounts map, keyed by email address; provider google or microsoft fills in the servers, and credentials are password or oauth (google_refresh or microsoft_refresh with a refresh token; microsoft_refresh accepts optional scopes). A provider google account with oauth uses the Gmail API instead, takes no imap, smtp, or username, and treats folders as Gmail labels; its grant needs https://www.googleapis.com/auth/gmail.modify or https://mail.google.com/, and the Google Cloud project of its client_id must have the Gmail API enabled. mail.send with mailbox sends through that account; add in_reply_to (a found email's id) to reply: to defaults to the email's reply address, subject to Re: and its subject, and the reply is threaded under the email.
+- mail.search publishes messages (oldest first; each has id, message_id, folder, from_name, from_address, to, cc, subject, date, unread, flagged, text, attachments), count, and truncated; do not declare outputs on the step. Searching never marks email read.
+- mail.organize takes emails as an ID, an email from mail.search, an {id, move_to} object, or a list, with mark (read, unread, flagged, unflagged) and/or move (folder, archive, trash). To process each email once, loop over messages with foreach and mark each email read inside the loop after its work, so a failed email stays unread for the next run.
+- xlsx.read reads an .xlsx sheet without a spreadsheet application: with.path, optional sheet, range (A2:F, Sheet!A2:F, a named range, or a table), header (true, false, a row number, or [3, 4] for two header rows), columns (names or {name: alias}), types ({amount: number, due: date}; a pinned column also reads full-width digits, ￥123,000, 123,000円, 2026年10月3日, and era dates such as 令和8年10月3日 or R8.10.3), where ({Status: ""} or {Status: {ne: Done}}), and max_rows. It publishes rows (objects keyed by header, each with _row), count, headers, sheet, range, warnings, and truncated; do not declare outputs on the step. Numbers stay numbers, dates become ISO text, and text keeps leading zeros. Read a workbook first with dagu_read target=workbook to learn its sheets, headers, and types.
+- xlsx.write and xlsx.append write rows (usually ${steps.<id>.outputs.rows}; pass columns such as ${steps.<id>.outputs.headers} to keep column order) or an input json, jsonl, or csv file to a sheet; xlsx.info and xlsx.list_sheets describe a workbook. Writers publish path, sheet, changes ({rows_updated, rows_appended, columns_added, cells_changed}), dry_run, and warnings; dry_run: true reports without saving, wait_for_unlock: 5m retries a workbook another program holds open, and artifact: true keeps a copy with the run.
+- xlsx.update_rows writes results back to the rows they came from: key names the column that identifies a row (or _row), rows carry the key and the fields to write, and set maps sheet columns to row fields ({Status: status}) or literals ({Reviewed: {value: yes}}); without set every field other than the key and _row goes to the column of the same name. missing is fail, skip, or append. Before any cell is written the step checks that the key column is still in the header row and that a row addressed by _row still holds its key, and refuses when either changed; with key: _row there is no key to compare, so only the row number's range is checked and a sheet whose rows moved is not detected. A set column the sheet lacks is added at the right of the header. For "do this for each row and mark it done", read with where: {Status: ""}, foreach over the rows with a collect that carries the key and the result fields, and pass that collected output to update_rows.
+- xlsx.validate checks a sheet against rules before a workflow acts on it: required (columns the header must have), not_blank, unique, types ({Amount: number}), allowed ({Status: [Open, Done]}); at least one. It publishes ok, problems (each with code missing_column, blank, type, duplicate, or not_allowed, plus sheet, cell, row, column, message), count, rows, headers, sheet, range, warnings, truncated. on_problem: warn (default) succeeds with the problems published; fail fails the step after listing them and publishes nothing. To stop and ask someone, add a human.task step with a precondition on ${steps.<id>.outputs.count} (expected "num:>0") and continue_on: {skipped: true}.
+- xlsx.write_cells fills a template: cells maps addresses (B2, Sheet1!B2, or a defined name for one cell) to a value, {value: v, type: t}, {formula: "=SUM(B2:B9)"}, or null to clear; styles are kept. merge lists ranges to merge first ([A1:D1]); a range over a filled cell or another merged region fails the step, and changes.merged counts the ranges merged. output writes the result to a new workbook and leaves path untouched; the workbook at path must exist. xlsx.sheet takes operation add, copy, rename, or delete with sheet, to, if_exists (fail, skip, replace), missing (fail, skip), position, and publishes sheets; use if_exists: skip for reruns. xlsx.convert exports a sheet to the csv, json, or jsonl file named by output (format from the extension or format), with every row and for csv encoding (utf-8, utf-8-bom, shift_jis) and delimiter; the reverse is xlsx.write with input, whose csv takes the same encoding and delimiter. dagu dry warns when an xlsx step's workbook, sheet, or column does not exist.
+- xlsx.extract reads fields out of a sheet laid out as a form rather than a table, such as a quote whose layout differs by supplier: with.instruction says what to find and with.schema (type: object) names the fields as properties, each optionally typed (string, number, integer, boolean, or string with format date or date-time) and described. A model is shown the sheet's cells (address, kind, bold or fill, text cut to 200 characters; send_values: false hides non-text values) and answers only the address of each field's cell or null; the engine then reads the typed value from that cell, so no value is invented. It needs the DAG-level llm block or with.llm. Outputs are each property, cells (property to the Sheet!B7 it was read from), sheet, warnings, and source (model or cache); do not declare outputs on the step. The model also names the cells that are labels, and the answered addresses are cached by the sheet's shape with a digest of each label, so a layout seen before makes no model request as long as the instruction, the schema, and the labels are unchanged; a form of the same template with a box left blank is read from the cache too, while a label renamed in place asks again. cache: false asks every run, and dagu xlsx cache clear <dag> drops the cache. A pinned type reads Japanese text as xlsx.read does.`,
 		},
 		{
 			topic:       "tools",
@@ -126,14 +142,14 @@ Addressing:
 
 Fields:
 
-- target: required in target mode. Values are references, reference, dags, dag, dag_spec, dag_profile, dag_search, wiki, wiki_page, wiki_search, runs, run, run_logs, and step_log.
+- target: required in target mode. Values are references, reference, dags, dag, dag_spec, dag_profile, dag_search, wiki, wiki_page, wiki_search, workbook, runs, run, run_logs, and step_log.
 - name: DAG name or reference topic name. Required for dag, dag_spec, dag_profile, run, run_logs, and step_log. Optional for reference; defaults to authoring. Forbidden for references, dags, and runs.
 - dagRunId: required for run, run_logs, and step_log. Forbidden for other targets.
 - subRunId: optional child DAG-run ID for run and step_log. The name and dagRunId fields identify its root run.
 - stepName: required for step_log. Forbidden for other targets.
 - query: URL query string without a leading question mark. Allowed for dags, wiki, runs, run_logs, and step_log.
 - workspace: all, default, or a workspace name. Optional for wiki, wiki_search, and dag_search; omitted means all accessible workspaces. Required for wiki_page, where all is not allowed.
-- path: Wiki page path without .md. Required for wiki_page.
+- path: Wiki page path without .md, required for wiki_page; or a workbook file path on the server, required for workbook.
 - search: search text. Required for wiki_search and dag_search.
 - prefix: Wiki page path prefix without .md. Optional for wiki and wiki_search.
 - cursor: opaque cursor returned by the same search target. Optional for wiki_search and dag_search.
@@ -152,6 +168,7 @@ Targets:
 - wiki lists the Wiki tree or a flat page list. In tree mode, page and perPage select direct children of the workspace or prefix, and each returned directory includes its descendants. In flat mode, they select individual pages.
 - wiki_page reads one Markdown Wiki page.
 - wiki_search searches accessible Wiki pages in stable path order. Continue with nextCursor while keeping search, workspace, and prefix unchanged.
+- workbook inspects an .xlsx file on the server: for each sheet its used range, detected data block, header row, headers, column types, row count, tables, and five typed sample rows; plus named ranges and the date system. The path is any file the server process can read and is recorded in the audit log. Use the result to write xlsx.read with the right sheet, range, columns, and types.
 - runs lists DAG-runs.
 - run reads one DAG-run. With subRunId, it reads the child run under the identified root run.
 - run_logs reads scheduler and step log metadata.
@@ -159,7 +176,7 @@ Targets:
 
 Query parameters:
 
-- dags: page, perPage, name, labels, active, sort, order.
+- dags: page, perPage, name, labels, active, sort, order. perPage accepts 1 to 200.
 - wiki: page, perPage, flat, sort, order, prefix. perPage accepts 1 to 200.
 - runs: name, dagRunId, status, fromDate, toDate, limit, cursor, labels. status may repeat.
 - run_logs: tail. Values from 1 to 10000 are honored.
@@ -256,7 +273,7 @@ Fields:
 - labels: labels for start and enqueue.
 - stepName: optional step name for retry.
 - includeDownstream: when true, retry the selected step and every reachable descendant. Requires stepName.
-- wait: when true, wait for the identified run to reach a terminal state before returning. Requires a name that identifies the run.
+- wait: when true, wait for the identified run to reach a terminal state or a waiting checkpoint before returning. Requires a name that identifies the run.
 - waitTimeoutSeconds: maximum seconds to wait, from 1 to 300. Defaults to 60.
 
 Action behavior:
@@ -266,7 +283,7 @@ Action behavior:
 - retry retries an existing DAG-run and may target a step with stepName, optionally including downstream steps.
 - stop stops an existing DAG-run.
 - Fields unsupported by an action are invalid. params, singleton, noReuse, and labels apply only to start and enqueue; queue only to enqueue; stepName and includeDownstream only to retry.
-- With wait=true, the call returns once the run reaches a terminal state or the timeout elapses. On timeout the run keeps executing and the output has completed=false.
+- With wait=true, the call returns once the run reaches a terminal state, stops at a waiting checkpoint, or the timeout elapses. A run stopped at a checkpoint has completed=false and reports each waiting step under run.steps as humanTask or approval with its prompt; resolve them to resume the run. On timeout the run keeps executing and the output has completed=false.
 
 Output:
 
@@ -293,7 +310,7 @@ Errors:
 
 dagu_execute returns resource links for the DAG-run and logs when a run can be identified.
 
-Clients that support MCP resource subscriptions can subscribe to the dagu://runs/{name}/{dagRunId} resource. Dagu sends a resource update notification when the run reaches a terminal state: success, failed, aborted, partial success, or rejected.
+Clients that support MCP resource subscriptions can subscribe to the dagu://runs/{name}/{dagRunId} resource. Dagu sends a resource update notification when the run reaches a terminal state: success, failed, aborted, partial success, or rejected. Dagu also notifies when the run stops at a waiting checkpoint, and keeps watching so the later terminal state is notified too.
 
 Clients without resource subscription support have two options: pass wait=true to dagu_execute to wait for the result inside the tool call, or poll dagu_read target=run with the same name and dagRunId.`,
 		},

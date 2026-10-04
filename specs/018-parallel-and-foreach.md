@@ -283,6 +283,10 @@ Rules:
 - Parent step retry retries the fan-out step. This spec does not define
   per-item retry of only failed items.
 
+- The step-level `pass_env` field applies to every represented child run. Each
+  child run receives the same requested values, evaluated once when the child
+  run parameters are resolved. See Spec 006, "Sub-DAG Passed Environment".
+
 #### `dag.enqueue` Semantics
 
 When `parallel` is used with `action: dag.enqueue`, the parent step creates or
@@ -300,6 +304,9 @@ Rules:
 - `max_concurrent` does not control later queue processing. Queue processing is
   owned by the queue configuration.
 
+- `pass_env` is not supported for `dag.enqueue`; queued child runs cannot carry
+  transient parent environment values through queue persistence.
+
 #### Aggregate Outputs
 
 When a `parallel` step writes an aggregate output, the payload is JSON.
@@ -312,7 +319,7 @@ For `action: dag.run`, the payload object has these required fields:
 | `summary.succeeded` | Number of represented child DAG runs counted as successful. |
 | `summary.failed` | Number of represented child DAG runs not counted as successful. |
 | `results` | Child run result objects. |
-| `outputs` | Output maps from successful child DAG runs. |
+| `outputs` | Output variable maps from successful child DAG runs. |
 
 Rules:
 
@@ -324,8 +331,30 @@ Rules:
 - A failed child DAG run contributes to `summary.failed` and must not contribute
   an output map to `outputs`.
 
-- Consumers must not infer item slot identity from `results` or `outputs` array
-  position unless a later spec adds an explicit ordering guarantee.
+- `results` follows `parallel.items` order. A child DAG run that more than one
+  item produces takes the position of the first of those items, so duplicate
+  coalescing drops entries without reordering the ones that remain.
+
+- `outputs` follows the `results` order with the entries for child DAG runs not
+  counted as successful removed, so `outputs[N]` addresses the Nth successful
+  child DAG run rather than the Nth item.
+
+- A finished `parallel` step also publishes its collected child outputs on the
+  step outputs channel as a JSON array of per-child output maps, so
+  `${step.outputs}` resolves after the step finishes. The array follows the
+  `outputs` ordering rule above, and a successful child DAG run that published
+  nothing contributes an empty object. When no child DAG run is counted as
+  successful, the step publishes nothing on the channel.
+
+- An entry in the published array merges the child run's output variables with
+  its declared outputs, so it carries more than the matching `outputs` entry in
+  the aggregate payload, which carries output variables alone.
+
+- The published array is readable through `${step.outputs}` and
+  `${step.outputs[N].NAME}` within the DAG that declares the step. It does not
+  merge into the run's collected outputs or into a parent run's
+  `${step.outputs}` map, because those carry name and value pairs and the array
+  has no names to merge under.
 
 For a `parallel` step using `action: dag.enqueue`, the payload object has these
 required fields, including when expansion or duplicate coalescing leaves exactly
@@ -544,8 +573,15 @@ Rules:
 
 - If every item body succeeds, the parent `foreach` step succeeds.
 
-- If one or more item bodies fail, the parent `foreach` step fails after all
-  item bodies that can run have reached a terminal status.
+- If one or more item bodies fail and at least one succeeds, the parent
+  `foreach` step is `partially_succeeded` once all item bodies that can run
+  have reached a terminal status: its dependents run, and the DAG run ends
+  partially succeeded. This differs from `parallel`, where a failed child
+  DAG run fails the parent step, because a foreach body is the work of one
+  item and the other items' results remain usable.
+
+- If every item body fails, the parent `foreach` step fails after all item
+  bodies that can run have reached a terminal status.
 
 - A failed item body does not prevent later item bodies from starting unless
   the parent step is aborted or times out.
@@ -589,6 +625,11 @@ Rules:
 - `outputs` is ordered by item slot index and includes only successful item
   bodies.
 
+- The aggregate is written whether or not every item body succeeded: failed
+  item bodies appear in `items` with `error`, and only successful ones
+  contribute to `outputs`. A dependent step reads it through the string-form
+  `output` variable (Spec 012), which is set even when the parent step fails.
+
 - If `foreach.collect` is omitted, successful item output maps are empty.
 
 - Dagu must not include the raw item value in the aggregate output.
@@ -611,6 +652,7 @@ Validation must fail when:
 - a static array item is a nested mapping.
 - a static mapping item contains a value that is not a string, number, or
   boolean.
+- `pass_env` appears on a `dag.enqueue` step (with or without `parallel`).
 
 Runtime execution must fail when:
 
@@ -647,8 +689,10 @@ Runtime execution must fail when:
 - item expansion produces more than `1000` items.
 - `foreach.key` resolves to an empty string.
 - two item slots resolve to the same item key.
-- an item body fails.
-- a collect expression fails to resolve after item body success.
+- every item body fails; a collect expression that fails to resolve after
+  its item body succeeded counts as that item's failure. When some item
+  bodies fail and others succeed, the step is `partially_succeeded`, as the
+  Behavior section states.
 
 ### Timeout and Abort
 

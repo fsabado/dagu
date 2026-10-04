@@ -120,6 +120,9 @@ type RunParams struct {
 	ParallelItem   string
 	DAGName        string
 	WorkerSelector map[string]string
+	// PassedEnv holds resolved "KEY=value" pairs the parent opted to share
+	// with the child run via the step's pass_env field.
+	PassedEnv []string
 }
 
 // ChatMessageHandler is an interface for executors that handle chat session messages.
@@ -173,6 +176,14 @@ type ToolDefinitionProvider interface {
 // OutputsProvider is implemented by executors that publish DAG/action outputs.
 type OutputsProvider interface {
 	GetOutputs() map[string]any
+}
+
+// OutputsValueProvider is implemented by executors that publish a raw JSON
+// value through the step outputs channel. Unlike OutputsProvider, the payload
+// is not required to be a JSON object; a parallel executor, for example,
+// publishes an array of per-child output maps.
+type OutputsValueProvider interface {
+	GetOutputsValue() any
 }
 
 // DeclaredOutputsProvider marks executor outputs as available to strict step output references.

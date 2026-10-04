@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/jsonutil"
 )
 
 var (
@@ -84,37 +86,68 @@ var legacyBuiltinContextAliasesByCanonical = func() map[string]string {
 
 type template struct{ source string }
 
+type protectedReferencesKey struct{}
+
+// protectedReferences maps the placeholders that stand in for references while
+// a field is evaluated.
+type protectedReferences struct {
+	all         *strings.Replacer // placeholder to inserted text or original reference
+	toCommand   *strings.Replacer // placeholder to the text a substituted command receives
+	fromCommand *strings.Replacer // command token back to its unresolved placeholder
+}
+
 func resolveBindings(
 	ctx context.Context,
 	input string,
 	scope RuntimeScope,
 	field string,
 	notices ValueReferenceNoticeSink,
-) (string, map[string]string, error) {
-	protected := make(map[string]string)
-	seed := input
+) (string, protectedReferences, error) {
+	var all, toCommand, fromCommand []string
+	// Tokens come from one process-wide counter and all contain "DAGU_", so they
+	// only need checking against input that contains it.
+	taken := input
+	if !strings.Contains(input, "DAGU_") {
+		taken = ""
+	}
+	// A leading non-identifier rune keeps an adjacent $NAME from absorbing a placeholder.
 	resolved, err := walkBindings(input, func(token string, path string) (string, error) {
 		value, err := bindingValue(ctx, path, scope, true)
 		if err != nil {
 			addUnresolvedReferenceNotice(notices, field, token, err)
-			placeholder := uniqueToken(seed, "__DAGU_UNRESOLVED_REF__")
-			seed += placeholder
-			protected[placeholder] = token
+			placeholder := uniqueToken(taken, "\uE000DAGU_UNRESOLVED_REF_")
+			// Shells get an ASCII token because Windows substitution output may not keep other runes.
+			commandToken := uniqueToken(taken, "__DAGU_UNRESOLVED_REF__")
+			all = append(all, placeholder, token)
+			toCommand = append(toCommand, placeholder, commandToken)
+			fromCommand = append(fromCommand, commandToken, placeholder)
 			return placeholder, nil
 		}
-		return formatBindingValue(value), nil
+		placeholder := uniqueToken(taken, "\uE000DAGU_RESOLVED_REF_")
+		text := formatBindingValue(value)
+		all = append(all, placeholder, text)
+		toCommand = append(toCommand, placeholder, text)
+		return placeholder, nil
 	})
-	return resolved, protected, err
+	return resolved, protectedReferences{
+		all:         newReferenceReplacer(all),
+		toCommand:   newReferenceReplacer(toCommand),
+		fromCommand: newReferenceReplacer(fromCommand),
+	}, err
 }
 
-func restoreProtectedReferences(input string, protected map[string]string) string {
-	if len(protected) == 0 {
+func newReferenceReplacer(replacements []string) *strings.Replacer {
+	if len(replacements) == 0 {
+		return nil
+	}
+	return strings.NewReplacer(replacements...)
+}
+
+func restoreProtectedReferences(input string, protected *strings.Replacer) string {
+	if protected == nil {
 		return input
 	}
-	for placeholder, token := range protected {
-		input = strings.ReplaceAll(input, placeholder, token)
-	}
-	return input
+	return protected.Replace(input)
 }
 
 func (t template) resolveReferences(ctx context.Context, r *resolver) string {
@@ -130,14 +163,67 @@ func (t template) resolveReferences(ctx context.Context, r *resolver) string {
 	})
 }
 
-func (t template) resolveQuotedReferences(ctx context.Context, r *resolver) string {
+func (t template) resolveQuotedReferences(ctx context.Context, r *resolver, style quotedRefStyle) string {
 	return quotedReferencePattern.ReplaceAllStringFunc(t.source, func(match string) string {
 		ref := match[3 : len(match)-2]
 		if value, ok := resolveQuotedReference(ctx, r, ref); ok {
-			return strconv.Quote(value)
+			return quoteQuotedRefValue(value, style)
 		}
 		return match
 	})
+}
+
+// quoteQuotedRefValue re-quotes a resolved value for the double-quoted span it
+// was resolved inside, using the escape convention the command interpreter
+// understands. POSIX shells resolve \" back to a literal quote; PowerShell
+// resolves neither that nor the backslash doubling strconv.Quote applies, so
+// it needs its own rendering.
+func quoteQuotedRefValue(value string, style quotedRefStyle) string {
+	switch style {
+	case quotedRefPowerShell:
+		return quotePowerShellValue(value)
+	case quotedRefPOSIX:
+		return strconv.Quote(value)
+	default:
+		return strconv.Quote(value)
+	}
+}
+
+// quotePowerShellValue renders value as a PowerShell double-quoted string. A
+// literal quote doubles rather than taking a backslash, the backtick is the
+// escape character and so doubles too, and a control character takes its
+// backtick form because a raw one would otherwise end the line.
+//
+// $ is deliberately left alone. Only a shell named by commandDefersShellVars
+// keeps $VAR for the shell to expand; for every other shell the variables
+// phase expands it after this one, and it does not recognize a backtick
+// escape, so escaping here would strand the backtick against the expanded
+// value. Whether a resolved value should be re-expanded at all is a separate
+// question from how it is quoted.
+func quotePowerShellValue(value string) string {
+	var b strings.Builder
+	b.Grow(len(value) + 2)
+	b.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '"':
+			b.WriteString(`""`)
+		case '`':
+			b.WriteString("``")
+		case '\n':
+			b.WriteString("`n")
+		case '\r':
+			b.WriteString("`r")
+		case '\t':
+			b.WriteString("`t")
+		case 0:
+			b.WriteString("`0")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func referenceParts(match string) (string, string, bool) {
@@ -468,7 +554,7 @@ func foreachObjectField(value any, field string) (any, bool) {
 func formatForeachItemValue(value any) any {
 	switch value.(type) {
 	case map[string]any, map[string]string, []any, []string:
-		data, err := json.Marshal(value)
+		data, err := jsonutil.MarshalUnescaped(value)
 		if err != nil {
 			return value
 		}

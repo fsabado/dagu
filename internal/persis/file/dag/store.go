@@ -5,6 +5,8 @@ package dag
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -41,6 +43,8 @@ type Options struct {
 	Recursive              bool                     // Discover DAG definitions in subdirectories
 	Symlinks               bool                     // Include recursive file symlinks and external targets
 	SkipDirectoryCreation  bool                     // Skip creating base directory for execution-scoped stores
+	legacyFlagsBaseDir     string
+	indexDir               string
 }
 
 // WithRecursiveDiscovery controls whether DAG files are discovered recursively.
@@ -68,6 +72,21 @@ func WithFileCache(cache *fileutil.Cache[*ir.DAG]) Option {
 func WithFlagsBaseDir(dir string) Option {
 	return func(o *Options) {
 		o.FlagsBaseDir = dir
+	}
+}
+
+// WithLegacyFlagsBaseDir sets the fallback suspension flag directory.
+func WithLegacyFlagsBaseDir(dir string) Option {
+	return func(o *Options) {
+		o.legacyFlagsBaseDir = dir
+	}
+}
+
+// WithIndexDir sets the directory holding the DAG definition index.
+// When unset, the index is kept in the DAG directory.
+func WithIndexDir(dir string) Option {
+	return func(o *Options) {
+		o.indexDir = dir
 	}
 }
 
@@ -128,12 +147,13 @@ func NewStore(baseDir string, opts ...Option) *Store {
 
 	return &Store{
 		baseDir:                baseDir,
+		indexPath:              resolveIndexPath(baseDir, options.indexDir),
 		flagsBaseDir:           options.FlagsBaseDir,
+		legacyFlagsBaseDir:     options.legacyFlagsBaseDir,
 		fileCache:              options.FileCache,
 		searchPaths:            searchPaths,
 		baseConfigPath:         options.BaseConfigPath,
 		workspaceBaseConfigDir: options.WorkspaceBaseConfigDir,
-		baseConfigState:        describeBaseConfigStateSet(options.BaseConfigPath, options.WorkspaceBaseConfigDir),
 		skipExamples:           options.SkipExamples,
 		recursive:              options.Recursive,
 		symlinks:               options.Symlinks,
@@ -143,13 +163,15 @@ func NewStore(baseDir string, opts ...Option) *Store {
 
 // Store persists DAG definitions in local files.
 type Store struct {
-	baseDir                string                   // Base directory for DAG storage
-	flagsBaseDir           string                   // Base directory for flag store
+	baseDir                string // Base directory for DAG storage
+	indexPath              string // DAG definition index file
+	flagsBaseDir           string // Base directory for flag store
+	legacyFlagsBaseDir     string
 	fileCache              *fileutil.Cache[*ir.DAG] // Optional cache for DAG objects
 	searchPaths            []string                 // Additional search paths for DAG files
 	baseConfigPath         string                   // Optional base config file applied when loading DAGs
 	workspaceBaseConfigDir string                   // Optional directory containing workspace base configs
-	baseConfigState        string                   // Last observed base config state for cache/index invalidation
+	baseConfigState        string                   // Empty until first load so indexes from previous processes are invalidated
 	skipExamples           bool                     // Skip creating example DAGs
 	recursive              bool                     // Discover DAG definitions in subdirectories
 	symlinks               bool                     // Include recursive file symlinks and external targets
@@ -208,50 +230,6 @@ func (store *Store) catalog(ctx context.Context, includeSearchPaths bool) (persi
 	return result, nil
 }
 
-func (store *Store) SetSuspended(_ context.Context, id string, suspended bool) error {
-	var err error
-	if suspended {
-		err = store.createFlag(fileName(id))
-	} else {
-		err = store.deleteFlag(fileName(id))
-		if errors.Is(err, os.ErrNotExist) {
-			err = nil
-		}
-	}
-	if err == nil {
-		store.invalidateIndex()
-	}
-	return err
-}
-
-func (store *Store) IsSuspended(_ context.Context, id string) (bool, error) {
-	return store.flagExistsResult(fileName(id))
-}
-
-func (store *Store) readSuspendFlags(ctx context.Context) (dagindex.SuspendFlags, error) {
-	flags := make(dagindex.SuspendFlags)
-	flagEntries, err := os.ReadDir(store.flagsBaseDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			exists, statErr := store.suspendFlagsDirExists()
-			if statErr != nil {
-				return nil, statErr
-			}
-			if !exists {
-				logger.Debug(ctx, "Suspend flags directory does not exist", tag.Dir(store.flagsBaseDir))
-				return flags, nil
-			}
-		}
-		return nil, fmt.Errorf("read suspend flags directory %s: %w", store.flagsBaseDir, err)
-	}
-	for _, fe := range flagEntries {
-		if !fe.IsDir() {
-			flags[fe.Name()] = struct{}{}
-		}
-	}
-	return flags, nil
-}
-
 func (store *Store) defaultLoadOptions(opts ...spec.LoadOption) []spec.LoadOption {
 	loadOpts := make([]spec.LoadOption, 0, len(opts)+1)
 	if store.baseConfigPath != "" {
@@ -264,25 +242,22 @@ func (store *Store) defaultLoadOptions(opts ...spec.LoadOption) []spec.LoadOptio
 	return loadOpts
 }
 
-func (store *Store) refreshBaseConfigState() {
-	if store.baseConfigPath == "" && store.workspaceBaseConfigDir == "" {
-		return
-	}
-
-	state := describeBaseConfigStateSet(store.baseConfigPath, store.workspaceBaseConfigDir)
-
+func (store *Store) refreshBaseConfigState() string {
 	store.baseConfigMu.Lock()
 	defer store.baseConfigMu.Unlock()
 
-	if state == store.baseConfigState {
-		return
+	if store.baseConfigPath == "" && store.workspaceBaseConfigDir == "" {
+		return store.baseConfigState
 	}
-
-	if store.fileCache != nil {
-		store.fileCache.InvalidateAll()
+	state := describeBaseConfigStateSet(store.baseConfigPath, store.workspaceBaseConfigDir)
+	if state != store.baseConfigState {
+		if store.fileCache != nil {
+			store.fileCache.InvalidateAll()
+		}
+		store.invalidateIndex()
+		store.baseConfigState = state
 	}
-	store.invalidateIndex()
-	store.baseConfigState = state
+	return store.baseConfigState
 }
 
 func describeBaseConfigStateSet(basePath, workspaceDir string) string {
@@ -348,6 +323,12 @@ func describeWorkspaceBaseConfigState(dir string) string {
 
 // Initialize ensures the storage is ready and creates example DAGs if needed
 func (store *Store) Initialize() error {
+	// An index left in the DAG directory by an earlier version is a stale
+	// cache; removal fails harmlessly when the directory is read-only. It is
+	// not retried, since Windows retries on access denied would stall startup.
+	if legacyIndex := filepath.Join(store.baseDir, dagindex.IndexFileName); legacyIndex != store.indexPath {
+		_ = os.Remove(legacyIndex)
+	}
 	return store.ensureDirExist()
 }
 
@@ -357,7 +338,7 @@ func (store *Store) GetMetadata(ctx context.Context, name string) (*ir.DAG, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to locate DAG %s in search paths (%v): %w", name, store.searchPaths, err)
 	}
-	store.refreshBaseConfigState()
+	baseState := store.refreshBaseConfigState()
 	loadOpts := store.defaultLoadOptions(
 		spec.WithDefaultName(fileutil.TrimYAMLFileExtension(filepath.Base(resolved.EntryPath))),
 		spec.OnlyMetadata(),
@@ -367,13 +348,15 @@ func (store *Store) GetMetadata(ctx context.Context, name string) (*ir.DAG, erro
 	if store.fileCache == nil {
 		return spec.Load(ctx, resolved.ResolvedPath, loadOpts...)
 	}
-	return store.fileCache.LoadLatestByKey(metadataCacheKey(resolved), resolved.ResolvedPath, func() (*ir.DAG, error) {
+	return store.fileCache.LoadLatestByKey(store.metadataCacheKey(resolved, baseState), resolved.ResolvedPath, func() (*ir.DAG, error) {
 		return spec.Load(ctx, resolved.ResolvedPath, loadOpts...)
 	})
 }
 
-func metadataCacheKey(resolved ResolvedFile) string {
-	return resolved.EntryPath + "\x00" + resolved.ResolvedPath
+// Cache keys include base state so an older in-flight load cannot replace current metadata.
+func (store *Store) metadataCacheKey(resolved ResolvedFile, baseState string) string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s", store.baseConfigPath,
+		store.workspaceBaseConfigDir, resolved.EntryPath, resolved.ResolvedPath, baseState)
 }
 
 // FileMode used for newly created DAG files
@@ -391,7 +374,7 @@ func (store *Store) Update(ctx context.Context, name string, yamlSpec []byte) er
 		return err
 	}
 	if store.fileCache != nil {
-		store.fileCache.Invalidate(metadataCacheKey(resolved))
+		store.fileCache.Invalidate(store.metadataCacheKey(resolved, store.refreshBaseConfigState()))
 	}
 	store.invalidateIndex()
 	return nil
@@ -429,7 +412,7 @@ func (store *Store) Delete(ctx context.Context, name string) error {
 		return err
 	}
 	if store.fileCache != nil {
-		store.fileCache.Invalidate(metadataCacheKey(resolved))
+		store.fileCache.Invalidate(store.metadataCacheKey(resolved, store.refreshBaseConfigState()))
 	}
 	store.invalidateIndex()
 	return nil
@@ -478,7 +461,7 @@ func (store *Store) loadIndex(ctx context.Context, files []DiscoveredFile) ([]*i
 		return nil, err
 	}
 
-	indexPath := filepath.Join(store.baseDir, dagindex.IndexFileName)
+	indexPath := store.indexPath
 
 	// Try loading existing index. A cached load error is re-checked against the
 	// current parser before it is served, so upgrading Dagu clears errors that
@@ -505,7 +488,17 @@ func (store *Store) loadIndex(ctx context.Context, files []DiscoveredFile) ([]*i
 func (store *Store) invalidateIndex() {
 	store.indexMu.Lock()
 	defer store.indexMu.Unlock()
-	_ = fileutil.Remove(filepath.Join(store.baseDir, dagindex.IndexFileName))
+	_ = fileutil.Remove(store.indexPath)
+}
+
+// resolveIndexPath names the index file inside indexDir after a hash of
+// baseDir, so DAG directories sharing one indexDir keep separate indexes.
+func resolveIndexPath(baseDir, indexDir string) string {
+	if indexDir == "" {
+		return filepath.Join(baseDir, dagindex.IndexFileName)
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(baseDir)))
+	return filepath.Join(indexDir, hex.EncodeToString(sum[:8])+".index")
 }
 
 func fileName(id string) string {
@@ -683,49 +676,6 @@ func dagFileCandidates(name string) []string {
 		return []string{name + ".yaml", name + ".yml"}
 	}
 }
-
-// CreateFlag creates the given file.
-func (store *Store) createFlag(file string) error {
-	if err := os.MkdirAll(store.flagsBaseDir, flagPermission); err != nil {
-		return err
-	}
-	return fileutil.WriteFileAtomic(path.Join(store.flagsBaseDir, file), []byte{}, flagPermission)
-}
-
-func (store *Store) flagExistsResult(file string) (bool, error) {
-	_, err := os.Stat(path.Join(store.flagsBaseDir, file))
-	if err == nil {
-		return true, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return false, err
-	}
-
-	_, err = store.suspendFlagsDirExists()
-	return false, err
-}
-
-func (store *Store) suspendFlagsDirExists() (bool, error) {
-	info, err := os.Stat(store.flagsBaseDir)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !info.IsDir() {
-		return false, fmt.Errorf("suspend flags path %s is not a directory", store.flagsBaseDir)
-	}
-	return true, nil
-}
-
-// deleteFlag deletes the given file.
-func (store *Store) deleteFlag(file string) error {
-	return fileutil.Remove(path.Join(store.flagsBaseDir, file))
-}
-
-// flagPermission is the default file permission for newly created files.
-var flagPermission os.FileMode = 0750
 
 // fileExists checks if a file exists.
 func fileExists(file string) bool {

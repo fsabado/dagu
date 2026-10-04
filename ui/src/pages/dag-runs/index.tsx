@@ -1,11 +1,12 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import dayjs from 'dayjs';
 import { Layers, List, Search } from 'lucide-react';
 import React from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Status } from '../../api/v1/schema';
+import dayjs from '@/lib/dayjs';
+import { Status, ViewSpecType } from '../../api/v1/schema';
+import { AutocompleteInput } from '@/components/ui/autocomplete-input';
 import { Button } from '@/components/ui/button';
 import { DateRangePicker } from '@/components/ui/date-range-picker';
 import { Input } from '@/components/ui/input';
@@ -19,6 +20,7 @@ import {
 import { LabelCombobox } from '@/components/ui/label-combobox';
 import { ToggleButton, ToggleGroup } from '@/components/ui/toggle-group';
 import { AppBarContext } from '../../contexts/AppBarContext';
+import { useCanWriteForWorkspace } from '../../contexts/AuthContext';
 import { useConfig } from '../../contexts/ConfigContext';
 import { useSearchState } from '../../contexts/SearchStateContext';
 import { useUserPreferences } from '../../contexts/UserPreference';
@@ -27,31 +29,70 @@ import { DAGRunDetailsModal } from '../../features/dag-runs/components/dag-run-d
 import DAGRunGroupedView from '../../features/dag-runs/components/dag-run-list/DAGRunGroupedView';
 import DAGRunTable from '../../features/dag-runs/components/dag-run-list/DAGRunTable';
 import { usePaginatedDAGRuns } from '../../features/dag-runs/hooks/dagRunPagination';
+import {
+  buildRunViewSpec,
+  dagRunsFilterSetFromView,
+  type DAGRunsFilterSet,
+  type DAGRunsFilterView,
+} from '../../features/dag-runs/lib/runViews';
+import { ViewSelector } from '../../features/views/ViewSelector';
+import {
+  viewMatchesScope,
+  viewScopeForSelection,
+} from '../../features/views/viewScope';
+import { useViews, type View } from '../../hooks/useViews';
 import { useQuery } from '../../hooks/api';
+import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 import { useBulkDAGRunSelection } from '../../features/dag-runs/hooks/useBulkDAGRunSelection';
 import {
   withoutWorkspaceLabels,
   workspaceSelectionKey,
   workspaceSelectionQuery,
 } from '../../lib/workspace';
+import { getDAGRunScheduleSortValue } from '../../lib/dagRunTiming';
 import StatusChip from '@/components/ui/status-chip';
 import Title from '@/components/ui/title';
 import type { StatusTab } from '@/features/dags/components/DAGStatus';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 
-type DAGRunsFilters = {
-  searchText: string;
-  dagRunId: string;
-  status: string;
-  labels: string[];
-  fromDate?: string;
-  toDate?: string;
-  dateRangeMode: 'preset' | 'specific' | 'custom';
-  datePreset: string;
-  specificPeriod: 'date' | 'month' | 'year';
-  specificValue: string;
-};
+type DAGRunsFilters = DAGRunsFilterSet;
+
+const ALL_RUNS_VIEW_PARAM = 'all';
+
+function readSelectedRunTab(search: string): StatusTab {
+  const tab = new URLSearchParams(search).get('selectedRunTab');
+  switch (tab) {
+    case 'status':
+    case 'timeline':
+    case 'outputs':
+    case 'artifacts':
+    case 'agent':
+    case 'chat':
+    case 'tasks':
+    case 'spec':
+    case 'approval':
+    case 'human-tasks':
+      return tab;
+    default:
+      return 'status';
+  }
+}
+
+const RUN_FILTER_QUERY_KEYS = [
+  'name',
+  'dagRunId',
+  'status',
+  'labels',
+  'tags',
+  'fromDate',
+  'toDate',
+  'dateMode',
+  'preset',
+  'specificValue',
+  'specificPeriod',
+  'view',
+] as const;
 
 const areLabelsEqual = (a: string[], b: string[]): boolean => {
   if (a.length !== b.length) return false;
@@ -98,6 +139,20 @@ const areFiltersEqual = (a: DAGRunsFilters, b: DAGRunsFilters): boolean =>
   a.specificPeriod === b.specificPeriod &&
   a.specificValue === b.specificValue;
 
+const cloneFilters = (filters: DAGRunsFilters): DAGRunsFilters => ({
+  ...filters,
+  labels: [...filters.labels],
+});
+
+function dagRunsFilterViewFromView(view: View): DAGRunsFilterView {
+  return {
+    id: view.id,
+    name: view.name,
+    pinned: view.pinned ?? false,
+    filters: dagRunsFilterSetFromView(view),
+  };
+}
+
 function useAutoLoadMore(
   sentinelRef: React.RefObject<HTMLDivElement | null>,
   enabled: boolean,
@@ -126,6 +181,9 @@ function supportsIntersectionObserver(): boolean {
   return typeof IntersectionObserver !== 'undefined';
 }
 
+const NAME_SUGGESTION_DEBOUNCE_MS = 300;
+const NAME_SUGGESTION_LIMIT = 50;
+
 function DAGRuns() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -144,6 +202,31 @@ function DAGRuns() {
     remoteNode: remoteKey,
     workspace: workspaceKey,
   });
+  const runViewScope = React.useMemo(
+    () => viewScopeForSelection(workspaceSelection),
+    [workspaceSelection]
+  );
+  const canManageRunViews = useCanWriteForWorkspace(runViewScope.workspace);
+  const {
+    views: sharedRunViews,
+    isLoading: runViewsLoading,
+    createView,
+    updateView,
+    deleteView,
+  } = useViews(ViewSpecType.run);
+  const scopedRunViews = React.useMemo(
+    () => sharedRunViews.filter((view) => viewMatchesScope(view, runViewScope)),
+    [sharedRunViews, runViewScope]
+  );
+  const runViews = React.useMemo(
+    () => scopedRunViews.map(dagRunsFilterViewFromView),
+    [scopedRunViews]
+  );
+  const defaultRunViewId = scopedRunViews.find((view) => view.isDefault)?.id;
+  const [activeRunViewId, setActiveRunViewId] = React.useState<string | null>(
+    null
+  );
+  const [runViewError, setRunViewError] = React.useState<string | null>(null);
 
   // Extract short datetime format from URL if present
   const parseDateFromUrl = React.useCallback(
@@ -185,10 +268,11 @@ function DAGRuns() {
     const dateWithSeconds =
       dateString.split(':').length < 3 ? `${dateString}:00` : dateString;
 
-    // Apply timezone offset and convert to unix timestamp (seconds)
+    // Interpret the wall clock in the configured timezone, never in the
+    // browser's, then convert to the Unix timestamp.
     if (config.tzOffsetInSec !== undefined) {
       return dayjs(dateWithSeconds)
-        .utcOffset(config.tzOffsetInSec / 60)
+        .utcOffset(config.tzOffsetInSec / 60, true)
         .unix();
     } else {
       return dayjs(dateWithSeconds).unix();
@@ -263,12 +347,9 @@ function DAGRuns() {
     const dagRunId = params.get('selectedRunId');
     return name && dagRunId ? { name, dagRunId } : null;
   });
-  const [selectedDAGRunInitialTab, setSelectedDAGRunInitialTab] =
-    React.useState<StatusTab>(() =>
-      new URLSearchParams(location.search).get('selectedRunTab') === 'artifacts'
-        ? 'artifacts'
-        : 'status'
-    );
+  const [selectedDAGRunTab, setSelectedDAGRunTab] = React.useState<StatusTab>(
+    () => readSelectedRunTab(location.search)
+  );
   const updateSelectedDAGRun = React.useCallback(
     (
       dagRun: { name: string; dagRunId: string } | null,
@@ -276,7 +357,7 @@ function DAGRuns() {
       replace = false
     ) => {
       setSelectedDAGRun(dagRun);
-      setSelectedDAGRunInitialTab(initialTab);
+      setSelectedDAGRunTab(initialTab);
       const params = new URLSearchParams(location.search);
       if (dagRun) {
         params.set('selectedRunName', dagRun.name);
@@ -308,9 +389,7 @@ function DAGRuns() {
     const name = params.get('selectedRunName');
     const dagRunId = params.get('selectedRunId');
     setSelectedDAGRun(name && dagRunId ? { name, dagRunId } : null);
-    setSelectedDAGRunInitialTab(
-      params.get('selectedRunTab') === 'artifacts' ? 'artifacts' : 'status'
-    );
+    setSelectedDAGRunTab(readSelectedRunTab(location.search));
   }, [location.search]);
 
   const selectDAGRun = React.useCallback(
@@ -379,16 +458,130 @@ function DAGRuns() {
 
   const lastPersistedFiltersRef = React.useRef<DAGRunsFilters | null>(null);
 
+  const getPresetDates = React.useCallback(
+    (preset: string): { from: string; to?: string } => {
+      const now = dayjs();
+      const startOfDay =
+        config.tzOffsetInSec !== undefined
+          ? now.utcOffset(config.tzOffsetInSec / 60).startOf('day')
+          : now.startOf('day');
+
+      switch (preset) {
+        case 'today':
+          return { from: startOfDay.format('YYYY-MM-DDTHH:mm') };
+        case 'yesterday':
+          return {
+            from: startOfDay.subtract(1, 'day').format('YYYY-MM-DDTHH:mm'),
+            to: startOfDay.format('YYYY-MM-DDTHH:mm'),
+          };
+        case 'last7days':
+          return {
+            from: startOfDay.subtract(7, 'day').format('YYYY-MM-DDTHH:mm'),
+          };
+        case 'last30days':
+          return {
+            from: startOfDay.subtract(30, 'day').format('YYYY-MM-DDTHH:mm'),
+          };
+        case 'thisWeek':
+          return {
+            from: startOfDay.startOf('week').format('YYYY-MM-DDTHH:mm'),
+          };
+        case 'thisMonth':
+          return {
+            from: startOfDay.startOf('month').format('YYYY-MM-DDTHH:mm'),
+          };
+        default:
+          return { from: startOfDay.format('YYYY-MM-DDTHH:mm') };
+      }
+    },
+    [config.tzOffsetInSec]
+  );
+
+  const getSpecificPeriodDates = React.useCallback(
+    (
+      period: 'date' | 'month' | 'year',
+      value: string
+    ): { from: string; to?: string } => {
+      switch (period) {
+        case 'date': {
+          const date = dayjs(value);
+          return {
+            from: date.startOf('day').format('YYYY-MM-DDTHH:mm'),
+            to: date.startOf('day').add(1, 'day').format('YYYY-MM-DDTHH:mm'),
+          };
+        }
+        case 'month': {
+          const date = dayjs(value);
+          return {
+            from: date.startOf('month').format('YYYY-MM-DDTHH:mm'),
+            to: date.startOf('month').add(1, 'month').format('YYYY-MM-DDTHH:mm'),
+          };
+        }
+        case 'year': {
+          const date = dayjs(value);
+          return {
+            from: date.startOf('year').format('YYYY-MM-DDTHH:mm'),
+            to: date.startOf('year').add(1, 'year').format('YYYY-MM-DDTHH:mm'),
+          };
+        }
+      }
+    },
+    []
+  );
+
+  // Saved run views store relative date filters (preset or specific value);
+  // resolve them to concrete dates whenever the view is applied or compared.
+  const resolveRunViewFilters = React.useCallback(
+    (filters: DAGRunsFilterSet): DAGRunsFilterSet => {
+      if (filters.dateRangeMode === 'preset') {
+        const dates = getPresetDates(filters.datePreset);
+        return { ...filters, fromDate: dates.from, toDate: dates.to };
+      }
+      if (filters.dateRangeMode === 'specific') {
+        const dates = getSpecificPeriodDates(
+          filters.specificPeriod,
+          filters.specificValue
+        );
+        return { ...filters, fromDate: dates.from, toDate: dates.to };
+      }
+      return {
+        ...filters,
+        fromDate: filters.fromDate ?? defaultFilters.fromDate,
+      };
+    },
+    [defaultFilters, getPresetDates, getSpecificPeriodDates]
+  );
+
+  const previousRunScopeRef = React.useRef(searchStateScope);
+
   React.useEffect(() => {
+    if (runViewsLoading) {
+      return;
+    }
+
+    // URL parameters belong to the previous workspace when the scope has
+    // just changed; drop them and start from the destination's default view
+    // (or All runs), so another workspace's filters cannot leak in. The ref
+    // is only advanced once the cleanup actually runs, so a scope change
+    // during view loading is still honored once loading completes.
+    const scopeChanged = previousRunScopeRef.current !== searchStateScope;
+    if (scopeChanged) {
+      previousRunScopeRef.current = searchStateScope;
+      setRunViewError(null);
+      const clean = new URLSearchParams();
+      clean.set('view', defaultRunViewId ?? ALL_RUNS_VIEW_PARAM);
+      navigate(
+        { pathname: location.pathname, search: `?${clean.toString()}` },
+        { replace: true }
+      );
+      return;
+    }
+
     const params = new URLSearchParams(location.search);
     const stored = searchState.readState<DAGRunsFilters>(
       'dagRuns',
       searchStateScope
     );
-    const base: DAGRunsFilters = {
-      ...defaultFilters,
-      ...(stored ?? {}),
-    };
 
     const urlFilters: Partial<DAGRunsFilters> = {};
     let hasUrlFilters = false;
@@ -420,16 +613,6 @@ function DAGRuns() {
       hasUrlFilters = true;
     }
 
-    if (params.has('fromDate')) {
-      urlFilters.fromDate = parseDateFromUrl(params.get('fromDate'));
-      hasUrlFilters = true;
-    }
-
-    if (params.has('toDate')) {
-      urlFilters.toDate = parseDateFromUrl(params.get('toDate'));
-      hasUrlFilters = true;
-    }
-
     const dateModeParam = params.get('dateMode');
     if (
       dateModeParam === 'preset' ||
@@ -437,6 +620,34 @@ function DAGRuns() {
       dateModeParam === 'custom'
     ) {
       urlFilters.dateRangeMode = dateModeParam;
+      hasUrlFilters = true;
+    }
+
+    // Concrete dates are only meaningful for a custom range; preset and
+    // specific modes keep their relative parameters and derive dates fresh.
+    // Legacy URLs may carry concrete dates without a dateMode at all — no
+    // relative preset can reproduce them, so they are honored as a custom
+    // range.
+    const usesConcreteDates =
+      dateModeParam === 'custom' || dateModeParam === null;
+    if (usesConcreteDates && params.has('fromDate')) {
+      urlFilters.fromDate = parseDateFromUrl(params.get('fromDate'));
+      hasUrlFilters = true;
+    }
+
+    if (usesConcreteDates && params.has('toDate')) {
+      urlFilters.toDate = parseDateFromUrl(params.get('toDate'));
+      hasUrlFilters = true;
+    }
+
+    // A URL that carries concrete dates without a dateMode represents a
+    // custom range: keep that mode so a later search does not re-derive the
+    // historical dates from a relative preset.
+    if (
+      dateModeParam === null &&
+      (params.has('fromDate') || params.has('toDate'))
+    ) {
+      urlFilters.dateRangeMode = 'custom';
       hasUrlFilters = true;
     }
 
@@ -461,53 +672,98 @@ function DAGRuns() {
       hasUrlFilters = true;
     }
 
+    let base: DAGRunsFilters = {
+      ...defaultFilters,
+      ...(stored ?? {}),
+    };
+    let nextActiveRunViewId: string | null = null;
+    const requestedViewId = params.get('view');
+    const requestedView =
+      requestedViewId === ALL_RUNS_VIEW_PARAM
+        ? undefined
+        : runViews.find((view) => view.id === requestedViewId);
+    const defaultView =
+      runViews.find((view) => view.id === defaultRunViewId) ?? undefined;
+
+    if (requestedViewId === ALL_RUNS_VIEW_PARAM) {
+      base = cloneFilters(defaultFilters);
+    } else if (requestedView) {
+      base = resolveRunViewFilters(requestedView.filters);
+      nextActiveRunViewId = requestedView.id;
+    } else if (!hasUrlFilters && defaultView) {
+      base = resolveRunViewFilters(defaultView.filters);
+      nextActiveRunViewId = defaultView.id;
+    }
+
     const next = hasUrlFilters ? { ...base, ...urlFilters } : base;
+    // Preset and specific modes define their range relative to "now", so they
+    // are derived on every restore, wherever the filters came from: the
+    // concrete dates a saved view or this session carries were computed when
+    // the mode was last picked and may be days old. Legacy URLs carrying
+    // concrete dates resolve to a custom range and keep those dates.
+    const resolved =
+      next.dateRangeMode === 'preset' || next.dateRangeMode === 'specific'
+        ? resolveRunViewFilters(next)
+        : next;
     const current = currentFiltersRef.current;
 
-    if (current && areFiltersEqual(current, next)) {
+    setActiveRunViewId(nextActiveRunViewId);
+
+    if (current && areFiltersEqual(current, resolved)) {
       if (hasUrlFilters) {
-        lastPersistedFiltersRef.current = next;
-        searchState.writeState('dagRuns', searchStateScope, next);
+        lastPersistedFiltersRef.current = resolved;
+        searchState.writeState('dagRuns', searchStateScope, resolved);
       }
       return;
     }
 
-    setSearchText(next.searchText);
-    setDagRunId(next.dagRunId);
-    setStatus(next.status);
-    setSelectedLabels(next.labels);
-    setFromDate(next.fromDate);
-    setToDate(next.toDate);
-    setDateRangeMode(next.dateRangeMode);
-    setDatePreset(next.datePreset);
-    setSpecificPeriod(next.specificPeriod);
-    setSpecificValue(next.specificValue);
+    setSearchText(resolved.searchText);
+    setDagRunId(resolved.dagRunId);
+    setStatus(resolved.status);
+    setSelectedLabels(resolved.labels);
+    setFromDate(resolved.fromDate);
+    setToDate(resolved.toDate);
+    setDateRangeMode(resolved.dateRangeMode);
+    setDatePreset(resolved.datePreset);
+    setSpecificPeriod(resolved.specificPeriod);
+    setSpecificValue(resolved.specificValue);
 
-    setAPISearchText(next.searchText);
-    setApiDagRunId(next.dagRunId);
-    setApiStatus(next.status);
-    setApiLabels(next.labels);
-    setApiFromDate(next.fromDate);
-    setApiToDate(next.toDate);
+    setAPISearchText(resolved.searchText);
+    setApiDagRunId(resolved.dagRunId);
+    setApiStatus(resolved.status);
+    setApiLabels(resolved.labels);
+    setApiFromDate(resolved.fromDate);
+    setApiToDate(resolved.toDate);
 
-    lastPersistedFiltersRef.current = next;
-    searchState.writeState('dagRuns', searchStateScope, next);
+    lastPersistedFiltersRef.current = resolved;
+    searchState.writeState('dagRuns', searchStateScope, resolved);
   }, [
     defaultFilters,
+    defaultRunViewId,
     location.search,
+    navigate,
     parseDateFromUrl,
+    resolveRunViewFilters,
+    runViews,
+    runViewsLoading,
     searchState,
     searchStateScope,
   ]);
 
   React.useEffect(() => {
+    // Persistence must wait for the URL/view restoration to complete:
+    // writing the initial default filters before stored state is restored
+    // would clobber the session's filters.
+    if (runViewsLoading) {
+      return;
+    }
     const persisted = lastPersistedFiltersRef.current;
     if (persisted && areFiltersEqual(persisted, currentFilters)) {
       return;
     }
     lastPersistedFiltersRef.current = currentFilters;
     searchState.writeState('dagRuns', searchStateScope, currentFilters);
-  }, [currentFilters, searchState, searchStateScope]);
+  }, [currentFilters, runViewsLoading, searchState, searchStateScope]);
 
   React.useEffect(() => {
     appBarContext.setTitle('Executions');
@@ -532,6 +788,33 @@ function DAGRuns() {
   const availableLabels = React.useMemo(
     () => withoutWorkspaceLabels(labelsData?.labels ?? []),
     [labelsData?.labels]
+  );
+
+  // Match DAG names server-side to feed the name filter autocomplete, so DAGs
+  // without loaded runs are suggested too.
+  const debouncedSearchText = useDebouncedValue(
+    searchText,
+    NAME_SUGGESTION_DEBOUNCE_MS
+  );
+  const dagNameQuery = debouncedSearchText.trim();
+  const { data: dagListData } = useQuery(
+    '/dags',
+    dagNameQuery
+      ? {
+          params: {
+            query: {
+              remoteNode: appBarContext.selectedRemoteNode || 'local',
+              name: dagNameQuery,
+              perPage: NAME_SUGGESTION_LIMIT,
+              ...workspaceQuery,
+            },
+          },
+        }
+      : null,
+    {
+      revalidateOnFocus: false,
+      revalidateIfStale: false,
+    }
   );
 
   const dagRunQuery = React.useMemo(
@@ -568,6 +851,62 @@ function DAGRuns() {
   } = usePaginatedDAGRuns({
     query: dagRunQuery,
   });
+
+  // DAG name suggestions combine name matches with names of runs already
+  // loaded, so runs whose DAG is no longer listed are still suggested.
+  const dagNameSuggestions = React.useMemo(() => {
+    const names = new Set<string>();
+    for (const item of dagListData?.dags ?? []) {
+      if (item.dag.name) {
+        names.add(item.dag.name);
+      }
+    }
+    for (const run of dagRuns) {
+      if (run.name) {
+        names.add(run.name);
+      }
+    }
+    return [...names];
+  }, [dagListData?.dags, dagRuns]);
+
+  const dagRunIdSuggestions = React.useMemo(() => {
+    const ids = new Set<string>();
+    for (const run of dagRuns) {
+      if (run.dagRunId) {
+        ids.add(run.dagRunId);
+      }
+    }
+    return [...ids];
+  }, [dagRuns]);
+
+  const navigateGroupedRunHistory = React.useCallback(
+    (direction: 'up' | 'down') => {
+      if (!selectedDAGRun) {
+        return;
+      }
+      const groupRuns = dagRuns
+        .filter((run) => run.name === selectedDAGRun.name)
+        .sort(
+          (a, b) =>
+            getDAGRunScheduleSortValue(b) - getDAGRunScheduleSortValue(a)
+        );
+      const index = groupRuns.findIndex(
+        (run) => run.dagRunId === selectedDAGRun.dagRunId
+      );
+      if (index < 0) {
+        return;
+      }
+      const nextRun = groupRuns[index + (direction === 'down' ? 1 : -1)];
+      if (nextRun) {
+        updateSelectedDAGRun(
+          { name: nextRun.name, dagRunId: nextRun.dagRunId },
+          selectedDAGRunTab,
+          true
+        );
+      }
+    },
+    [dagRuns, selectedDAGRun, selectedDAGRunTab, updateSelectedDAGRun]
+  );
   React.useEffect(() => {
     if (!isLoadingMore) {
       autoLoadPendingRef.current = false;
@@ -596,11 +935,16 @@ function DAGRuns() {
 
   const updateSearchParams = (updates: Record<string, string | undefined>) => {
     const params = new URLSearchParams(location.search);
+    if (!('view' in updates) && activeRunViewId) {
+      params.set('view', activeRunViewId);
+    }
     if ('labels' in updates) {
       params.delete('tags');
     }
     for (const [key, value] of Object.entries(updates)) {
-      if (value) {
+      // An explicit empty string overrides a saved view's value; only
+      // undefined removes the parameter.
+      if (value !== undefined) {
         params.set(key, value);
       } else {
         params.delete(key);
@@ -612,6 +956,9 @@ function DAGRuns() {
       search: search ? `?${search}` : '',
     });
   };
+
+  const searchOverrideKey = (value: string): string | undefined =>
+    activeRunViewId !== null ? value : value.length > 0 ? value : undefined;
 
   const handleSearch = (overrideStatus?: string) => {
     // Use override status if provided, otherwise use current status
@@ -626,10 +973,10 @@ function DAGRuns() {
     setApiToDate(toDate);
 
     updateSearchParams({
-      name: searchText,
-      dagRunId,
+      name: searchOverrideKey(searchText),
+      dagRunId: searchOverrideKey(dagRunId),
       status: statusToUse,
-      labels: selectedLabels.length > 0 ? selectedLabels.join(',') : undefined,
+      labels: searchOverrideKey(selectedLabels.join(',')),
       fromDate,
       toDate,
       dateMode: dateRangeMode,
@@ -639,14 +986,234 @@ function DAGRuns() {
     });
   };
 
-  const handleNameInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setSearchText(e.target.value);
+  const applyResolvedFilters = React.useCallback((filters: DAGRunsFilters) => {
+    setSearchText(filters.searchText);
+    setDagRunId(filters.dagRunId);
+    setStatus(filters.status);
+    setSelectedLabels(filters.labels);
+    setFromDate(filters.fromDate);
+    setToDate(filters.toDate);
+    setDateRangeMode(filters.dateRangeMode);
+    setDatePreset(filters.datePreset);
+    setSpecificPeriod(filters.specificPeriod);
+    setSpecificValue(filters.specificValue);
+    setAPISearchText(filters.searchText);
+    setApiDagRunId(filters.dagRunId);
+    setApiStatus(filters.status);
+    setApiLabels(filters.labels);
+    setApiFromDate(filters.fromDate);
+    setApiToDate(filters.toDate);
+  }, []);
+
+  const applyRunView = React.useCallback(
+    (view: DAGRunsFilterView) => {
+      setRunViewError(null);
+      const params = new URLSearchParams(location.search);
+      const filters = resolveRunViewFilters(view.filters);
+      // Apply the filters directly: when the resulting URL is unchanged
+      // (for example resetting a view that was selected from the dropdown),
+      // the restoration effect has no location change to react to.
+      applyResolvedFilters(filters);
+      for (const key of RUN_FILTER_QUERY_KEYS) {
+        params.delete(key);
+      }
+      params.set('view', view.id);
+      if (filters.searchText) {
+        params.set('name', filters.searchText);
+      }
+      if (filters.dagRunId) {
+        params.set('dagRunId', filters.dagRunId);
+      }
+      if (filters.status && filters.status !== 'all') {
+        params.set('status', filters.status);
+      }
+      if (filters.labels.length > 0) {
+        params.set('labels', filters.labels.join(','));
+      }
+      params.set('dateMode', filters.dateRangeMode);
+      if (filters.dateRangeMode === 'preset') {
+        params.set('preset', filters.datePreset);
+      } else if (filters.dateRangeMode === 'specific') {
+        params.set('specificValue', filters.specificValue);
+        params.set('specificPeriod', filters.specificPeriod);
+      } else {
+        // Only a custom range persists concrete dates; preset and specific
+        // modes derive them whenever the view is applied.
+        if (filters.fromDate) {
+          params.set('fromDate', filters.fromDate);
+        }
+        if (filters.toDate) {
+          params.set('toDate', filters.toDate);
+        }
+      }
+      const search = params.toString();
+      navigate(
+        { pathname: location.pathname, search: search ? `?${search}` : '' },
+        { replace: true }
+      );
+    },
+    [
+      applyResolvedFilters,
+      location.pathname,
+      location.search,
+      navigate,
+      resolveRunViewFilters,
+    ]
+  );
+
+  const handleSelectRunView = (viewId: string) => {
+    const view = runViews.find((item) => item.id === viewId);
+    if (view) {
+      applyRunView(view);
+    }
   };
 
-  const handleDagRunIdInputChange = (
-    e: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    setDagRunId(e.target.value);
+  const handleShowAllRuns = () => {
+    setRunViewError(null);
+    // Same rationale as applyRunView: the target URL may already be active,
+    // so restore the default filters directly.
+    applyResolvedFilters(cloneFilters(defaultFilters));
+    const params = new URLSearchParams(location.search);
+    for (const key of RUN_FILTER_QUERY_KEYS) {
+      params.delete(key);
+    }
+    params.set('view', ALL_RUNS_VIEW_PARAM);
+    const search = params.toString();
+    navigate(
+      { pathname: location.pathname, search: search ? `?${search}` : '' },
+      { replace: true }
+    );
+  };
+
+  const handleResetRunView = () => {
+    const view = runViews.find((item) => item.id === activeRunViewId);
+    if (view) {
+      applyRunView(view);
+    }
+  };
+
+  const handleSaveRunView = async (
+    name: string,
+    makeDefault: boolean,
+    pinned: boolean
+  ): Promise<void> => {
+    const filters = cloneFilters(currentFiltersRef.current);
+    setRunViewError(null);
+    try {
+      const view = await createView(
+        buildRunViewSpec(name, filters, makeDefault, pinned, runViewScope)
+      );
+      applyRunView(dagRunsFilterViewFromView(view));
+    } catch (error) {
+      setRunViewError(
+        error instanceof Error ? error.message : 'Failed to save run view'
+      );
+      throw error;
+    }
+  };
+
+  const handleUpdateRunView = async (): Promise<void> => {
+    const view = scopedRunViews.find((item) => item.id === activeRunViewId);
+    if (!view) {
+      return;
+    }
+    const filters = cloneFilters(currentFiltersRef.current);
+    setRunViewError(null);
+    try {
+      const updated = await updateView(
+        view.id,
+        buildRunViewSpec(
+          view.name,
+          filters,
+          view.isDefault ?? false,
+          view.pinned ?? false,
+          runViewScope
+        )
+      );
+      applyRunView(dagRunsFilterViewFromView(updated));
+    } catch (error) {
+      setRunViewError(
+        error instanceof Error ? error.message : 'Failed to update run view'
+      );
+      throw error;
+    }
+  };
+
+  const handleSetDefaultRunView = async (
+    viewId: string | undefined
+  ): Promise<void> => {
+    const target = scopedRunViews.find(
+      (view) => view.id === (viewId ?? defaultRunViewId)
+    );
+    if (!target) {
+      return;
+    }
+    setRunViewError(null);
+    try {
+      await updateView(
+        target.id,
+        buildRunViewSpec(
+          target.name,
+          dagRunsFilterSetFromView(target),
+          viewId !== undefined,
+          target.pinned ?? false,
+          runViewScope
+        )
+      );
+    } catch (error) {
+      setRunViewError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to update the default run view'
+      );
+      throw error;
+    }
+  };
+
+  const handleSetPinnedRunView = async (
+    viewId: string,
+    pinned: boolean
+  ): Promise<void> => {
+    const target = scopedRunViews.find((view) => view.id === viewId);
+    if (!target) {
+      return;
+    }
+    setRunViewError(null);
+    try {
+      await updateView(
+        target.id,
+        buildRunViewSpec(
+          target.name,
+          dagRunsFilterSetFromView(target),
+          target.isDefault ?? false,
+          pinned,
+          runViewScope
+        )
+      );
+    } catch (error) {
+      setRunViewError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to update the starred run view'
+      );
+      throw error;
+    }
+  };
+
+  const handleDeleteRunView = async (viewId: string): Promise<void> => {
+    const deletingActiveView = viewId === activeRunViewId;
+    setRunViewError(null);
+    try {
+      await deleteView(viewId);
+      if (deletingActiveView) {
+        handleShowAllRuns();
+      }
+    } catch (error) {
+      setRunViewError(
+        error instanceof Error ? error.message : 'Failed to delete run view'
+      );
+      throw error;
+    }
   };
 
   const handleStatusChange = (value: string) => {
@@ -659,45 +1226,13 @@ function DAGRuns() {
     setSelectedLabels(newLabels);
     setApiLabels(newLabels);
     updateSearchParams({
-      labels: newLabels.length > 0 ? newLabels.join(',') : undefined,
+      labels: searchOverrideKey(newLabels.join(',')),
     });
   };
 
   const handleViewModeChange = (value: string) => {
     const newViewMode = value as 'list' | 'grouped';
     updatePreference('dagRunsViewMode', newViewMode);
-  };
-
-  const getPresetDates = (preset: string): { from: string; to?: string } => {
-    const now = dayjs();
-    const startOfDay =
-      config.tzOffsetInSec !== undefined
-        ? now.utcOffset(config.tzOffsetInSec / 60).startOf('day')
-        : now.startOf('day');
-
-    switch (preset) {
-      case 'today':
-        return { from: startOfDay.format('YYYY-MM-DDTHH:mm') };
-      case 'yesterday':
-        return {
-          from: startOfDay.subtract(1, 'day').format('YYYY-MM-DDTHH:mm'),
-          to: startOfDay.format('YYYY-MM-DDTHH:mm'),
-        };
-      case 'last7days':
-        return {
-          from: startOfDay.subtract(7, 'day').format('YYYY-MM-DDTHH:mm'),
-        };
-      case 'last30days':
-        return {
-          from: startOfDay.subtract(30, 'day').format('YYYY-MM-DDTHH:mm'),
-        };
-      case 'thisWeek':
-        return { from: startOfDay.startOf('week').format('YYYY-MM-DDTHH:mm') };
-      case 'thisMonth':
-        return { from: startOfDay.startOf('month').format('YYYY-MM-DDTHH:mm') };
-      default:
-        return { from: startOfDay.format('YYYY-MM-DDTHH:mm') };
-    }
   };
 
   const handleDatePresetChange = (preset: string) => {
@@ -713,35 +1248,6 @@ function DAGRuns() {
       fromDate: dates.from,
       toDate: dates.to,
     });
-  };
-
-  const getSpecificPeriodDates = (
-    period: 'date' | 'month' | 'year',
-    value: string
-  ): { from: string; to?: string } => {
-    switch (period) {
-      case 'date': {
-        const date = dayjs(value);
-        return {
-          from: date.startOf('day').format('YYYY-MM-DDTHH:mm'),
-          to: date.endOf('day').format('YYYY-MM-DDTHH:mm'),
-        };
-      }
-      case 'month': {
-        const date = dayjs(value);
-        return {
-          from: date.startOf('month').format('YYYY-MM-DDTHH:mm'),
-          to: date.endOf('month').format('YYYY-MM-DDTHH:mm'),
-        };
-      }
-      case 'year': {
-        const date = dayjs(value);
-        return {
-          from: date.startOf('year').format('YYYY-MM-DDTHH:mm'),
-          to: date.endOf('year').format('YYYY-MM-DDTHH:mm'),
-        };
-      }
-    }
   };
 
   const getInputTypeForPeriod = (period: 'date' | 'month' | 'year'): string => {
@@ -820,12 +1326,6 @@ function DAGRuns() {
     }
   };
 
-  const handleInputKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
-      handleSearch();
-    }
-  };
-
   // Format timezone offset for display
   const formatTimezoneOffset = (): string => {
     if (config.tzOffsetInSec === undefined) return '';
@@ -845,12 +1345,42 @@ function DAGRuns() {
 
   const tzLabel = formatTimezoneOffset();
 
+  const activeRunView = runViews.find((view) => view.id === activeRunViewId);
+  const isRunViewEdited = activeRunView
+    ? !areFiltersEqual(
+        resolveRunViewFilters(activeRunView.filters),
+        currentFilters
+      )
+    : false;
+  const isAllRunsView =
+    activeRunViewId === null && areFiltersEqual(currentFilters, defaultFilters);
+
   return (
     <div className="max-w-7xl">
       <div className="flex items-center justify-between mb-2">
-        <Title>
-          <I18nText text={'Executions'} />
-        </Title>
+        <div className="flex min-w-0 items-center gap-3">
+          <Title>
+            <I18nText text={'Executions'} />
+          </Title>
+          <ViewSelector
+            kind="run"
+            views={runViews}
+            activeViewId={activeRunViewId}
+            defaultViewId={defaultRunViewId}
+            isAllView={isAllRunsView}
+            isActiveViewEdited={isRunViewEdited}
+            canManageViews={canManageRunViews}
+            error={runViewError}
+            onSelectView={handleSelectRunView}
+            onShowAll={handleShowAllRuns}
+            onResetView={handleResetRunView}
+            onSaveView={handleSaveRunView}
+            onUpdateView={handleUpdateRunView}
+            onSetDefault={handleSetDefaultRunView}
+            onSetPinned={handleSetPinnedRunView}
+            onDeleteView={handleDeleteRunView}
+          />
+        </div>
         <I18nProps>
           <ToggleGroup aria-label="View mode" className="h-9 p-0.5">
             <I18nProps>
@@ -886,20 +1416,22 @@ function DAGRuns() {
         <div className="mb-3 space-y-3 rounded-lg border border-border bg-card/50 p-3">
           <div className="flex flex-wrap items-center gap-2">
             <I18nProps>
-              <Input
+              <AutocompleteInput
                 placeholder="Filter by DAG name..."
                 value={searchText}
-                onChange={handleNameInputChange}
-                onKeyDown={handleInputKeyPress}
+                onValueChange={setSearchText}
+                onEnterPress={() => handleSearch()}
+                suggestions={dagNameSuggestions}
                 className="w-[200px]"
               />
             </I18nProps>
             <I18nProps>
-              <Input
+              <AutocompleteInput
                 placeholder="Filter by Run ID..."
                 value={dagRunId}
-                onChange={handleDagRunIdInputChange}
-                onKeyDown={handleInputKeyPress}
+                onValueChange={setDagRunId}
+                onEnterPress={() => handleSearch()}
+                suggestions={dagRunIdSuggestions}
                 className="w-[180px]"
               />
             </I18nProps>
@@ -1159,7 +1691,16 @@ function DAGRuns() {
           dagRunId={selectedDAGRun.dagRunId}
           isOpen={!!selectedDAGRun}
           onClose={() => updateSelectedDAGRun(null, 'status', true)}
-          initialTab={selectedDAGRunInitialTab}
+          onNavigate={
+            viewMode === 'grouped' ? navigateGroupedRunHistory : undefined
+          }
+          initialTab={selectedDAGRunTab}
+          activeTab={viewMode === 'grouped' ? selectedDAGRunTab : undefined}
+          onTabChange={
+            viewMode === 'grouped'
+              ? (tab) => updateSelectedDAGRun(selectedDAGRun, tab, true)
+              : undefined
+          }
         />
       )}
     </div>

@@ -42,6 +42,21 @@ func TestToStepIncludesHarnessPrompt(t *testing.T) {
 	assert.Nil(t, (*step.Commands)[0].Args)
 }
 
+func TestToStepIncludesExpectedAny(t *testing.T) {
+	step := toStep(ir.Step{
+		Preconditions: []*ir.Condition{
+			{Condition: "${MODE}", ExpectedAny: []string{"full", "minimal"}},
+		},
+	})
+
+	require.NotNil(t, step.Preconditions)
+	require.Len(t, *step.Preconditions, 1)
+	precondition := (*step.Preconditions)[0]
+	require.NotNil(t, precondition.ExpectedAny)
+	assert.Equal(t, []string{"full", "minimal"}, *precondition.ExpectedAny)
+	assert.Nil(t, precondition.Expected)
+}
+
 func TestToDAGRunSummaryIncludesScheduleTime(t *testing.T) {
 	status := ir.DAGRunStatus{
 		Name:           "test-dag",
@@ -109,8 +124,9 @@ func TestToDAGRunDetailsIncludesHumanTaskContract(t *testing.T) {
 				ID:   "review",
 				Name: "Review",
 				HumanTask: &ir.HumanTaskConfig{
-					Prompt: "Confirm the release",
-					Form:   json.RawMessage(`{"type":"object","properties":{"count":{"type":"integer","maximum":9007199254740993}}}`),
+					Prompt:    "Confirm the release",
+					Form:      json.RawMessage(`{"type":"object","properties":{"count":{"type":"integer","maximum":9007199254740993}}}`),
+					Artifacts: []string{"changes.diff", "reports/test.html"},
 				},
 			},
 			Status:         ir.NodeSucceeded,
@@ -122,6 +138,8 @@ func TestToDAGRunDetailsIncludesHumanTaskContract(t *testing.T) {
 	require.Len(t, details.Nodes, 1)
 	require.NotNil(t, details.Nodes[0].Step.HumanTask)
 	assert.Equal(t, "Confirm the release", details.Nodes[0].Step.HumanTask.Prompt)
+	require.NotNil(t, details.Nodes[0].Step.HumanTask.Artifacts)
+	assert.Equal(t, []string{"changes.diff", "reports/test.html"}, *details.Nodes[0].Step.HumanTask.Artifacts)
 	require.NotNil(t, details.Nodes[0].Step.HumanTask.Form)
 	assert.Equal(t, "object", (*details.Nodes[0].Step.HumanTask.Form)["type"])
 	properties := (*details.Nodes[0].Step.HumanTask.Form)["properties"].(map[string]any)
@@ -129,6 +147,47 @@ func TestToDAGRunDetailsIncludesHumanTaskContract(t *testing.T) {
 	assert.Equal(t, json.Number("9007199254740993"), count["maximum"])
 	require.NotNil(t, details.HumanTaskResumePending)
 	assert.True(t, *details.HumanTaskResumePending)
+}
+
+func TestToDAGRunDetailsIncludesHumanTaskPushBack(t *testing.T) {
+	status := ir.DAGRunStatus{
+		Name:     "test-dag",
+		DAGRunID: "run-1",
+		Status:   ir.Waiting,
+		Nodes: []*ir.Node{
+			{
+				Step: ir.Step{ID: "review", Name: "Review", HumanTask: &ir.HumanTaskConfig{
+					Prompt: "Review",
+					PushBack: &ir.HumanTaskPushBackConfig{
+						RewindTo: "implement",
+						Form:     json.RawMessage(`{"type":"object","properties":{"feedback":{"type":"string"}},"additionalProperties":false}`),
+					},
+				}},
+				Status: ir.NodeWaiting,
+			},
+			{
+				Step: ir.Step{ID: "confirm", Name: "Confirm", HumanTask: &ir.HumanTaskConfig{
+					Prompt:   "Confirm",
+					PushBack: &ir.HumanTaskPushBackConfig{RewindTo: "implement"},
+				}},
+				Status: ir.NodeWaiting,
+			},
+		},
+	}
+
+	details := ToDAGRunDetails(status)
+	require.Len(t, details.Nodes, 2)
+
+	pushBack := details.Nodes[0].Step.HumanTask.PushBack
+	require.NotNil(t, pushBack)
+	assert.Equal(t, "implement", pushBack.RewindTo)
+	require.NotNil(t, pushBack.Form)
+	assert.Equal(t, false, (*pushBack.Form)["additionalProperties"])
+
+	pushBack = details.Nodes[1].Step.HumanTask.PushBack
+	require.NotNil(t, pushBack)
+	assert.Equal(t, "implement", pushBack.RewindTo)
+	assert.Nil(t, pushBack.Form)
 }
 
 func TestToDAGRunDetailsTreatsNullHumanTaskFormAsAbsent(t *testing.T) {
@@ -163,6 +222,30 @@ func TestToDAGRunDetailsTreatsHumanTaskFormWithTrailingDataAsAbsent(t *testing.T
 	require.Len(t, details.Nodes, 1)
 	require.NotNil(t, details.Nodes[0].Step.HumanTask)
 	assert.Nil(t, details.Nodes[0].Step.HumanTask.Form)
+}
+
+func TestToDAGRunDetailsIncludesError(t *testing.T) {
+	status := ir.DAGRunStatus{
+		Name:     "test-dag",
+		DAGRunID: "run-1",
+		Status:   ir.Failed,
+		Error:    "field 'actions.broken_action.input_schema': failed to parse schema JSON",
+	}
+
+	details := ToDAGRunDetails(status)
+	require.NotNil(t, details.Error)
+	assert.Equal(t, status.Error, *details.Error)
+}
+
+func TestToDAGRunDetailsOmitsErrorWhenEmpty(t *testing.T) {
+	status := ir.DAGRunStatus{
+		Name:     "test-dag",
+		DAGRunID: "run-1",
+		Status:   ir.Succeeded,
+	}
+
+	details := ToDAGRunDetails(status)
+	assert.Nil(t, details.Error)
 }
 
 func TestToDAGRunSummaryOmitsAutoRetryLimitWhenUnconfigured(t *testing.T) {
@@ -258,6 +341,12 @@ func TestToDAGDetailsIncludesParamDefDescriptions(t *testing.T) {
 	require.Len(t, *details.ParamDefs, 1)
 	require.NotNil(t, (*details.ParamDefs)[0].Description)
 	assert.Equal(t, "Free-form operator notes", *(*details.ParamDefs)[0].Description)
+}
+
+func TestToDAGDetailsIncludesQueue(t *testing.T) {
+	details := toDAGDetails(&ir.DAG{Name: "test-dag", Queue: "normal"})
+	require.NotNil(t, details.Queue)
+	assert.Equal(t, "normal", *details.Queue)
 }
 
 func TestToDAGDetailsIncludesHistoryRetentionRuns(t *testing.T) {
@@ -447,6 +536,24 @@ func TestToNodeIncludesNormalizedPushBackHistory(t *testing.T) {
 	assert.Equal(t, "revise the summary", (*entry.Inputs)["FEEDBACK"])
 	_, ok := (*entry.Inputs)["IGNORED"]
 	assert.False(t, ok)
+}
+
+func TestToAgentSession(t *testing.T) {
+	session := toAgentSession(&ir.AgentSession{
+		Provider: "browser",
+		State:    ir.AgentSessionWaiting,
+		Interactions: []ir.AgentInteraction{
+			{ID: "ask-1-1", Kind: ir.AgentInteractionQuestion, Status: ir.AgentInteractionPending, ExpiresAt: "2026-09-24T12:00:00Z"},
+			{ID: "perm-1", Kind: ir.AgentInteractionPermission, Status: ir.AgentInteractionPending},
+		},
+	})
+
+	require.NotNil(t, session.Interactions)
+	interactions := *session.Interactions
+	require.Len(t, interactions, 2)
+	require.NotNil(t, interactions[0].ExpiresAt)
+	assert.Equal(t, "2026-09-24T12:00:00Z", *interactions[0].ExpiresAt)
+	assert.Nil(t, interactions[1].ExpiresAt)
 }
 
 func TestToDAGIncludesTypedSchedules(t *testing.T) {
@@ -722,4 +829,83 @@ func TestStepOutputsOmittedWhenOnlyCaptured(t *testing.T) {
 	details := ToDAGRunDetails(status)
 	require.Len(t, details.Nodes, 1)
 	assert.Nil(t, details.Nodes[0].Step.Outputs)
+}
+
+func runningLocalStatus() ir.DAGRunStatus {
+	return ir.DAGRunStatus{
+		Name:         "test-dag",
+		DAGRunID:     "run-1",
+		Status:       ir.Running,
+		PID:          ir.PID(4242),
+		PIDStartedAt: 1700000000123,
+	}
+}
+
+func TestToDAGRunSummaryIncludesProcessForLocalRunningRun(t *testing.T) {
+	for _, workerID := range []string{"", "local"} {
+		status := runningLocalStatus()
+		status.WorkerID = workerID
+
+		summary := toDAGRunSummary(status)
+
+		require.NotNil(t, summary.Process, "workerID %q is local", workerID)
+		assert.Equal(t, 4242, summary.Process.Pid)
+		assert.Equal(t, int64(1700000000123), summary.Process.StartedAtMs)
+	}
+}
+
+func TestToDAGRunSummaryOmitsProcessForRemoteRun(t *testing.T) {
+	status := runningLocalStatus()
+	status.WorkerID = "worker-a@1234"
+
+	summary := toDAGRunSummary(status)
+
+	assert.Nil(t, summary.Process)
+}
+
+func TestToDAGRunSummaryOmitsProcessUnlessRunning(t *testing.T) {
+	// A waiting run has already ended the process that recorded this identity:
+	// resuming it starts a new attempt with a new process.
+	for _, status := range []ir.Status{
+		ir.NotStarted, ir.Queued, ir.Waiting, ir.Succeeded,
+		ir.Failed, ir.Aborted, ir.PartiallySucceeded, ir.Rejected,
+	} {
+		run := runningLocalStatus()
+		run.Status = status
+
+		summary := toDAGRunSummary(run)
+
+		assert.Nil(t, summary.Process, "status %s", status)
+	}
+}
+
+func TestToDAGRunSummaryOmitsProcessWithoutRecordedIdentity(t *testing.T) {
+	for _, identity := range []struct {
+		pid       ir.PID
+		startedAt int64
+	}{{0, 0}, {4242, 0}, {0, 1700000000123}} {
+		run := runningLocalStatus()
+		run.PID, run.PIDStartedAt = identity.pid, identity.startedAt
+
+		summary := toDAGRunSummary(run)
+
+		assert.Nil(t, summary.Process, "pid %d started %d", identity.pid, identity.startedAt)
+	}
+}
+
+func TestToDAGRunDetailsIncludesProcessForLocalRunningRun(t *testing.T) {
+	details := ToDAGRunDetails(runningLocalStatus())
+
+	require.NotNil(t, details.Process)
+	assert.Equal(t, 4242, details.Process.Pid)
+	assert.Equal(t, int64(1700000000123), details.Process.StartedAtMs)
+}
+
+func TestToDAGRunDetailsOmitsProcessForRemoteRun(t *testing.T) {
+	status := runningLocalStatus()
+	status.WorkerID = "worker-a@1234"
+
+	details := ToDAGRunDetails(status)
+
+	assert.Nil(t, details.Process)
 }

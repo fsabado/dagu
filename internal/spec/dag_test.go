@@ -804,7 +804,7 @@ func TestBuildMaxActiveRuns(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := &dag{MaxActiveRuns: tt.input}
+			d := &dag{MaxActiveRuns: &tt.input}
 			result, err := buildMaxActiveRuns(testBuildContext(), d)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expected, result)
@@ -836,7 +836,7 @@ func TestBuildQueue(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := &dag{Queue: tt.input}
+			d := &dag{Queue: &tt.input}
 			result, err := buildQueue(testBuildContext(), d)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expected, result)
@@ -867,7 +867,7 @@ func TestBuildSkipIfSuccessful(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := &dag{SkipIfSuccessful: tt.input}
+			d := &dag{SkipIfSuccessful: &tt.input}
 			result, err := buildSkipIfSuccessful(testBuildContext(), d)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expected, result)
@@ -3651,6 +3651,8 @@ steps:
 		}
 	}
 	require.True(t, found, "FULL_PATH env var not found")
+	// Unresolved entries are not marked as resolved root env.
+	require.Equal(t, ir.EnvSpan{}, d.RootEnvSpan)
 }
 
 func TestBuildEnvReferencesParamsOnlyMetadata(t *testing.T) {
@@ -3813,4 +3815,100 @@ func TestRouterNotAllowedInChainType(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A step listed under several routes of one router runs when any of them
+// matches, so those patterns share one precondition. Another router targeting
+// the same step adds its own precondition, which must also pass.
+func TestRouterSharedTarget(t *testing.T) {
+	t.Parallel()
+
+	built, err := (&dag{
+		Type: "graph",
+		Steps: []any{
+			map[string]any{
+				"name":  "router",
+				"type":  "router",
+				"value": "${MODE}",
+				"routes": map[string]any{
+					"full":    []string{"shared", "single"},
+					"minimal": []string{"shared"},
+					"re:^m":   []string{"shared"},
+					"x":       []string{"repeated", "repeated"},
+				},
+			},
+			map[string]any{
+				"name":  "router2",
+				"type":  "router",
+				"value": "${REGION}",
+				"routes": map[string]any{
+					"eu": []string{"shared"},
+				},
+			},
+			map[string]any{"name": "shared", "command": "echo shared"},
+			map[string]any{"name": "single", "command": "echo single"},
+			map[string]any{"name": "repeated", "command": "echo repeated"},
+		},
+	}).build(testBuildContext())
+	require.NoError(t, err)
+
+	steps := make(map[string]ir.Step, len(built.Steps))
+	for _, step := range built.Steps {
+		steps[step.Name] = step
+	}
+	assert.Equal(t, []*ir.Condition{
+		{Condition: "${MODE}", ExpectedAny: []string{"full", "minimal", "re:^m"}},
+		{Condition: "${REGION}", Expected: "eu"},
+	}, steps["shared"].Preconditions)
+	assert.Equal(t, []string{"router", "router2"}, steps["shared"].Depends)
+	assert.Equal(t, []*ir.Condition{{Condition: "${MODE}", Expected: "full"}}, steps["single"].Preconditions)
+	assert.Equal(t, []*ir.Condition{{Condition: "${MODE}", Expected: "x"}}, steps["repeated"].Preconditions)
+}
+
+func TestRouterNumericRoutePattern(t *testing.T) {
+	t.Parallel()
+
+	newDAG := func(pattern string) *dag {
+		return &dag{
+			Type: "graph",
+			Steps: []any{
+				map[string]any{
+					"name":  "router",
+					"type":  "router",
+					"value": "${CONFIDENCE}",
+					"routes": map[string]any{
+						pattern: []string{"step_a"},
+					},
+				},
+				map[string]any{"name": "step_a", "command": "echo A"},
+			},
+		}
+	}
+
+	t.Run("Valid", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := newDAG("num:>=0.8").build(testBuildContext())
+		require.NoError(t, err)
+	})
+
+	t.Run("Invalid", func(t *testing.T) {
+		t.Parallel()
+
+		for _, pattern := range []string{"num:", "num:0.8", "num:==0.8", "num:>=abc"} {
+			_, err := newDAG(pattern).build(testBuildContext())
+			require.Error(t, err, "pattern %q should be rejected", pattern)
+			assert.Contains(t, err.Error(), "numeric comparison is invalid")
+		}
+	})
+
+	// Route patterns went unvalidated for re: until they shared precondition
+	// pattern validation.
+	t.Run("InvalidRegexp", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := newDAG("re:[").build(testBuildContext())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "regexp is invalid")
+	})
 }

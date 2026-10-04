@@ -31,8 +31,13 @@ type runOptions struct {
 	step              string
 	includeDownstream bool
 	retryPath         dagrun.RetryPath
-	preparedAttempt   dagrun.Attempt
-	noReuse           bool
+
+	bypassPreconditions bool
+	preparedAttempt     dagrun.Attempt
+	noReuse             bool
+	// seed is the queued status of a selected-steps run, which is dispatched
+	// as a retry of that attempt.
+	seed *ir.DAGRunStatus
 }
 
 func dagDefinitionIDFromEnv() string {

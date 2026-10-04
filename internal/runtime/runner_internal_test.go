@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
+	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
 
 	"github.com/dagucloud/dagu/v2/internal/build"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -158,6 +160,74 @@ func TestSetupVariables_StepEnvEvaluatesSequentiallyWithRuntimeVars(t *testing.T
 	}
 }
 
+// env_file variables of the selected container enter the step scope between
+// step env and container env (spec 006).
+func TestSetupVariablesEnvFile(t *testing.T) {
+	t.Parallel()
+
+	container := &ir.Container{
+		EnvFile: []string{".env"},
+		Env:     []string{"B=container"},
+	}
+	tests := []struct {
+		name         string
+		step         ir.Step
+		dagContainer *ir.Container
+	}{
+		{
+			name: "step container",
+			step: ir.Step{Name: "render", Env: []string{"A=step"}, Container: container},
+		},
+		{
+			name:         "dag container fallback",
+			step:         ir.Step{Name: "render", Env: []string{"A=step"}},
+			dagContainer: container,
+		},
+	}
+
+	setup := func(t *testing.T, step ir.Step, dagContainer *ir.Container, workDir string) (context.Context, error) {
+		t.Helper()
+		plan, err := NewPlan(step)
+		require.NoError(t, err)
+		node := plan.GetNodeByName(step.Name)
+		require.NotNil(t, node)
+
+		ctx := NewContext(
+			context.Background(),
+			&ir.DAG{Name: "test-dag", WorkingDir: workDir, Container: dagContainer},
+			"run-1",
+			filepath.Join(t.TempDir(), "dag.log"),
+		)
+		return New(&Config{}).setupVariables(ctx, plan, node)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			workDir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(workDir, ".env"), []byte("A=file\nB=file\nFILE_ONLY=f\n"), 0o600))
+
+			ctx, err := setup(t, tt.step, tt.dagContainer, workDir)
+			require.NoError(t, err)
+
+			result := AllEnvsMap(ctx)
+			assert.Equal(t, "file", result["A"])
+			assert.Equal(t, "container", result["B"])
+			assert.Equal(t, "f", result["FILE_ONLY"])
+		})
+	}
+
+	t.Run("missing file", func(t *testing.T) {
+		t.Parallel()
+		_, err := setup(t, ir.Step{
+			Name:      "render",
+			Container: &ir.Container{EnvFile: []string{"missing.env"}},
+		}, nil, t.TempDir())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing.env")
+	})
+}
+
 func TestPrepareBuildPlanInfersFileDependency(t *testing.T) {
 	t.Parallel()
 
@@ -243,6 +313,44 @@ func TestRunner_StepRetryWithDownstreamIncludesInferredBuildDescendant(t *testin
 	consumerBuild := plan.GetNodeByName(consumer.Name).State().Build
 	require.NotNil(t, consumerBuild)
 	assert.Equal(t, ir.BuildDecisionDeferred, consumerBuild.Decision)
+}
+
+// Descendants reached through inferred build edges are reset at run start,
+// after build planning resolved their paths. A reset human task still reopens
+// from its template, and the other reset steps keep their resolved paths.
+func TestFinalizeStepRetrySelectionReopensHumanTaskFromTemplate(t *testing.T) {
+	t.Parallel()
+
+	template := &ir.HumanTaskConfig{Prompt: "Review ${params.target}"}
+	producer := ir.Step{Name: "producer", Outputs: []ir.StepOutputDeclaration{{Name: "artifact", Path: "artifact.txt"}}}
+	consumer := ir.Step{Name: "consumer", Inputs: []ir.StepInputDeclaration{{Name: "artifact", Path: "artifact.txt"}}}
+	review := ir.Step{Name: "review", Depends: []string{"consumer"}, HumanTask: template}
+	dag := &ir.DAG{Type: ir.TypeBuild, Steps: []ir.Step{producer, consumer, review}}
+	openedReview := review
+	openedReview.HumanTask = &ir.HumanTaskConfig{Prompt: "Review production"}
+	nodes := []*Node{
+		NodeWithData(NodeData{Step: producer, State: NodeState{Status: ir.NodeSucceeded}}),
+		NodeWithData(NodeData{Step: consumer, State: NodeState{Status: ir.NodeSucceeded}}),
+		NodeWithData(NodeData{
+			Step:  openedReview,
+			State: NodeState{Status: ir.NodeSucceeded, HumanTaskInput: []byte(`{}`)},
+		}),
+	}
+	plan, err := CreateStepRetryPlanWithOptions(dag, nodes, producer.Name, StepRetryPlanOptions{
+		IncludeDownstream: true,
+	})
+	require.NoError(t, err)
+
+	resolvedConsumer := nodes[1].Step()
+	resolvedConsumer.Inputs = []ir.StepInputDeclaration{{Name: "artifact", Path: "/work/artifact.txt"}}
+	nodes[1].SetStep(resolvedConsumer)
+	require.NoError(t, plan.AddInferredDependency(producer.Name, consumer.Name))
+	plan.finalizeStepRetrySelection()
+
+	assert.Equal(t, ir.NodeNotStarted, nodes[1].State().Status)
+	assert.Equal(t, "/work/artifact.txt", nodes[1].Step().Inputs[0].Path)
+	assert.Equal(t, ir.NodeNotStarted, nodes[2].State().Status)
+	assert.Equal(t, template, nodes[2].Step().HumanTask)
 }
 
 func TestPrepareBuildPlanRejectsRedirectAlias(t *testing.T) {
@@ -672,4 +780,175 @@ func TestPrepareBuildPlanRejectsInferredCycle(t *testing.T) {
 	assert.False(t, plan.IsInferredDependency(firstNode.ID(), secondNode.ID()))
 	assert.Empty(t, plan.Dependents(firstNode.ID()))
 	assert.Equal(t, []int{secondNode.ID()}, plan.Dependencies(firstNode.ID()))
+}
+
+// report must not release the sender until the receiver has acknowledged the
+// update, so a node's status reaches durable storage before execution
+// continues past it.
+func TestReportWaitsForAck(t *testing.T) {
+	t.Parallel()
+
+	r := New(&Config{})
+	ch := make(chan ProgressUpdate)
+	node := &Node{}
+
+	returned := make(chan struct{})
+	go func() {
+		r.report(context.Background(), ch, node)
+		close(returned)
+	}()
+
+	update := <-ch
+	require.Same(t, node, update.Node)
+	select {
+	case <-returned:
+		t.Fatal("report returned before the update was acknowledged")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	update.Ack(nil)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("report did not return after the update was acknowledged")
+	}
+}
+
+// A receiver that reports a persistence failure must not change the run
+// outcome: the terminal status write decides that.
+func TestReportKeepsRunOutcomeOnAckError(t *testing.T) {
+	t.Parallel()
+
+	r := New(&Config{})
+	ch := make(chan ProgressUpdate)
+	go func() {
+		update := <-ch
+		update.Ack(errors.New("sync error"))
+	}()
+
+	r.report(context.Background(), ch, &Node{})
+	require.False(t, r.isError())
+}
+
+// A receiver that never acknowledges must not pin the sender for the rest of
+// the run; a cancelled context releases it.
+func TestReportStopsWaitingOnContextDone(t *testing.T) {
+	t.Parallel()
+
+	r := New(&Config{})
+	ch := make(chan ProgressUpdate)
+	go func() { <-ch }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		r.report(ctx, ch, &Node{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("report did not return after the context was cancelled")
+	}
+}
+
+// A nil progress channel is the "nobody is listening" case and must never
+// block, so senders can stay unconditional.
+func TestReportWithoutChannelDoesNotBlock(t *testing.T) {
+	t.Parallel()
+
+	New(&Config{}).report(context.Background(), nil, &Node{})
+}
+
+// A sender that stopped waiting must not wedge the receiver: the ack it
+// abandoned is still buffered, so a later one is dropped rather than blocking
+// the goroutine that drives every other node's status write.
+func TestAckDoesNotBlockAfterSenderAbandonsWait(t *testing.T) {
+	t.Parallel()
+
+	r := New(&Config{})
+	ch := make(chan ProgressUpdate)
+	go func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r.report(ctx, ch, &Node{})
+	}()
+
+	update := <-ch
+	acked := make(chan struct{})
+	go func() {
+		update.Ack(nil)
+		update.Ack(nil)
+		close(acked)
+	}()
+
+	select {
+	case <-acked:
+	case <-time.After(time.Second):
+		t.Fatal("Ack blocked after the sender stopped waiting")
+	}
+}
+
+func TestResolveHumanTaskArtifacts(t *testing.T) {
+	newContext := func(entries map[string]string) context.Context {
+		ctx := runctx.NewContext(context.Background(), &ir.DAG{Name: "test-dag"}, "", "")
+		env := NewEnv(ctx, ir.Step{Name: "review"})
+		env.Scope = env.Scope.WithEntries(entries, cmnvalue.EnvSourceStepEnv)
+		return WithEnv(ctx, env)
+	}
+
+	t.Run("ResolvesReferences", func(t *testing.T) {
+		ctx := newContext(map[string]string{"OUT": "reports"})
+
+		got, err := resolveHumanTaskArtifacts(ctx, []string{"${OUT}/report.html", "changes.diff"})
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{"reports/report.html", "changes.diff"}, got)
+	})
+
+	// Two distinct templates can collapse to one path, which must not fail the
+	// task or render the same reference twice.
+	t.Run("DeduplicatesResolvedPaths", func(t *testing.T) {
+		ctx := newContext(map[string]string{"A": "reports", "B": "reports"})
+
+		got, err := resolveHumanTaskArtifacts(ctx, []string{"${A}/r.html", "changes.diff", "${B}/r.html"})
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{"reports/r.html", "changes.diff"}, got)
+	})
+
+	t.Run("RejectsResolvedEmptyPath", func(t *testing.T) {
+		ctx := newContext(map[string]string{"OUT": ""})
+
+		_, err := resolveHumanTaskArtifacts(ctx, []string{"${OUT}"})
+
+		require.ErrorContains(t, err, "must not be empty")
+	})
+
+	t.Run("NoArtifacts", func(t *testing.T) {
+		got, err := resolveHumanTaskArtifacts(newContext(nil), nil)
+
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+
+	// A reference can carry path segments that the authored literal never had,
+	// so the resolved value must be re-checked against the artifact-path rules.
+	t.Run("RejectsResolvedEscape", func(t *testing.T) {
+		ctx := newContext(map[string]string{"OUT": "../../etc"})
+
+		_, err := resolveHumanTaskArtifacts(ctx, []string{"${OUT}/passwd"})
+
+		require.ErrorContains(t, err, "parent directory")
+	})
+
+	t.Run("RejectsResolvedAbsolutePath", func(t *testing.T) {
+		ctx := newContext(map[string]string{"OUT": "/etc"})
+
+		_, err := resolveHumanTaskArtifacts(ctx, []string{"${OUT}/passwd"})
+
+		require.ErrorContains(t, err, "must be relative")
+	})
 }

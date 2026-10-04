@@ -373,16 +373,9 @@ func (s *SecretStore) ResolveValue(ctx context.Context, id string) (string, *sec
 	if sr.Secret == nil {
 		return "", nil, fmt.Errorf("secret store: decode for ResolveValue %q: missing secret payload", id)
 	}
-	if sr.Secret.Status == secret.StatusDisabled {
-		return "", nil, secret.ErrDisabled
-	}
-	v, ok := secretCurrentVersion(&sr)
-	if !ok {
-		return "", nil, secret.ErrNoValue
-	}
-	plaintext, err := s.encryptor.Decrypt(v.EncryptedValue)
+	plaintext, v, err := s.decryptCurrent(&sr)
 	if err != nil {
-		return "", nil, fmt.Errorf("secret store: decrypt version %d: %w", v.Version, err)
+		return "", nil, err
 	}
 	now := time.Now().UTC()
 	sr.Secret.LastResolvedAt = &now
@@ -398,6 +391,20 @@ func (s *SecretStore) ResolveValue(ctx context.Context, id string) (string, *sec
 		UpdatedAt: now,
 	}); err != nil {
 		return "", nil, fmt.Errorf("secret store: persist resolve metadata %q: %w", id, err)
+	}
+	return plaintext, secretVersionMetadata(v), nil
+}
+
+// ReadValue decrypts and returns the current plaintext value without
+// recording the read.
+func (s *SecretStore) ReadValue(ctx context.Context, id string) (string, *secret.VersionMetadata, error) {
+	sr, err := s.loadByID(ctx, id)
+	if err != nil {
+		return "", nil, err
+	}
+	plaintext, v, err := s.decryptCurrent(sr)
+	if err != nil {
+		return "", nil, err
 	}
 	return plaintext, secretVersionMetadata(v), nil
 }
@@ -463,6 +470,21 @@ func (s *SecretStore) appendVersion(sr *secretStoredRecord, input secret.WriteVa
 	sr.Secret.UpdatedBy = input.CreatedBy
 	sr.Secret.UpdatedAt = input.CreatedAt
 	return nil
+}
+
+func (s *SecretStore) decryptCurrent(sr *secretStoredRecord) (string, secretStoredVersion, error) {
+	if sr.Secret.Status == secret.StatusDisabled {
+		return "", secretStoredVersion{}, secret.ErrDisabled
+	}
+	v, ok := secretCurrentVersion(sr)
+	if !ok {
+		return "", secretStoredVersion{}, secret.ErrNoValue
+	}
+	plaintext, err := s.encryptor.Decrypt(v.EncryptedValue)
+	if err != nil {
+		return "", secretStoredVersion{}, fmt.Errorf("secret store: decrypt version %d: %w", v.Version, err)
+	}
+	return plaintext, v, nil
 }
 
 func secretCurrentVersion(sr *secretStoredRecord) (secretStoredVersion, bool) {

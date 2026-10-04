@@ -245,7 +245,14 @@ func (e *harnessExecutor) Run(ctx context.Context) error {
 
 		lastErr = err
 		if ctx.Err() != nil {
-			return err
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				e.exitCode = 124 // Standard timeout exit code
+			}
+			if errors.Is(err, ctx.Err()) {
+				return err
+			}
+			// Cancellation can race a real failure, such as a missing binary.
+			return errors.Join(ctx.Err(), err)
 		}
 		if i+1 < len(e.configs) {
 			next := e.configs[i+1]
@@ -380,6 +387,9 @@ func (e *harnessExecutor) invocationCommand(ctx context.Context, cfg providerCon
 	}
 
 	cmd := exec.CommandContext(ctx, binaryPath, args...)
+	// The managed process owns cancellation so the entire process group stops
+	// before the cancellation result is reported.
+	cmd.Cancel = nil
 	if len(cmd.Args) > 0 {
 		cmd.Args[0] = cfg.binaryName()
 	}

@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	humanTaskFlagInput      = "input"
-	humanTaskFlagInputsJSON = "inputs-json"
+	humanTaskFlagInput             = "input"
+	humanTaskFlagInputsJSON        = "inputs-json"
+	humanTaskFlagExpectedIteration = "expected-iteration"
 )
 
 var (
@@ -29,6 +30,11 @@ var (
 	humanTaskStepFlag = commandLineFlag{
 		name:     "step",
 		usage:    "ID of the human task step to complete",
+		required: true,
+	}
+	humanTaskPushBackStepFlag = commandLineFlag{
+		name:     "step",
+		usage:    "ID of the human task step to push back",
 		required: true,
 	}
 	humanTaskInputsJSONFlag = commandLineFlag{
@@ -46,6 +52,7 @@ func HumanTask() *cobra.Command {
 		return ctx.Command.Help()
 	})
 	command.AddCommand(humanTaskCompleteCommand())
+	command.AddCommand(humanTaskPushBackCommand())
 	return command
 }
 
@@ -60,6 +67,21 @@ func humanTaskCompleteCommand() *cobra.Command {
 		humanTaskInputsJSONFlag,
 	}, runHumanTaskComplete)
 	command.Flags().StringArray(humanTaskFlagInput, nil, "Human task input in key=value form; repeatable")
+	return command
+}
+
+func humanTaskPushBackCommand() *cobra.Command {
+	command := NewCommand(&cobra.Command{
+		Use:   "push-back [flags] <DAG name>",
+		Short: "Send a waiting human task back to its rewind target with feedback",
+		Args:  cobra.ExactArgs(1),
+	}, []commandLineFlag{
+		humanTaskRunIDFlag,
+		humanTaskPushBackStepFlag,
+		humanTaskInputsJSONFlag,
+	}, runHumanTaskPushBack)
+	command.Flags().StringArray(humanTaskFlagInput, nil, "Push-back feedback in key=value form; repeatable")
+	command.Flags().Int(humanTaskFlagExpectedIteration, 0, "Fail unless the task is at this push-back iteration")
 	return command
 }
 
@@ -79,47 +101,68 @@ func runHumanTaskComplete(ctx *Context, args []string) error {
 	return runHumanTaskCompleteWith(ctx, args, defaultHumanTaskCompleteDeps())
 }
 
-func runHumanTaskCompleteWith(ctx *Context, args []string, deps humanTaskCompleteDeps) error {
+// humanTaskCommandArgs holds the arguments shared by human-task subcommands.
+type humanTaskCommandArgs struct {
+	dagName  string
+	dagRunID string
+	stepID   string
+	input    humantask.Input
+}
+
+func readHumanTaskCommandArgs(ctx *Context, args []string, subcommand string) (humanTaskCommandArgs, error) {
 	if ctx.IsRemote() {
-		return fmt.Errorf("human-task complete only supports the local context")
+		return humanTaskCommandArgs{}, fmt.Errorf("human-task %s only supports the local context", subcommand)
 	}
 	if ctx.Persistence.DAGRunRepository == nil {
-		return fmt.Errorf("DAG-run repository is not configured")
+		return humanTaskCommandArgs{}, fmt.Errorf("DAG-run repository is not configured")
 	}
 
 	dagRunID, err := ctx.StringParam(humanTaskRunIDFlag.name)
 	if err != nil {
-		return err
+		return humanTaskCommandArgs{}, err
 	}
 	stepID, err := ctx.StringParam(humanTaskStepFlag.name)
 	if err != nil {
-		return err
+		return humanTaskCommandArgs{}, err
 	}
 	stepID = strings.TrimSpace(stepID)
 	if stepID == "" {
-		return fmt.Errorf("--step must not be empty")
+		return humanTaskCommandArgs{}, fmt.Errorf("--step must not be empty")
 	}
 	input, err := parseHumanTaskCompletionInput(ctx.Command)
 	if err != nil {
-		return err
+		return humanTaskCommandArgs{}, err
 	}
 	dagName := strings.TrimSpace(args[0])
 	if dagName == "" {
-		return fmt.Errorf("DAG name must not be empty")
+		return humanTaskCommandArgs{}, fmt.Errorf("DAG name must not be empty")
 	}
+	return humanTaskCommandArgs{dagName: dagName, dagRunID: dagRunID, stepID: stepID, input: input}, nil
+}
 
-	service := humantask.Service{
+func newLocalHumanTaskService(ctx *Context, deps humanTaskCompleteDeps) humantask.Service {
+	return humantask.Service{
 		DAGRunRepository: ctx.Persistence.DAGRunRepository,
 		QueueStore:       ctx.Persistence.QueueStore,
 		ProcRepository:   ctx.Persistence.ProcRepository,
 		Now:              deps.now,
 	}
-	completedBy, completedByID := localHumanTaskSubject(deps)
+}
+
+func runHumanTaskCompleteWith(ctx *Context, args []string, deps humanTaskCompleteDeps) error {
+	command, err := readHumanTaskCommandArgs(ctx, args, "complete")
+	if err != nil {
+		return err
+	}
+	stepID := command.stepID
+
+	service := newLocalHumanTaskService(ctx, deps)
+	completedBy, completedByID := localOSSubject(deps.currentUser)
 	result, err := service.Complete(ctx, humantask.CompleteRequest{
-		DAGName:       dagName,
-		DAGRunID:      dagRunID,
+		DAGName:       command.dagName,
+		DAGRunID:      command.dagRunID,
 		StepID:        stepID,
-		Input:         input,
+		Input:         command.input,
 		CompletedBy:   completedBy,
 		CompletedByID: completedByID,
 	})
@@ -129,7 +172,7 @@ func runHumanTaskCompleteWith(ctx *Context, args []string, deps humanTaskComplet
 		}
 		return err
 	}
-	if result.RemainingWaitingSteps > 0 {
+	if !result.ResumeRequested {
 		if result.AlreadyCompleted {
 			_, err := fmt.Fprintf(ctx.Command.OutOrStdout(), "Human task %s was already completed.\n", stepID)
 			return err
@@ -153,19 +196,72 @@ func runHumanTaskCompleteWith(ctx *Context, args []string, deps humanTaskComplet
 	return err
 }
 
-func localHumanTaskSubject(deps humanTaskCompleteDeps) (name, id string) {
-	if deps.currentUser == nil {
-		return "", ""
+func runHumanTaskPushBack(ctx *Context, args []string) error {
+	return runHumanTaskPushBackWith(ctx, args, defaultHumanTaskCompleteDeps())
+}
+
+func runHumanTaskPushBackWith(ctx *Context, args []string, deps humanTaskCompleteDeps) error {
+	command, err := readHumanTaskCommandArgs(ctx, args, "push-back")
+	if err != nil {
+		return err
 	}
-	current, err := deps.currentUser()
-	if err != nil || current == nil {
-		return "", ""
+	expectedIteration, err := parseHumanTaskExpectedIteration(ctx.Command)
+	if err != nil {
+		return err
 	}
-	name = strings.TrimSpace(current.Username)
-	if uid := strings.TrimSpace(current.Uid); uid != "" {
-		id = "os:" + uid
+
+	service := newLocalHumanTaskService(ctx, deps)
+	by, byID := localOSSubject(deps.currentUser)
+	result, err := service.PushBack(ctx, humantask.PushBackRequest{
+		DAGName:           command.dagName,
+		DAGRunID:          command.dagRunID,
+		StepID:            command.stepID,
+		Input:             command.input,
+		ExpectedIteration: expectedIteration,
+		By:                by,
+		ByID:              byID,
+	})
+	if err != nil {
+		if _, ok := errors.AsType[*humantask.PushBackQueueError](err); ok {
+			return fmt.Errorf("%w; run the same command again to retry", err)
+		}
+		return err
 	}
-	return name, id
+
+	out := ctx.Command.OutOrStdout()
+	if result.AlreadyPushedBack {
+		message := fmt.Sprintf("Human task %s was already pushed back to %s", command.stepID, result.RewindTo)
+		if result.Queued {
+			_, err = fmt.Fprintf(out, "%s; DAG-run queued for resume.\n", message)
+			return err
+		}
+		_, err = fmt.Fprintf(out, "%s.\n", message)
+		return err
+	}
+	message := fmt.Sprintf("Pushed back human task %s to %s", command.stepID, result.RewindTo)
+	switch {
+	case !result.ResumeRequested:
+		_, err = fmt.Fprintf(out, "%s; DAG-run remains waiting.\n", message)
+	case !result.Queued:
+		_, err = fmt.Fprintf(out, "%s; DAG-run was already queued for resume.\n", message)
+	default:
+		_, err = fmt.Fprintf(out, "%s; DAG-run queued for resume.\n", message)
+	}
+	return err
+}
+
+func parseHumanTaskExpectedIteration(command *cobra.Command) (*int, error) {
+	if !command.Flags().Changed(humanTaskFlagExpectedIteration) {
+		return nil, nil
+	}
+	iteration, err := command.Flags().GetInt(humanTaskFlagExpectedIteration)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read --%s: %w", humanTaskFlagExpectedIteration, err)
+	}
+	if iteration < 0 {
+		return nil, fmt.Errorf("--%s must be a non-negative integer", humanTaskFlagExpectedIteration)
+	}
+	return &iteration, nil
 }
 
 func parseHumanTaskCompletionInput(command *cobra.Command) (humantask.Input, error) {

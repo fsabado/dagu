@@ -28,6 +28,7 @@ type Definition struct {
 	EnvPassthrough         []string     `mapstructure:"env_passthrough"`
 	EnvPassthroughPrefixes []string     `mapstructure:"env_passthrough_prefixes"`
 	OpenCode               *OpenCodeDef `mapstructure:"opencode"`
+	Browser                *BrowserDef  `mapstructure:"browser"`
 
 	// Authentication
 	Auth *AuthDef `mapstructure:"auth"`
@@ -84,6 +85,9 @@ type Definition struct {
 	// Execution
 	DefaultExecutionMode string `mapstructure:"default_execution_mode"`
 
+	// Signal handling
+	SignalHandling *SignalHandlingDef `mapstructure:"signal_handling"`
+
 	// Features
 	Monitoring *MonitoringDef `mapstructure:"monitoring"`
 	Metrics    *string        `mapstructure:"metrics"` // "public" or "private"
@@ -102,6 +106,11 @@ type Definition struct {
 type OpenCodeDef struct {
 	Executable     string   `mapstructure:"executable"`
 	EnvPassthrough []string `mapstructure:"env_passthrough"`
+}
+
+// BrowserDef configures the browsers that browser steps start on this host.
+type BrowserDef struct {
+	Sandbox *bool `mapstructure:"sandbox"`
 }
 
 // DAGDiscoveryDef configures DAG definition discovery.
@@ -416,6 +425,13 @@ type SchedulerDef struct {
 type QueueConfigDef struct {
 	Enabled bool       `mapstructure:"enabled"`
 	Config  []QueueDef `mapstructure:"config"`
+}
+
+// SignalHandlingDef configures how supervising Dagu processes handle OS signals.
+type SignalHandlingDef struct {
+	// EnablePropagation forwards shutdown signals received by a supervising
+	// process (server, scheduler, start-all) to running DAG-run subprocesses.
+	EnablePropagation *bool `mapstructure:"enable_propagation"`
 }
 
 // QueueDef configures an individual queue.

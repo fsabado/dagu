@@ -43,8 +43,11 @@ type Plan struct {
 }
 
 type stepRetrySelection struct {
-	targetID int
-	resetIDs map[int]struct{}
+	targetID            int
+	resetIDs            map[int]struct{}
+	bypassPreconditions bool
+	// steps holds the restored DAG steps that reset descendants reopen from.
+	steps map[string]ir.Step
 }
 
 // NewPlan creates a new execution plan from the given steps.
@@ -141,6 +144,9 @@ type StepRetryPlanOptions struct {
 	// IncludeDownstream resets the selected step and every reachable descendant.
 	// Unrelated branches keep their existing status.
 	IncludeDownstream bool
+	// BypassPreconditions marks reset nodes to skip step precondition
+	// evaluation when they execute.
+	BypassPreconditions bool
 }
 
 // CreateStepRetryPlan creates a new execution plan for retrying a specific step.
@@ -179,12 +185,21 @@ func CreateStepRetryPlanWithOptions(dag *ir.DAG, nodes []*Node, stepName string,
 	if targetNode == nil {
 		return nil, fmt.Errorf("%w: %s", ErrMissingNode, stepName)
 	}
-	resetStepRetryNode(targetNode, targetNode.State().Status == ir.NodeRetrying)
+	template, err := retryStepForNode(targetNode, steps)
+	if err != nil {
+		return nil, err
+	}
+	resetStepRetryNode(targetNode, template, targetNode.State().Status == ir.NodeRetrying)
+	if opts.BypassPreconditions {
+		targetNode.SetBypassPreconditions(true)
+	}
 
 	if opts.IncludeDownstream {
 		p.stepRetry = &stepRetrySelection{
-			targetID: targetNode.id,
-			resetIDs: map[int]struct{}{targetNode.id: {}},
+			targetID:            targetNode.id,
+			resetIDs:            map[int]struct{}{targetNode.id: {}},
+			bypassPreconditions: opts.BypassPreconditions,
+			steps:               steps,
 		}
 		p.expandStepRetrySelection()
 	}
@@ -192,9 +207,14 @@ func CreateStepRetryPlanWithOptions(dag *ir.DAG, nodes []*Node, stepName string,
 	return p, nil
 }
 
-func resetStepRetryNode(node *Node, preserveRetryBudget bool) {
+// resetStepRetryNode clears node for another run. It keeps the node's current
+// step, which build planning may have resolved, but takes the human-task
+// template so a reopened task resolves its prompt and artifacts again.
+func resetStepRetryNode(node *Node, template ir.Step, preserveRetryBudget bool) {
 	retryCount := node.GetRetryCount()
-	clearNodeForRetry(node, node.Step())
+	step := node.Step()
+	step.HumanTask = template.HumanTask
+	clearNodeForRetry(node, step)
 	node.SetRetryCount(retryCount)
 	if !preserveRetryBudget {
 		node.retryPolicy = RetryPolicy{} // manual step retries start with a fresh retry budget
@@ -209,7 +229,10 @@ func (p *Plan) expandStepRetrySelection() {
 		if _, reset := p.stepRetry.resetIDs[node.id]; reset {
 			continue
 		}
-		resetStepRetryNode(node, false)
+		resetStepRetryNode(node, p.stepRetry.steps[node.Name()], false)
+		if p.stepRetry.bypassPreconditions {
+			node.SetBypassPreconditions(true)
+		}
 		p.stepRetry.resetIDs[node.id] = struct{}{}
 	}
 	p.markSkippedSidePrerequisites(p.stepRetry.resetIDs)
@@ -315,9 +338,22 @@ func rebindRetryNodesToSteps(nodes []*Node, steps map[string]ir.Step) error {
 		if err != nil {
 			return err
 		}
-		node.SetStep(step)
+		node.SetStep(withOpenedHumanTask(node, step))
 	}
 	return nil
+}
+
+// withOpenedHumanTask keeps the prompt and artifacts an opened human task was
+// presented with, so they stay stable while the task carries across attempts.
+func withOpenedHumanTask(node *Node, step ir.Step) ir.Step {
+	opened := node.Step().HumanTask
+	state := node.State()
+	if step.HumanTask == nil || opened == nil ||
+		(state.Status != ir.NodeWaiting && len(state.HumanTaskInput) == 0) {
+		return step
+	}
+	step.HumanTask = opened
+	return step
 }
 
 func retryStepForNode(node *Node, steps map[string]ir.Step) (ir.Step, error) {
@@ -465,7 +501,7 @@ func (p *Plan) setupRetry(ctx context.Context, steps map[string]ir.Step) error {
 func clearNodeForRetry(node *Node, step ir.Step) {
 	session := node.GetAgentSession()
 	previousStatus := node.State().Status
-	node.ClearState(step)
+	node.clearStateForRetry(step)
 	if session == nil {
 		return
 	}
@@ -655,7 +691,7 @@ func (p *Plan) isRunningLocked() bool {
 func (p *Plan) hasActiveNodesLocked() bool {
 	for _, node := range p.nodes {
 		s := node.State().Status
-		if s == ir.NodeRunning || s == ir.NodeRetrying {
+		if s == ir.NodeRunning || s == ir.NodeRetrying || node.isExecuting() {
 			return true
 		}
 	}

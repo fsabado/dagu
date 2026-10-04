@@ -274,7 +274,7 @@ Rules:
 
 | Field | Availability | Meaning |
 | --- | --- | --- |
-| `context.pushback.iteration` | Steps re-executed after approval push-back | Current push-back iteration as a decimal string. |
+| `context.pushback.iteration` | Steps re-executed after an approval or human-task push-back | Current push-back iteration as a decimal string. |
 | `context.pushback.previous_stdout_file` | Rewound steps that had previous stdout | Absolute path to the previous stdout log for the current step. |
 
 Rules:
@@ -283,6 +283,15 @@ Rules:
   compatibility environment variables.
 - Push-back context is missing on the first execution before any push-back
   occurs.
+- `DAG_PUSHBACK` stays within 30 KiB (30720 bytes). When the full history does
+  not fit, the payload keeps the most recent history entries that fit; the run
+  status keeps the full history.
+- The inputs of one push-back, encoded as one JSON object, are limited to
+  16 KiB (16384 bytes). A larger push-back is rejected before it changes the
+  run.
+- A step that declares `approval.input` receives only those input names from an
+  approval push-back. Human-task push-back feedback holds only declared
+  feedback properties and reaches every rewound step unchanged.
 
 ### Environment Projection
 
@@ -333,8 +342,8 @@ Push-back projection:
 
 | Environment variable | Source | Availability |
 | --- | --- | --- |
-| `DAG_PUSHBACK` | Push-back metadata JSON | Steps re-executed after approval push-back only. |
-| `DAG_PUSHBACK_ITERATION` | `context.pushback.iteration` | Steps re-executed after approval push-back only. |
+| `DAG_PUSHBACK` | Push-back metadata JSON | Steps re-executed after an approval or human-task push-back only. |
+| `DAG_PUSHBACK_ITERATION` | `context.pushback.iteration` | Steps re-executed after an approval or human-task push-back only. |
 | `DAG_PUSHBACK_PREVIOUS_STDOUT_FILE` | `context.pushback.previous_stdout_file` | Rewound steps that had previous stdout. |
 
 Webhook projection:
@@ -386,7 +395,7 @@ Availability rules:
 - Profile context is available only when a runtime profile was selected.
 - Webhook context is available only for webhook-triggered runs.
 - Push-back context is available only for step executions caused by an
-  approval push-back cycle.
+  approval or human-task push-back cycle.
 
 Validation rules:
 

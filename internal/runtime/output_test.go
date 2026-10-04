@@ -243,6 +243,32 @@ func TestNode_OutputCaptureDeadlock(t *testing.T) {
 	assert.Len(t, output, 64*1024+1, "output should be exactly 64KB + 1 byte")
 }
 
+// With secrets declared, a final line without a newline reaches the step log
+// once the attempt ends. The log is read before teardown because continue_on
+// output patterns are checked then.
+func TestNode_MaskedLogFinalLine(t *testing.T) {
+	executorType := registerOutputTestExecutor(t, func(_ context.Context, exec *outputTestExecutor) error {
+		_, err := io.WriteString(exec.stdout, "first\nlast s3cr3t")
+		return err
+	})
+	step := ir.Step{
+		Name:           "masked-log",
+		ExecutorConfig: ir.ExecutorConfig{Type: executorType},
+	}
+
+	node := NewNode(step, NodeState{})
+	ctx := NewContext(context.Background(), &ir.DAG{Name: "test"}, "masked-log", "test.log",
+		runctx.WithSecrets([]string{"TOKEN=s3cr3t"}))
+	require.NoError(t, node.Prepare(ctx, t.TempDir(), "masked-log"))
+	t.Cleanup(func() { require.NoError(t, node.Teardown()) })
+
+	require.NoError(t, node.Execute(ctx))
+
+	content, err := os.ReadFile(node.StdoutFile())
+	require.NoError(t, err)
+	assert.Equal(t, "first\nlast *******", string(content))
+}
+
 func TestNode_OutputExceedsLimit(t *testing.T) {
 	executorType := registerOutputTestExecutor(t, func(ctx context.Context, exec *outputTestExecutor) error {
 		return writeRepeatedX(ctx, exec.stdout, 2*1024*1024)
@@ -273,7 +299,7 @@ func TestNode_OutputExceedsLimit(t *testing.T) {
 	assert.Error(t, err, "should return error when output exceeds limit")
 	assert.Contains(t, err.Error(), "output exceeded maximum size limit", "error should mention output size limit")
 
-	_ = node.Teardown()
+	require.ErrorContains(t, node.Teardown(), "output exceeded maximum size limit")
 }
 
 func TestNode_CustomOutputLimit(t *testing.T) {
@@ -516,6 +542,42 @@ func TestOutputCoordinator_CloseResources(t *testing.T) {
 		_ = oc.closeResources()
 		assert.True(t, oc.closed)
 	})
+}
+
+func TestCaptureRetryAfterLimit(t *testing.T) {
+	t.Parallel()
+	for _, source := range []string{"stdout", "stderr"} {
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+			oc := &OutputCoordinator{stdoutWriter: io.Discard, stderrWriter: io.Discard}
+			t.Cleanup(func() { require.NoError(t, oc.closeResources()) })
+			ctx := NewContext(t.Context(), &ir.DAG{MaxOutputSize: 16}, "capture-retry", "test.log")
+			data := NodeData{Step: ir.Step{
+				StructuredOutput: map[string]ir.StepOutputEntry{"value": {From: source}},
+			}}
+			cmd := &outputTestExecutor{}
+			capture := oc.capturedOutput
+			if source == "stderr" {
+				capture = oc.capturedStderr
+			}
+			for _, output := range []string{strings.Repeat("x", 32), "retry"} {
+				require.NoError(t, oc.setupExecutorIO(ctx, cmd, data))
+				writer := cmd.stdout
+				if source == "stderr" {
+					writer = cmd.stderr
+				}
+				_, err := io.WriteString(writer, output)
+				require.NoError(t, err)
+				got, err := capture(ctx)
+				if output == "retry" {
+					require.NoError(t, err)
+					assert.Equal(t, output, got)
+				} else {
+					require.ErrorContains(t, err, "maximum size limit")
+				}
+			}
+		})
+	}
 }
 
 // mockWriteCloser is a test implementation of io.WriteCloser

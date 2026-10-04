@@ -4,6 +4,7 @@
 package spec005_params_test
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/dagucloud/dagu/v2/conformance/harness"
@@ -196,6 +197,22 @@ func TestMissingRuntimeValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStepStdinPathResolvesNamedParams covers the `steps[].stdin` row of the
+// Spec 003 field matrix. It stands apart from the shared runtime table because
+// the fixture reads standard input with cat.
+func TestStepStdinPathResolvesNamedParams(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses cat to read standard input")
+	}
+	t.Parallel()
+
+	dagu := harness.NewRunner(t)
+	dagu.WriteFile("stdin-prod.txt", "prod\n")
+	result := dagu.Run("start", "--params", spec005RuntimeParams, "step_stdin_path.yaml")
+	result.ExpectExitCode(0)
+	dagu.ExpectFileContent("stdin-read.txt", "prod\n")
 }
 
 func spec005StartCases() []spec005StartCase {
@@ -460,10 +477,10 @@ func spec005StartCases() []spec005StartCase {
 			args:              []string{"start", "--run-id", "spec005_stdout_artifact", "--params", spec005RuntimeParams, "step_stdout_artifact.yaml"},
 			missingArgs:       []string{"start", "--run-id", "spec005_stdout_artifact_missing", "step_stdout_artifact.yaml"},
 			file:              "step_stdout_artifact.yaml",
-			outputGlob:        "artifacts/spec005-step-stdout-artifact/dag-run_*_spec005_stdout_artifact/reports/prod/stdout.txt",
+			outputGlob:        "artifacts/*/*/*/*_spec005-step-stdout-artifact_*/reports/prod/stdout.txt",
 			outputContent:     "prod\n",
 			missingParam:      "environment",
-			missingOutputGlob: "artifacts/spec005-step-stdout-artifact/dag-run_*_spec005_stdout_artifact_missing/reports/${params.environment}/stdout.txt",
+			missingOutputGlob: "artifacts/*/*/*/*_spec005-step-stdout-artifact_*/reports/${params.environment}/stdout.txt",
 			missingOutput:     new("prod\n"),
 		},
 		{
@@ -471,10 +488,10 @@ func spec005StartCases() []spec005StartCase {
 			args:              []string{"start", "--run-id", "spec005_stderr_artifact", "--params", spec005RuntimeParams, "step_stderr_artifact.yaml"},
 			missingArgs:       []string{"start", "--run-id", "spec005_stderr_artifact_missing", "step_stderr_artifact.yaml"},
 			file:              "step_stderr_artifact.yaml",
-			outputGlob:        "artifacts/spec005-step-stderr-artifact/dag-run_*_spec005_stderr_artifact/reports/prod/stderr.txt",
+			outputGlob:        "artifacts/*/*/*/*_spec005-step-stderr-artifact_*/reports/prod/stderr.txt",
 			outputContent:     "prod\n",
 			missingParam:      "environment",
-			missingOutputGlob: "artifacts/spec005-step-stderr-artifact/dag-run_*_spec005_stderr_artifact_missing/reports/${params.environment}/stderr.txt",
+			missingOutputGlob: "artifacts/*/*/*/*_spec005-step-stderr-artifact_*/reports/${params.environment}/stderr.txt",
 			missingOutput:     new("prod\n"),
 		},
 		{
@@ -579,10 +596,10 @@ func spec005StartCases() []spec005StartCase {
 			args:              []string{"start", "--run-id", "spec005_handler_stdout_artifact", "--params", spec005RuntimeParams, "handler_stdout_artifact.yaml"},
 			missingArgs:       []string{"start", "--run-id", "spec005_handler_stdout_artifact_missing", "handler_stdout_artifact.yaml"},
 			file:              "handler_stdout_artifact.yaml",
-			outputGlob:        "artifacts/spec005-handler-stdout-artifact/dag-run_*_spec005_handler_stdout_artifact/reports/prod/stdout.txt",
+			outputGlob:        "artifacts/*/*/*/*_spec005-handler-stdout-artifact_*/reports/prod/stdout.txt",
 			outputContent:     "prod\n",
 			missingParam:      "environment",
-			missingOutputGlob: "artifacts/spec005-handler-stdout-artifact/dag-run_*_spec005_handler_stdout_artifact_missing/reports/${params.environment}/stdout.txt",
+			missingOutputGlob: "artifacts/*/*/*/*_spec005-handler-stdout-artifact_*/reports/${params.environment}/stdout.txt",
 			missingOutput:     new("prod\n"),
 		},
 		{
@@ -590,10 +607,10 @@ func spec005StartCases() []spec005StartCase {
 			args:              []string{"start", "--run-id", "spec005_handler_stderr_artifact", "--params", spec005RuntimeParams, "handler_stderr_artifact.yaml"},
 			missingArgs:       []string{"start", "--run-id", "spec005_handler_stderr_artifact_missing", "handler_stderr_artifact.yaml"},
 			file:              "handler_stderr_artifact.yaml",
-			outputGlob:        "artifacts/spec005-handler-stderr-artifact/dag-run_*_spec005_handler_stderr_artifact/reports/prod/stderr.txt",
+			outputGlob:        "artifacts/*/*/*/*_spec005-handler-stderr-artifact_*/reports/prod/stderr.txt",
 			outputContent:     "prod\n",
 			missingParam:      "environment",
-			missingOutputGlob: "artifacts/spec005-handler-stderr-artifact/dag-run_*_spec005_handler_stderr_artifact_missing/reports/${params.environment}/stderr.txt",
+			missingOutputGlob: "artifacts/*/*/*/*_spec005-handler-stderr-artifact_*/reports/${params.environment}/stderr.txt",
 			missingOutput:     new("prod\n"),
 		},
 	}

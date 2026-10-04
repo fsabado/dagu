@@ -41,6 +41,9 @@ var (
 	// WithIncludeDownstream records that a targeted step retry should also
 	// reset reachable descendants.
 	WithIncludeDownstream = runctx.WithIncludeDownstream
+	// WithBypassPreconditions records that steps reset by a targeted step
+	// retry skip step precondition evaluation.
+	WithBypassPreconditions = runctx.WithBypassPreconditions
 	// WithAttemptID sets the DAG-run attempt identifier.
 	WithAttemptID = runctx.WithAttemptID
 	// WithWorkerID sets the execution host identifier.
@@ -59,6 +62,9 @@ var (
 	WithDefaultEnvVars = runctx.WithDefaultEnvVars
 	// WithEnvVars sets additional execution-scoped environment variables.
 	WithEnvVars = runctx.WithEnvVars
+	// WithInheritedEnvs sets environment entries a child run inherits from the
+	// parent run scope.
+	WithInheritedEnvs = runctx.WithInheritedEnvs
 	// WithCoordinator sets the coordinator dispatcher for distributed execution.
 	WithCoordinator = runctx.WithCoordinator
 	// WithDefaultSecrets sets low-precedence inherited secret environment variables.

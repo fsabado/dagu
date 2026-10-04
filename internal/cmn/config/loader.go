@@ -70,6 +70,7 @@ type ConfigLoader struct {
 	trustedProxyGroupMappingsSet     bool
 	trustedProxyWorkspaceMappings    map[string][]TrustedProxyWorkspaceGrant
 	trustedProxyWorkspaceMappingsSet bool
+	legacySuspendFlagsDir            string
 }
 
 // ConfigLoaderOption defines a functional option for configuring a ConfigLoader.
@@ -324,6 +325,7 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 	l.loadCacheConfig(&cfg, def)
 	l.loadWebhooksConfig(&cfg, def)
 	l.loadExecutionModeConfig(&cfg, def)
+	l.loadSignalHandlingConfig(&cfg, def)
 
 	if err := l.LoadLegacyFields(&cfg, def); err != nil {
 		return nil, err
@@ -365,6 +367,7 @@ func (l *ConfigLoader) loadCoreConfig(cfg *Config, def Definition) error {
 	if cfg.OpenCode.Executable == "" {
 		cfg.OpenCode.Executable = "opencode"
 	}
+	cfg.Browser = BrowserConfig{NoSandbox: !l.v.GetBool("browser.sandbox")}
 	cfg.DAGDiscovery = DAGDiscoveryConfig{
 		Recursive: l.v.GetBool("dag_discovery.recursive"),
 		Symlinks:  l.v.GetBool("dag_discovery.symlinks"),
@@ -1715,6 +1718,17 @@ func (l *ConfigLoader) loadExecutionModeConfig(cfg *Config, _ Definition) {
 	cfg.DefaultExecMode = mode
 }
 
+// loadSignalHandlingConfig loads signal handling options. The legacy camelCase
+// spelling "signalHandling.enablePropagation" is still accepted when it comes
+// from admin.yaml, which bypasses the legacy key check for compatibility.
+func (l *ConfigLoader) loadSignalHandlingConfig(cfg *Config, _ Definition) {
+	if l.v.IsSet("signal_handling.enable_propagation") {
+		cfg.SignalHandling.EnablePropagation = l.v.GetBool("signal_handling.enable_propagation")
+		return
+	}
+	cfg.SignalHandling.EnablePropagation = l.v.GetBool("signalhandling.enablepropagation")
+}
+
 func (l *ConfigLoader) loadCacheConfig(cfg *Config, def Definition) {
 	cfg.Cache = CacheModeNormal
 	if def.Cache == nil {
@@ -1757,6 +1771,21 @@ func (l *ConfigLoader) finalizePaths(cfg *Config) error {
 
 	if cfg.Paths.ToolsDir == "" {
 		cfg.Paths.ToolsDir = filepath.Join(cfg.Paths.DataDir, "tools")
+	}
+
+	// Suspend flags default under the shared data directory so every process
+	// observing the same data_dir sees identical suspension state. A legacy
+	// default location is recorded for compatibility only when the path was
+	// not configured explicitly.
+	if cfg.Paths.SuspendFlagsDir == "" {
+		cfg.Paths.SuspendFlagsDir = filepath.Join(cfg.Paths.DataDir, "suspend")
+		if l.legacySuspendFlagsDir != "" && l.legacySuspendFlagsDir != cfg.Paths.SuspendFlagsDir {
+			cfg.Paths.SuspendFlagsDirLegacy = l.legacySuspendFlagsDir
+		}
+	} else if !pathWithinDir(cfg.Paths.DataDir, cfg.Paths.SuspendFlagsDir) {
+		l.warnings = append(l.warnings, fmt.Sprintf(
+			"paths.suspend_flags_dir %q is outside paths.data_dir %q; suspension state may diverge across Dagu processes",
+			cfg.Paths.SuspendFlagsDir, cfg.Paths.DataDir))
 	}
 
 	if cfg.Paths.EventStoreDir == "" {
@@ -1803,6 +1832,18 @@ func selectRenamedPath(canonical, legacy string) (string, bool, error) {
 		return legacy, true, nil
 	}
 	return canonical, false, nil
+}
+
+// pathWithinDir reports whether path is the same as or contained by dir.
+func pathWithinDir(dir, path string) bool {
+	if dir == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func pathExists(path string) (bool, error) {
@@ -1950,6 +1991,7 @@ func (l *ConfigLoader) setupViper(xdgConfig XDGConfig, homeDir, configFile, appH
 		}
 	}
 
+	l.legacySuspendFlagsDir = paths.LegacySuspendFlagsDir
 	l.configureViper(paths.ConfigDir, configFile)
 	l.bindEnvironmentVariables()
 	l.setViperDefaultValues(paths)
@@ -1963,7 +2005,6 @@ func (l *ConfigLoader) setViperDefaultValues(paths Paths) {
 	l.v.SetDefault("dag_discovery.recursive", false)
 	l.v.SetDefault("dag_discovery.symlinks", false)
 	l.v.SetDefault("paths.dags_dir", paths.DAGsDir)
-	l.v.SetDefault("paths.suspend_flags_dir", paths.SuspendFlagsDir)
 	l.v.SetDefault("paths.data_dir", paths.DataDir)
 	l.v.SetDefault("paths.log_dir", paths.LogsDir)
 	l.v.SetDefault("paths.artifact_dir", paths.ArtifactsDir)
@@ -2008,6 +2049,9 @@ func (l *ConfigLoader) setViperDefaultValues(paths Paths) {
 
 	// Queues
 	l.v.SetDefault("queues.enabled", true)
+
+	// Browser steps
+	l.v.SetDefault("browser.sandbox", true)
 
 	// Scheduler
 	l.v.SetDefault("scheduler.lock_stale_threshold", "30s")
@@ -2091,6 +2135,7 @@ var envBindings = []envBinding{
 	{key: "env_passthrough_prefixes", env: "ENV_PASSTHROUGH_PREFIXES"},
 	{key: "opencode.executable", env: "OPENCODE_EXECUTABLE"},
 	{key: "opencode.env_passthrough", env: "OPENCODE_ENV_PASSTHROUGH"},
+	{key: "browser.sandbox", env: "BROWSER_SANDBOX"},
 
 	// Secrets
 	{key: "secrets.vault.address", env: "SECRETS_VAULT_ADDRESS"},
@@ -2207,6 +2252,9 @@ var envBindings = []envBinding{
 
 	// Execution
 	{key: "default_execution_mode", env: "DEFAULT_EXECUTION_MODE"},
+
+	// Signal handling
+	{key: "signal_handling.enable_propagation", env: "SIGNAL_PROPAGATION"},
 
 	// Queues
 	{key: "queues.enabled", env: "QUEUE_ENABLED"},

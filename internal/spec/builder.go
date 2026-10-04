@@ -208,13 +208,8 @@ func parsePreconditionEntry(_ buildContext, precondition any) ([]*ir.Condition, 
 				if !ok || strings.TrimSpace(val) == "" {
 					return nil, ir.NewValidationError("preconditions", vv, ErrPreconditionValueMustBeString)
 				}
-				if after, ok0 := strings.CutPrefix(val, "re:"); ok0 {
-					if strings.TrimSpace(after) == "" {
-						return nil, ir.NewValidationError("preconditions", vv, fmt.Errorf("expected regexp is empty"))
-					}
-					if _, err := regexp.Compile(after); err != nil {
-						return nil, ir.NewValidationError("preconditions", vv, fmt.Errorf("expected regexp is invalid: %w", err))
-					}
+				if err := validateMatchPattern(val); err != nil {
+					return nil, ir.NewValidationError("preconditions", vv, fmt.Errorf("expected %w", err))
 				}
 				ret.Expected = val
 				hasExpected = true
@@ -259,27 +254,6 @@ var (
 	secretEnvNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	secretRefPathPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$`)
 )
-
-var reservedSecretEnvNames = []string{
-	runenv.EnvKeyDAGName,
-	runenv.EnvKeyDAGRunID,
-	runenv.EnvKeyDAGRunLogFile,
-	runenv.EnvKeyDAGRunStepName,
-	runenv.EnvKeyDAGRunStepStdoutFile,
-	runenv.EnvKeyDAGRunStepStderrFile,
-	runenv.EnvKeyDAGRunStatus,
-	runenv.EnvKeyDAGWikiDir,
-	runenv.EnvKeyDAGDocsDir,
-	runenv.EnvKeyDAGParamsJSON,
-	runenv.EnvKeyDAGParamsJSONCompat,
-	runenv.EnvKeyDAGRunWorkDir,
-	runenv.EnvKeyDAGRunArtifactsDir,
-	runenv.EnvKeyDAGPushBack,
-	runenv.EnvKeyDAGPushBackIteration,
-	runenv.EnvKeyDAGPushBackPreviousStdoutFile,
-	runenv.EnvKeyExternalStepRetry,
-	runenv.EnvKeyQueueDispatchRetry,
-}
 
 // parseSecretRefs parses secret references from the YAML definition.
 func parseSecretRefs(ctx buildContext, d *dag) ([]secretref.Ref, error) {
@@ -341,7 +315,7 @@ func parseSecretRefs(ctx buildContext, d *dag) ([]secretref.Ref, error) {
 
 func reservedSecretNameConflicts() map[string]string {
 	conflicts := make(map[string]string)
-	for _, name := range reservedSecretEnvNames {
+	for _, name := range runenv.ReservedRunEnvNames() {
 		conflicts[name] = "Dagu-managed runtime environment variable"
 	}
 	return conflicts

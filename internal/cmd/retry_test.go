@@ -184,7 +184,8 @@ steps:
 		require.Equal(t, ir.TriggerTypeRetry, latestStatus.TriggerType)
 	})
 
-	t.Run("QueuedRetryDoesNotWaitForTerminalSourceProc", func(t *testing.T) {
+	// A queued retry must not publish a state that the source can overwrite.
+	t.Run("QueuedRetryRejectsLiveSource", func(t *testing.T) {
 		const dagName = "queued-retry-live-source-dag"
 		th := test.SetupCommand(t, test.WithConfigMutator(func(cfg *config.Config) {
 			cfg.Queues = config.Queues{
@@ -233,16 +234,17 @@ steps:
 		})
 
 		args := []string{"retry", fmt.Sprintf("--run-id=%s", runID), dagFile.Location}
-		th.RunCommand(t, cmd.Retry(), test.CmdTest{Args: args})
+		err = th.RunCommandWithError(t, cmd.Retry(), test.CmdTest{Args: args})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "is still finalizing")
 
 		items, err := th.QueueStore.List(th.Context, dagFile.ProcGroup())
 		require.NoError(t, err)
-		require.Len(t, items, 1)
+		require.Empty(t, items)
 
-		queuedStatus, err := attempt.ReadStatus(th.Context)
+		failedStatus, err := attempt.ReadStatus(th.Context)
 		require.NoError(t, err)
-		require.Equal(t, ir.Queued, queuedStatus.Status)
-		require.Equal(t, ir.TriggerTypeRetry, queuedStatus.TriggerType)
+		require.Equal(t, ir.Failed, failedStatus.Status)
 	})
 
 	t.Run("QueueDispatchRetryTreatsMissingRunAsStaleDispatch", func(t *testing.T) {
@@ -450,6 +452,77 @@ steps:
 		} else {
 			require.Equal(t, expectedDir, observedDir)
 		}
+	})
+
+	t.Run("StepRetryBypassesPreconditions", func(t *testing.T) {
+		t.Parallel()
+
+		th := test.SetupCommand(t)
+
+		dagFile := th.DAG(t, `name: retry-bypass-preconditions
+steps:
+  - name: target
+    run: echo ran
+    output: RESULT
+    preconditions:
+      - condition: blocked
+        expected: ready
+`)
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", dagFile.Location},
+		})
+
+		dag, err := th.DAGRepository.GetMetadata(th.Context, dagFile.Location)
+		require.NoError(t, err)
+		status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag)
+		require.NoError(t, err)
+		require.Len(t, status.Nodes, 1)
+		require.Equal(t, ir.NodeSkipped, status.Nodes[0].Status)
+
+		// Without the flag the unmet precondition keeps skipping the step.
+		th.RunCommand(t, cmd.Retry(), test.CmdTest{
+			Args: []string{"retry", "--run-id", status.DAGRunID, "--step", "target", dagFile.Name},
+		})
+
+		latestAttempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dagFile.Name, status.DAGRunID))
+		require.NoError(t, err)
+		latestStatus, err := latestAttempt.ReadStatus(th.Context)
+		require.NoError(t, err)
+		require.Len(t, latestStatus.Nodes, 1)
+		require.Equal(t, ir.NodeSkipped, latestStatus.Nodes[0].Status)
+
+		th.RunCommand(t, cmd.Retry(), test.CmdTest{
+			Args: []string{
+				"retry", "--run-id", status.DAGRunID, "--step", "target",
+				"--bypass-preconditions", dagFile.Name,
+			},
+		})
+
+		latestAttempt, err = th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dagFile.Name, status.DAGRunID))
+		require.NoError(t, err)
+		latestStatus, err = latestAttempt.ReadStatus(th.Context)
+		require.NoError(t, err)
+		require.Len(t, latestStatus.Nodes, 1)
+		require.Equal(t, ir.NodeSucceeded, latestStatus.Nodes[0].Status)
+		require.Equal(t, "ran", test.StatusOutputValue(t, latestStatus, "RESULT"))
+	})
+
+	t.Run("BypassPreconditionsRequiresStep", func(t *testing.T) {
+		t.Parallel()
+
+		th := test.SetupCommand(t)
+
+		dagFile := th.DAG(t, `steps:
+  - name: "1"
+    run: echo ok
+`)
+
+		err := th.RunCommandWithError(t, cmd.Retry(), test.CmdTest{
+			Args: []string{"retry", "--run-id=any", "--bypass-preconditions", dagFile.Location},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--bypass-preconditions requires --step")
 	})
 
 	t.Run("QueuedCatchupRetryRestoresEnvSecretsFromPersistedFullDAG", func(t *testing.T) {

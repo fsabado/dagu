@@ -37,6 +37,13 @@ var v2RunWithFields = map[string]struct{}{
 
 type actionNormalizer func(normalized map[string]any, with map[string]any) error
 
+// Name prefixes of builtin action families.
+const (
+	artifactActionPrefix = "artifact."
+	browserActionPrefix  = "browser."
+	computerActionPrefix = "computer."
+)
+
 var builtinActionNormalizers = map[string]actionNormalizer{
 	"artifact.list":       operationAction("artifact", "list"),
 	"artifact.read":       operationAction("artifact", "read"),
@@ -44,12 +51,17 @@ var builtinActionNormalizers = map[string]actionNormalizer{
 	"archive.create":      operationAction("archive", "create"),
 	"archive.extract":     operationAction("archive", "extract"),
 	"archive.list":        operationAction("archive", "list"),
+	"browser.extract":     normalizeBrowserExtractAction,
+	"browser.run":         normalizeBrowserRunAction,
 	"chat.completion":     normalizeChatAction,
+	"computer.extract":    normalizeComputerExtractAction,
+	"computer.run":        normalizeComputerRunAction,
 	"container.run":       optionalCommandAction("container", "command"),
 	"dag.enqueue":         normalizeDagEnqueueAction,
 	"dag.run":             normalizeDagRunAction,
 	"data.convert":        operationAction("data", "convert"),
 	"data.pick":           operationAction("data", "pick"),
+	"decision.evaluate":   normalizeDecisionAction,
 	"docker.run":          optionalCommandAction("docker", "command"),
 	"exec":                normalizeExecAction,
 	"file.copy":           operationAction("file", "copy"),
@@ -70,6 +82,8 @@ var builtinActionNormalizers = map[string]actionNormalizer{
 	"k8s.run":             optionalCommandAction("k8s", "command"),
 	"kubernetes.run":      optionalCommandAction("kubernetes", "command"),
 	"log.write":           normalizeLogAction,
+	"mail.organize":       normalizeMailOrganizeAction,
+	"mail.search":         normalizeMailSearchAction,
 	"mail.send":           typedAction("mail"),
 	"noop":                normalizeNoopAction,
 	"outputs.write":       operationAction("outputs", "write"),
@@ -95,6 +109,17 @@ var builtinActionNormalizers = map[string]actionNormalizer{
 	"wait.file":           operationAction("wait", "file"),
 	"wait.http":           operationAction("wait", "http"),
 	"wait.until":          operationAction("wait", "until"),
+	"xlsx.append":         xlsxAction("append", true),
+	"xlsx.convert":        xlsxAction("convert", true),
+	"xlsx.extract":        xlsxExtractAction(),
+	"xlsx.info":           xlsxAction("info", true),
+	"xlsx.list_sheets":    xlsxAction("list_sheets", true),
+	"xlsx.read":           xlsxAction("read", true),
+	"xlsx.sheet":          xlsxAction("sheet", true),
+	"xlsx.update_rows":    xlsxAction("update_rows", true),
+	"xlsx.validate":       xlsxAction("validate", true),
+	"xlsx.write":          xlsxAction("write", true),
+	"xlsx.write_cells":    xlsxAction("write_cells", true),
 }
 
 func normalizeStepExecutionRaw(raw map[string]any, registry *customStepTypeRegistry) (map[string]any, error) {
@@ -395,6 +420,98 @@ func typedAction(executorType string) actionNormalizer {
 	}
 }
 
+func normalizeDecisionAction(normalized map[string]any, with map[string]any) error {
+	_, hasOutput := normalized["output"]
+	_, hasSchema := normalized["output_schema"]
+	stdout, _ := normalized["stdout"].(map[string]any)
+	_, hasStdoutOutputs := stdout["outputs"]
+	if !hasOutput && !hasSchema && !hasStdoutOutputs {
+		normalized["output_schema"] = map[string]any{
+			"type":     "object",
+			"required": []any{"answers", "model", "usage"},
+			"properties": map[string]any{
+				"answers": map[string]any{"type": "object"},
+				"model":   map[string]any{"type": "string"},
+				"usage":   map[string]any{"type": "object"},
+			},
+		}
+	}
+	return finishAction(normalized, "decision", with)
+}
+
+// normalizeBrowserRunAction moves with.llm to the step llm field, where it
+// replaces the DAG-level llm block as it does for chat.completion.
+func normalizeBrowserRunAction(normalized map[string]any, with map[string]any) error {
+	if _, ok := with["do"]; !ok {
+		return ir.NewValidationError("with", with, fmt.Errorf("browser.run requires with.do"))
+	}
+	moveActionLLM(normalized, with)
+	return finishAction(normalized, ir.ExecutorTypeBrowser, with)
+}
+
+// moveActionLLM moves with.llm to the step llm field.
+func moveActionLLM(normalized map[string]any, with map[string]any) {
+	if llm, ok := with["llm"]; ok {
+		normalized["llm"] = llm
+		delete(with, "llm")
+	}
+}
+
+// normalizeComputerRunAction moves with.llm to the step llm field, as
+// browser.run does.
+func normalizeComputerRunAction(normalized map[string]any, with map[string]any) error {
+	if _, ok := with["do"]; !ok {
+		return ir.NewValidationError("with", with, fmt.Errorf("computer.run requires with.do"))
+	}
+	moveActionLLM(normalized, with)
+	return finishAction(normalized, ir.ExecutorTypeComputer, with)
+}
+
+// normalizeComputerExtractAction rewrites computer.extract into computer.run
+// with a single extract operation.
+func normalizeComputerExtractAction(normalized map[string]any, with map[string]any) error {
+	if err := singleExtractOperation(with); err != nil {
+		return err
+	}
+	return normalizeComputerRunAction(normalized, with)
+}
+
+// normalizeBrowserExtractAction rewrites browser.extract into browser.run
+// with a single extract operation.
+func normalizeBrowserExtractAction(normalized map[string]any, with map[string]any) error {
+	if _, err := requireActionStringField(with, "url"); err != nil {
+		return err
+	}
+	if err := singleExtractOperation(with); err != nil {
+		return err
+	}
+	return normalizeBrowserRunAction(normalized, with)
+}
+
+// singleExtractOperation replaces with.instruction, with.schema, and
+// with.timeout by a with.do holding one extract operation.
+func singleExtractOperation(with map[string]any) error {
+	instruction, err := requireActionStringField(with, "instruction")
+	if err != nil {
+		return err
+	}
+	schema, ok := with["schema"].(map[string]any)
+	if !ok {
+		return ir.NewValidationError("with", with, fmt.Errorf("with.schema must be an object schema"))
+	}
+	extract := map[string]any{
+		"extract": map[string]any{"instruction": instruction, "schema": schema},
+	}
+	if timeout, ok := with["timeout"]; ok {
+		extract["timeout"] = timeout
+		delete(with, "timeout")
+	}
+	delete(with, "instruction")
+	delete(with, "schema")
+	with["do"] = []any{extract}
+	return nil
+}
+
 func normalizeHTTPRequestAction(normalized map[string]any, with map[string]any) error {
 	if _, err := requireActionStringField(with, "method"); err != nil {
 		return err
@@ -643,16 +760,23 @@ func validateGitWorktreeFields(with map[string]any, allowed map[string]gitWorktr
 }
 
 func validateGitWorktreeOutputOverrides(normalized map[string]any) error {
+	return validateFixedOutputs(normalized, "git worktree")
+}
+
+// validateFixedOutputs rejects output declarations on actions whose outputs
+// are fixed.
+func validateFixedOutputs(normalized map[string]any, action string) error {
+	err := fmt.Errorf("%s actions have fixed outputs", action)
 	if _, ok := normalized["output"]; ok {
-		return ir.NewValidationError("output", normalized["output"], fmt.Errorf("git worktree actions have fixed outputs"))
+		return ir.NewValidationError("output", normalized["output"], err)
 	}
 	if _, ok := normalized["outputs"]; ok {
-		return ir.NewValidationError("outputs", normalized["outputs"], fmt.Errorf("git worktree actions have fixed outputs"))
+		return ir.NewValidationError("outputs", normalized["outputs"], err)
 	}
 	stdout, ok := normalized["stdout"].(map[string]any)
 	if ok {
 		if _, hasOutputs := stdout["outputs"]; hasOutputs {
-			return ir.NewValidationError("stdout.outputs", stdout["outputs"], fmt.Errorf("git worktree actions have fixed outputs"))
+			return ir.NewValidationError("stdout.outputs", stdout["outputs"], err)
 		}
 	}
 	return nil

@@ -108,6 +108,30 @@ func TestMultipleAndSequentialCheckpoints(t *testing.T) {
 		waitForFileContent(t, dagu.ProjectPath("deployed.txt"), "deployed\n")
 	})
 
+	t.Run("independent task branches", func(t *testing.T) {
+		dagu := harness.NewRunner(t)
+		env := sharedEnv(t)
+		const runID = "spec031-independent-tasks"
+
+		startWaiting(t, dagu, env, runID, "independent_waiting.yaml")
+		first := complete(t, dagu, env, runID, "review_a", "independent_waiting.yaml")
+		first.ExpectExitCode(0)
+		first.ExpectStdout("Completed human task review_a; DAG-run queued for resume.\n")
+		first.ExpectStderr("")
+		waitForFileContent(t, dagu.ProjectPath("after_a.txt"), "after_a\n")
+		// review_b renders as waiting while the resumed attempt runs, so match the run result.
+		status := waitForStatus(t, dagu, env, runID, "independent_waiting.yaml", "Result: Waiting")
+		require.Contains(t, status.Stdout(), "Confirm B in "+runID)
+		dagu.ExpectNoFile("finished.txt")
+
+		second := complete(t, dagu, env, runID, "review_b", "independent_waiting.yaml")
+		second.ExpectExitCode(0)
+		second.ExpectStdout("Completed human task review_b; DAG-run queued for resume.\n")
+		second.ExpectStderr("")
+		waitForStatus(t, dagu, env, runID, "independent_waiting.yaml", "Succeeded")
+		waitForFileContent(t, dagu.ProjectPath("finished.txt"), "finished\n")
+	})
+
 	t.Run("sequential tasks", func(t *testing.T) {
 		dagu := harness.NewRunner(t)
 		env := sharedEnv(t)
@@ -241,6 +265,50 @@ func TestPreconditionSkipAndDryRun(t *testing.T) {
 	dagu.ExpectNoFile("snapshot.txt")
 }
 
+// A push-back re-runs the rewind target with the feedback, reopens the task
+// at the next iteration, rejects a request made for the earlier review, and
+// lets completion finish the run once.
+func TestPushBackReviewLoop(t *testing.T) {
+	dagu := harness.NewRunner(t)
+	env := sharedEnv(t)
+	const runID = "spec031-review"
+	const file = "push_back.yaml"
+
+	startWaiting(t, dagu, env, runID, file)
+	waitForFileContent(t, dagu.ProjectPath("attempts.txt"), ":\n")
+	status := waitForStatus(t, dagu, env, runID, file, "Waiting")
+	require.Contains(t, status.Stdout(), "push back: rewind to implement")
+	require.Contains(t, collapseStatusLines(status.Stdout()), `"feedback":{"type":"string"}`)
+	status.ExpectStdoutNotContains("push-back iteration")
+
+	result := pushBack(t, dagu, env, runID, "review", file, "--input=feedback=add-tests", "--expected-iteration=0")
+	result.ExpectExitCode(0)
+	result.ExpectStdout("Pushed back human task review to implement; DAG-run queued for resume.\n")
+	result.ExpectStderr("")
+
+	waitForFileContent(t, dagu.ProjectPath("attempts.txt"), ":\n1:add-tests\n")
+	// The resumed attempt wrote the second line, so the next waiting checkpoint
+	// is the reopened review. The review line can show the iteration while that
+	// attempt is still finalizing, so wait for the run itself to be waiting.
+	status = waitForStatus(t, dagu, env, runID, file, "Waiting")
+	require.Contains(t, status.Stdout(), "push-back iteration: 1")
+	dagu.ExpectNoFile("published.txt")
+
+	stale := pushBack(t, dagu, env, runID, "review", file, "--input=feedback=again", "--expected-iteration=0")
+	stale.ExpectNonZeroExitCode()
+	stale.ExpectStdout("")
+	stale.ExpectStderrContains("review", "iteration 1")
+
+	done := complete(t, dagu, env, runID, "review", file)
+	done.ExpectExitCode(0)
+	done.ExpectStdout("Completed human task review; DAG-run queued for resume.\n")
+	done.ExpectStderr("")
+
+	waitForStatus(t, dagu, env, runID, file, "Succeeded")
+	waitForFileContent(t, dagu.ProjectPath("published.txt"), "published\n")
+	waitForFileContent(t, dagu.ProjectPath("attempts.txt"), ":\n1:add-tests\n")
+}
+
 func collapseStatusLines(stdout string) string {
 	var result strings.Builder
 	for line := range strings.SplitSeq(stdout, "\n") {
@@ -274,4 +342,36 @@ func runConcurrentCompletions(
 	close(start)
 	wg.Wait()
 	return results
+}
+
+func TestArtifactReferencesResolveWhenTaskOpens(t *testing.T) {
+	dagu := harness.NewRunner(t)
+	env := sharedEnv(t)
+	const runID = "spec031-artifacts"
+
+	startWaiting(t, dagu, env, runID, "artifact_snapshot.yaml")
+	status := waitForStatus(t, dagu, env, runID, "artifact_snapshot.yaml", "Waiting")
+	require.Contains(t, status.Stdout(), "reports/production/summary.txt")
+	require.Contains(t, status.Stdout(), "reports/release.diff")
+	require.NotContains(t, status.Stdout(), "${params.target}")
+
+	// The run writes none of the referenced artifacts, and completion must not
+	// care.
+	result := complete(t, dagu, env, runID, "review", "artifact_snapshot.yaml")
+	result.ExpectExitCode(0)
+	waitForStatus(t, dagu, env, runID, "artifact_snapshot.yaml", "Succeeded")
+}
+
+func TestArtifactReferenceEscapingArtifactDirFailsWithoutOpening(t *testing.T) {
+	dagu := harness.NewRunner(t)
+	env := sharedEnv(t)
+	const runID = "spec031-artifact-escape"
+
+	start := dagu.RunWithEnv(env, "start", "--run-id="+runID,
+		"--params=target=../../secret", "artifact_escape.yaml")
+	start.ExpectNonZeroExitCode()
+	start.ExpectStderrContains("human task artifacts", "parent directory segments")
+
+	status := waitForStatus(t, dagu, env, runID, "artifact_escape.yaml", "Failed")
+	require.NotContains(t, status.Stdout(), "Waiting")
 }

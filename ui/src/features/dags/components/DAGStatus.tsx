@@ -39,6 +39,7 @@ import { DAGContext } from '../contexts/DAGContext';
 import { getEventHandlers } from '../lib/getEventHandlers';
 import { updateDAGRunNodeStatus } from '../lib/nodeStatus';
 import { ApprovalTab } from './approval';
+import { ApprovalResumeAlert } from './approval/ApprovalResumeAlert';
 import { AgentSessionTab } from './agent-session';
 import ArtifactsTab from './artifacts/ArtifactsTab';
 import { ChatHistoryTab } from './chat-history';
@@ -68,6 +69,8 @@ type Props = {
   fileName: string;
   artifactEnabled?: boolean;
   initialTab?: StatusTab;
+  activeTab?: StatusTab;
+  onTabChange?: (tab: StatusTab) => void;
   fillHeight?: boolean;
 };
 
@@ -97,6 +100,8 @@ function DAGStatus({
   fileName,
   artifactEnabled = false,
   initialTab = 'status',
+  activeTab: controlledActiveTab,
+  onTabChange,
   fillHeight = false,
 }: Props) {
   const { ts } = useI18n();
@@ -106,9 +111,22 @@ function DAGStatus({
   const navigate = useNavigate();
   const { showError } = useErrorModal();
   const [modal, setModal] = useState(false);
-  const [activeTab, setActiveTab] = useState<StatusTab>(initialTab);
+  const [internalActiveTab, setInternalActiveTab] = useState<StatusTab>(initialTab);
+  const activeTab = controlledActiveTab ?? internalActiveTab;
+  const isTabControlled = controlledActiveTab !== undefined;
   const [selectedAgentStep, setSelectedAgentStep] = useState('');
   const [displayDAGRun, setDisplayDAGRun] = useState(dagRun);
+
+  function setActiveTab(value: React.SetStateAction<StatusTab>): void {
+    if (!isTabControlled) {
+      setInternalActiveTab(value);
+      return;
+    }
+    const nextTab = typeof value === 'function' ? value(activeTab) : value;
+    if (nextTab !== activeTab) {
+      onTabChange?.(nextTab);
+    }
+  }
 
   useEffect(() => {
     setDisplayDAGRun(dagRun);
@@ -513,9 +531,14 @@ function DAGStatus({
   ]);
 
   useEffect(() => {
-    setActiveTab(initialTab);
+    if (!isTabControlled) {
+      setInternalActiveTab(initialTab);
+    }
+  }, [displayDAGRunIdentity, initialTab, isTabControlled]);
+
+  useEffect(() => {
     setSelectedAgentStep('');
-  }, [displayDAGRunIdentity, initialTab]);
+  }, [displayDAGRunIdentity]);
 
   // Reset to status tab if selected tab is not available
   useEffect(() => {
@@ -759,6 +782,14 @@ function DAGStatus({
             </div>
           </div>
         </div>
+
+        {displayDAGRun.status === Status.Waiting &&
+          displayDAGRun.approvalResumePending && (
+            <ApprovalResumeAlert
+              key={displayDAGRunIdentity}
+              dagRun={displayDAGRun}
+            />
+          )}
 
         {/* Status Tab Content */}
         {childRunStack.length > 0 && (

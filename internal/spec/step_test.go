@@ -5,11 +5,16 @@ package spec
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
+
+	cmnschema "github.com/dagucloud/dagu/v2/internal/cmn/schema"
 
 	"github.com/dagucloud/dagu/v2/internal/executor/registry"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -23,10 +28,10 @@ func TestMain(m *testing.M) {
 	// Register executor capabilities for testing.
 	// In production, this is done by runtime/builtin init functions.
 
-	// Command executors: support command, multiple commands, script, shell
+	// Command executors: support command, multiple commands, script, shell, stdin
 	for _, t := range []string{"", "shell", "command"} {
 		registry.RegisterExecutorCapabilities(t, registry.ExecutorCapabilities{
-			Command: true, MultipleCommands: true, Script: true, Shell: true,
+			Command: true, MultipleCommands: true, Script: true, Shell: true, Stdin: true,
 		})
 	}
 	// Docker: supports command, multiple commands, and container
@@ -68,8 +73,8 @@ func TestMain(m *testing.M) {
 			SubDAG: true, WorkerSelector: true,
 		})
 	}
-	// mail: no command support
-	registry.RegisterExecutorCapabilities("mail", registry.ExecutorCapabilities{})
+	// mail: search and organize operations
+	registry.RegisterExecutorCapabilities("mail", registry.ExecutorCapabilities{Command: true})
 	// log: no command support
 	registry.RegisterExecutorCapabilities("log", registry.ExecutorCapabilities{})
 	// outputs: supports write command
@@ -77,7 +82,13 @@ func TestMain(m *testing.M) {
 	// state: supports operation commands only
 	registry.RegisterExecutorCapabilities("state", registry.ExecutorCapabilities{Command: true})
 	// chat: LLM executor
-	registry.RegisterExecutorCapabilities("chat", registry.ExecutorCapabilities{LLM: true})
+	registry.RegisterExecutorCapabilities("chat", registry.ExecutorCapabilities{LLM: true, Messages: true})
+	// llm_tool: uses an llm config without chat messages
+	registry.RegisterExecutorCapabilities("llm_tool", registry.ExecutorCapabilities{LLM: true})
+	// browser: uses an llm config without chat messages
+	registry.RegisterExecutorCapabilities(ir.ExecutorTypeBrowser, registry.ExecutorCapabilities{LLM: true})
+	// computer: uses an llm config without chat messages
+	registry.RegisterExecutorCapabilities(ir.ExecutorTypeComputer, registry.ExecutorCapabilities{LLM: true})
 
 	os.Exit(m.Run())
 }
@@ -620,6 +631,61 @@ func TestBuildStepContinueOn(t *testing.T) {
 	}
 }
 
+// An unusable pattern here used to reach runtime, where a numeric comparison
+// was matched as the literal text it is written as and an uncompilable regexp
+// was dropped, both without reporting anything.
+func TestBuildStepContinueOnOutputPattern(t *testing.T) {
+	t.Parallel()
+
+	build := func(pattern string) error {
+		s := &step{ContinueOn: continueOnValueMap(map[string]any{"output": []string{pattern}})}
+		_, err := buildStepContinueOn(testStepBuildContext(), s)
+		return err
+	}
+
+	t.Run("Valid", func(t *testing.T) {
+		t.Parallel()
+
+		// re: matches the text of a numeric comparison literally.
+		for _, pattern := range []string{"WARNING", "re:^ERROR.*", "re:num:>=5"} {
+			require.NoError(t, build(pattern), "pattern %q should be accepted", pattern)
+		}
+	})
+
+	t.Run("Numeric", func(t *testing.T) {
+		t.Parallel()
+
+		for _, pattern := range []string{"num:>=5", "num:", "num:>=abc"} {
+			err := build(pattern)
+			require.Error(t, err, "pattern %q should be rejected", pattern)
+			assert.Contains(t, err.Error(), "continue_on.output")
+			assert.Contains(t, err.Error(), "numeric comparison is not supported in log patterns")
+		}
+	})
+
+	t.Run("InvalidRegexp", func(t *testing.T) {
+		t.Parallel()
+
+		err := build("re:[")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "regexp is invalid")
+	})
+
+	t.Run("StepDefault", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := LoadYAML(context.Background(), []byte(`
+defaults:
+  continue_on:
+    output: ["num:>=5"]
+steps:
+  - command: echo hi
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "numeric comparison is not supported in log patterns")
+	})
+}
+
 func TestBuildStepRetryPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -863,6 +929,59 @@ func TestBuildStepRepeatPolicy(t *testing.T) {
 			name: "WhileWithoutConditionOrExitCode",
 			repeatPolicy: &repeatPolicy{
 				Repeat: types.RepeatModeFromString("while"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "NumericExpected",
+			repeatPolicy: &repeatPolicy{
+				Repeat:    types.RepeatModeFromString("until"),
+				Condition: "${N}",
+				Expected:  "num:>=3",
+			},
+			expected: ir.RepeatPolicy{
+				RepeatMode: ir.RepeatModeUntil,
+				Condition:  &ir.Condition{Condition: "${N}", Expected: "num:>=3"},
+			},
+		},
+		{
+			name: "NumericExpectedReference",
+			repeatPolicy: &repeatPolicy{
+				Repeat:    types.RepeatModeFromString("until"),
+				Condition: "${N}",
+				Expected:  "num:>=${threshold}",
+			},
+			expected: ir.RepeatPolicy{
+				RepeatMode: ir.RepeatModeUntil,
+				Condition:  &ir.Condition{Condition: "${N}", Expected: "num:>=${threshold}"},
+			},
+		},
+		{
+			name: "InvalidNumericExpectedInterpolated",
+			repeatPolicy: &repeatPolicy{
+				Repeat:    types.RepeatModeFromString("until"),
+				Condition: "${N}",
+				Expected:  "num:>=0.${threshold}",
+			},
+			wantErr: true,
+		},
+		{
+			// An unusable pattern here used to reach runtime, where an until
+			// loop with no limit repeats on it forever.
+			name: "InvalidNumericExpected",
+			repeatPolicy: &repeatPolicy{
+				Repeat:    types.RepeatModeFromString("until"),
+				Condition: "${N}",
+				Expected:  "num:==3",
+			},
+			wantErr: true,
+		},
+		{
+			name: "InvalidRegexpExpected",
+			repeatPolicy: &repeatPolicy{
+				Repeat:    types.RepeatModeFromString("until"),
+				Condition: "${N}",
+				Expected:  "re:[",
 			},
 			wantErr: true,
 		},
@@ -2053,6 +2172,29 @@ func TestBuildStepContainer(t *testing.T) {
 				PullPolicy: ir.PullPolicyMissing,
 			},
 		},
+		{
+			name: "ContainerWithEnvFile",
+			input: &container{
+				Image:   "alpine:3.18",
+				EnvFile: stringOrArrayList([]string{".env", ".env.local"}),
+			},
+			expected: &ir.Container{
+				Image:      "alpine:3.18",
+				PullPolicy: ir.PullPolicyMissing,
+				EnvFile:    []string{".env", ".env.local"},
+			},
+		},
+		{
+			name: "ExecModeContainerWithEnvFile",
+			input: &container{
+				Exec:    "existing-container",
+				EnvFile: stringOrArray(".env"),
+			},
+			expected: &ir.Container{
+				Exec:    "existing-container",
+				EnvFile: []string{".env"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -2442,6 +2584,84 @@ func TestValidateShell(t *testing.T) {
 	}
 }
 
+func TestValidateStdin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		executorType string
+		stdin        string
+		wantErr      bool
+	}{
+		// Executors that support stdin
+		{
+			name:         "StdinWithDefaultExecutor",
+			executorType: "",
+			stdin:        "data.txt",
+			wantErr:      false,
+		},
+		{
+			name:         "StdinWithCommandExecutor",
+			executorType: "command",
+			stdin:        "data.txt",
+			wantErr:      false,
+		},
+		{
+			name:         "StdinWithShellExecutor",
+			executorType: "shell",
+			stdin:        "data.txt",
+			wantErr:      false,
+		},
+		// Executors that do not support stdin
+		{
+			name:         "StdinWithDockerExecutor",
+			executorType: "docker",
+			stdin:        "data.txt",
+			wantErr:      true,
+		},
+		{
+			name:         "StdinWithSSHExecutor",
+			executorType: "ssh",
+			stdin:        "data.txt",
+			wantErr:      true,
+		},
+		{
+			name:         "StdinWithHTTPExecutor",
+			executorType: "http",
+			stdin:        "data.txt",
+			wantErr:      true,
+		},
+		// Empty stdin - should always pass
+		{
+			name:         "EmptyStdinWithSSHExecutor",
+			executorType: "ssh",
+			stdin:        "",
+			wantErr:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := &ir.Step{
+				Stdin: tt.stdin,
+				ExecutorConfig: ir.ExecutorConfig{
+					Type: tt.executorType,
+				},
+			}
+			err := validateStdin(result)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), "does not support stdin field")
+				assert.Contains(t, err.Error(), tt.executorType)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestValidateContainer(t *testing.T) {
 	t.Parallel()
 
@@ -2658,10 +2878,11 @@ func TestValidateCommand(t *testing.T) {
 			wantErr:      true,
 		},
 		{
+			// The command carries the mail operation, such as search.
 			name:         "CommandWithMailExecutor",
 			executorType: "mail",
-			commands:     []ir.CommandEntry{{Command: "send"}},
-			wantErr:      true,
+			commands:     []ir.CommandEntry{{Command: "search"}},
+			wantErr:      false,
 		},
 		// Empty commands - should always pass
 		{
@@ -3333,6 +3554,13 @@ func TestValidateLLM(t *testing.T) {
 			wantErr: true,
 			errMsg:  "at least one message is required",
 		},
+		{
+			name: "NoMessagesForExecutorWithoutMessages",
+			step: &ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{Type: "llm_tool"},
+				LLM:            &ir.LLMConfig{Provider: "openai", Model: "gpt-4"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -3374,6 +3602,14 @@ func TestValidateMessages(t *testing.T) {
 			name: "MessagesWithUnsupportedExecutor",
 			step: &ir.Step{
 				ExecutorConfig: ir.ExecutorConfig{Type: "shell"},
+				Messages:       []ir.PromptMessage{{Role: "user", Content: "hello"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "MessagesWithLLMExecutorWithoutMessages",
+			step: &ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{Type: "llm_tool"},
 				Messages:       []ir.PromptMessage{{Role: "user", Content: "hello"}},
 			},
 			wantErr: true,
@@ -4064,4 +4300,97 @@ steps:
     run: cat ${build.stdout}
 `), WithoutEval())
 	require.NoError(t, err)
+}
+
+// The artifact-relative path rule is implemented twice: here for authored
+// values, and as cleanArtifactOutputPath in internal/runtime for values
+// resolved at run time. Human-task artifact safety depends on the two
+// agreeing, so this table is kept byte-identical with
+// TestCleanArtifactOutputPathAgreement apart from the empty-path message,
+// which is the one intended divergence.
+func TestCleanStepArtifactPathAgreement(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		input   string
+		want    string
+		wantErr string
+	}{
+		{name: "Empty", input: "", wantErr: "path must not be empty"},
+		{name: "WhitespaceOnly", input: "   ", wantErr: "path must not be empty"},
+		{name: "Absolute", input: "/etc/passwd", wantErr: "artifact path must be relative"},
+		{name: "Home", input: "~", wantErr: "artifact path must be relative"},
+		{name: "HomeRelative", input: "~/secret", wantErr: "artifact path must be relative"},
+		{name: "WindowsDrive", input: "C:/secret", wantErr: "artifact path must be relative"},
+		{name: "LeadingParent", input: "../secret", wantErr: "artifact path must not contain parent directory segments"},
+		{name: "InteriorParent", input: "a/../b", wantErr: "artifact path must not contain parent directory segments"},
+		{name: "CurrentDirectory", input: ".", wantErr: "artifact path must name a file"},
+		{name: "Backslashes", input: `reports\test.html`, want: "reports/test.html"},
+		{name: "TrailingSlash", input: "reports/", want: "reports"},
+		{name: "DoubleSeparator", input: "a//b.txt", want: "a/b.txt"},
+		{name: "LeadingDotSlash", input: "./a.txt", want: "a.txt"},
+		{name: "SurroundingSpace", input: "  a.txt  ", want: "a.txt"},
+		{name: "Nested", input: "reports/2026/a.txt", want: "reports/2026/a.txt"},
+		{name: "UnresolvedReference", input: "${params.OUT}/report.html", want: "${params.OUT}/report.html"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := cleanStepArtifactPath(tt.input)
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// The DAG JSON schema re-encodes the artifact-path rule as a regular
+// expression so the editor can flag a bad path before the parser sees it.
+// That makes it a second implementation of cleanStepArtifactPath, in another
+// language, and it is only useful while the two agree.
+func TestArtifactPathSchemaPatternMatchesParser(t *testing.T) {
+	t.Parallel()
+
+	var doc struct {
+		Definitions map[string]struct {
+			Properties map[string]struct {
+				Items *struct {
+					Not *struct {
+						Pattern string `json:"pattern"`
+					} `json:"not"`
+				} `json:"items"`
+			} `json:"properties"`
+		} `json:"definitions"`
+	}
+	require.NoError(t, json.Unmarshal(cmnschema.DAGSchemaJSON, &doc))
+
+	items := doc.Definitions["humanTaskActionConfig"].Properties["artifacts"].Items
+	require.NotNil(t, items)
+	require.NotNil(t, items.Not, "artifacts.items must keep its rejection pattern")
+	reject := regexp.MustCompile(items.Not.Pattern)
+
+	for _, input := range []string{
+		"", "   ", "/etc/passwd", "~", "~/secret", "C:/secret", `\secret`,
+		"../secret", "a/../b", "a/..", "..", ".", "  ~  ",
+		`reports\test.html`, "reports/", "a//b.txt", "./a.txt", "  a.txt  ",
+		"reports/2026/a.txt", "${params.OUT}/report.html", "~foo", "a/..b/c",
+		"...", "a.txt",
+	} {
+		t.Run(input, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := cleanStepArtifactPath(input)
+			// minLength and the \S pattern already reject these two.
+			schemaRejects := reject.MatchString(input) ||
+				input == "" || strings.TrimSpace(input) == ""
+
+			assert.Equal(t, err != nil, schemaRejects,
+				"schema and parser disagree on %q", input)
+		})
+	}
 }

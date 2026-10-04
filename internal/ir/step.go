@@ -51,6 +51,8 @@ type Step struct {
 	// Each entry represents a command to be executed sequentially.
 	// For single commands, this will contain exactly one entry.
 	Commands []CommandEntry `json:"commands,omitempty"`
+	// Stdin is the file whose contents are piped to the standard input.
+	Stdin string `json:"stdin,omitempty"`
 	// Stdout is the file to store the standard output.
 	Stdout string `json:"stdout,omitempty"`
 	// StdoutArtifact is the artifact-relative file path to store standard output.
@@ -229,7 +231,24 @@ func (s *Step) String() string {
 type SubDAG struct {
 	Name   string `json:"name,omitempty"`
 	Params string `json:"params,omitempty"`
+	// PassEnv selects parent environment values to hand to the child run.
+	// Nil preserves the default of passing nothing beyond params.
+	PassEnv *SubDAGPassEnv `json:"passEnv,omitempty"`
 }
+
+// SubDAGPassEnv describes which parent environment values a sub DAG run
+// receives beyond its own definition.
+type SubDAGPassEnv struct {
+	// All passes the parent run's own environment values.
+	All bool `json:"all,omitempty"`
+	// Names lists the parent environment variables to pass.
+	Names []string `json:"names,omitempty"`
+}
+
+// ReservedEnvPrefix marks environment variable names Dagu reserves for internal
+// run transport. Names carrying it are never accepted from authored workflows
+// and never cross a run boundary.
+const ReservedEnvPrefix = "_DAGU_"
 
 // CommandEntry represents a single command in a multi-command step.
 // Each entry contains a parsed command with its arguments.
@@ -473,10 +492,25 @@ type ApprovalConfig struct {
 	RewindTo string `json:"rewindTo,omitempty"`
 }
 
-// HumanTaskConfig defines the prompt and input form for a human task step.
+// HumanTaskConfig defines the prompt, input form, artifact references, and
+// push-back for a human task step.
 type HumanTaskConfig struct {
-	Prompt string          `json:"prompt,omitempty"`
-	Form   json.RawMessage `json:"form,omitempty"`
+	Prompt    string          `json:"prompt,omitempty"`
+	Form      json.RawMessage `json:"form,omitempty"`
+	Artifacts []string        `json:"artifacts,omitempty"`
+	// PushBack lets the operator send the task back to an upstream step.
+	// Nil means the task can only be completed.
+	PushBack *HumanTaskPushBackConfig `json:"pushBack,omitempty"`
+}
+
+// HumanTaskPushBackConfig defines where a human-task push-back rewinds and the
+// feedback it accepts.
+type HumanTaskPushBackConfig struct {
+	// RewindTo is the name of the upstream step that runs again first.
+	RewindTo string `json:"rewindTo"`
+	// Form is the normalized feedback form. Empty means push-back accepts no
+	// input.
+	Form json.RawMessage `json:"form,omitempty"`
 }
 
 const (
@@ -507,6 +541,15 @@ const (
 
 	// ExecutorTypeOutputs is the executor type for publishing named outputs.
 	ExecutorTypeOutputs = "outputs"
+
+	// ExecutorTypeBrowser is the executor type for browser automation steps.
+	ExecutorTypeBrowser = "browser"
+
+	// ExecutorTypeComputer is the executor type for desktop automation steps.
+	ExecutorTypeComputer = "computer"
+
+	// ExecutorTypeXlsx is the executor type for workbook steps.
+	ExecutorTypeXlsx = "xlsx"
 )
 
 // RouterConfig contains routing configuration for router-type steps.

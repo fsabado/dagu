@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
@@ -407,6 +408,34 @@ func TestQueueProcessor_DefersUnchangedDistributedDispatchFailure(t *testing.T) 
 	require.Len(t, items, 1)
 }
 
+func TestQueueProcessor_DistributedDispatchFailsRunOnDefinitionError(t *testing.T) {
+	// A dispatch rejected because the definition cannot be built can never
+	// succeed, so the run is failed with the build error instead of staying
+	// queued behind a generic dispatch condition.
+	f := newQueueFixture(t).withDAG("broken-definition", 1).
+		withProcessor(config.Queues{}).
+		simulateQueue(1, false)
+	buildErr := errors.New("field 'actions.broken_action.input_schema': failed to parse schema JSON")
+	dispatcher := &mockDispatcher{errFunc: func(int32) error {
+		return &dispatch.DefinitionError{Err: buildErr}
+	}}
+	f.processor.dagExecutor = NewDAGExecutor(dispatcher, nil, config.ExecutionModeDistributed, "")
+	f.enqueueToQueue(f.dag.Name, "run-1", queuedomain.QueuePriorityHigh)
+
+	f.processor.ProcessQueueItems(f.ctx, f.dag.Name)
+
+	attempt, err := f.dagRunRepository.FindAttempt(f.ctx, ir.NewDAGRunRef(f.dag.Name, "run-1"))
+	require.NoError(t, err)
+	runStatus, err := attempt.ReadStatus(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, runStatus.Status)
+	assert.Contains(t, runStatus.Error, buildErr.Error())
+
+	items, err := f.queueStore.List(f.ctx, f.dag.Name)
+	require.NoError(t, err)
+	assert.Empty(t, items)
+}
+
 func TestQueueProcessor_ProcessQueueItems_FailsClosedOnLeaseCountError(t *testing.T) {
 	f := newQueueFixture(t).withDAG("distributed-count-error-dag", 1).
 		withProcessor(config.Queues{}).
@@ -529,7 +558,7 @@ func TestQueueProcessor_SelectRunnableQueueItemsSkipsOutstandingReservations(t *
 
 func TestQueueProcessor_StaleOutstandingDispatchReservationsExpire(t *testing.T) {
 	f := newQueueFixture(t).withDAG("distributed-stale-select-dag", 1).
-		withProcessor(config.Queues{}, WithLeaseStaleThreshold(time.Nanosecond)).
+		withProcessor(config.Queues{}, WithLeaseStaleThreshold(freshDistributedTestThreshold)).
 		simulateQueue(1, false)
 
 	f.enqueueRuns(1)
@@ -540,22 +569,26 @@ func TestQueueProcessor_StaleOutstandingDispatchReservationsExpire(t *testing.T)
 	status, err := attempt.ReadStatus(f.ctx)
 	require.NoError(t, err)
 
-	require.NoError(t, f.dispatchStore.Enqueue(f.ctx, &dispatch.DispatchTask{
-		DAGRunID:   runRef.ID,
-		Target:     f.dag.Name,
-		QueueName:  f.dag.Name,
-		AttemptID:  attempt.ID(),
-		AttemptKey: queueAttemptKey(runRef, attempt, status),
-	}))
+	synctest.Test(t, func(t *testing.T) {
+		require.NoError(t, f.dispatchStore.Enqueue(f.ctx, &dispatch.DispatchTask{
+			DAGRunID:   runRef.ID,
+			Target:     f.dag.Name,
+			QueueName:  f.dag.Name,
+			AttemptID:  attempt.ID(),
+			AttemptKey: queueAttemptKey(runRef, attempt, status),
+		}))
 
-	var count int
-	var countErr error
-	require.Eventually(t, func() bool {
-		count, countErr = f.processor.newQueueDispatcher().countOutstandingDispatchReservations(f.ctx, f.dag.Name)
-		return countErr == nil && count == 0
-	}, 500*time.Millisecond, 10*time.Millisecond)
-	require.NoError(t, countErr)
-	assert.Zero(t, count)
+		dispatcher := f.processor.newQueueDispatcher()
+		count, err := dispatcher.countOutstandingDispatchReservations(f.ctx, f.dag.Name)
+		require.NoError(t, err)
+		require.Equal(t, 1, count)
+
+		// Advance the test clock past expiry without imposing a deadline on disk I/O.
+		time.Sleep(2 * freshDistributedTestThreshold)
+		count, err = dispatcher.countOutstandingDispatchReservations(f.ctx, f.dag.Name)
+		require.NoError(t, err)
+		assert.Zero(t, count)
+	})
 
 	items, err := f.queueStore.List(f.ctx, f.dag.Name)
 	require.NoError(t, err)
@@ -1081,6 +1114,63 @@ func TestQueueProcessor_SuspendedSchedulerManagedQueuedRunsAreAbortedAndDequeued
 			assert.Equal(t, trigger, status.TriggerType)
 		})
 	}
+}
+
+func TestQueueProcessor_SuspendedCleanupPreservesNewRetry(t *testing.T) {
+	dagName := "suspended-retry-race-dag"
+	f := newQueueFixture(t).withDAG(dagName, 1)
+	runRef := ir.NewDAGRunRef(dagName, "run-1")
+	var enqueueErr error
+	f.withProcessor(config.Queues{}, WithIsSuspended(func(ctx context.Context, name string) (bool, error) {
+		attempt, err := f.dagRunRepository.FindAttempt(ctx, runRef)
+		if err != nil {
+			return false, err
+		}
+		status, err := attempt.ReadStatus(ctx)
+		if err != nil {
+			return false, err
+		}
+		status.Status = ir.Failed
+		status.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := attempt.Open(ctx); err != nil {
+			return false, err
+		}
+		if err := attempt.Write(ctx, *status); err != nil {
+			_ = attempt.Close(ctx)
+			return false, err
+		}
+		if err := attempt.Close(ctx); err != nil {
+			return false, err
+		}
+		_, enqueueErr = queuedomain.EnqueueRetry(
+			ctx,
+			f.dagRunRepository,
+			f.queueStore,
+			f.dag,
+			status,
+			queuedomain.EnqueueRetryOptions{Processes: f.procRepository.(queuedomain.RunProcesses)},
+		)
+		return name == dagName, nil
+	})).simulateQueue(1, false)
+	f.enqueueRunWithTrigger("run-1", ir.TriggerTypeScheduler)
+
+	items, err := f.queueStore.List(f.ctx, dagName)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	originalItemID := items[0].ID()
+
+	f.processor.ProcessQueueItems(f.ctx, dagName)
+
+	require.NoError(t, enqueueErr)
+	status, err := f.dagRunRepository.FindAttempt(f.ctx, runRef)
+	require.NoError(t, err)
+	latest, err := status.ReadStatus(f.ctx)
+	require.NoError(t, err)
+	require.Equal(t, ir.Queued, latest.Status)
+	items, err = f.queueStore.List(f.ctx, dagName)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	require.NotEqual(t, originalItemID, items[0].ID())
 }
 
 func TestQueueProcessor_LeavesSchedulerManagedRunQueuedWhenSuspensionReadFails(t *testing.T) {

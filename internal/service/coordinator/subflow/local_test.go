@@ -217,7 +217,7 @@ steps:
 func TestLocalRunPreservesDAGBaseConfigWithWorkspace(t *testing.T) {
 	t.Parallel()
 
-	th := test.Setup(t)
+	th := test.Setup(t, test.WithStatusPersistence())
 	rootDir := t.TempDir()
 	outputFile := filepath.Join(t.TempDir(), "base-value.txt")
 	definition := []byte(`name: workspace-base-config
@@ -243,12 +243,21 @@ steps:
 	require.NoError(t, err)
 
 	root := ir.NewDAGRunRef("parent", uuid.Must(uuid.NewV7()).String())
-	runner := subflow.NewLocal(th.DAGRunMgr, th.DAGRepository)
+	childRunID := uuid.Must(uuid.NewV7()).String()
+	parentWorkspace := "ops"
+	parent := &ir.DAG{Name: root.Name, BaseConfigWorkspace: &parentWorkspace}
+	rootAttempt, err := th.DAGRunRepository.CreateAttempt(th.Context, parent, time.Now(), root.ID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	require.NoError(t, rootAttempt.Open(th.Context))
+	require.NoError(t, rootAttempt.Close(th.Context))
+	dag.BaseConfigWorkspace = nil
+	runner := subflow.NewLocal(th.DAGRunMgr, th.DAGRepository, subflow.WithLocalDAGRunRepository(th.DAGRunRepository))
 	result, err := runner.Run(th.Context, executor.SubWorkflowRequest{
 		DAG:          dag,
+		ParentDAG:    parent,
 		RootDAGRun:   root,
 		ParentDAGRun: root,
-		RunID:        uuid.Must(uuid.NewV7()).String(),
+		RunID:        childRunID,
 		Workspace: &executor.SubWorkflowWorkspace{
 			Descriptor: *desc,
 			Archive:    archive,
@@ -261,6 +270,11 @@ steps:
 	content, err := os.ReadFile(outputFile)
 	require.NoError(t, err)
 	require.Equal(t, "base", string(content))
+	attempt, err := th.DAGRunRepository.FindSubAttempt(th.Context, root, childRunID)
+	require.NoError(t, err)
+	snapshot, err := attempt.ReadDAG(th.Context)
+	require.NoError(t, err)
+	require.Equal(t, &parentWorkspace, snapshot.BaseConfigWorkspace)
 }
 
 func TestLocalRunPreservesBuildPathBaseFromCopiedDefinition(t *testing.T) {
@@ -314,6 +328,43 @@ steps:
 	content, err := os.ReadFile(filepath.Join(authoredDir, "artifact.txt"))
 	require.NoError(t, err)
 	require.Equal(t, "source", string(content))
+}
+
+func TestLocalRunChildParamsOverrideInheritedParentEnv(t *testing.T) {
+	th := test.Setup(t)
+	child := th.DAG(t, `name: precedence-child
+params:
+  - ENV: ""
+steps:
+  - name: report
+    run: echo "ENV=${ENV} SHARED=${SHARED}"
+    output: RESULT
+`)
+	root := ir.NewDAGRunRef("parent", uuid.Must(uuid.NewV7()).String())
+	// The parent run holds ENV as a param and SHARED as a DAG env value. Both
+	// reach the in-process child through implicit env inheritance, but the
+	// params the calling step passed are the child's own contract and win.
+	parentCtx := runctx.NewContext(
+		th.Context,
+		&ir.DAG{Name: root.Name, Env: []string{"SHARED=from-parent-env", "ENV=from-parent-env"}},
+		root.ID,
+		filepath.Join(t.TempDir(), "parent.log"),
+		runctx.WithParams([]string{"ENV=production"}),
+	)
+	runner := subflow.NewLocal(th.DAGRunMgr, th.DAGRepository)
+
+	result, err := runner.Run(parentCtx, executor.SubWorkflowRequest{
+		DAG:          child.DAG,
+		RootDAGRun:   root,
+		ParentDAGRun: root,
+		RunID:        uuid.Must(uuid.NewV7()).String(),
+		Params:       "ENV=staging",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, ir.Succeeded, result.Status)
+	require.Equal(t, "ENV=staging SHARED=from-parent-env", result.Outputs["RESULT"])
 }
 
 func TestLocalRunPreparesDeclaredTools(t *testing.T) {

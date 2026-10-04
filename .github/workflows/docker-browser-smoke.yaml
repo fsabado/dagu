@@ -1,0 +1,110 @@
+name: Dev Image Browser
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    paths:
+      - Dockerfile.dev
+      - entrypoint.sh
+      - deploy/docker/smoke/**
+      - deploy/docker/browser/**
+      - internal/runtime/builtin/browser/**
+      - internal/browserhost/**
+      - internal/cmn/config/**
+      - internal/cmd/**
+      - internal/launcher/**
+      - internal/service/frontend/**
+      - internal/service/scheduler/**
+      - internal/runtime/node.go
+      - internal/runtime/plan.go
+      - go.mod
+      - go.sum
+      - .github/workflows/docker-browser-smoke.yaml
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile.dev
+      - entrypoint.sh
+      - deploy/docker/smoke/**
+      - deploy/docker/browser/**
+      - internal/runtime/builtin/browser/**
+      - internal/browserhost/**
+      - internal/cmn/config/**
+      - internal/cmd/**
+      - internal/launcher/**
+      - internal/service/frontend/**
+      - internal/service/scheduler/**
+      - internal/runtime/node.go
+      - internal/runtime/plan.go
+      - go.mod
+      - go.sum
+      - .github/workflows/docker-browser-smoke.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-image-browser-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser-step:
+    name: Browser step on ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build the dev image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile.dev
+          platforms: ${{ matrix.platform }}
+          load: true
+          provenance: false
+          tags: dagu-ci:dev
+
+      - name: Check graceful signal shutdown through Tini
+        run: bash deploy/docker/smoke/signal-shutdown.sh
+
+      # The documented command copies the bundled profile out of the image.
+      - name: Check the bundled seccomp profile
+        run: |
+          docker run --rm dagu-ci:dev cat /usr/share/dagu/seccomp-chromium.json \
+            | cmp - deploy/docker/browser/seccomp-chromium.json
+
+      # The Compose service applies the seccomp profile and the /dev/shm size.
+      # The entrypoint runs Dagu as the image's non-root user, and CI is not
+      # passed into the container, so the browser starts with its sandbox.
+      - name: Run a browser step through Docker Compose
+        working-directory: deploy/docker/browser
+        env:
+          DAGU_IMAGE: dagu-ci:dev
+        run: |
+          docker compose run --rm -v "$GITHUB_WORKSPACE/deploy/docker/smoke:/smoke:ro" \
+            dagu dagu start /smoke/browser.yaml
+
+      - name: Run a browser step with the sandbox off
+        run: |
+          docker run --rm -e DAGU_BROWSER_SANDBOX=false --shm-size=1g \
+            -v "$PWD/deploy/docker/smoke:/smoke:ro" \
+            dagu-ci:dev dagu start /smoke/browser.yaml

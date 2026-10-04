@@ -11,15 +11,16 @@ import (
 
 // commandLineFlag defines a CLI flag with its configuration options.
 type commandLineFlag struct {
-	name         string
-	shorthand    string
-	defaultValue string
-	usage        string
-	required     bool
-	isBool       bool
-	hidden       bool
-	bindViper    bool
-	viperKey     string // Custom viper key (if different from kebab-to-camel name)
+	name          string
+	shorthand     string
+	defaultValue  string
+	usage         string
+	required      bool
+	isBool        bool
+	isStringArray bool // Repeatable flag; each occurrence adds one value
+	hidden        bool
+	bindViper     bool
+	viperKey      string // Custom viper key (if different from kebab-to-camel name)
 }
 
 // Base flags included in all commands
@@ -94,6 +95,12 @@ var (
 		name:      "params",
 		shorthand: "p",
 		usage:     "Parameters to pass to the dag-run (overrides DAG defaults; supports positional values and key=value pairs, e.g., P1=foo P2=bar)",
+	}
+
+	paramsStdinFlag = commandLineFlag{
+		name:   "params-stdin",
+		usage:  "Read run parameters from piped or redirected stdin (up to 1 MiB; -- and --params take precedence)",
+		isBool: true,
 	}
 
 	nameFlag = commandLineFlag{
@@ -182,6 +189,12 @@ var (
 	downstreamForRetry = commandLineFlag{
 		name:   "downstream",
 		usage:  "Also retry reachable downstream steps (requires --step)",
+		isBool: true,
+	}
+
+	bypassPreconditionsFlag = commandLineFlag{
+		name:   "bypass-preconditions",
+		usage:  "Skip step precondition evaluation for retried steps (requires --step)",
 		isBool: true,
 	}
 
@@ -403,6 +416,18 @@ var (
 		isBool:    true,
 	}
 
+	pruneArtifactsOlderThanFlag = commandLineFlag{
+		name:         "older-than",
+		shorthand:    "t",
+		defaultValue: "24h",
+		usage:        "Only remove artifact entries older than duration (e.g. 10d, 24h, 1w). A minimum of 1h is enforced",
+	}
+
+	pruneArtifactsRootFlag = commandLineFlag{
+		name:  "root",
+		usage: "Artifact root to prune (default: configured paths.artifact_dir), such as a previous <data_dir>/artifacts or a DAG's artifacts.dir. Roots holding run history or logs are refused",
+	}
+
 	psDAGFlag = commandLineFlag{
 		name:      "dag",
 		shorthand: "d",
@@ -413,6 +438,13 @@ var (
 		name:      "run-id",
 		shorthand: "r",
 		usage:     "Filter by run ID (partial match supported)",
+	}
+
+	psFormatFlag = commandLineFlag{
+		name:         "format",
+		shorthand:    "f",
+		defaultValue: "table",
+		usage:        "Output format: table or json (default: table)",
 	}
 )
 
@@ -520,6 +552,8 @@ func initFlags(cmd *cobra.Command, additionalFlags ...commandLineFlag) {
 func registerFlag(cmd *cobra.Command, flag commandLineFlag) {
 	if flag.isBool {
 		cmd.Flags().BoolP(flag.name, flag.shorthand, false, flag.usage)
+	} else if flag.isStringArray {
+		cmd.Flags().StringArrayP(flag.name, flag.shorthand, nil, flag.usage)
 	} else {
 		cmd.Flags().StringP(flag.name, flag.shorthand, flag.defaultValue, flag.usage)
 	}

@@ -4,9 +4,12 @@
 package spec006_env_test
 
 import (
+	"os/exec"
+	"runtime"
 	"testing"
 
 	"github.com/dagucloud/dagu/v2/conformance/harness"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidate(t *testing.T) {
@@ -198,6 +201,7 @@ func TestRuntime(t *testing.T) {
 		args    []string
 		output  string
 		content string
+		setup   func(*testing.T, *harness.Runner)
 	}{
 		{
 			name:    "env declaration forms preserve order",
@@ -266,6 +270,7 @@ func TestRuntime(t *testing.T) {
 			file:    "direct_execution_env_expansion.yaml",
 			output:  "direct-exec.txt",
 			content: "api ${MISSING}\n",
+			setup:   buildArgWriter,
 		},
 	}
 	for _, tc := range cases {
@@ -273,6 +278,9 @@ func TestRuntime(t *testing.T) {
 			t.Parallel()
 
 			dagu := harness.NewRunner(t)
+			if tc.setup != nil {
+				tc.setup(t, dagu)
+			}
 			args := tc.args
 			if len(args) == 0 {
 				args = []string{"start", tc.file}
@@ -294,6 +302,15 @@ func TestRuntime(t *testing.T) {
 			"root-env-read-workflow-shadow\nDAG_RUN_ID=step-shadow\nSTEP_COPY=step-shadow\n",
 		)
 		dagu.ExpectFileContent("protected-final.txt", "ROOT_COPY=root-shadow\nfinal-protected\nresolved-matches-process\n")
+	})
+
+	t.Run("missing container env_file fails the step", func(t *testing.T) {
+		t.Parallel()
+
+		dagu := harness.NewRunner(t)
+		result := dagu.Run("start", "container_env_file_missing.yaml")
+		result.ExpectNonZeroExitCode()
+		result.ExpectStderrContains("missing.env")
 	})
 
 	t.Run("duplicate predecessor outputs follow authored dependency order", func(t *testing.T) {
@@ -345,6 +362,7 @@ func TestRuntime(t *testing.T) {
 		t.Parallel()
 
 		dagu := harness.NewRunner(t)
+		buildArgWriter(t, dagu)
 		result := dagu.RunWithEnv(
 			[]string{"DIRECT_PROCESS_ONLY=from-process"},
 			"start",
@@ -366,4 +384,87 @@ func TestRuntime(t *testing.T) {
 		result.ExpectExitCode(0)
 		dagu.ExpectFileContent("action-with-env.txt", "$ACTION_PROCESS_ONLY\n${ACTION_PROCESS_ONLY}\n")
 	})
+}
+
+// TestSubDAGPassedEnv covers the step-level pass_env field: which parent values
+// reach a child run, and which authored forms are rejected.
+func TestSubDAGPassedEnv(t *testing.T) {
+	t.Parallel()
+
+	t.Run("listed name does not fall back to the process environment", func(t *testing.T) {
+		t.Parallel()
+
+		dagu := harness.NewRunner(t)
+		result := dagu.RunWithEnv(
+			[]string{"PASS_PROCESS_ONLY=from-process"},
+			"start",
+			"pass_env_no_process_env_fallback.yaml",
+		)
+		result.ExpectExitCode(0)
+		// An unresolved reference is preserved literally, so the literal is the
+		// signal that the name never resolved. A leak would write the value.
+		dagu.ExpectFileContent("passed-env.txt", "[${PASS_PROCESS_ONLY}]")
+	})
+
+	t.Run("listed name resolves from the parent run environment", func(t *testing.T) {
+		t.Parallel()
+
+		dagu := harness.NewRunner(t)
+		result := dagu.Run("start", "pass_env_named_run_value.yaml")
+		result.ExpectExitCode(0)
+		dagu.ExpectFileContent("passed-named.txt", "[from-parent]")
+	})
+
+	invalidCases := []struct {
+		name        string
+		file        string
+		stderrParts []string
+	}{
+		{
+			name:        "rejected on dag.enqueue",
+			file:        "invalid_pass_env_enqueue.yaml",
+			stderrParts: []string{"pass_env", "dag.enqueue"},
+		},
+		{
+			name:        "rejected for a reserved name",
+			file:        "invalid_pass_env_reserved_name.yaml",
+			stderrParts: []string{"pass_env", "_DAGU_INTERNAL_THING"},
+		},
+		{
+			name:        "rejected for a secret",
+			file:        "invalid_pass_env_secret.yaml",
+			stderrParts: []string{"pass_env", "API_TOKEN", "secret"},
+		},
+		{
+			name:        "rejected for a run-managed name",
+			file:        "invalid_pass_env_run_managed_name.yaml",
+			stderrParts: []string{"pass_env", "DAG_RUN_WORK_DIR"},
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dagu := harness.NewRunner(t)
+			result := dagu.Run("validate", tc.file)
+			result.ExpectExitCode(1)
+			result.ExpectStdout("")
+			result.ExpectStderrContains(tc.stderrParts...)
+			result.ExpectStderrNotContains("Usage:")
+		})
+	}
+}
+
+// Compile outside the workflow timeout so direct execution tests measure
+// environment resolution independently of a cold Go build cache.
+func buildArgWriter(t *testing.T, dagu *harness.Runner) {
+	t.Helper()
+
+	name := "write_arg"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	cmd := exec.CommandContext(t.Context(), "go", "build", "-o", dagu.ProjectPath(name), "testdata/write_arg.go")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "%s", output)
 }

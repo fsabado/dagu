@@ -40,15 +40,18 @@ type DispatchTask struct {
 	ParentDAGRunName string
 	ParentDAGRunID   string
 
-	Operation      DispatchOperation
-	DAGRunID       string
-	Target         string
-	Definition     string
-	AttemptID      string
-	AttemptKey     string
-	Step           string
-	Params         string
-	ParallelItem   string
+	Operation    DispatchOperation
+	DAGRunID     string
+	Target       string
+	Definition   string
+	AttemptID    string
+	AttemptKey   string
+	Step         string
+	Params       string
+	ParallelItem string
+	// PassedEnv carries resolved "KEY=value" pairs the parent opted to share
+	// with the child run via the step's pass_env field.
+	PassedEnv      []string
 	QueueName      string
 	WorkerID       string
 	TargetWorkerID string
@@ -58,17 +61,19 @@ type DispatchTask struct {
 
 	PreviousStatus *ir.DAGRunStatus
 
-	BaseConfig    string
-	Labels        string
-	ScheduleTime  string
-	SourceFile    string
-	SourceWorkDir string
+	BaseConfig          string
+	BaseConfigWorkspace *string
+	Labels              string
+	ScheduleTime        string
+	SourceFile          string
+	SourceWorkDir       string
 
 	WorkerSelector map[string]string
 
-	ExternalStepRetry bool
-	IncludeDownstream bool
-	RetryPath         string
+	ExternalStepRetry   bool
+	IncludeDownstream   bool
+	BypassPreconditions bool
+	RetryPath           string
 
 	WorkspaceBundleDigest      string
 	WorkspaceBundleSize        int64
@@ -98,4 +103,18 @@ type Dispatcher interface {
 	Cleanup(ctx context.Context) error
 	GetDAGRunStatus(ctx context.Context, dagName, dagRunID string, rootRef *ir.DAGRunRef) (*DAGRunStatusResult, error)
 	RequestCancel(ctx context.Context, dagName, dagRunID string, rootRef *ir.DAGRunRef) error
+}
+
+// DefinitionError reports a dispatch rejected because its DAG definition
+// cannot be built. Dispatching the same definition again cannot succeed.
+type DefinitionError struct {
+	Err error
+}
+
+func (e *DefinitionError) Error() string {
+	return "invalid DAG definition: " + e.Err.Error()
+}
+
+func (e *DefinitionError) Unwrap() error {
+	return e.Err
 }

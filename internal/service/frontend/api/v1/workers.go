@@ -19,7 +19,7 @@ func (a *API) GetWorkers(ctx context.Context, _ api.GetWorkersRequestObject) (ap
 	if err := a.requireDeveloperOrAbove(ctx); err != nil {
 		return nil, err
 	}
-	logger.Info(ctx, "GetWorkers called")
+	logger.Debug(ctx, "GetWorkers called")
 
 	errors := []string{}
 	workers := []api.Worker{}

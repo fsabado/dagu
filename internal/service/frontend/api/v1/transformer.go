@@ -14,6 +14,7 @@ import (
 	"github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/humantask"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -204,15 +205,14 @@ func toStep(obj ir.Step) api.Step {
 
 	if obj.HumanTask != nil {
 		humanTask := &api.HumanTaskConfig{Prompt: obj.HumanTask.Prompt}
-		if len(obj.HumanTask.Form) > 0 {
-			var form map[string]any
-			decoder := json.NewDecoder(bytes.NewReader(obj.HumanTask.Form))
-			decoder.UseNumber()
-			if err := decoder.Decode(&form); err == nil && form != nil {
-				var extra any
-				if err := decoder.Decode(&extra); err == io.EOF {
-					humanTask.Form = &form
-				}
+		if len(obj.HumanTask.Artifacts) > 0 {
+			humanTask.Artifacts = ptrOf(append([]string(nil), obj.HumanTask.Artifacts...))
+		}
+		humanTask.Form = toHumanTaskForm(obj.HumanTask.Form)
+		if pushBack := obj.HumanTask.PushBack; pushBack != nil {
+			humanTask.PushBack = &api.HumanTaskPushBackConfig{
+				RewindTo: pushBack.RewindTo,
+				Form:     toHumanTaskForm(pushBack.Form),
 			}
 		}
 		step.HumanTask = humanTask
@@ -249,9 +249,10 @@ func toStep(obj ir.Step) api.Step {
 
 func toPrecondition(obj *ir.Condition) api.Condition {
 	condition := api.Condition{
-		Expected: ptrOf(obj.Expected),
-		Negate:   ptrOf(obj.Negate),
-		Error:    ptrOf(""),
+		Expected:    ptrOf(obj.Expected),
+		ExpectedAny: ptrOf(obj.ExpectedAny),
+		Negate:      ptrOf(obj.Negate),
+		Error:       ptrOf(""),
 	}
 	if obj.Condition != "" {
 		condition.Condition = ptrOf(obj.Condition)
@@ -266,6 +267,21 @@ func toPreconditionResult(result ir.ConditionResult) api.Condition {
 	condition := toPrecondition(&result.Condition)
 	condition.Error = ptrOf(result.Error)
 	return condition
+}
+
+// toDAGRunProcess reports the operating system process executing a DAG-run on
+// this host, and nil when there is none to report. A finished or waiting
+// DAG-run names a process that has already exited, and a DAG-run executed by a
+// worker names a process in that worker host's identifier namespace, so
+// neither is answerable here.
+func toDAGRunProcess(s ir.DAGRunStatus) *api.DAGRunProcess {
+	if s.Status != ir.Running || dispatch.IsRemoteWorkerID(s.WorkerID) {
+		return nil
+	}
+	if s.PID <= 0 || s.PIDStartedAt <= 0 {
+		return nil
+	}
+	return &api.DAGRunProcess{Pid: int(s.PID), StartedAtMs: s.PIDStartedAt}
 }
 
 func toTriggerType(t ir.TriggerType) *api.TriggerType {
@@ -351,6 +367,7 @@ func toDAGRunSummary(s ir.DAGRunStatus) api.DAGRunSummary {
 		Status:             api.Status(s.Status),
 		StatusLabel:        api.StatusLabel(s.Status.String()),
 		WorkerId:           ptrOf(s.WorkerID),
+		Process:            toDAGRunProcess(s),
 		TriggerType:        toTriggerType(s.TriggerType),
 		TriggerActor:       ptrOf(s.TriggerActor),
 		Labels:             &s.Labels,
@@ -392,10 +409,19 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 	if s.AutoRetryLimit > 0 {
 		autoRetryLimit = ptrOf(s.AutoRetryLimit)
 	}
+	var runError *string
+	if s.Error != "" {
+		runError = ptrOf(s.Error)
+	}
 	artifactsAvailable := hasArtifactEntries(s.ArchiveDir)
 	var humanTaskResumePending *bool
 	if humantask.ResumePending(&s) {
 		humanTaskResumePending = ptrOf(true)
+	}
+
+	var approvalPending *bool
+	if approvalResumePending(&s) {
+		approvalPending = ptrOf(true)
 	}
 
 	return api.DAGRunDetails{
@@ -412,6 +438,7 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 		Params:                 ptrOf(s.Params),
 		DagRunId:               s.DAGRunID,
 		Workspace:              workspaceResponseNameFromLabelStrings(s.Labels),
+		Error:                  runError,
 		ProfileName:            toRuntimeProfileName(s.ProfileName),
 		QueuedAt:               ptrOf(s.QueuedAt),
 		AutoRetryCount:         s.AutoRetryCount,
@@ -423,7 +450,9 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 		Status:                 api.Status(s.Status),
 		StatusLabel:            api.StatusLabel(s.Status.String()),
 		WorkerId:               ptrOf(s.WorkerID),
+		Process:                toDAGRunProcess(s),
 		HumanTaskResumePending: humanTaskResumePending,
+		ApprovalResumePending:  approvalPending,
 		TriggerType:            toTriggerType(s.TriggerType),
 		TriggerActor:           ptrOf(s.TriggerActor),
 		Preconditions:          ptrOf(preconditions),
@@ -547,7 +576,7 @@ func toAgentSession(session *ir.AgentSession) *api.AgentSession {
 			Id: interaction.ID, Kind: api.AgentInteractionKind(interaction.Kind), Status: api.AgentInteractionStatus(interaction.Status),
 			Permission: ptrOf(interaction.Permission), Patterns: ptrOf(interaction.Patterns), AllowForSessionPatterns: ptrOf(interaction.AllowForSessionPatterns),
 			Questions: ptrOf(questions), Decision: ptrOf(interaction.Decision), Answers: ptrOf(interaction.Answers),
-			CreatedAt: ptrOf(interaction.CreatedAt), RespondedAt: ptrOf(interaction.RespondedAt),
+			CreatedAt: ptrOf(interaction.CreatedAt), ExpiresAt: ptrOf(interaction.ExpiresAt), RespondedAt: ptrOf(interaction.RespondedAt),
 			RespondedBy: ptrOf(interaction.RespondedBy), RespondedById: ptrOf(interaction.RespondedByID),
 		})
 	}
@@ -573,6 +602,25 @@ func toAgentSessionEvent(event ir.AgentSessionEvent) api.AgentSessionEvent {
 		Timestamp: ptrOf(event.Timestamp), Role: ptrOf(event.Role), Content: ptrOf(event.Content),
 		Name: ptrOf(event.Name), Status: ptrOf(event.Status), Files: ptrOf(event.Files),
 	}
+}
+
+// toHumanTaskForm decodes a stored human-task form, keeping number precision.
+// It returns nil for an empty or unreadable form.
+func toHumanTaskForm(raw json.RawMessage) *map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var form map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&form); err != nil || form == nil {
+		return nil
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil
+	}
+	return &form
 }
 
 func toPushBackHistory(node *ir.Node) []api.PushBackHistoryEntry {
@@ -696,6 +744,7 @@ func toDAGDetails(dag *ir.DAG) *api.DAGDetails {
 		Params:            ptrOf(dag.Params),
 		ParamDefs:         paramDefs,
 		ParamSchema:       paramSchema,
+		Queue:             ptrOf(dag.Queue),
 		Preconditions:     ptrOf(preconditions),
 		Resources:         toDAGResources(dag.Resources),
 		Schedule:          ptrOf(schedules),

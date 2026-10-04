@@ -21,6 +21,9 @@ type ExecutorCapabilities struct {
 	Script bool
 	// Shell indicates whether the executor uses shell/shellArgs/shellPackages.
 	Shell bool
+	// Stdin indicates whether the executor supports the stdin field for piping
+	// a file's contents to the command's standard input.
+	Stdin bool
 	// Container indicates whether the executor supports step-level container config.
 	Container bool
 	// SubDAG indicates whether the executor can execute sub-DAGs.
@@ -29,10 +32,21 @@ type ExecutorCapabilities struct {
 	WorkerSelector bool
 	// LLM indicates whether the executor supports the llm field.
 	LLM bool
+	// Messages indicates whether the executor takes the messages field and
+	// requires at least one message when an llm config is present.
+	Messages bool
 	// CommandContext returns command execution facts for command field resolution.
 	CommandContext func(ctx context.Context, step ir.Step) cmnvalue.CommandContext
 	// ScriptContext returns command execution facts for script field resolution.
 	ScriptContext func(ctx context.Context, step ir.Step) cmnvalue.CommandContext
+	// DryRunCheck reports what a dry run can tell will fail on this host, such
+	// as a file the step reads that does not exist, without running the step.
+	// It receives the declared step with its with fields resolved as far as a
+	// dry run can; a value that still holds a reference, such as a step
+	// output, is left as written and the check must skip it. The error's text
+	// is shown as a warning and never fails the dry run; several problems can
+	// be joined into one error.
+	DryRunCheck func(ctx context.Context, step ir.Step) error
 }
 
 // executorCapabilitiesRegistry is a typed registry of executor capabilities.

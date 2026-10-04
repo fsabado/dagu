@@ -15,6 +15,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	fileartifact "github.com/dagucloud/dagu/v2/internal/persis/file/artifact"
 	"github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
@@ -26,10 +27,12 @@ import (
 type Persistence struct {
 	DAGRepository             *persis.DAGRepository
 	DAGRunRepository          *persis.DAGRunRepository
+	ArtifactRepository        *persis.ArtifactRepository
 	ProcRepository            *persis.ProcRepository
 	QueueStore                queue.QueueStore
 	StateStore                dagrun.StateStore
 	SchedulerStateStore       schedulerstate.Store
+	SchedulerPauseStore       schedulerstate.PauseStore
 	ServiceRegistry           serviceregistry.ServiceRegistry
 	DispatchTaskStore         dispatch.DispatchTaskStore
 	WorkerHeartbeatStore      dispatch.WorkerHeartbeatStore
@@ -39,8 +42,9 @@ type Persistence struct {
 }
 
 type filePersistenceOptions struct {
-	DAGCache          *fileutil.Cache[*ir.DAG]
-	DAGRunStatusCache *fileutil.Cache[*ir.DAGRunStatus]
+	DAGCache            *fileutil.Cache[*ir.DAG]
+	DAGRunStatusCache   *fileutil.Cache[*ir.DAGRunStatus]
+	ArtifactRecordCache *fileutil.Cache[*fileartifact.Record]
 }
 
 func newFilePersistence(
@@ -64,6 +68,12 @@ func newFilePersistence(
 	dagRunOpts = append(dagRunOpts, file.WithDAGRunRemovalEnqueuer(cleanupQueue))
 	dagRunRepository := file.NewDAGRunRepository(cfg, dagRunOpts...)
 
+	var artifactOpts []file.ArtifactRepositoryOption
+	if opts.ArtifactRecordCache != nil {
+		artifactOpts = append(artifactOpts, file.WithArtifactRecordCache(opts.ArtifactRecordCache))
+	}
+	artifactRepository := file.NewArtifactRepository(cfg, artifactOpts...)
+
 	dagRunLeaseStore := store.NewDAGRunLeaseStore(
 		backend.Collection(persis.CollectionDAGRunLeases),
 	)
@@ -73,6 +83,9 @@ func newFilePersistence(
 	queueStore := store.NewQueueStore(backend.Collection(persis.CollectionQueue))
 	stateStore := store.NewDAGStateStore(backend.Collection(persis.CollectionDAGState))
 	schedulerStateStore := store.NewSchedulerStateStore(
+		backend.Collection(persis.CollectionSchedulerState),
+	)
+	schedulerPauseStore := store.NewSchedulerPauseStore(
 		backend.Collection(persis.CollectionSchedulerState),
 	)
 	serviceRegistry := file.NewServiceRegistry(cfg)
@@ -96,10 +109,12 @@ func newFilePersistence(
 	return Persistence{
 		DAGRepository:             dagRepository,
 		DAGRunRepository:          dagRunRepository,
+		ArtifactRepository:        artifactRepository,
 		ProcRepository:            procRepository,
 		QueueStore:                queueStore,
 		StateStore:                stateStore,
 		SchedulerStateStore:       schedulerStateStore,
+		SchedulerPauseStore:       schedulerPauseStore,
 		ServiceRegistry:           serviceRegistry,
 		DispatchTaskStore:         dispatchTaskStore,
 		WorkerHeartbeatStore:      workerHeartbeatStore,

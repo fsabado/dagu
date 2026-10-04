@@ -17,6 +17,7 @@ import (
 	daguapi "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/dagsettings"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	persisfile "github.com/dagucloud/dagu/v2/internal/persis/file"
 	filedag "github.com/dagucloud/dagu/v2/internal/persis/file/dag"
@@ -720,6 +721,7 @@ func TestServerExposesReferenceResourcesAndPrompts(t *testing.T) {
 	require.Contains(t, authoring.Contents[0].Text, "Build workflows are local-only")
 	require.Contains(t, authoring.Contents[0].Text, "schedule profile is an activation filter")
 	require.Contains(t, authoring.Contents[0].Text, "target=dag_profile")
+	require.Contains(t, authoring.Contents[0].Text, "output_schema answers through a forced respond tool")
 
 	prompts, err := session.ListPrompts(ctx, nil)
 	require.NoError(t, err)
@@ -774,6 +776,159 @@ func TestReadToolListsAndReadsAltDAGsDir(t *testing.T) {
 	spec := callTool(t, ctx, session, toolRead, readInput{Target: readTargetDAGSpec, Name: "alt-dag"})
 	require.False(t, spec.IsError)
 	require.Contains(t, structuredJSON(t, spec), "name: alt-dag")
+}
+
+func TestReferenceCollectionResource(t *testing.T) {
+	ctx := context.Background()
+	session := connectTestClient(t, ctx, NewServer(nil))
+
+	resources, err := session.ListResources(ctx, nil)
+	require.NoError(t, err)
+	collection := findResource(t, resources.Resources, readResourceReferenceCollectionURI)
+	require.Equal(t, resourceMIMEJSON, collection.MIMEType)
+
+	read, err := session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: readResourceReferenceCollectionURI})
+	require.NoError(t, err)
+	require.Len(t, read.Contents, 1)
+	require.Equal(t, readResourceReferenceCollectionURI, read.Contents[0].URI)
+	require.Equal(t, resourceMIMEJSON, read.Contents[0].MIMEType)
+	require.Contains(t, read.Contents[0].Text, `"uri":"dagu://reference/authoring"`)
+	require.Contains(t, read.Contents[0].Text, `"uri":"dagu://reference/read-tool"`)
+
+	// Reference resources accept no query parameters.
+	svc := &Service{}
+	_, _, err = svc.readResourceText(ctx, readResourceReferenceCollectionURI+"?unknown=1")
+	require.Error(t, err)
+}
+
+func TestRunsCollectionResource(t *testing.T) {
+	ctx := context.Background()
+	dagStore := testutil.NewFileDAGRepository(t.TempDir(), filedag.WithSkipExamples(true))
+	require.NoError(t, dagStore.Create(ctx, "run-dag", []byte("name: run-dag\nsteps: []\n")))
+
+	runRepo := testutil.NewFileDAGRunRepository(filepath.Join(t.TempDir(), "dag-runs"), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "run-dag", Labels: ir.NewLabels([]string{"env=prod", "team=backend"})}
+	attempt, err := runRepo.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	require.NoError(t, attempt.Open(ctx))
+	status := ir.InitialStatus(dag)
+	status.DAGRunID = "run-1"
+	status.Status = ir.Succeeded
+	require.NoError(t, attempt.Write(ctx, status))
+	require.NoError(t, attempt.Close(ctx))
+
+	api := frontendapi.New(dagStore, runRepo, nil, nil, runtime.Manager{}, &config.Config{}, nil, nil, prometheus.NewRegistry(), nil)
+	session := connectTestClient(t, ctx, NewServer(api))
+
+	resources, err := session.ListResources(ctx, nil)
+	require.NoError(t, err)
+	collection := findResource(t, resources.Resources, readResourceRunsCollectionURI)
+	require.Equal(t, resourceMIMEJSON, collection.MIMEType)
+
+	read, err := session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: readResourceRunsCollectionURI})
+	require.NoError(t, err)
+	require.Len(t, read.Contents, 1)
+	require.Equal(t, readResourceRunsCollectionURI, read.Contents[0].URI)
+	require.Equal(t, resourceMIMEJSON, read.Contents[0].MIMEType)
+	require.Contains(t, read.Contents[0].Text, `"name":"run-dag"`)
+	require.Contains(t, read.Contents[0].Text, `"dagRunId":"run-1"`)
+	require.Contains(t, read.Contents[0].Text, `"uri":"dagu://runs/run-dag/run-1"`)
+
+	// Query-bearing collection URIs route through the resource template and
+	// follow the same query rules as dagu_read URI mode.
+	filtered, err := session.ReadResource(ctx, &mcpsdk.ReadResourceParams{
+		URI: readResourceRunsCollectionURI + "?name=run-dag&limit=10",
+	})
+	require.NoError(t, err)
+	require.Len(t, filtered.Contents, 1)
+	require.Equal(t, resourceMIMEJSON, filtered.Contents[0].MIMEType)
+	require.Contains(t, filtered.Contents[0].Text, `"dagRunId":"run-1"`)
+
+	assertCollectionQueryEncoding(t, ctx, session, readResourceRunsCollectionURI, dag.Name)
+
+	_, err = session.ReadResource(ctx, &mcpsdk.ReadResourceParams{
+		URI: readResourceRunsCollectionURI + "?bogus=*",
+	})
+	require.Error(t, err)
+}
+
+func TestDAGsCollectionResource(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	altDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(altDir, "alt-dag.yaml"), []byte("name: alt-dag\nlabels: [env=prod, team=backend]\nsteps: []\n"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(baseDir, "main-dag.yaml"), []byte("name: main-dag\nsteps: []\n"), 0600))
+
+	cfg := &config.Config{}
+	cfg.Paths.DAGsDir = baseDir
+	cfg.Paths.AltDAGsDir = altDir
+	cfg.Core.SkipExamples = true
+
+	repo, err := persisfile.NewDAGRepository(cfg, persisfile.WithDAGSearchPaths([]string{altDir}))
+	require.NoError(t, err)
+	api := frontendapi.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil)
+	session := connectTestClient(t, ctx, NewServer(api))
+
+	resources, err := session.ListResources(ctx, nil)
+	require.NoError(t, err)
+	collection := findResource(t, resources.Resources, readResourceDAGsCollectionURI)
+	require.Equal(t, resourceMIMEJSON, collection.MIMEType)
+
+	read, err := session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: readResourceDAGsCollectionURI})
+	require.NoError(t, err)
+	require.Len(t, read.Contents, 1)
+	require.Equal(t, readResourceDAGsCollectionURI, read.Contents[0].URI)
+	require.Equal(t, resourceMIMEJSON, read.Contents[0].MIMEType)
+	require.Contains(t, read.Contents[0].Text, `"name":"alt-dag"`)
+	require.Contains(t, read.Contents[0].Text, `"uri":"dagu://dags/alt-dag/spec"`)
+	require.Contains(t, read.Contents[0].Text, `"name":"main-dag"`)
+	require.Contains(t, read.Contents[0].Text, `"uri":"dagu://dags/main-dag/spec"`)
+
+	filtered, err := session.ReadResource(ctx, &mcpsdk.ReadResourceParams{
+		URI: readResourceDAGsCollectionURI + "?name=alt-dag&perPage=20",
+	})
+	require.NoError(t, err)
+	require.Len(t, filtered.Contents, 1)
+	require.Equal(t, resourceMIMEJSON, filtered.Contents[0].MIMEType)
+	require.Contains(t, filtered.Contents[0].Text, `"name":"alt-dag"`)
+	require.NotContains(t, filtered.Contents[0].Text, `"name":"main-dag"`)
+
+	assertCollectionQueryEncoding(t, ctx, session, readResourceDAGsCollectionURI, "alt-dag")
+
+	// Serving the filtered form must not widen the accepted parameter set.
+	_, err = session.ReadResource(ctx, &mcpsdk.ReadResourceParams{
+		URI: readResourceDAGsCollectionURI + "?bogus=*",
+	})
+	require.Error(t, err)
+}
+
+func assertCollectionQueryEncoding(t *testing.T, ctx context.Context, session *mcpsdk.ClientSession, baseURI, wantName string) {
+	t.Helper()
+
+	for _, query := range []string{
+		"labels=env=pr*",
+		"labels=env%3Dpr%2A",
+		"labels=env%3Dprod%2C+team%3Dbackend",
+		"labels=env%3Dprod%2C%20team%3Dbackend",
+	} {
+		t.Run(query, func(t *testing.T) {
+			tool := callTool(t, ctx, session, toolRead, readInput{URI: baseURI + "?" + query})
+			require.False(t, tool.IsError)
+			data, err := json.Marshal(structuredMap(t, tool)["data"])
+			require.NoError(t, err)
+			require.Contains(t, string(data), `"name":"`+wantName+`"`)
+
+			// Resource links must remain readable with the tool's query encoding.
+			require.Len(t, tool.Content, 2)
+			link, ok := tool.Content[1].(*mcpsdk.ResourceLink)
+			require.True(t, ok)
+			read, err := session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: link.URI})
+			require.NoError(t, err)
+			require.Len(t, read.Contents, 1)
+			require.Equal(t, resourceMIMEJSON, read.Contents[0].MIMEType)
+			require.JSONEq(t, string(data), read.Contents[0].Text)
+		})
+	}
 }
 
 func TestReadToolCanReadReferenceResource(t *testing.T) {
@@ -1048,6 +1203,155 @@ func TestNormalizeRunDetailsIncludesRunHierarchy(t *testing.T) {
 	}, subRuns)
 }
 
+func TestNormalizeRunDetailsDescribesWaitingSteps(t *testing.T) {
+	t.Parallel()
+
+	form := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"environment": map[string]any{"type": "string"},
+		},
+	}
+	stepID := "release_review"
+	approvalPrompt := "Approve the deployment"
+	approvalInput := []string{"ticket"}
+	rewindTo := "build"
+	raw := daguapi.GetDAGRunDetails200JSONResponse{
+		DagRunDetails: daguapi.DAGRunDetails{
+			Name:        "release",
+			DagRunId:    "run-1",
+			Status:      daguapi.StatusWaiting,
+			StatusLabel: "waiting",
+			Nodes: []daguapi.Node{
+				{
+					Step: daguapi.Step{
+						Name:      "release_review",
+						Id:        &stepID,
+						HumanTask: &daguapi.HumanTaskConfig{Prompt: "Choose the release target", Form: &form},
+					},
+					Status:      daguapi.NodeStatusWaiting,
+					StatusLabel: "waiting",
+				},
+				{
+					// An acknowledgement-only task declares no form.
+					Step: daguapi.Step{
+						Name:      "acknowledge",
+						HumanTask: &daguapi.HumanTaskConfig{Prompt: "Confirm maintenance has started"},
+					},
+					Status:      daguapi.NodeStatusWaiting,
+					StatusLabel: "waiting",
+				},
+				{
+					// An approval gate parks a step the same way a human task does.
+					// rewindTo describes push-back, which is not the approver's input.
+					Step: daguapi.Step{
+						Name: "deploy_gate",
+						Approval: &daguapi.ApprovalConfig{
+							Prompt:   &approvalPrompt,
+							Input:    &approvalInput,
+							Required: &approvalInput,
+							RewindTo: &rewindTo,
+						},
+					},
+					Status:      daguapi.NodeStatusWaiting,
+					StatusLabel: "waiting",
+				},
+			},
+		},
+	}
+
+	data, err := normalizeRunDetails(raw, runAddress{})
+	require.NoError(t, err)
+
+	steps, ok := data["steps"].([]map[string]any)
+	require.True(t, ok)
+	require.Equal(t, map[string]any{
+		"prompt": "Choose the release target",
+		"form":   form,
+	}, steps[0]["humanTask"])
+	require.Equal(t, map[string]any{"prompt": "Confirm maintenance has started"}, steps[1]["humanTask"])
+	require.Equal(t, map[string]any{
+		"prompt":   approvalPrompt,
+		"input":    approvalInput,
+		"required": approvalInput,
+	}, steps[2]["approval"])
+}
+
+// A run whose human-task input was accepted still reports itself as waiting
+// until its retry is queued, with no step waiting on an operator.
+func TestNormalizeRunDetailsFlagsPendingHumanTaskResume(t *testing.T) {
+	t.Parallel()
+
+	resumePending := true
+	raw := daguapi.GetDAGRunDetails200JSONResponse{
+		DagRunDetails: daguapi.DAGRunDetails{
+			Name:                   "release",
+			DagRunId:               "run-2",
+			Status:                 daguapi.StatusWaiting,
+			StatusLabel:            "waiting",
+			HumanTaskResumePending: &resumePending,
+			Nodes: []daguapi.Node{
+				{
+					Step: daguapi.Step{
+						Name:      "release_review",
+						HumanTask: &daguapi.HumanTaskConfig{Prompt: "Choose the release target"},
+					},
+					Status:      daguapi.NodeStatusSuccess,
+					StatusLabel: "finished",
+				},
+			},
+		},
+	}
+
+	data, err := normalizeRunDetails(raw, runAddress{})
+	require.NoError(t, err)
+	require.Equal(t, true, data["humanTaskResumePending"])
+
+	steps, ok := data["steps"].([]map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, steps[0], "humanTask")
+}
+
+func TestHasWaitingStep(t *testing.T) {
+	t.Parallel()
+
+	waitingHumanTask := daguapi.Node{
+		Step:   daguapi.Step{Name: "release_review", HumanTask: &daguapi.HumanTaskConfig{Prompt: "Choose the release target"}},
+		Status: daguapi.NodeStatusWaiting,
+	}
+	waitingApproval := daguapi.Node{
+		Step:   daguapi.Step{Name: "deploy_gate", Approval: &daguapi.ApprovalConfig{}},
+		Status: daguapi.NodeStatusWaiting,
+	}
+	answered := daguapi.Node{
+		Step:   daguapi.Step{Name: "release_review", HumanTask: &daguapi.HumanTaskConfig{Prompt: "Choose the release target"}},
+		Status: daguapi.NodeStatusSuccess,
+	}
+
+	tests := []struct {
+		name  string
+		nodes []daguapi.Node
+		want  bool
+	}{
+		{name: "open human task", nodes: []daguapi.Node{answered, waitingHumanTask}, want: true},
+		{name: "open approval gate", nodes: []daguapi.Node{answered, waitingApproval}, want: true},
+		// The run still reports itself as waiting here, but it resumes on its
+		// own once the retry is queued, so there is nobody to prompt.
+		{name: "answered with resume not yet queued", nodes: []daguapi.Node{answered}, want: false},
+		{name: "no steps", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			run := daguapi.DAGRunDetails{Status: daguapi.StatusWaiting, Nodes: tt.nodes}
+			require.Equal(t, tt.want, hasWaitingStep(run))
+		})
+	}
+}
+
 func TestNormalizeRunListIncludesTimestampsAndCursor(t *testing.T) {
 	t.Parallel()
 
@@ -1145,6 +1449,78 @@ func TestRunLogsURIWithQueryPreservesQuery(t *testing.T) {
 		"dagu://runs/demo%20dag/run%2F1/logs?node=step%201&tail=true",
 		runLogsURIWithQuery("demo dag", "run/1", "node=step%201&tail=true"),
 	)
+}
+
+func TestWatchStateObserve(t *testing.T) {
+	t.Parallel()
+
+	type poll struct {
+		status int
+		notify bool
+		stop   bool
+	}
+	tests := []struct {
+		name  string
+		polls []poll
+	}{
+		{
+			name: "a checkpoint is announced once, not once per poll",
+			polls: []poll{
+				{status: int(ir.Running)},
+				{status: int(ir.Waiting), notify: true},
+				{status: int(ir.Waiting)},
+				{status: int(ir.Waiting)},
+			},
+		},
+		{
+			name: "a second checkpoint is announced after the run resumes",
+			polls: []poll{
+				{status: int(ir.Waiting), notify: true},
+				{status: int(ir.Running)},
+				{status: int(ir.Waiting), notify: true},
+			},
+		},
+		{
+			name: "a resumed run still reports its terminal state",
+			polls: []poll{
+				{status: int(ir.Waiting), notify: true},
+				{status: int(ir.Running)},
+				{status: int(ir.Succeeded), notify: true, stop: true},
+			},
+		},
+		{
+			name: "pre-terminal states stay silent",
+			polls: []poll{
+				{status: int(ir.NotStarted)},
+				{status: int(ir.Queued)},
+				{status: int(ir.Running)},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var state watchState
+			for i, p := range tt.polls {
+				notify, stop := state.observe(p.status)
+				require.Equalf(t, p.notify, notify, "poll %d notify", i)
+				require.Equalf(t, p.stop, stop, "poll %d stop", i)
+			}
+		})
+	}
+}
+
+func TestWatchStateObserveStopsOnEveryTerminalStatus(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []ir.Status{ir.Failed, ir.Aborted, ir.Succeeded, ir.PartiallySucceeded, ir.Rejected} {
+		var state watchState
+		notify, stop := state.observe(int(status))
+		require.Truef(t, notify, "%s must be announced", status)
+		require.Truef(t, stop, "%s must end the watch", status)
+	}
 }
 
 func TestRunWatcherStopsAfterPersistentErrors(t *testing.T) {

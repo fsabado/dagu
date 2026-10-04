@@ -4,13 +4,20 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	filedag "github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
 	"github.com/stretchr/testify/assert"
@@ -511,6 +518,54 @@ func TestTickPlanner_PlanLiveRun(t *testing.T) {
 	assert.Len(t, runs, 1)
 	assert.Equal(t, "live-dag", runs[0].DAG.Name)
 	assert.Equal(t, ir.TriggerTypeScheduler, runs[0].TriggerType)
+}
+
+func TestTickPlanner_PlanEveryInterval(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	eventCh := make(chan DAGChangeEvent, 256)
+	tp := NewTickPlanner(TickPlannerConfig{
+		IsSuspended: func(_ context.Context, _ string) (bool, error) {
+			return false, nil
+		},
+		GetLatestStatus: func(_ context.Context, _ *ir.DAG) (ir.DAGRunStatus, error) {
+			return ir.DAGRunStatus{}, nil
+		},
+		Dispatch: func(_ context.Context, _ DAGEntry, _ string, _ ir.TriggerType, _ time.Time) error {
+			return nil
+		},
+		GenRunID: func(_ context.Context) (string, error) {
+			return "every-run-id", nil
+		},
+		IsRunning: func(_ context.Context, _ *ir.DAG) (bool, error) {
+			return false, nil
+		},
+		Clock: func() time.Time {
+			return start
+		},
+		Events: eventCh,
+	})
+
+	schedule, err := ir.NewCronSchedule("@every 2m")
+	require.NoError(t, err)
+	dag := &ir.DAG{
+		Name:     "every-dag",
+		Schedule: []ir.Schedule{schedule},
+	}
+	require.NoError(t, tp.Init(context.Background(), testDAGEntries(dag)))
+
+	// The epoch-aligned two-minute grid lands on every other minute tick.
+	for i, wantRun := range []bool{true, false, true} {
+		tick := start.Add(time.Duration(i) * time.Minute)
+		runs := tp.Plan(context.Background(), tick)
+		if !wantRun {
+			assert.Empty(t, runs, "tick %s", tick)
+			continue
+		}
+		require.Len(t, runs, 1, "tick %s", tick)
+		assert.True(t, tick.Equal(runs[0].ScheduledTime), "tick %s: got %s", tick, runs[0].ScheduledTime)
+	}
 }
 
 func TestTickPlanner_PlanSuspendedDAGSkipped(t *testing.T) {
@@ -1019,6 +1074,44 @@ func TestTickPlanner_ShouldRunGuardRunning(t *testing.T) {
 	now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
 	runs := tp.Plan(context.Background(), now)
 	assert.Len(t, runs, 0, "should not plan run when DAG is already running")
+}
+
+// A slot skipped because its DAG is busy is logged with the DAG and the slot,
+// so the missing run can be traced.
+func TestPlanLogsBusySkip(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		running bool
+		queued  bool
+		want    string
+	}{
+		{"Running", true, false, "Skipping job because the DAG is running"},
+		{"Queued", false, true, "Skipping job because a run of the DAG is queued"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			logs := &syncBuffer{buf: new(bytes.Buffer)}
+			ctx := logger.WithFixedLogger(t.Context(), logger.NewLogger(
+				logger.WithFormat("text"), logger.WithWriter(logs),
+			))
+			tp, _ := newTestTickPlanner(&mockStateStore{state: newMockState(now.Add(-time.Minute))})
+			tp.cfg.IsRunning = func(context.Context, *ir.DAG) (bool, error) { return tt.running, nil }
+			tp.cfg.IsQueued = func(context.Context, *ir.DAG) (bool, error) { return tt.queued, nil }
+			dag := &ir.DAG{Name: "busy-dag", Schedule: []ir.Schedule{mustParseSchedule(t, "0 * * * *")}}
+			require.NoError(t, tp.Init(ctx, testDAGEntries(dag)))
+
+			require.Empty(t, tp.Plan(ctx, now))
+			out := logs.String()
+			assert.Contains(t, out, tt.want)
+			assert.Contains(t, out, "dag=busy-dag")
+			assert.Contains(t, out, "scheduled-time=2026-02-07T12:00:00")
+		})
+	}
 }
 
 func TestTickPlanner_PlanStopSchedule(t *testing.T) {
@@ -2061,6 +2154,49 @@ func TestTickPlanner_DispatchRunStart(t *testing.T) {
 	assert.Equal(t, scheduledTime, gotScheduleTime, "Dispatch callback should receive the scheduled time")
 }
 
+// A scheduled run of a DAG that names a configured queue waits for capacity
+// instead of starting as its schedule fires.
+func TestTickPlanner_DispatchRunStartQueued(t *testing.T) {
+	t.Parallel()
+
+	var dispatched, enqueued bool
+	tp := NewTickPlanner(TickPlannerConfig{
+		Dispatch: func(_ context.Context, _ DAGEntry, _ string, _ ir.TriggerType, _ time.Time) error {
+			dispatched = true
+			return nil
+		},
+		Enqueue: func(_ context.Context, _ DAGEntry, _ string, _ ir.TriggerType, _ time.Time) error {
+			enqueued = true
+			return nil
+		},
+		QueuesEnabled:  true,
+		HasGlobalQueue: func(dag *ir.DAG) bool { return dag.Queue == "paced" },
+		Events:         make(chan DAGChangeEvent, 1),
+	})
+	require.NoError(t, tp.Init(context.Background(), nil))
+
+	tp.DispatchRun(context.Background(), PlannedRun{
+		DAGEntry:      DAGEntry{DAG: &ir.DAG{Name: "start-dag", Queue: "paced"}},
+		RunID:         "run-1",
+		ScheduledTime: time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC),
+		ScheduleType:  ScheduleTypeStart,
+		TriggerType:   ir.TriggerTypeScheduler,
+	})
+	assert.True(t, enqueued, "a run the queue paces should be enqueued")
+	assert.False(t, dispatched, "a run the queue paces should not start directly")
+
+	enqueued = false
+	tp.DispatchRun(context.Background(), PlannedRun{
+		DAGEntry:      DAGEntry{DAG: &ir.DAG{Name: "own-queue-dag"}},
+		RunID:         "run-2",
+		ScheduledTime: time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC),
+		ScheduleType:  ScheduleTypeStart,
+		TriggerType:   ir.TriggerTypeScheduler,
+	})
+	assert.True(t, dispatched, "a run without a configured queue should start directly")
+	assert.False(t, enqueued, "a run without a configured queue should not be enqueued")
+}
+
 func TestTickPlanner_DispatchRunSuspendedStartSkipped(t *testing.T) {
 	t.Parallel()
 
@@ -2478,6 +2614,134 @@ func TestComputePrevExecTime(t *testing.T) {
 			sched := mustParseSchedule(t, tt.schedule)
 			got := computePrevExecTime(tt.next, sched)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestInheritedScheduling(t *testing.T) {
+	for _, recursive := range []bool{false, true} {
+		for _, workspaceBase := range []bool{false, true} {
+			for _, policy := range []ir.OverlapPolicy{ir.OverlapPolicySkip, ir.OverlapPolicyAll, ir.OverlapPolicyLatest} {
+				t.Run(fmt.Sprintf("Recursive=%t/Workspace=%t/%s", recursive, workspaceBase, policy), func(t *testing.T) {
+					root := t.TempDir()
+					dir := filepath.Join(root, "dags")
+					fileDir := dir
+					if recursive {
+						fileDir = filepath.Join(dir, "nested")
+					}
+					require.NoError(t, os.MkdirAll(fileDir, 0750))
+					path := filepath.Join(fileDir, "scheduled.yaml")
+					require.NoError(t, os.WriteFile(path, []byte("labels: [workspace=ops]\nsteps:\n  - run: echo tick\n"), 0600))
+					basePath := filepath.Join(root, "base.yaml")
+					base := fmt.Sprintf("schedule:\n  start: '* * * * *'\n  stop: '0 0 * * *'\n  restart: '0 1 * * *'\ncatchup_window: 1h\noverlap_policy: %s\nqueue: pool\n", policy)
+					require.NoError(t, os.WriteFile(basePath, []byte(base), 0600))
+					opts := []filedag.Option{filedag.WithSkipExamples(true), filedag.WithBaseConfig(basePath), filedag.WithRecursiveDiscovery(recursive)}
+					loadOpts := []spec.LoadOption{spec.WithBaseConfig(basePath), spec.WithoutEval()}
+					if workspaceBase {
+						workspaceDir := filepath.Join(root, "workspaces")
+						require.NoError(t, os.MkdirAll(filepath.Join(workspaceDir, "ops"), 0750))
+						require.NoError(t, os.WriteFile(filepath.Join(workspaceDir, "ops", "base.yaml"), []byte(base), 0600))
+						require.NoError(t, os.WriteFile(basePath, []byte("queue: global\n"), 0600))
+						opts = append(opts, filedag.WithWorkspaceBaseConfigDir(workspaceDir))
+						loadOpts = append(loadOpts, spec.WithWorkspaceBaseConfigDir(workspaceDir))
+					}
+					repo := testutil.NewFileDAGRepository(dir, opts...)
+					reader := filedag.NewFileEntryReader(dir, repo, recursive, basePath, "")
+					require.NoError(t, reader.Init(t.Context()))
+					t.Cleanup(reader.Stop)
+					entries := reader.Entries()
+					require.Len(t, entries, 1)
+					full, err := spec.Load(t.Context(), path, loadOpts...)
+					require.NoError(t, err)
+					metadata := entries[0].DAG
+					require.Equal(t, full.ProcGroup(), metadata.ProcGroup())
+					require.Equal(t, "pool", metadata.ProcGroup())
+					require.Equal(t, full.Schedule, metadata.Schedule)
+					require.Equal(t, full.StopSchedule, metadata.StopSchedule)
+					require.Equal(t, full.RestartSchedule, metadata.RestartSchedule)
+
+					for _, guard := range []string{"running", "queued"} {
+						t.Run(guard, func(t *testing.T) {
+							now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+							busy := true
+							enqueued := make(map[string]int)
+							newPlanner := func(queues bool) *TickPlanner {
+								planner, _ := newTestTickPlanner(&mockStateStore{state: newMockState(now.Add(-3 * time.Minute))})
+								planner.cfg.QueuesEnabled = queues
+								planner.cfg.IsRunning = func(_ context.Context, dag *ir.DAG) (bool, error) {
+									require.Equal(t, full.ProcGroup(), dag.ProcGroup())
+									return busy && guard == "running", nil
+								}
+								planner.cfg.IsQueued = func(_ context.Context, dag *ir.DAG) (bool, error) {
+									require.Equal(t, full.ProcGroup(), dag.ProcGroup())
+									return busy && guard == "queued", nil
+								}
+								planner.cfg.Enqueue = func(_ context.Context, entry DAGEntry, runID string, _ ir.TriggerType, _ time.Time) error {
+									require.Equal(t, full.ProcGroup(), entry.DAG.ProcGroup())
+									enqueued[runID]++
+									return nil
+								}
+
+								require.NoError(t, planner.Init(t.Context(), entries))
+								return planner
+							}
+							planner := newPlanner(true)
+							require.Empty(t, planner.Plan(t.Context(), now))
+							busy = false
+							runs := planner.Plan(t.Context(), now.Add(time.Minute))
+							require.Len(t, runs, 1)
+							require.Equal(t, ir.TriggerTypeCatchUp, runs[0].TriggerType)
+							var want time.Time
+							switch policy {
+							case ir.OverlapPolicyAll:
+								want = now.Add(-2 * time.Minute)
+							case ir.OverlapPolicySkip:
+								want = now.Add(-time.Minute)
+							case ir.OverlapPolicyLatest:
+								want = now
+							}
+							require.True(t, want.Equal(runs[0].ScheduledTime))
+							planner.DispatchRun(t.Context(), runs[0])
+							require.Equal(t, 1, enqueued[runs[0].RunID])
+							disabled := newPlanner(false)
+							runs = disabled.Plan(t.Context(), now)
+							require.Len(t, runs, 1)
+							require.Equal(t, ir.TriggerTypeScheduler, runs[0].TriggerType)
+						})
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestBaseRefreshUpdatesPlanner(t *testing.T) {
+	for _, recursive := range []bool{false, true} {
+		t.Run(fmt.Sprint(recursive), func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "dags")
+			require.NoError(t, os.MkdirAll(dir, 0750))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "scheduled.yaml"), []byte("name: scheduled\nsteps:\n  - run: echo tick\n"), 0600))
+			base := filepath.Join(root, "base.yaml")
+			require.NoError(t, os.WriteFile(base, []byte("queue: old\nschedule: '0 * * * *'\n"), 0600))
+			repo := testutil.NewFileDAGRepository(dir, filedag.WithBaseConfig(base), filedag.WithRecursiveDiscovery(recursive))
+			reader := filedag.NewFileEntryReader(dir, repo, recursive, base, "")
+			require.NoError(t, reader.Init(t.Context()))
+			t.Cleanup(reader.Stop)
+			planner, _ := newTestTickPlanner(nil)
+			require.NoError(t, planner.Init(t.Context(), reader.Entries()))
+			require.NoError(t, os.WriteFile(base, []byte("queue: updated\nschedule: '*/5 * * * *'\n"), 0600))
+			go reader.Start(t.Context())
+			select {
+			case event := <-reader.Events():
+				require.Equal(t, DAGChangeUpdated, event.Type)
+				planner.handleEvent(t.Context(), event)
+			case <-time.After(3 * time.Second):
+				t.Fatal("base update did not notify the planner")
+			}
+			dag := planner.entries["scheduled"].DAG
+			require.Equal(t, "updated", dag.ProcGroup())
+			require.Equal(t, "*/5 * * * *", dag.Schedule[0].Expression)
 		})
 	}
 }

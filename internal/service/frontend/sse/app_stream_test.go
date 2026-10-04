@@ -4,6 +4,7 @@
 package sse
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,6 +16,35 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 )
+
+func TestLegacySuspendFlagEvent(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	legacy := filepath.Join(root, "legacy")
+	require.NoError(t, os.Mkdir(legacy, 0o750))
+	flag := filepath.Join(legacy, "alpha.suspend")
+	require.NoError(t, os.WriteFile(flag, nil, 0o600))
+	service, err := NewAppStreamService(AppStreamConfig{
+		Paths: config.PathsConfig{
+			SuspendFlagsDir:       filepath.Join(root, "suspend"),
+			SuspendFlagsDirLegacy: legacy,
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(service.Shutdown)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events, unsubscribe := service.Subscribe(ctx)
+	defer unsubscribe()
+	require.NoError(t, os.Remove(flag))
+	select {
+	case event := <-events:
+		assert.Equal(t, AppEventTypeDAGChanged, event.Type)
+		assert.Equal(t, "suspend_flag_removed", event.Reason)
+	case <-ctx.Done():
+		t.Fatal("legacy flag removal did not trigger a DAG refresh")
+	}
+}
 
 type recordingFileWatcher struct {
 	added []string
@@ -155,6 +185,36 @@ func TestHandleWikiPageEventSkipsAttachmentPaths(t *testing.T) {
 		assert.Equal(t, AppEventTypeWiki, event.Type)
 		assert.Equal(t, "guide/page", event.Path)
 	}
+}
+
+// The pause flag and the watermark share a directory, and both have to invalidate
+// DAG listings so next-run columns stay truthful.
+func TestHandleSchedulerStateEventCoversWatermarkAndPause(t *testing.T) {
+	newService := func(t *testing.T) *AppStreamService {
+		t.Helper()
+		coalescer := newAppEventCoalescer(time.Hour, func(AppEvent) {})
+		t.Cleanup(func() {
+			coalescer.mu.Lock()
+			defer coalescer.mu.Unlock()
+			if coalescer.timer != nil {
+				coalescer.timer.Stop()
+			}
+		})
+		return &AppStreamService{coalescer: coalescer}
+	}
+
+	for _, name := range []string{schedulerStateFileName, schedulerPauseFileName} {
+		service := newService(t)
+		service.handleSchedulerStateEvent("", name, fsnotify.Write)
+		require.Len(t, service.coalescer.pending, 1, "expected %s to raise an event", name)
+		for _, event := range service.coalescer.pending {
+			assert.Equal(t, AppEventTypeScheduler, event.Type)
+		}
+	}
+
+	service := newService(t)
+	service.handleSchedulerStateEvent("", "locks/some.lock", fsnotify.Write)
+	assert.Empty(t, service.coalescer.pending)
 }
 
 func TestMarkdownPollingWatcherEmitsOnlyMarkdownEvents(t *testing.T) {

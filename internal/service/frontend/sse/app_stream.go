@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/filenotify"
 	persisfile "github.com/dagucloud/dagu/v2/internal/persis/file"
-	"github.com/dagucloud/dagu/v2/internal/service/scheduler/filenotify"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -24,6 +24,7 @@ const (
 	appStreamDebounceInterval  = 200 * time.Millisecond
 	wikiPollingInterval        = 30 * time.Second
 	schedulerStateFileName     = "state.json"
+	schedulerPauseFileName     = "paused.json"
 )
 
 type AppEventType string
@@ -671,9 +672,16 @@ func NewAppStreamService(cfg AppStreamConfig) (*AppStreamService, error) {
 	}
 	service.watchers = append(service.watchers,
 		newWikiDirectoryWatcher(cfg.Paths.WikiDir, true, service.handleWikiPageEvent, service.publishReset),
-		newDirectoryWatcher(cfg.Paths.SuspendFlagsDir, true, service.handleSuspendFlagEvent, service.publishReset),
 		newOneLevelDirectoryWatcher(cfg.Paths.QueueDir, true, service.handleQueueEvent, service.publishReset),
 	)
+	for _, flagsDir := range uniqueNonEmptyPaths(cfg.Paths.SuspendFlagsDir, cfg.Paths.SuspendFlagsDirLegacy) {
+		service.watchers = append(service.watchers, newDirectoryWatcher(
+			flagsDir,
+			flagsDir == filepath.Clean(cfg.Paths.SuspendFlagsDir),
+			service.handleSuspendFlagEvent,
+			service.publishReset,
+		))
+	}
 
 	for _, watcher := range service.watchers {
 		if watcher == nil {
@@ -747,7 +755,9 @@ func (s *AppStreamService) handleSuspendFlagEvent(_, relPath string, op fsnotify
 }
 
 func (s *AppStreamService) handleSchedulerStateEvent(_, relPath string, op fsnotify.Op) {
-	if filepath.ToSlash(relPath) != schedulerStateFileName {
+	switch filepath.ToSlash(relPath) {
+	case schedulerStateFileName, schedulerPauseFileName:
+	default:
 		return
 	}
 	s.coalescer.Enqueue(AppEvent{

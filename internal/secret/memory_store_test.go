@@ -155,6 +155,10 @@ func (s *memoryStoreForTest) ResolveValue(_ context.Context, id string) (string,
 	return value, cloneVersion(s.versions[id]), nil
 }
 
+func (s *memoryStoreForTest) ReadValue(ctx context.Context, id string) (string, *VersionMetadata, error) {
+	return s.ResolveValue(ctx, id)
+}
+
 func (s *memoryStoreForTest) writeValueLocked(id string, input WriteValueInput) {
 	sec := s.secrets[id]
 	version := sec.CurrentVersion + 1

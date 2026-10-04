@@ -11,9 +11,11 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/eventstore"
+	filedag "github.com/dagucloud/dagu/v2/internal/persis/file/dag"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
 	schedulerfile "github.com/dagucloud/dagu/v2/internal/service/scheduler/file"
+	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/spf13/cobra"
 )
 
@@ -56,6 +58,13 @@ func newScheduler(ctx *Context, deps scheduler.Dependencies) (*scheduler.Schedul
 		ctx.Config,
 		runtime.WithLatestStatusAllHistory(),
 	)
+	if deps.EntryReader == nil {
+		deps.EntryReader = filedag.NewFileEntryReader(
+			ctx.Config.Paths.DAGsDir, ctx.Persistence.DAGRepository,
+			ctx.Config.DAGDiscovery.Recursive, ctx.Config.Paths.BaseConfig,
+			workspace.BaseConfigDir(ctx.Config.Paths.DAGsDir),
+		)
+	}
 	deps.DAGRepository = ctx.Persistence.DAGRepository
 	deps.DAGRunRepository = ctx.Persistence.DAGRunRepository
 	deps.QueueStore = ctx.Persistence.QueueStore
@@ -63,6 +72,7 @@ func newScheduler(ctx *Context, deps scheduler.Dependencies) (*scheduler.Schedul
 	deps.ServiceRegistry = ctx.Persistence.ServiceRegistry
 	deps.CoordinatorClient = coordinatorClient
 	deps.SchedulerStateStore = ctx.Persistence.SchedulerStateStore
+	deps.SchedulerPauseStore = ctx.Persistence.SchedulerPauseStore
 	deps.DAGRunLeaseStore = ctx.Persistence.DAGRunLeaseStore
 	deps.DispatchTaskStore = ctx.Persistence.DispatchTaskStore
 	deps.WorkerHeartbeatStore = ctx.Persistence.WorkerHeartbeatStore
@@ -88,7 +98,9 @@ func runScheduler(ctx *Context, _ []string) error {
 		slog.String("log-format", ctx.Config.Core.LogFormat),
 	)
 
+	ctx.Context = ctx.withSignalPropagation(ctx.Context)
 	schedulerCtx := ctx.WithEventSource(eventstore.SourceServiceScheduler)
+	startBrowserReaper(schedulerCtx, ctx.Config.Paths.DataDir, ctx.Persistence.DAGRunRepository)
 	scheduler, err := newScheduler(schedulerCtx, deps)
 	if err != nil {
 		return fmt.Errorf("failed to initialize scheduler: %w", err)

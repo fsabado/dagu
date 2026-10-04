@@ -20,6 +20,9 @@ Flags:
 - `--name/-N` — Override DAG name
 - `--run-id/-r` — Custom run ID
 - `--from-run-id` — Historic dag-run ID to use as the template for a new run
+- `--only` — Run only this step (name or ID) in a new run of the current definition; repeatable. Other steps are recorded as skipped. Not with `--from-run-id`
+- `--outputs-from` — Finished run of the same DAG whose step outputs and work directory feed the `--only` steps (requires `--only`)
+- `--output` — Output of a step skipped by `--only`, as `<step>.<name>=<value>`; repeatable, takes precedence over `--outputs-from` (requires `--only`)
 - `--labels` — Additional labels (comma-separated key=value or key-only)
 - `--tags` — Deprecated alias for `--labels`
 - `--default-working-dir` — Default working directory for DAGs without explicit workingDir
@@ -83,10 +86,10 @@ Stop and restart a DAG run: `dagu restart <dag-name> [--run-id/-r <id>]`
 Retry a previous DAG run using the same run ID.
 
 ```sh
-dagu retry <dag> --run-id/-r <id> [--step <name>] [--downstream] [--worker-id <id>]
+dagu retry <dag> --run-id/-r <id> [--step <name>] [--downstream] [--bypass-preconditions] [--worker-id <id>]
 ```
 
-`--step` retries only the selected step. Add `--downstream` to also reset every reachable descendant; unrelated branches keep their current status. `--downstream` requires `--step`.
+`--step` retries only the selected step. Add `--downstream` to also reset every reachable descendant; unrelated branches keep their current status. `--downstream` requires `--step`. Add `--bypass-preconditions` to skip step precondition evaluation for this retry; it also requires `--step` and a local CLI context. DAG-level preconditions and lifecycle handlers still apply. With `--sub-run-id <child-id>`, the bypass also reaches the selected child retry, including children dispatched to workers.
 
 ### dagu human-task complete
 
@@ -103,11 +106,33 @@ Flags:
 - `--input` — Form input in `key=value` form; repeatable and coerced using the form schema
 - `--inputs-json` — Typed form input as one JSON object
 
-`--input` and `--inputs-json` are mutually exclusive. Omit both for an acknowledgement-only task. Completing one of several waiting human tasks leaves the DAG run waiting; completing the last one starts the run resume automatically. Human tasks cannot be used in sub-DAGs. A distributed run is re-queued, so its scheduler must be running. The command only supports the local context.
+`--input` and `--inputs-json` are mutually exclusive. Omit both for an acknowledgement-only task. Completing a human task resumes the DAG run automatically when it unblocks a step or no other step is waiting; otherwise the run keeps waiting. Human tasks cannot be used in sub-DAGs. A distributed run is re-queued, so its scheduler must be running. The command only supports the local context.
 
 ```sh
 dagu human-task complete --run-id=run-1 --step=review --input environment=production deploy
 dagu human-task complete --run-id=run-1 --step=review --inputs-json='{"environment":"production","notify":true}' deploy
+```
+
+### dagu human-task push-back
+
+Send a waiting human task that declares `with.push_back` back to its rewind target with feedback. The rewind target and every step that depends on it, directly or transitively, run again, then the task opens again.
+
+```sh
+dagu human-task push-back [flags] <root-dag-name>
+```
+
+Flags:
+
+- `--run-id/-r`: Root DAG-run ID containing the human task; required
+- `--step`: Human task step ID; required and matched against `id`
+- `--input`: Feedback in `key=value` form; repeatable and coerced using `with.push_back.form`
+- `--inputs-json`: Typed feedback as one JSON object
+- `--expected-iteration`: Fail unless the task is at this push-back iteration; `0` before the first push-back
+
+Feedback is limited to 16 KiB as JSON. The push-back is stored before the run is queued. If queueing fails, run the same command again: until the task opens again, an identical repeat only retries the queue and prints `Human task <step> was already pushed back to <target>`. After the task reopens, a repeat pushes it back again, so pass `--expected-iteration` when a command may be repeated. The command only supports the local context.
+
+```sh
+dagu human-task push-back --run-id=run-1 --step=review --input feedback="Add tests" --expected-iteration=0 deploy
 ```
 
 ### dagu dry
@@ -166,7 +191,7 @@ Flags:
 
 ### dagu rm
 
-Remove DAG run history and/or the DAG YAML definition. At least one of `--history` or `--definition` is required. Active runs are never deleted from history; definition deletion is refused while the DAG has alive processes. With `--definition`, identify the DAG by filename, stem, or configured path.
+Remove DAG run history and/or the DAG YAML definition. At least one of `--history` or `--definition` is required. Active runs are never deleted from history; definition deletion is refused while the DAG has alive processes. With `--definition`, identify the DAG by filename, stem, or configured path. Deleting all history (no `--older-than`) also clears the browser and computer replay caches of the DAG on this host.
 
 ```sh
 dagu rm [--history|-H] [--definition|-d] [-t <duration>] [-f] [--dry-run] <dag>
@@ -179,6 +204,46 @@ Flags:
 - `--older-than/-t` — With `--history`: delete runs older than a duration (e.g. `10d`, `24h`, `1w`). Omitted = delete all history
 - `--force/-f` — Skip confirmation prompt
 - `--dry-run` — Preview deletions without removing history or the definition
+
+### dagu browser cache clear
+
+Clear the recorded `act` operations that browser steps replay, so the next run asks the model again. Use it after a site changes its layout. Without `--step`, every step of the DAG is cleared. The cache lives on the host that ran the step; in distributed mode, run it on the worker. REST: `DELETE /api/v1/dags/{fileName}/browser-cache[?step=<id>]`.
+
+```sh
+dagu browser cache clear <dag> [--step <id>]
+```
+
+### dagu computer check
+
+Check that computer steps can capture the screen and send input in the current session. Run it as the user and in the session of the worker that runs computer steps. On macOS it also asks macOS to show the Screen Recording and Accessibility prompts for missing permissions. Exits nonzero and lists the problems when the desktop cannot be automated. `--format json` prints `{os, width, height, ready, problems}`, each problem with a `code` (such as `screen_recording`, `accessibility`, or `screen_locked`) and a `message`.
+
+```sh
+dagu computer check [--format json]
+```
+
+### dagu computer cache clear
+
+Clear the recorded `act` operations that computer steps replay, so the next run asks the model again. Without `--step`, every step of the DAG is cleared. The cache lives on the host that ran the step; in distributed mode, run it on the worker.
+
+```sh
+dagu computer cache clear <dag> [--step <id>]
+```
+
+### dagu xlsx inspect
+
+Describe every sheet of an `.xlsx` workbook: used range, detected data block, header row, column names and types, row count, tables, and a few typed sample rows, plus the workbook's named ranges and date system. It reads the file directly, needs no configuration or engine, and creates no run. `--sheet` limits the output to one sheet and `--rows` sets the sample size. `--format json` prints one object: `path`, `date_system`, `sheets` (each with `name`, `used_range`, `range`, `header_row`, `headers`, `types`, `row_count`, `tables`, `sample`), `named_ranges`, and `warnings`.
+
+```sh
+dagu xlsx inspect <path> [--sheet <name>] [--rows <n>] [--format json]
+```
+
+### dagu xlsx read
+
+Print the typed rows of a sheet the way `xlsx.read` publishes them: numbers stay numbers, dates become ISO 8601 text, text keeps its leading zeros, and each row carries `_row`. The flags mirror the action's fields: `--sheet`, `--range`, `--header` (`true`, `false`, a row number, or `3,4`), `--columns` (comma-separated, with `name:alias` renames), and `--max-rows`. The text format is tab-separated, with tabs, line breaks, and backslashes inside a cell escaped as `\t`, `\n`, `\r`, and `\\` so one cell stays in one column; `--format json` prints `rows`, `count`, `headers`, `sheet`, `range`, `warnings`, and `truncated`.
+
+```sh
+dagu xlsx read <path> [--sheet <name>] [--range A2:F] [--header false] [--columns "a,b:c"] [--max-rows <n>] [--format json]
+```
 
 ### dagu ps
 
@@ -199,6 +264,21 @@ Deprecated: prefer `dagu rm --history`.
 ```sh
 dagu cleanup <dag-name> [--retention-days <n>] [--dry-run] [--yes/-y]
 ```
+
+### dagu prune-artifacts
+
+Remove artifact directories and index records that no surviving DAG run points to. Orphans appear when a run record is deleted by a route other than `dagu rm`, or when the artifact root moved. Only the artifact layout is examined: `<root>/YYYY/MM/DD/<run>` directories with their index records, and pre-date `<root>/<dag>/dag-run_<ts>_<id>` directories. Liveness is decided by name: an entry is removed only when no run in the current history tree could still claim it, and only when it is older than `--older-than`. A minimum age of 1h is always enforced because a run's artifact directory exists before its record does. Without `--yes`, the command reports how many entries it found before asking to delete them.
+
+```sh
+dagu prune-artifacts [--older-than|-t <duration>] [--root <dir>] [--dry-run] [--yes/-y]
+```
+
+Flags:
+
+- `--older-than/-t` — Only remove entries older than a duration (e.g. `10d`, `24h`, `1w`). Default `24h`; a minimum of 1h is enforced
+- `--root` — Artifact root to prune (default: configured `paths.artifact_dir`). Pass a previous artifacts directory (e.g. `<old data_dir>/artifacts`) or a DAG's `artifacts.dir`. A root that holds the run history or the log directory is refused
+- `--dry-run` — Preview removals without deleting
+- `--yes/-y` — Skip confirmation prompt
 
 ### dagu schema
 
@@ -286,3 +366,4 @@ Start distributed worker: `dagu worker --worker.coordinators <host:port,...> [--
 - `dagu version` — Show version
 - `dagu upgrade [--check] [--version/-v <ver>] [--dry-run] [--yes/-y]` — Self-update binary
 - `dagu license <activate|deactivate|check>` — Manage license
+- `dagu secret resolve <ref> [--workspace <name>]` — Print a registry secret's plaintext value to stdout, without a trailing newline; a workspace falls back to global like a DAG's `secrets:` entry, and an unknown workspace fails. Each read is recorded in the audit log. Local context only

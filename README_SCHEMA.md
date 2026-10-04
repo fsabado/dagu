@@ -106,6 +106,7 @@ Common step fields:
 | `continue_on` | Continue after selected failure, skip, exit-code, or output conditions. |
 | `preconditions` | Conditions that must pass before the step starts. |
 | `worker_selector` | Required worker labels. Keys and values support variable substitution (e.g. `${VAR}`); parallel sub-DAG steps can reference `${ITEM}`. |
+| `stdin` | File path piped to the step command's standard input. |
 | `stdout`, `stderr`, `log_output` | Step log output configuration. `stdout` can also publish DAG/action outputs. |
 | `output` | Captured stdout variable or structured step-scoped output. |
 | `output_schema` | JSON Schema for stdout JSON validation. |
@@ -198,13 +199,26 @@ Current builtin actions:
 | `jq.filter` | jq transforms | `filter`, plus `data` or `input` |
 | `dag.run` | Child DAG execution | `dag`, optional `params` |
 | `dag.enqueue` | Asynchronous child DAG enqueue | `dag`, optional `params`, optional `queue` |
-| `human.task` | Operator input before downstream steps continue | `prompt`, optional flat scalar `form` |
+| `human.task` | Operator input before downstream steps continue | `prompt`, optional flat scalar `form`, optional `artifacts`, optional `push_back` |
 | `router.route` | Conditional routing | `value`, `routes` |
 | `chat.completion` | LLM chat completion | `prompt` or `messages`, model config |
 | `harness.run` | CLI coding-agent harnesses | `prompt`, provider config, optional `stdin` |
+| `browser.extract`, `browser.run` | Browser automation in a local Chrome | `url`, `instruction` and `schema`; or `do` operations; `llm` from the DAG or `with.llm` |
+| `computer.extract`, `computer.run` | Desktop automation on macOS and Windows workers | `instruction` and `schema`; or `do` operations; `llm` from the DAG or `with.llm` |
 | `template.render` | Text/template rendering | Exactly one of `template` or `template_ref`, optional data/config |
 | `log.write` | Log messages | `message` |
 | `mail.send` | Email sending | mail executor config |
+| `mail.search` | Email search over IMAP or the Gmail API | `mailbox` and search filters |
+| `mail.organize` | Email marking and moving | `mailbox`, `emails`, `mark` or `move` |
+| `xlsx.read` | Workbook reading | `path`, optional `password`, `sheet`, `range`, `header`, `columns`, `types`, `where` |
+| `xlsx.info`, `xlsx.list_sheets` | Workbook metadata | `path`, optional `password` |
+| `xlsx.write`, `xlsx.append` | Workbook writing | `path`, `rows` or `input` |
+| `xlsx.update_rows` | Workbook row updates | `path`, `rows`, `key`, optional `set` and `missing` |
+| `xlsx.validate` | Workbook checks | `path`, at least one of `required`, `not_blank`, `unique`, `types`, `allowed`; optional `on_problem`, `max_problems` |
+| `xlsx.write_cells` | Template filling | `path`, `cells`, optional `merge`, `output`, `sheet` |
+| `xlsx.sheet` | Sheet management | `path`, `operation`, `sheet`, `to` for `copy` and `rename`, optional `if_exists`, `missing`, `position` |
+| `xlsx.convert` | Workbook export | `path`, `output`, optional `format`, `encoding`, `delimiter` |
+| `xlsx.extract` | Fields of a form-like sheet located by a model | `path`, `instruction`, `schema`, a model through `llm`; optional `sheet`, `range`, `send_values`, `cache` |
 | `archive.create`, `archive.extract`, `archive.list` | Archive operations | archive config |
 | `file.stat`, `file.read`, `file.write`, `file.copy`, `file.move`, `file.delete`, `file.mkdir`, `file.list` | File operations | path/source/destination/content config |
 | `git.checkout` | Git repository checkout | `repository`, `path`, optional `ref`, `depth`, auth config |
@@ -234,7 +248,7 @@ exposed to the parent step as `${step.outputs.*}`.
 
 ### Human Task
 
-Use `human.task` for a standalone processless step that waits for operator input. It requires an explicit `id` and `with.prompt`; omit `with.form` for acknowledgement-only tasks. Human tasks are allowed only in root DAGs. A root DAG containing one may run locally or on a distributed worker selected by its DAG-level `worker_selector`.
+Use `human.task` for a standalone processless step that waits for operator input. It requires an explicit `id` and `with.prompt`; omit `with.form` for acknowledgement-only tasks. Add `with.artifacts` to show the operator artifacts from the run as review context. Human tasks are allowed only in root DAGs. A root DAG containing one may run locally or on a distributed worker selected by its DAG-level `worker_selector`.
 
 ```yaml
 steps:
@@ -257,6 +271,8 @@ steps:
     depends: [review]
     run: ./deploy.sh '${steps.review.outputs.environment}'
 ```
+
+`with.artifacts` entries are artifact-relative paths; absolute paths, `~`, and `..` segments are rejected. Like the prompt, they are value-resolved when the task opens, and the resolved path is re-checked under the same rules. Referencing an artifact does not enable artifact storage, and a missing artifact never blocks completion.
 
 Form `additionalProperties` defaults to `false`. Every declared form property is a step output, published when submitted or defaulted, and available as `${steps.<step_id>.outputs.<name>}`; do not author `outputs:` on the human task. Complete a waiting task from a local CLI context with `dagu human-task complete --run-id=<run-id> --step=review <dag-name>`, adding repeated `--input key=value` flags or one `--inputs-json` object when the form accepts input. The scheduler must be running to resume a distributed run.
 

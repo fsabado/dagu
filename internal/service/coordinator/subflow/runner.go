@@ -159,7 +159,7 @@ func (r *Runner) Run(ctx context.Context, req executor.SubWorkflowRequest) (*ir.
 		if req.ExternalStepRetry && previousStatus.Status == ir.Succeeded {
 			return statusToRunStatus(previousStatus, req.RunID), nil
 		}
-		if err := r.dispatchRetryWithStatus(ctx, req, "", previousStatus, false); err != nil {
+		if err := r.dispatchRetryWithStatus(ctx, req, "", previousStatus, false, false); err != nil {
 			logger.Error(dispatchCtx, "Distributed child workflow retry dispatch failed", tag.Error(err))
 			return nil, fmt.Errorf("distributed retry failed: %w", err)
 		}
@@ -276,7 +276,7 @@ func (r *Runner) dispatchRetry(ctx context.Context, req executor.SubWorkflowRetr
 	if err != nil {
 		return fmt.Errorf("failed to load child workflow status for retry: %w", err)
 	}
-	return r.dispatchRetryWithStatus(ctx, req.SubWorkflowRequest, req.StepName, previousStatus, req.IncludeDownstream)
+	return r.dispatchRetryWithStatus(ctx, req.SubWorkflowRequest, req.StepName, previousStatus, req.IncludeDownstream, req.BypassPreconditions)
 }
 
 func (r *Runner) dispatchRetryWithStatus(
@@ -285,8 +285,9 @@ func (r *Runner) dispatchRetryWithStatus(
 	stepName string,
 	previousStatus *ir.DAGRunStatus,
 	includeDownstream bool,
+	bypassPreconditions bool,
 ) error {
-	task, err := r.buildRetryTask(req, stepName, previousStatus, includeDownstream)
+	task, err := r.buildRetryTask(req, stepName, previousStatus, includeDownstream, bypassPreconditions)
 	if err != nil {
 		return fmt.Errorf("failed to build retry coordinator task: %w", err)
 	}
@@ -325,6 +326,7 @@ func (r *Runner) buildRetryTask(
 	stepName string,
 	previousStatus *ir.DAGRunStatus,
 	includeDownstream bool,
+	bypassPreconditions bool,
 ) (*dispatch.DispatchTask, error) {
 	extra := []executor.TaskOption{executor.WithPreviousStatus(previousStatus)}
 	if stepName != "" {
@@ -332,6 +334,9 @@ func (r *Runner) buildRetryTask(
 	}
 	if includeDownstream {
 		extra = append(extra, executor.WithIncludeDownstream(true))
+	}
+	if bypassPreconditions {
+		extra = append(extra, executor.WithBypassPreconditions(true))
 	}
 	opts, err := r.taskOptions(req, extra...)
 	if err != nil {
@@ -378,8 +383,11 @@ func (r *Runner) taskOptions(
 	if req.ParallelItem != "" {
 		options = append(options, executor.WithParallelItem(req.ParallelItem))
 	}
+	if len(req.PassedEnv) > 0 {
+		options = append(options, executor.WithPassedEnv(req.PassedEnv))
+	}
 	if baseConfig := subWorkflowBaseConfig(req); len(baseConfig) > 0 {
-		options = append(options, executor.WithBaseConfig(string(baseConfig)))
+		options = append(options, executor.WithBaseConfig(string(baseConfig), subWorkflowBaseWorkspace(req)))
 	}
 	if req.DAG.SourceFile != "" {
 		options = append(options, executor.WithSourceFile(req.DAG.SourceFile))
@@ -403,6 +411,15 @@ func (r *Runner) taskOptions(
 
 	options = append(options, extra...)
 	return options, nil
+}
+
+func subWorkflowBaseWorkspace(req executor.SubWorkflowRequest) *string {
+	// Provenance follows inherited base content; legacy children may have content without provenance.
+	if req.ParentDAG != nil && (req.DAG.BaseConfigWorkspace == nil ||
+		(len(req.DAG.BaseConfigData) == 0 && req.Workspace == nil)) {
+		return req.ParentDAG.BaseConfigWorkspace
+	}
+	return req.DAG.BaseConfigWorkspace
 }
 
 func subWorkflowBaseConfig(req executor.SubWorkflowRequest) []byte {
@@ -613,6 +630,9 @@ func outputVariablesFromNodes(nodes []*ir.Node) map[string]string {
 	return outputs
 }
 
+// outputValuesFromNodes merges every node's published outputs into the run's
+// outputs. A payload that is not an object, such as the array a parallel step
+// publishes, has no names to merge under and does not reach the parent run.
 func outputValuesFromNodes(nodes []*ir.Node) map[string]any {
 	outputs := make(map[string]any)
 	for _, node := range nodes {

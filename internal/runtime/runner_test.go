@@ -18,12 +18,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
+
 	"github.com/dagucloud/dagu/v2/internal/executor/registry"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/chat"
 	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -93,6 +96,43 @@ func registerStoppedStatusExecutor(t *testing.T) (string, <-chan *stoppedStatusE
 	return executorType, execCh
 }
 
+// reportedStatusExecutor finishes at once and reports its own node status,
+// as executors such as dag.run do.
+type reportedStatusExecutor struct {
+	status ir.NodeStatus
+}
+
+func (reportedStatusExecutor) SetStdout(io.Writer) {}
+
+func (reportedStatusExecutor) SetStderr(io.Writer) {}
+
+func (reportedStatusExecutor) Run(context.Context) error { return nil }
+
+func (reportedStatusExecutor) Kill(os.Signal) error { return nil }
+
+func (e reportedStatusExecutor) DetermineNodeStatus() (ir.NodeStatus, error) {
+	return e.status, nil
+}
+
+func registerReportedStatusExecutor(t *testing.T, status ir.NodeStatus) string {
+	t.Helper()
+
+	executorType := "test-reported-status-" + uuid.Must(uuid.NewV7()).String()
+	runtimeexec.RegisterExecutor(
+		executorType,
+		func(context.Context, ir.Step) (runtimeexec.Executor, error) {
+			return reportedStatusExecutor{status: status}, nil
+		},
+		nil,
+		registry.ExecutorCapabilities{},
+	)
+	t.Cleanup(func() {
+		runtimeexec.UnregisterExecutor(executorType)
+	})
+
+	return executorType
+}
+
 func shellTestPath(path string) string {
 	return filepath.ToSlash(path)
 }
@@ -130,6 +170,14 @@ func fileMissingCommand(path string) string {
 		return fmt.Sprintf("if (-not (Test-Path %s)) { exit 0 } else { exit 1 }", test.PowerShellQuote(path))
 	}
 	return fmt.Sprintf("test ! -f %s", test.PosixQuote(path))
+}
+
+// gatedCommand creates started and then waits until release exists.
+func gatedCommand(started, release string) string {
+	return createEmptyFileCommand(started) + "; " + test.ForOS(
+		fmt.Sprintf("while [ ! -f %s ]; do sleep 0.05; done", test.PosixQuote(release)),
+		fmt.Sprintf("while (-not (Test-Path %s)) { Start-Sleep -Milliseconds 50 }", test.PowerShellQuote(release)),
+	)
 }
 
 func repeatExpectedCondition(counterFile, expected string) *ir.Condition {
@@ -500,6 +548,7 @@ func TestRunner(t *testing.T) {
 		)
 
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 
 		// 1, 2, 3 should be executed even though 2 failed
 		result.assertNodeStatus(t, "1", ir.NodeSucceeded)
@@ -547,6 +596,7 @@ func TestRunner(t *testing.T) {
 		)
 
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 
 		// 1, 2 should be executed even though 1 failed
 		result.assertNodeStatus(t, "1", ir.NodeFailed)
@@ -569,6 +619,7 @@ func TestRunner(t *testing.T) {
 		)
 
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 
 		// 1, 2 should be executed even though 1 failed
 		result.assertNodeStatus(t, "1", ir.NodeFailed)
@@ -596,6 +647,7 @@ func TestRunner(t *testing.T) {
 		)
 
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 
 		// Step 1 fails but matches continueOn output, allowing step 2 to run
 		result.assertNodeStatus(t, "1", ir.NodeFailed)
@@ -623,6 +675,7 @@ func TestRunner(t *testing.T) {
 		)
 
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 
 		// 1, 2 should be executed even though 1 failed
 		result.assertNodeStatus(t, "1", ir.NodeFailed)
@@ -744,6 +797,31 @@ func TestRunner(t *testing.T) {
 		node := result.nodeByName(t, "1")
 		require.Equal(t, 1, node.State().DoneCount)  // 1 successful execution
 		require.Equal(t, 1, node.State().RetryCount) // 1 retry
+	})
+	t.Run("RetryCanceled", func(t *testing.T) {
+		r := setupRunner(t)
+		plan := r.newPlan(t, newStep("1", withScript("exit 23"), withRetryPolicy(1, 30*time.Second)))
+		ctx, cancel := context.WithCancel(runtime.NewContext(r.Context,
+			&ir.DAG{Name: "test_dag", WorkingDir: plan.workDir}, r.cfg.DAGRunID,
+			filepath.Join(r.cfg.LogDir, "retry.log")))
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- r.runner.Run(ctx, plan.Plan, nil) }()
+		node := plan.GetNodeByName("1")
+		require.Eventually(t, func() bool { return node.GetRetryCount() == 1 },
+			platformTestDuration(5*time.Second, 30*time.Second), 10*time.Millisecond)
+		lastError := node.Error()
+		require.Error(t, lastError)
+		r.runner.Signal(ctx, plan.Plan, os.Kill, nil, false)
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, lastError)
+		case <-time.After(5 * time.Second):
+			t.Fatal("canceled retry did not finish")
+		}
+		require.Equal(t, ir.NodeAborted, node.State().Status)
+		require.Equal(t, ir.Aborted, r.runner.Status(ctx, plan.Plan))
+		require.Equal(t, 1, node.GetRetryCount())
 	})
 	t.Run("RetryPolicySuccess", func(t *testing.T) {
 		file := filepath.Join(
@@ -1164,25 +1242,29 @@ func TestRunner(t *testing.T) {
 		node := result.nodeByName(t, "1")
 		require.Equal(t, 1, node.State().DoneCount)
 	})
+	// The attempt blocks until released so the stop is certain to arrive while
+	// it runs; a running node may not have started its first attempt yet.
 	t.Run("StopRepetitiveTaskGracefully", func(t *testing.T) {
+		dir := t.TempDir()
+		started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
 		r := setupRunner(t)
 
 		plan := r.newPlan(t,
 			newStep("1",
-				withCommand("sleep 0.1"),
+				withCommand(gatedCommand(started, release)),
 				withRepeatPolicy(true, time.Millisecond*50),
 			),
 		)
 
-		done := make(chan struct{})
+		running := make(chan bool, 1)
 		go func() {
-			waitForNodeStatus(plan.Plan, "1", ir.NodeRunning, 5*time.Second)
+			running <- waitForFile(started, platformTestDuration(5*time.Second, 30*time.Second))
 			plan.signal(syscall.SIGTERM)
-			close(done)
+			_ = os.WriteFile(release, nil, 0600)
 		}()
 
 		result := plan.assertRun(t, ir.Succeeded)
-		<-done
+		require.True(t, <-running, "attempt did not start")
 
 		result.assertNodeStatus(t, "1", ir.NodeSucceeded)
 	})
@@ -1462,6 +1544,91 @@ func TestRunner(t *testing.T) {
 		assert.Contains(t, string(content), "downstream")
 	})
 
+	t.Run("StdinPipesStepStdoutFileToProcess", func(t *testing.T) {
+		if windowsShellTest() {
+			t.Skip("uses cat to read stdin")
+		}
+		r := setupRunner(t)
+
+		plan := r.newPlan(t,
+			newStep("first",
+				withID("first"),
+				withCommand("echo upstream-data"),
+			),
+			newStep("second",
+				withDepends("first"),
+				withStdin("${first.stdout}"),
+				withCommand("cat"),
+				withOutput("OUT"),
+			),
+		)
+
+		result := plan.assertRun(t, ir.Succeeded)
+		result.assertNodeStatus(t, "first", ir.NodeSucceeded)
+		result.assertNodeStatus(t, "second", ir.NodeSucceeded)
+
+		node := result.nodeByName(t, "second")
+		output, ok := node.NodeData().State.OutputVariables.Load("OUT")
+		require.True(t, ok, "output variable not found")
+		assert.Equal(t, "OUT=upstream-data", output)
+	})
+
+	t.Run("StdinMissingFileFailsStep", func(t *testing.T) {
+		if windowsShellTest() {
+			t.Skip("uses cat to read stdin")
+		}
+		r := setupRunner(t)
+
+		plan := r.newPlan(t,
+			newStep("reader",
+				withStdin("does-not-exist.txt"),
+				withCommand("cat"),
+			),
+		)
+
+		result := plan.assertRun(t, ir.Failed)
+		result.assertNodeStatus(t, "reader", ir.NodeFailed)
+	})
+
+	t.Run("StdinEmptyAfterResolutionFailsStep", func(t *testing.T) {
+		if windowsShellTest() {
+			t.Skip("uses cat to read stdin")
+		}
+		r := setupRunner(t)
+
+		plan := r.newPlan(t,
+			newStep("reader",
+				withEnvVars("EMPTY="),
+				withStdin("${env.EMPTY}"),
+				withCommand("cat"),
+			),
+		)
+
+		result := plan.assertRun(t, ir.Failed)
+		result.assertNodeStatus(t, "reader", ir.NodeFailed)
+		node := result.nodeByName(t, "reader")
+		require.ErrorContains(t, node.State().Error, "resolved to an empty path")
+	})
+
+	t.Run("StdinUnresolvedReferenceFailsStep", func(t *testing.T) {
+		if windowsShellTest() {
+			t.Skip("uses cat to read stdin")
+		}
+		r := setupRunner(t)
+
+		plan := r.newPlan(t,
+			newStep("reader",
+				withStdin("${no_such_step.stdout}"),
+				withCommand("cat"),
+			),
+		)
+
+		result := plan.assertRun(t, ir.Failed)
+		result.assertNodeStatus(t, "reader", ir.NodeFailed)
+		node := result.nodeByName(t, "reader")
+		require.ErrorContains(t, node.State().Error, "must resolve before execution")
+	})
+
 	t.Run("DAGRunStatusNotAvailableToMainSteps", func(t *testing.T) {
 		r := setupRunner(t)
 
@@ -1628,6 +1795,123 @@ func TestRunner(t *testing.T) {
 		result.assertNodeStatus(t, "1", ir.NodeSucceeded)
 		node := result.nodeByName(t, "1")
 		assert.Equal(t, 2, node.State().DoneCount)
+	})
+
+	t.Run("RepeatErrorContinueOn", func(t *testing.T) {
+		cases := []struct {
+			name            string
+			continueOn      ir.ContinueOn
+			status          ir.Status
+			nodeStatus      ir.NodeStatus
+			dependentStatus ir.NodeStatus
+		}{
+			{
+				name:            "Fail",
+				status:          ir.Failed,
+				nodeStatus:      ir.NodeFailed,
+				dependentStatus: ir.NodeAborted,
+			},
+			{
+				name:            "Continue",
+				continueOn:      ir.ContinueOn{Failure: true},
+				status:          ir.PartiallySucceeded,
+				nodeStatus:      ir.NodeFailed,
+				dependentStatus: ir.NodeSucceeded,
+			},
+			{
+				name:            "MarkSuccess",
+				continueOn:      ir.ContinueOn{Failure: true, MarkSuccess: true},
+				status:          ir.Succeeded,
+				nodeStatus:      ir.NodeSucceeded,
+				dependentStatus: ir.NodeSucceeded,
+			},
+			{
+				name:            "UnmatchedMarkSuccess",
+				continueOn:      ir.ContinueOn{ExitCode: []int{1}, MarkSuccess: true},
+				status:          ir.Failed,
+				nodeStatus:      ir.NodeFailed,
+				dependentStatus: ir.NodeAborted,
+			},
+		}
+		for _, mode := range []ir.RepeatMode{ir.RepeatModeWhile, ir.RepeatModeUntil} {
+			for _, tc := range cases {
+				t.Run(string(mode)+"/"+tc.name, func(t *testing.T) {
+					r := setupRunner(t)
+					plan := r.newPlan(t,
+						newStep("1", withCommand(test.Output("tick")), withContinueOn(tc.continueOn),
+							func(step *ir.Step) {
+								step.RepeatPolicy.RepeatMode = mode
+								step.RepeatPolicy.Condition = &ir.Condition{
+									Condition: "not-a-number",
+									Expected:  "num:>=1",
+								}
+							},
+						),
+						successStep("2", "1"),
+					)
+
+					// Evaluation errors stop repetition even when continuation permits success.
+					result := plan.assertRun(t, tc.status)
+					result.assertNodeStatus(t, "1", tc.nodeStatus)
+					result.assertNodeStatus(t, "2", tc.dependentStatus)
+					node := result.nodeByName(t, "1")
+					assert.Equal(t, 1, node.State().DoneCount)
+					require.NotErrorIs(t, node.State().Error, runtime.ErrConditionNotMet)
+					require.ErrorContains(t, node.State().Error, "is not a number")
+					if tc.status != ir.Succeeded {
+						require.ErrorContains(t, result.Error, "is not a number")
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("RepeatPolicyUntilConditionNotMetRespectsLimit", func(t *testing.T) {
+		r := setupRunner(t)
+		plan := r.newPlan(t,
+			newStep("1",
+				withCommand(test.Output("tick")),
+				func(step *ir.Step) {
+					step.RepeatPolicy.RepeatMode = ir.RepeatModeUntil
+					step.RepeatPolicy.Condition = &ir.Condition{
+						Condition: "pending",
+						Expected:  "done",
+					}
+					step.RepeatPolicy.Interval = 20 * time.Millisecond
+					step.RepeatPolicy.Limit = 3
+				},
+			),
+		)
+
+		// A legitimately not-met condition repeats until the limit stops it.
+		result := plan.assertRun(t, ir.Succeeded)
+		result.assertNodeStatus(t, "1", ir.NodeSucceeded)
+
+		node := result.nodeByName(t, "1")
+		assert.Equal(t, 3, node.State().DoneCount)
+	})
+
+	t.Run("RepeatPolicyUntilConditionMetStopsAfterFirstAttempt", func(t *testing.T) {
+		r := setupRunner(t)
+		plan := r.newPlan(t,
+			newStep("1",
+				withCommand(test.Output("tick")),
+				func(step *ir.Step) {
+					step.RepeatPolicy.RepeatMode = ir.RepeatModeUntil
+					step.RepeatPolicy.Condition = &ir.Condition{
+						Condition: "ready",
+						Expected:  "ready",
+					}
+					step.RepeatPolicy.Interval = 20 * time.Millisecond
+				},
+			),
+		)
+
+		result := plan.assertRun(t, ir.Succeeded)
+		result.assertNodeStatus(t, "1", ir.NodeSucceeded)
+
+		node := result.nodeByName(t, "1")
+		assert.Equal(t, 1, node.State().DoneCount)
 	})
 	t.Run("RetryPolicyWithOutputCapture", func(t *testing.T) {
 		r := setupRunner(t)
@@ -1913,6 +2197,51 @@ func TestRunner_DryRunWithHandlers(t *testing.T) {
 	result.assertNodeStatus(t, "onSuccess", ir.NodeSucceeded)
 }
 
+// A missing shell or command never fails a dry run: the real run may execute
+// on another host, or an upstream step may create the executable first.
+func TestRunner_DryRunStepChecks(t *testing.T) {
+	missing := "dagu-test-missing-9f3c2b1a"
+
+	t.Run("MissingExecutablesSucceed", func(t *testing.T) {
+		handler := newStep("onSuccess", withCommand(missing+"-handler"))
+		r := setupRunner(t,
+			func(cfg *runtime.Config) {
+				cfg.Dry = true
+			},
+			withOnSuccess(handler),
+		)
+
+		plan := r.newPlan(t,
+			newStep("1", withCommand("true"), withShell(missing+"-shell")),
+			newStep("2", withCommand(missing+"-command --flag")),
+			newStep("3", withCommand("./no-exec.sh")),
+		)
+
+		result := plan.assertRun(t, ir.Succeeded)
+		result.assertNodeStatus(t, "1", ir.NodeSucceeded)
+		result.assertNodeStatus(t, "2", ir.NodeSucceeded)
+		result.assertNodeStatus(t, "3", ir.NodeSucceeded)
+		result.assertNodeStatus(t, "onSuccess", ir.NodeSucceeded)
+	})
+
+	t.Run("HandlerEnvErrorFailsHandler", func(t *testing.T) {
+		handler := successStep("onSuccess")
+		handler.Env = []string{"DAGU_TEST_NO_EQUALS"}
+		r := setupRunner(t,
+			func(cfg *runtime.Config) {
+				cfg.Dry = true
+			},
+			withOnSuccess(handler),
+		)
+
+		plan := r.newPlan(t, successStep("1"))
+
+		result := plan.assertRun(t, ir.Failed)
+		result.assertNodeStatus(t, "onSuccess", ir.NodeFailed)
+		require.ErrorContains(t, result.Error, "DAGU_TEST_NO_EQUALS")
+	})
+}
+
 func TestRunner_ConcurrentExecution(t *testing.T) {
 	steps := func(script func(string) string) []ir.Step {
 		return []ir.Step{
@@ -1941,6 +2270,37 @@ func TestRunner_ConcurrentExecution(t *testing.T) {
 	resultConcurrent.assertNodeStatus(t, "1", ir.NodeSucceeded)
 	resultConcurrent.assertNodeStatus(t, "2", ir.NodeSucceeded)
 	resultConcurrent.assertNodeStatus(t, "3", ir.NodeSucceeded)
+}
+
+// A negative child value must clear an inherited limit without blocking graph
+// scheduling.
+func TestRunner_NegativeMaxActiveSteps(t *testing.T) {
+	dag, err := spec.LoadYAML(t.Context(), []byte(`
+max_active_steps: -1
+steps:
+  - run: "true"
+`), spec.WithBaseConfigContent([]byte("max_active_steps: 1\n")))
+	require.NoError(t, err)
+	require.Equal(t, -1, dag.MaxActiveSteps)
+
+	const stepCount = 3
+	readyDir := filepath.Join(t.TempDir(), "ready")
+	steps := make([]ir.Step, 0, stepCount)
+	for i := 1; i <= stepCount; i++ {
+		name := strconv.Itoa(i)
+		steps = append(steps, newStep(name, withScript(concurrentBarrierScript(
+			name,
+			readyDir,
+			stepCount,
+			platformTestDuration(10*time.Second, 30*time.Second),
+		))))
+	}
+
+	r := setupRunner(t, withMaxActiveRuns(dag.MaxActiveSteps))
+	result := r.newPlan(t, steps...).assertRun(t, ir.Succeeded)
+	for i := 1; i <= stepCount; i++ {
+		result.assertNodeStatus(t, strconv.Itoa(i), ir.NodeSucceeded)
+	}
 }
 
 func TestRunner_ErrorHandling(t *testing.T) {
@@ -2077,6 +2437,51 @@ func TestRunner_DAGPreconditions(t *testing.T) {
 		require.NoError(t, r.runner.Run(successCtx, successPlan.Plan, nil))
 		assert.Equal(t, ir.Succeeded, r.runner.Status(successCtx, successPlan.Plan))
 	})
+
+	// A timeout that cuts a DAG-level check short fails the run like any
+	// other workflow timeout.
+	t.Run("DAGPreconditionInterruptedByTimeout", func(t *testing.T) {
+		r := setupRunner(t, withTimeout(200*time.Millisecond))
+		plan := r.newPlan(t, successStep("1"))
+		ctx := dagPreconditionContext(r, plan, &ir.Condition{Condition: test.Sleep(30 * time.Second)})
+
+		start := time.Now()
+		err := r.runner.Run(ctx, plan.Plan, nil)
+		assert.Less(t, time.Since(start), 10*time.Second)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, ir.Failed, r.runner.Status(ctx, plan.Plan))
+		assert.Equal(t, ir.NodeNotStarted, plan.GetNodeByName("1").State().Status)
+	})
+
+	// An abort that interrupts a DAG-level check aborts the run without
+	// waiting for the check to finish.
+	t.Run("DAGPreconditionInterruptedByAbort", func(t *testing.T) {
+		r := setupRunner(t)
+		plan := r.newPlan(t, successStep("1"))
+		ctx := dagPreconditionContext(r, plan, &ir.Condition{Condition: test.Sleep(30 * time.Second)})
+
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			plan.signal(syscall.SIGTERM)
+		}()
+
+		start := time.Now()
+		require.NoError(t, r.runner.Run(ctx, plan.Plan, nil))
+		assert.Less(t, time.Since(start), 10*time.Second)
+		assert.Equal(t, ir.Aborted, r.runner.Status(ctx, plan.Plan))
+		assert.Equal(t, ir.NodeNotStarted, plan.GetNodeByName("1").State().Status)
+	})
+}
+
+// dagPreconditionContext returns a run context for a DAG gated by conditions.
+func dagPreconditionContext(r testHelper, plan planHelper, conditions ...*ir.Condition) context.Context {
+	dag := &ir.DAG{
+		Name:          "test_dag",
+		WorkingDir:    plan.workDir,
+		Preconditions: conditions,
+	}
+	logFilePath := filepath.Join(r.cfg.LogDir, fmt.Sprintf("%s_%s.log", dag.Name, r.cfg.DAGRunID))
+	return runtime.NewContext(plan.Context, dag, r.cfg.DAGRunID, logFilePath)
 }
 
 func TestRunner_DAGPreconditionShellReferencePreserved(t *testing.T) {
@@ -2164,6 +2569,16 @@ func TestRunner_StatusDefersForcedStatusUntilTerminal(t *testing.T) {
 }
 
 func TestRunner_SignalHandling(t *testing.T) {
+	t.Run("ForceBeforeRun", func(t *testing.T) {
+		r := setupRunner(t, withOnAbort(successStep("onAbort")), withOnExit(successStep("onExit")))
+		plan := r.newPlan(t, successStep("1"))
+		r.runner.Stop(r.Context, plan.Plan, cmdutil.ForceTermination(), nil, false)
+		result := plan.assertRun(t, ir.Aborted)
+		result.assertNodeStatus(t, "1", ir.NodeNotStarted)
+		result.assertNodeStatus(t, "onAbort", ir.NodeSucceeded)
+		result.assertNodeStatus(t, "onExit", ir.NodeSucceeded)
+	})
+
 	t.Run("SignalBeforeRun", func(t *testing.T) {
 		r := setupRunner(t)
 		plan := r.newPlan(t, successStep("1"))
@@ -2374,6 +2789,46 @@ func TestRunner_PreconditionWithError(t *testing.T) {
 	// Conditions that exit with non-zero are just "not met", not errors
 }
 
+// A step precondition check cut short by workflow abort or timeout aborts the
+// step, and the run ends as that abort or timeout defines instead of treating
+// the step as skipped or failed.
+func TestRunner_StepPreconditionInterrupted(t *testing.T) {
+	newInterruptedPlan := func(r testHelper) planHelper {
+		return r.newPlan(t, newStep("1",
+			withPrecondition(&ir.Condition{Condition: test.Sleep(30 * time.Second)}),
+			withCommand("echo should_not_run"),
+		))
+	}
+
+	t.Run("Timeout", func(t *testing.T) {
+		r := setupRunner(t, withTimeout(200*time.Millisecond), withOnFailure(successStep("onFailure")))
+		plan := newInterruptedPlan(r)
+
+		start := time.Now()
+		result := plan.assertRun(t, ir.Failed)
+		assert.Less(t, time.Since(start), 10*time.Second)
+		require.ErrorIs(t, result.Error, context.DeadlineExceeded)
+		result.assertNodeStatus(t, "1", ir.NodeAborted)
+		result.assertNodeStatus(t, "onFailure", ir.NodeSucceeded)
+	})
+
+	t.Run("Abort", func(t *testing.T) {
+		r := setupRunner(t, withOnAbort(successStep("onAbort")))
+		plan := newInterruptedPlan(r)
+
+		go func() {
+			waitForNodeStatus(plan.Plan, "1", ir.NodeRunning, 5*time.Second)
+			plan.signal(syscall.SIGTERM)
+		}()
+
+		start := time.Now()
+		result := plan.assertRun(t, ir.Aborted)
+		assert.Less(t, time.Since(start), 10*time.Second)
+		result.assertNodeStatus(t, "1", ir.NodeAborted)
+		result.assertNodeStatus(t, "onAbort", ir.NodeSucceeded)
+	})
+}
+
 func TestRunner_MultipleHandlerExecution(t *testing.T) {
 	recordHandler := func(name string) ir.Step {
 		return newStep(name, withScript(fmt.Sprintf(`echo "Handler %s executed"`, name)))
@@ -2442,6 +2897,96 @@ func TestRunner_CancelDuringHandlerExecution(t *testing.T) {
 	result.assertNodeStatus(t, "onExit", ir.NodeSucceeded)
 }
 
+func TestRunner_RepeatErrorCanceled(t *testing.T) {
+	for _, mode := range []ir.RepeatMode{ir.RepeatModeWhile, ir.RepeatModeUntil} {
+		for _, markSuccess := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/MarkSuccess=%t", mode, markSuccess), func(t *testing.T) {
+				executorType, execCh := registerStoppedStatusExecutor(t)
+				r := setupRunner(t)
+				plan := r.newPlan(t, newStep("1", withExecutorType(executorType),
+					withContinueOn(ir.ContinueOn{Failure: true, MarkSuccess: markSuccess}),
+					func(step *ir.Step) {
+						step.RepeatPolicy.RepeatMode = mode
+						step.RepeatPolicy.Condition = &ir.Condition{Condition: "not-a-number", Expected: "num:>=1"}
+					},
+				))
+				ctx := runtime.NewContext(r.Context, &ir.DAG{Name: "test_dag", WorkingDir: plan.workDir}, r.cfg.DAGRunID, "")
+				done := make(chan error, 1)
+				go func() {
+					done <- r.runner.Run(ctx, plan.Plan, nil)
+				}()
+
+				exec := <-execCh
+				<-exec.ready
+				// Cancellation precedes completion so the repeat check sees an aborted attempt.
+				r.runner.Cancel(plan.Plan)
+				require.NoError(t, exec.Kill(syscall.SIGTERM))
+
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(platformTestDuration(2*time.Second, 10*time.Second)):
+					t.Fatal("runner did not finish after cancellation")
+				}
+				require.Equal(t, ir.Aborted, r.runner.Status(ctx, plan.Plan))
+				result := runResult{planHelper: plan}
+				result.assertNodeStatus(t, "1", ir.NodeAborted)
+				require.ErrorContains(t, result.nodeByName(t, "1").State().Error, "executor stopped")
+			})
+		}
+	}
+}
+
+func TestRunner_RepeatErrorTimeout(t *testing.T) {
+	for _, mode := range []ir.RepeatMode{ir.RepeatModeWhile, ir.RepeatModeUntil} {
+		for _, stepTimeout := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/StepTimeout=%t", mode, stepTimeout), func(t *testing.T) {
+				timeout := platformTestDuration(100*time.Millisecond, time.Second)
+				executorType, _ := registerStoppedStatusExecutor(t)
+				dagTimeout := timeout
+				if stepTimeout {
+					dagTimeout = 0
+				}
+				r := setupRunner(t, withTimeout(dagTimeout))
+				plan := r.newPlan(t, newStep("1", withExecutorType(executorType), func(step *ir.Step) {
+					if stepTimeout {
+						step.Timeout = timeout
+					}
+					step.RepeatPolicy.RepeatMode = mode
+					step.RepeatPolicy.Condition = &ir.Condition{Condition: "not-a-number", Expected: "num:>=1"}
+				}))
+
+				result := plan.assertRun(t, ir.Failed)
+				require.ErrorIs(t, result.Error, context.DeadlineExceeded)
+				if stepTimeout {
+					result.assertNodeStatus(t, "1", ir.NodeFailed)
+					assert.Equal(t, 124, result.nodeByName(t, "1").State().ExitCode)
+				} else {
+					result.assertNodeStatus(t, "1", ir.NodeAborted)
+				}
+				require.ErrorIs(t, result.nodeByName(t, "1").State().Error, context.DeadlineExceeded)
+			})
+		}
+	}
+}
+
+func TestRunner_RepeatConditionTimeout(t *testing.T) {
+	for _, mode := range []ir.RepeatMode{ir.RepeatModeWhile, ir.RepeatModeUntil} {
+		t.Run(string(mode), func(t *testing.T) {
+			r := setupRunner(t, withTimeout(platformTestDuration(200*time.Millisecond, 2*time.Second)))
+			plan := r.newPlan(t, newStep("1", withCommand(test.Output("tick")), func(step *ir.Step) {
+				step.RepeatPolicy.RepeatMode = mode
+				step.RepeatPolicy.Condition = &ir.Condition{Condition: test.Sleep(30 * time.Second)}
+			}))
+
+			result := plan.assertRun(t, ir.Failed)
+			require.ErrorIs(t, result.Error, context.DeadlineExceeded)
+			result.assertNodeStatus(t, "1", ir.NodeAborted)
+			assert.Equal(t, 1, result.nodeByName(t, "1").State().DoneCount)
+		})
+	}
+}
+
 func TestRunner_RepeatPolicyWithCancel(t *testing.T) {
 	if windowsShellTest() {
 		t.Skip("Skipping flaky shell-based repeat cancellation test on Windows")
@@ -2477,6 +3022,50 @@ func TestRunner_RepeatPolicyWithCancel(t *testing.T) {
 	assert.True(t, <-repeated, "runner should schedule repeat before cancel")
 	assert.GreaterOrEqual(t, readRepeatCounterValue(t, counterFile), 2)
 	assert.Equal(t, 1, node.State().DoneCount)
+}
+
+// A stop that arrives while a repeating step checks its repeat condition
+// aborts the pending repetition instead of completing the step with the
+// finished attempt's outcome, also when the executor reports that outcome.
+func TestRunner_RepeatStopDuringCheck(t *testing.T) {
+	tests := []struct {
+		name   string
+		action func(t *testing.T) stepOption
+	}{
+		{
+			name:   "Command",
+			action: func(*testing.T) stepOption { return withCommand(test.Output("tick")) },
+		},
+		{
+			name: "ReportedStatus",
+			action: func(t *testing.T) stepOption {
+				return withExecutorType(registerReportedStatusExecutor(t, ir.NodeSucceeded))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
+			r := setupRunner(t)
+			plan := r.newPlan(t, newStep("1", tt.action(t), func(step *ir.Step) {
+				step.RepeatPolicy.RepeatMode = ir.RepeatModeWhile
+				step.RepeatPolicy.Condition = &ir.Condition{Condition: gatedCommand(started, release)}
+			}))
+
+			checking := make(chan bool, 1)
+			go func() {
+				checking <- waitForFile(started, platformTestDuration(5*time.Second, 30*time.Second))
+				r.runner.Signal(r.Context, plan.Plan, syscall.SIGTERM, nil, false)
+				_ = os.WriteFile(release, nil, 0600)
+			}()
+
+			result := plan.assertRun(t, ir.Aborted)
+			require.True(t, <-checking, "repeat condition did not start")
+			result.assertNodeStatus(t, "1", ir.NodeAborted)
+			require.Equal(t, 1, result.nodeByName(t, "1").State().DoneCount)
+		})
+	}
 }
 
 func TestRunner_RepeatPolicyWithLimit(t *testing.T) {
@@ -3255,6 +3844,7 @@ func TestRunner_StepIDAccess(t *testing.T) {
 		)
 
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 		result.assertNodeStatus(t, "check", ir.NodeFailed)
 		result.assertNodeStatus(t, "verify", ir.NodeSucceeded)
 
@@ -3509,6 +4099,7 @@ func TestRunnerPartialSuccess(t *testing.T) {
 
 		// The overall DAG should complete with partial success
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 
 		// Verify individual node statuses
 		result.assertNodeStatus(t, "step1", ir.NodeSucceeded)
@@ -3568,6 +4159,7 @@ func TestRunnerPartialSuccess(t *testing.T) {
 
 		// The overall DAG should complete with partial success
 		result := plan.assertRun(t, ir.PartiallySucceeded)
+		require.Error(t, result.Error, "a failed step allowed to continue still reports the failure")
 
 		// Verify individual node statuses
 		result.assertNodeStatus(t, "step1", ir.NodeFailed)
@@ -3651,8 +4243,11 @@ func TestRunner_DeadlockDetection(t *testing.T) {
 	logFile := filepath.Join(cfg.LogDir, dag.Name+".log")
 	ctx := runtime.NewContext(context.Background(), dag, cfg.DAGRunID, logFile)
 
-	progressCh := make(chan *runtime.Node, 2)
+	progressCh := make(chan runtime.ProgressUpdate)
+	drained := drainProgress(progressCh)
 	err = r.Run(ctx, plan, progressCh)
+	close(progressCh)
+	<-drained
 
 	require.ErrorIs(t, err, runtime.ErrDeadlockDetected)
 	require.Equal(t, ir.Failed, r.Status(ctx, plan))
@@ -3674,17 +4269,13 @@ func TestRunner_ClosesPreparedOutputWritersOnFailedProgress(t *testing.T) {
 		runtime.WithLogWriterFactory(writers),
 	)
 
-	progressCh := make(chan *runtime.Node, 4)
+	progressCh := make(chan runtime.ProgressUpdate)
+	drained := drainProgress(progressCh)
 	err := helper.runner.Run(ctx, plan.Plan, progressCh)
 	close(progressCh)
 
-	progressCount := 0
-	for range progressCh {
-		progressCount++
-	}
-
 	require.Error(t, err)
-	require.GreaterOrEqual(t, progressCount, 2)
+	require.GreaterOrEqual(t, len(<-drained), 2)
 	require.Equal(t, 2, writers.closes)
 }
 
@@ -4178,6 +4769,61 @@ func TestPushBackInputsExposeJSONHistoryEnvForRewoundStep(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "reviewer-b", second["by"])
 	assert.Equal(t, "2026-04-26T06:20:00Z", second["at"])
+}
+
+// An approval step's input allowlist limits approval push-back inputs, but
+// human-task feedback holds only declared properties and reaches it unchanged.
+func TestPushBackEnvScopesApprovalAllowlistBySource(t *testing.T) {
+	t.Parallel()
+
+	if windowsShellTest() {
+		t.Skip("Skipping Unix-specific env assertion on Windows")
+	}
+
+	tests := []struct {
+		name      string
+		humanTask bool
+		want      string
+	}{
+		{name: "HumanTaskFeedback", humanTask: true, want: "feedback=add tests extra=kept"},
+		{name: "ApprovalInputs", want: "feedback= extra="},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := setupRunner(t)
+			step := newStep("draft",
+				withScript("printf 'feedback=%s extra=%s\\n' \"$feedback\" \"$extra\"\nprintf '%s' \"$DAG_PUSHBACK\""),
+				withApproval(&ir.ApprovalConfig{Input: []string{"FEEDBACK"}}),
+			)
+			plan := r.newPlan(t, step)
+			node := plan.GetNodeByName("draft")
+			require.NotNil(t, node)
+
+			inputs := map[string]string{"feedback": "add tests", "extra": "kept"}
+			node.SetApprovalIteration(1)
+			node.SetPushBackInputs(inputs)
+			node.SetPushBackHistory([]ir.PushBackEntry{{Iteration: 1, Inputs: inputs, Step: "review", HumanTask: tt.humanTask}})
+
+			result := plan.assertRun(t, ir.Waiting)
+			output, err := os.ReadFile(result.nodeByName(t, "draft").GetStdout())
+			require.NoError(t, err)
+			lines := strings.SplitN(strings.TrimSpace(string(output)), "\n", 2)
+			require.Len(t, lines, 2)
+			assert.Equal(t, tt.want, lines[0])
+
+			var payload struct {
+				Inputs map[string]string `json:"inputs"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(lines[1]), &payload))
+			if tt.humanTask {
+				assert.Equal(t, inputs, payload.Inputs)
+			} else {
+				assert.Empty(t, payload.Inputs)
+			}
+		})
+	}
 }
 
 // TestPushBackPreconditionUsesSameEnvAsCommand verifies that rewound steps

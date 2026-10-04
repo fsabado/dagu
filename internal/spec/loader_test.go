@@ -21,6 +21,130 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestHarnessWorkingDirWarnings(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		root        string
+		step        string
+		opts        []spec.LoadOption
+		wantWarning bool
+	}{
+		{name: "Missing", wantWarning: true},
+		{name: "Step", step: "    working_dir: ./repo\n"},
+		{name: "Root", root: "working_dir: ./repo\n"},
+		{name: "Expression", step: "    working_dir: ${params.repo}\n", root: "params:\n  repo: ./repo\n"},
+		{name: "Base", opts: []spec.LoadOption{spec.WithBaseConfigContent([]byte("working_dir: ./repo\n"))}},
+		{name: "Default", opts: []spec.LoadOption{spec.WithDefaultWorkingDir("./repo")}},
+		{name: "StepContainer", step: "    container: {image: alpine, working_dir: /repo}\n"},
+		{name: "RootContainer", root: "container: {image: alpine, working_dir: /repo}\n"},
+		{name: "ContainerMissing", step: "    container: {image: alpine}\n", wantWarning: true},
+		{name: "ContainerHostDir", root: "working_dir: ./repo\n", step: "    container: {image: alpine}\n", wantWarning: true},
+		{name: "ContainerDefault", step: "    container: {image: alpine}\n", opts: []spec.LoadOption{spec.WithDefaultWorkingDir("./repo")}, wantWarning: true},
+		{name: "ContainerOverride", root: "container: {image: alpine, working_dir: /repo}\n", step: "    container: {image: alpine}\n", wantWarning: true},
+		{name: "ContainerExec", step: "    container: {exec: agent, working_dir: /repo}\n"},
+		{name: "BaseContainer", opts: []spec.LoadOption{spec.WithBaseConfigContent([]byte("container: {image: alpine, working_dir: /repo}\n"))}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			data := []byte("name: workspace-check\n" + tc.root + `steps:
+  - id: review
+    action: harness.run
+    with:
+      provider: claude
+      prompt: Review this repository.
+` + tc.step)
+			for _, fromFile := range []bool{false, true} {
+				var dag *ir.DAG
+				var err error
+				if fromFile {
+					dag, err = spec.Load(context.Background(), createTempYAMLFile(t, string(data)), tc.opts...)
+				} else {
+					dag, err = spec.LoadYAML(context.Background(), data, tc.opts...)
+				}
+				require.NoError(t, err)
+				if tc.wantWarning {
+					require.Len(t, dag.BuildWarnings, 1)
+					assert.Contains(t, dag.BuildWarnings[0], "workspace-check")
+					assert.Contains(t, dag.BuildWarnings[0], "review")
+					assert.Contains(t, dag.BuildWarnings[0], "working_dir")
+				} else {
+					assert.Empty(t, dag.BuildWarnings)
+				}
+			}
+		})
+	}
+}
+
+func TestHarnessWarningsInLocalDAG(t *testing.T) {
+	t.Parallel()
+	dag, err := spec.LoadYAML(context.Background(), []byte(`name: parent
+working_dir: /parent
+steps:
+  - run: echo parent
+---
+name: child
+steps:
+  - id: review
+    action: harness.run
+    with:
+      provider: claude
+      prompt: Review this repository.
+handler_on:
+  success:
+    action: harness.run
+    with:
+      provider: claude
+      prompt: Summarize changes.
+`))
+	require.NoError(t, err)
+	require.Len(t, dag.BuildWarnings, 2)
+	for _, warning := range dag.BuildWarnings {
+		assert.Contains(t, warning, "child")
+	}
+	assert.Contains(t, dag.BuildWarnings[0], "review")
+	assert.Contains(t, dag.BuildWarnings[1], "success")
+}
+
+func TestHarnessWarningsInForeach(t *testing.T) {
+	t.Parallel()
+	data := []byte(`name: nested
+steps:
+  - id: loop
+    foreach:
+      items: [one]
+      steps:
+        - id: review
+          action: harness.run
+          with:
+            provider: claude
+            prompt: Review this repository.
+`)
+	dag, err := spec.LoadYAML(context.Background(), data)
+	require.NoError(t, err)
+	require.Len(t, dag.BuildWarnings, 1)
+	assert.Contains(t, dag.BuildWarnings[0], "steps.loop.foreach.steps.review")
+
+	dag, err = spec.LoadYAML(context.Background(), data, spec.WithDefaultWorkingDir(t.TempDir()))
+	require.NoError(t, err)
+	assert.Empty(t, dag.BuildWarnings)
+}
+
+func TestHarnessWarningsAfterBaseMerge(t *testing.T) {
+	t.Parallel()
+	base := []byte(`handler_on:
+  success:
+    action: harness.run
+    with:
+      provider: claude
+      prompt: Summarize changes.
+`)
+	dag, err := spec.LoadYAML(context.Background(), []byte("working_dir: ./repo\nsteps:\n  - run: echo done\n"), spec.WithBaseConfigContent(base))
+	require.NoError(t, err)
+	assert.Empty(t, dag.BuildWarnings)
+}
+
 func TestLoad(t *testing.T) {
 	t.Parallel()
 
@@ -682,6 +806,85 @@ steps:
 	})
 }
 
+func TestSchedulingInheritance(t *testing.T) {
+	t.Parallel()
+
+	base := "overlap_policy: all\ncatchup_window: 24h\nskip_if_successful: true\nmax_active_runs: 3\nqueue: pool\n"
+	for _, source := range []string{"file", "workspace", "embedded"} {
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			basePath := filepath.Join(root, "base.yaml")
+			require.NoError(t, os.WriteFile(basePath, []byte(base), 0600))
+			opts := []spec.LoadOption{spec.WithoutEval()}
+			switch source {
+			case "file":
+				opts = append(opts, spec.WithBaseConfig(basePath))
+			case "workspace":
+				workspaceDir := filepath.Join(root, "workspaces")
+				require.NoError(t, os.MkdirAll(filepath.Join(workspaceDir, "ops"), 0750))
+				require.NoError(t, os.WriteFile(filepath.Join(workspaceDir, "ops", "base.yaml"), []byte(base), 0600))
+				require.NoError(t, os.WriteFile(basePath, []byte("overlap_policy: latest\ncatchup_window: 1h\nqueue: global\nmax_active_runs: 2\n"), 0600))
+				opts = append(opts, spec.WithBaseConfig(basePath), spec.WithWorkspaceBaseConfigDir(workspaceDir))
+			case "embedded":
+				// Transported content must take precedence over local base files.
+				require.NoError(t, os.WriteFile(basePath, []byte("overlap_policy: invalid\n"), 0600))
+				opts = append(opts, spec.WithBaseConfig(basePath), spec.WithBaseConfigContent([]byte(base)))
+			}
+
+			for _, tc := range []struct {
+				name, authored string
+				policy         ir.OverlapPolicy
+				window         time.Duration
+				skip           bool
+				runs           int
+				queue          string
+			}{
+				{name: "Inherit", policy: ir.OverlapPolicyAll, window: 24 * time.Hour, skip: true, runs: 3, queue: "pool"},
+				{name: "Override", authored: "overlap_policy: latest\ncatchup_window: 2h\nmax_active_runs: 2\nqueue: child\n", policy: ir.OverlapPolicyLatest, window: 2 * time.Hour, skip: true, runs: 2, queue: "child"},
+				{name: "Disable", authored: "overlap_policy: skip\ncatchup_window: \"\"\nskip_if_successful: false\nmax_active_runs: 0\nqueue: \"\"\n", policy: ir.OverlapPolicySkip, runs: 1},
+				{name: "EmptyPolicy", authored: "overlap_policy: \"\"\n", policy: ir.OverlapPolicySkip, window: 24 * time.Hour, skip: true, runs: 3, queue: "pool"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					path := createTempYAMLFile(t, "name: inherited\nlabels: [workspace=ops]\n"+tc.authored+"steps:\n  - run: echo tick\n")
+					for _, metadata := range []bool{false, true} {
+						t.Run(fmt.Sprintf("Metadata=%t", metadata), func(t *testing.T) {
+							loadOpts := append([]spec.LoadOption{}, opts...)
+							if metadata {
+								loadOpts = append(loadOpts, spec.OnlyMetadata(), spec.SkipSchemaValidation())
+							}
+							dag, err := spec.Load(t.Context(), path, loadOpts...)
+							require.NoError(t, err)
+							assert.Equal(t, tc.policy, dag.OverlapPolicy)
+							assert.Equal(t, tc.window, dag.CatchupWindow)
+							assert.Equal(t, tc.skip, dag.SkipIfSuccessful)
+							assert.Equal(t, tc.runs, dag.MaxActiveRuns)
+							assert.Equal(t, tc.queue, dag.Queue)
+							group := tc.queue
+							if group == "" {
+								group = dag.Name
+							}
+							assert.Equal(t, group, dag.ProcGroup())
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestSchedulingDefaults(t *testing.T) {
+	t.Parallel()
+	path := createTempYAMLFile(t, "steps:\n  - run: echo tick\n")
+	dag, err := spec.Load(t.Context(), path)
+	require.NoError(t, err)
+	assert.Equal(t, ir.OverlapPolicySkip, dag.OverlapPolicy)
+	assert.Equal(t, 1, dag.MaxActiveRuns)
+	assert.Zero(t, dag.CatchupWindow)
+	assert.False(t, dag.SkipIfSuccessful)
+	assert.Equal(t, dag.Name, dag.ProcGroup())
+}
+
 func TestLoadBaseConfig(t *testing.T) {
 	t.Parallel()
 
@@ -864,6 +1067,10 @@ steps:
 		assert.Contains(t, dag.Env, "BASE_ENV=base_value")
 		assert.Contains(t, dag.Env, "SUB_ENV=sub_value")
 		assert.Contains(t, dag.Env, "OVERWRITE_ENV=sub_overwrite_value")
+
+		// The root env span covers the child's own entries, not the base ones.
+		span := dag.RootEnvSpan
+		assert.ElementsMatch(t, []string{"SUB_ENV=sub_value", "OVERWRITE_ENV=sub_overwrite_value"}, dag.Env[span.Start:span.End])
 
 		// Other fields should be inherited
 		assert.Equal(t, "/base/logs", dag.LogDir)
@@ -1847,21 +2054,32 @@ steps:
     run: echo "child"
 `), 0600))
 
-	dag, err := spec.Load(context.Background(), dagFile,
-		spec.WithBaseConfig(globalBase),
-		spec.WithWorkspaceBaseConfigDir(workspaceConfigDir),
-	)
-	require.NoError(t, err)
+	for _, metadata := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Metadata=%t", metadata), func(t *testing.T) {
+			loadMode := spec.WithoutEval()
+			if metadata {
+				loadMode = spec.OnlyMetadata()
+			}
+			dag, err := spec.Load(context.Background(), dagFile,
+				spec.WithBaseConfig(globalBase),
+				spec.WithWorkspaceBaseConfigDir(workspaceConfigDir),
+				loadMode,
+			)
+			require.NoError(t, err)
 
-	childDAG, ok := dag.LocalDAGs["child-task"]
-	require.True(t, ok)
+			childDAG, ok := dag.LocalDAGs["child-task"]
+			require.True(t, ok)
 
-	assert.Contains(t, dag.Env, "WORKSPACE_ONLY=ops")
-	assert.Contains(t, dag.Env, "SHARED=workspace")
-	assert.Contains(t, childDAG.Env, "GLOBAL_ONLY=global")
-	assert.Contains(t, childDAG.Env, "WORKSPACE_ONLY=ops")
-	assert.Contains(t, childDAG.Env, "SHARED=workspace")
-	assert.Contains(t, string(childDAG.BaseConfigData), "WORKSPACE_ONLY")
+			assert.Contains(t, dag.Env, "WORKSPACE_ONLY=ops")
+			assert.Contains(t, dag.Env, "SHARED=workspace")
+			assert.Contains(t, childDAG.Env, "GLOBAL_ONLY=global")
+			assert.Contains(t, childDAG.Env, "WORKSPACE_ONLY=ops")
+			assert.Contains(t, childDAG.Env, "SHARED=workspace")
+			assert.Contains(t, string(childDAG.BaseConfigData), "WORKSPACE_ONLY")
+			require.NotNil(t, childDAG.BaseConfigWorkspace)
+			assert.Equal(t, "ops", *childDAG.BaseConfigWorkspace)
+		})
+	}
 }
 
 func TestLoadYAMLWithOpts_TypeInheritanceInMultiDocumentYAML(t *testing.T) {
@@ -2198,14 +2416,16 @@ steps:
 		})
 	}
 
-	t.Run("EmptyDocumentSeparator", func(t *testing.T) {
-		t.Parallel()
-
-		// TODO: The YAML parser has limitations with empty documents (---)
-		// The behavior is inconsistent - sometimes it skips them, sometimes it errors.
-		// For now, we test that it loads something, but the sub DAG after
-		// the empty document may or may not be loaded.
-		multiDAGContent := `steps:
+	// Empty documents (bare `---` separators) and comment-only documents are
+	// skipped; every real document in the stream must still be loaded.
+	emptyDocTests := []struct {
+		name      string
+		content   string
+		wantLocal string
+	}{
+		{
+			name: "EmptyDocumentBetweenDAGs",
+			content: `steps:
   - name: step1
     run: echo "main"
 
@@ -2216,16 +2436,89 @@ name: child
 steps:
   - name: step1
     run: echo "child"
-`
-		tmpFile := createTempYAMLFile(t, multiDAGContent)
+`,
+			wantLocal: "child",
+		},
+		{
+			name: "CommentOnlyDocumentBetweenDAGs",
+			content: `steps:
+  - name: step1
+    run: echo "main"
 
-		// The behavior with empty documents is unpredictable
-		_, err := spec.Load(context.Background(), tmpFile)
-		if err != nil {
-			// If it errors, it should be a decode error
-			assert.Contains(t, err.Error(), "failed to decode document")
-		}
-	})
+---
+# this document only contains a comment
+---
+name: child
+steps:
+  - name: step1
+    run: echo "child"
+`,
+			wantLocal: "child",
+		},
+		{
+			name: "LeadingEmptyDocuments",
+			content: `---
+---
+steps:
+  - name: step1
+    run: echo "main"
+`,
+		},
+		{
+			name: "TrailingEmptyDocuments",
+			content: `steps:
+  - name: step1
+    run: echo "main"
+---
+name: child
+steps:
+  - name: step1
+    run: echo "child"
+---
+---
+`,
+			wantLocal: "child",
+		},
+	}
+
+	for _, tt := range emptyDocTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tmpFile := createTempYAMLFile(t, tt.content)
+			dag, err := spec.Load(context.Background(), tmpFile)
+			require.NoError(t, err)
+			assert.Len(t, dag.Steps, 1)
+			if tt.wantLocal == "" {
+				assert.Empty(t, dag.LocalDAGs)
+				return
+			}
+			local, ok := dag.LocalDAGs[tt.wantLocal]
+			require.True(t, ok, "document after an empty document must be loaded")
+			assert.Equal(t, tt.wantLocal, local.Name)
+		})
+	}
+
+	// A stream without a single real document is an error.
+	emptyStreamTests := []struct {
+		name    string
+		content string
+	}{
+		{name: "EmptyFile", content: ``},
+		{name: "OnlySeparator", content: "---\n"},
+		{name: "OnlySeparators", content: "---\n---\n"},
+		{name: "OnlyComment", content: "# just a comment\n"},
+		{name: "OnlySeparatorAndComment", content: "---\n# just a comment\n"},
+	}
+
+	for _, tt := range emptyStreamTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tmpFile := createTempYAMLFile(t, tt.content)
+			_, err := spec.Load(context.Background(), tmpFile)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "no DAGs found")
+		})
+	}
 
 	t.Run("ComplexMultiDAGWithParameters", func(t *testing.T) {
 		t.Parallel()
@@ -3205,4 +3498,45 @@ steps:
 		require.Len(t, dag.Steps, 1)
 		require.Equal(t, "SIGTERM", dag.Steps[0].SignalOnStop)
 	})
+}
+
+func TestMetadataBaseSkipsRuntimeFields(t *testing.T) {
+	t.Parallel()
+	base := createTempYAMLFile(t, `
+catchup_window: 6h
+env:
+  DYNAMIC: "`+"`exit 7`"+`"
+params:
+  schema: missing-schema.json
+  values:
+    region: tokyo
+defaults:
+  timeout_sec: invalid
+handler_on:
+  success:
+    run: echo success
+`)
+	path := createTempYAMLFile(t, "steps:\n  - run: echo tick\n")
+	dag, err := spec.Load(t.Context(), path, spec.WithBaseConfig(base), spec.OnlyMetadata(), spec.WithoutEval(), spec.SkipSchemaValidation())
+	require.NoError(t, err)
+	assert.Equal(t, 6*time.Hour, dag.CatchupWindow)
+	assert.Contains(t, dag.Env, "DYNAMIC=`exit 7`")
+	assert.Empty(t, dag.Steps)
+	assert.Nil(t, dag.HandlerOn.Success)
+}
+
+func TestMetadataBaseValidation(t *testing.T) {
+	t.Parallel()
+	for _, base := range []string{"overlap_policy: invalid", "catchup_window: 0s", "catchup_window: -1h", "schedule: invalid"} {
+		t.Run(base, func(t *testing.T) {
+			basePath := createTempYAMLFile(t, base)
+			path := createTempYAMLFile(t, "steps:\n  - run: echo tick\n")
+			opts := []spec.LoadOption{spec.WithBaseConfig(basePath), spec.OnlyMetadata(), spec.WithoutEval()}
+			_, err := spec.Load(t.Context(), path, opts...)
+			require.Error(t, err)
+			dag, err := spec.Load(t.Context(), path, append(opts, spec.WithAllowBuildErrors())...)
+			require.NoError(t, err)
+			require.NotEmpty(t, dag.BuildErrors)
+		})
+	}
 }

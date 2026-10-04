@@ -163,6 +163,14 @@ func registerResources(server *mcpsdk.Server, svc *Service) {
 		MIMEType:    mcpAppMIMEType,
 	}, svc.readResource)
 
+	server.AddResource(&mcpsdk.Resource{
+		URI:         readResourceReferenceCollectionURI,
+		Name:        "dagu_references",
+		Title:       "Dagu references",
+		Description: "Available built-in MCP reference resources.",
+		MIMEType:    resourceMIMEJSON,
+	}, svc.readResource)
+
 	for _, ref := range referenceResources() {
 		server.AddResource(&mcpsdk.Resource{
 			URI:         ref.uri,
@@ -172,6 +180,24 @@ func registerResources(server *mcpsdk.Server, svc *Service) {
 			MIMEType:    resourceMIMEText,
 		}, svc.readResource)
 	}
+
+	server.AddResource(&mcpsdk.Resource{
+		URI:         readResourceDAGsCollectionURI,
+		Name:        "dags",
+		Title:       "DAGs",
+		Description: "DAG summaries visible to the caller.",
+		MIMEType:    resourceMIMEJSON,
+	}, svc.readResource)
+
+	// Reserved expansion lets valid query characters such as '+' and '*'
+	// reach the collection's query validator.
+	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "dagu://dags?{+query}",
+		Name:        "dags_query",
+		Title:       "DAGs (filtered)",
+		Description: "DAG summaries visible to the caller. query is a URL query string accepted by dagu_read target=dags.",
+		MIMEType:    resourceMIMEJSON,
+	}, svc.readResource)
 
 	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "dagu://dags/{name}/spec",
@@ -205,11 +231,29 @@ func registerResources(server *mcpsdk.Server, svc *Service) {
 		MIMEType:    resourceMIMEText,
 	}, svc.readResource)
 
+	server.AddResource(&mcpsdk.Resource{
+		URI:         readResourceRunsCollectionURI,
+		Name:        "dag_runs",
+		Title:       "DAG-runs",
+		Description: "DAG-run summaries visible to the caller.",
+		MIMEType:    resourceMIMEJSON,
+	}, svc.readResource)
+
+	// The SDK matches registered resources by exact URI, so query-bearing
+	// reads of the collection route through this template instead.
+	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "dagu://runs?{+query}",
+		Name:        "dag_runs_filtered",
+		Title:       "Filtered DAG-runs",
+		Description: "DAG-run summaries visible to the caller. query is a URL query string accepted by dagu_read target=runs. status may be repeated.",
+		MIMEType:    resourceMIMEJSON,
+	}, svc.readResource)
+
 	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "dagu://runs/{name}/{dagRunId}",
 		Name:        "dag_run",
 		Title:       "DAG-run details",
-		Description: "Current DAG-run details. Clients may subscribe to receive a resource update notification when the run reaches a terminal state.",
+		Description: "Current DAG-run details. Clients may subscribe to receive a resource update notification when the run reaches a terminal state or stops at a waiting checkpoint.",
 		MIMEType:    resourceMIMEJSON,
 	}, svc.readResource)
 
@@ -297,6 +341,16 @@ func registerPrompts(server *mcpsdk.Server) {
 			{Name: "dagRunId", Description: "DAG-run ID.", Required: true},
 		},
 	}, promptDebugRun)
+}
+
+// listDAGs returns the normalized DAG collection model, including DAGs
+// discovered under the alternate DAGs directory.
+func (svc *Service) listDAGs(ctx context.Context, query string) (map[string]any, error) {
+	raw, err := svc.api.GetDAGsListDataIncludingAltDirs(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeDAGList(raw)
 }
 
 func (svc *Service) getDAGSpec(ctx context.Context, name string) (map[string]any, error) {
@@ -671,6 +725,16 @@ func (svc *Service) readResourceText(ctx context.Context, rawURI string) (string
 
 	switch parsed.Host {
 	case "reference":
+		if len(segments) == 0 {
+			if parsed.RawQuery != "" {
+				return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+			}
+			text, err := jsonText(readReferenceCollection())
+			if err != nil {
+				return "", "", err
+			}
+			return text, resourceMIMEJSON, nil
+		}
 		if len(segments) != 1 {
 			return "", "", mcpsdk.ResourceNotFoundError(rawURI)
 		}
@@ -680,6 +744,23 @@ func (svc *Service) readResourceText(ctx context.Context, rawURI string) (string
 		}
 		return ref.text, resourceMIMEText, nil
 	case "dags":
+		if len(segments) == 0 {
+			if readErr := validateReadQuery(readTargetDAGs, parsed.RawQuery, true, rawURI); readErr != nil {
+				return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+			}
+			if err := svc.requireAPI(); err != nil {
+				return "", "", err
+			}
+			data, err := svc.listDAGs(ctx, parsed.RawQuery)
+			if err != nil {
+				return "", "", err
+			}
+			text, err := jsonText(data)
+			if err != nil {
+				return "", "", err
+			}
+			return text, resourceMIMEJSON, nil
+		}
 		if len(segments) != 2 || segments[1] != "spec" {
 			return "", "", mcpsdk.ResourceNotFoundError(rawURI)
 		}
@@ -717,6 +798,27 @@ func (svc *Service) readResourceText(ctx context.Context, rawURI string) (string
 		}
 		return text, resourceMIMEJSON, nil
 	case "runs":
+		if len(segments) == 0 {
+			if readErr := validateReadQuery(readTargetRuns, parsed.RawQuery, true, rawURI); readErr != nil {
+				return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+			}
+			if err := svc.requireAPI(); err != nil {
+				return "", "", err
+			}
+			raw, err := svc.api.GetDAGRunsListData(ctx, parsed.RawQuery)
+			if err != nil {
+				return "", "", err
+			}
+			data, err := normalizeRunList(raw)
+			if err != nil {
+				return "", "", err
+			}
+			text, err := jsonText(data)
+			if err != nil {
+				return "", "", err
+			}
+			return text, resourceMIMEJSON, nil
+		}
 		if !isRunResourceSegments(segments) && !isStepLogResourceSegments(segments) &&
 			!isSubRunResourceSegments(segments) && !isSubStepLogResourceSegments(segments) {
 			return "", "", mcpsdk.ResourceNotFoundError(rawURI)
@@ -817,6 +919,28 @@ func (svc *Service) unsubscribe(ctx context.Context, req *mcpsdk.UnsubscribeRequ
 	return nil
 }
 
+// watchState tracks whether the current waiting checkpoint has already been
+// announced, so a checkpoint notifies once rather than once per poll.
+type watchState struct {
+	notifiedWaiting bool
+}
+
+// observe reports whether the watcher should send a resource update for status
+// and whether it should stop watching afterwards.
+func (w *watchState) observe(status int) (notify, stop bool) {
+	switch {
+	case isTerminalStatus(status):
+		return true, true
+	case ir.Status(status).IsWaiting():
+		notify = !w.notifiedWaiting
+		w.notifiedWaiting = true
+		return notify, false
+	default:
+		w.notifiedWaiting = false
+		return false, false
+	}
+}
+
 func (svc *Service) watchRunResource(ctx context.Context, uri string, id uint64) {
 	defer svc.removeWatcher(uri, id)
 
@@ -832,6 +956,7 @@ func (svc *Service) watchRunResource(ctx context.Context, uri string, id uint64)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	consecutiveErrors := 0
+	var state watchState
 
 	for {
 		select {
@@ -847,11 +972,13 @@ func (svc *Service) watchRunResource(ctx context.Context, uri string, id uint64)
 				continue
 			}
 			consecutiveErrors = 0
-			if !isTerminalStatus(status) {
-				continue
+			notify, stop := state.observe(status)
+			if notify {
+				_ = svc.server.ResourceUpdated(ctx, &mcpsdk.ResourceUpdatedNotificationParams{URI: uri})
 			}
-			_ = svc.server.ResourceUpdated(ctx, &mcpsdk.ResourceUpdatedNotificationParams{URI: uri})
-			return
+			if stop {
+				return
+			}
 		}
 	}
 }
@@ -919,10 +1046,15 @@ func isSubStepLogResourceSegments(segments []string) bool {
 	return len(segments) == 7 && segments[2] == "sub" && segments[4] == "steps" && segments[6] == "logs"
 }
 
+// isTerminalStatus reports whether a DAG-run status is final. A waiting
+// checkpoint is not final: the run resumes once an operator resolves its
+// waiting steps.
 func isTerminalStatus(status int) bool {
-	switch status {
-	case 2, 3, 4, 6, 8:
+	switch ir.Status(status) {
+	case ir.Failed, ir.Aborted, ir.Succeeded, ir.PartiallySucceeded, ir.Rejected:
 		return true
+	case ir.NotStarted, ir.Running, ir.Queued, ir.Waiting:
+		return false
 	default:
 		return false
 	}

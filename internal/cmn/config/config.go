@@ -21,6 +21,7 @@ import (
 type Config struct {
 	Core            Core
 	OpenCode        OpenCodeConfig
+	Browser         BrowserConfig
 	Server          Server
 	EventStore      EventStoreConfig
 	Webhooks        WebhooksConfig
@@ -35,6 +36,7 @@ type Config struct {
 	Scheduler       Scheduler
 	Monitoring      MonitoringConfig
 	DefaultExecMode ExecutionMode
+	SignalHandling  SignalHandlingConfig
 	Cache           CacheMode
 	GitSync         GitSyncConfig
 	Tunnel          TunnelConfig
@@ -47,6 +49,15 @@ type Config struct {
 type OpenCodeConfig struct {
 	Executable     string
 	EnvPassthrough []string
+}
+
+// BrowserConfig configures the browsers that browser steps start on this
+// host.
+type BrowserConfig struct {
+	// NoSandbox turns off Chromium's sandbox for every browser started on
+	// this host, for hosts where the sandbox cannot start. Pages are then
+	// isolated from the host only by the operating system user.
+	NoSandbox bool
 }
 
 // DAGDiscoveryConfig controls how DAG definitions are discovered.
@@ -405,34 +416,37 @@ const (
 
 // PathsConfig represents the file system paths configuration.
 type PathsConfig struct {
-	DAGsDir            string
-	WikiDir            string
-	WikiDirLegacy      bool
-	Executable         string
-	LogDir             string
-	ArtifactDir        string
-	DAGStateDir        string
-	DataDir            string
-	ToolsDir           string
-	SuspendFlagsDir    string
-	AdminLogsDir       string
-	EventStoreDir      string
-	BaseConfig         string
-	AltDAGsDir         string
-	DAGRunsDir         string
-	DAGRunWorkDir      string
-	QueueDir           string
-	ProcDir            string
-	ServiceRegistryDir string
-	UsersDir           string
-	APIKeysDir         string
-	WebhooksDir        string
-	ContextsDir        string
-	RemoteNodesDir     string
-	WorkspacesDir      string
-	ViewsDir           string
-	ConfigFileUsed     string
-	ConfigFilesUsed    []string
+	DAGsDir         string
+	WikiDir         string
+	WikiDirLegacy   bool
+	Executable      string
+	LogDir          string
+	ArtifactDir     string
+	DAGStateDir     string
+	DataDir         string
+	ToolsDir        string
+	SuspendFlagsDir string
+	// SuspendFlagsDirLegacy is the fallback suspension directory when the
+	// primary directory was not configured explicitly.
+	SuspendFlagsDirLegacy string
+	AdminLogsDir          string
+	EventStoreDir         string
+	BaseConfig            string
+	AltDAGsDir            string
+	DAGRunsDir            string
+	DAGRunWorkDir         string
+	QueueDir              string
+	ProcDir               string
+	ServiceRegistryDir    string
+	UsersDir              string
+	APIKeysDir            string
+	WebhooksDir           string
+	ContextsDir           string
+	RemoteNodesDir        string
+	WorkspacesDir         string
+	ViewsDir              string
+	ConfigFileUsed        string
+	ConfigFilesUsed       []string
 }
 
 // SecretsConfig holds global defaults for external secret providers.
@@ -569,6 +583,14 @@ type Worker struct {
 type Proc struct {
 	HeartbeatInterval time.Duration // Default: 5s
 	StaleThreshold    time.Duration // Default: 90s
+}
+
+// SignalHandlingConfig controls how supervising Dagu processes handle OS signals.
+type SignalHandlingConfig struct {
+	// EnablePropagation forwards shutdown signals (SIGINT, SIGTERM) received by
+	// a supervising process (server, scheduler, start-all) to the process
+	// groups of running DAG-run subprocesses it launched. Default: false.
+	EnablePropagation bool
 }
 
 // Scheduler represents the scheduler configuration.

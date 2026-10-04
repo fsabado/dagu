@@ -4,6 +4,141 @@
 import type { Locale } from '@/contexts/UserPreference';
 
 const english = {
+  'Artifact preview': 'Artifact preview',
+  'Task artifacts': 'Task artifacts',
+  'Referenced artifacts are not available for this DAG run yet.':
+    'Referenced artifacts are not available for this DAG run yet.',
+  'Open DAG run': 'Open DAG run',
+  'Back to files': 'Back to files',
+  '↑↓ / j k navigate · ←→ folders · Enter preview': '↑↓ / j k navigate · ←→ folders · Enter preview',
+  '↑↓ / j k navigate · ←→ folders · Enter preview · / filter': '↑↓ / j k navigate · ←→ folders · Enter preview · / filter',
+  'Incoming webhook': 'Incoming webhook',
+  'Bot destination': 'Bot destination',
+  'Webhook destination': 'Webhook destination',
+  'Channel actions for {channel}': 'Channel actions for {channel}',
+  'Delete channel': 'Delete channel',
+  '{count} channel': '{count} channel',
+  '{count} channels': '{count} channels',
+  'Create reusable destinations, then choose events in Rules.':
+    'Create reusable destinations, then choose events in Rules.',
+  'View rules': 'View rules',
+  'Search channels': 'Search channels',
+  'No matching channels': 'No matching channels',
+  'Try a different name or provider.': 'Try a different name or provider.',
+  'Add a channel to create your first notification destination.':
+    'Add a channel to create your first notification destination.',
+  'Edit channel': 'Edit channel',
+  'Save a destination, then use it in notification rules.':
+    'Save a destination, then use it in notification rules.',
+  'Create channel': 'Create channel',
+  'Email delivery': 'Email delivery',
+  'Shared sender for email channels.': 'Shared sender for email channels.',
+  'Configure email delivery before testing an email channel.':
+    'Configure email delivery before testing an email channel.',
+  'Adding a channel does not send notifications. Set up a rule to start delivery.':
+    'Adding a channel does not send notifications. Set up a rule to start delivery.',
+  'Go to Rules': 'Go to Rules',
+  'Choose where workflow updates go and when they are sent.':
+    'Choose where workflow updates go and when they are sent.',
+  'Applies to': 'Applies to',
+  'Global defaults': 'Global defaults',
+  'Used unless a workspace or workflow has its own rules.':
+    'Used unless a workspace or workflow has its own rules.',
+  'Workspace rules apply unless a workflow has its own rules.':
+    'Workspace rules apply unless a workflow has its own rules.',
+  'Add rule': 'Add rule',
+  'Choose a destination for this rule.': 'Choose a destination for this rule.',
+  'Every channel already has a rule. Edit an existing rule or create another channel.':
+    'Every channel already has a rule. Edit an existing rule or create another channel.',
+  'Rule for {channel}': 'Rule for {channel}',
+  'Rule actions for {channel}': 'Rule actions for {channel}',
+  'Delete rule': 'Delete rule',
+  'Notify on': 'Notify on',
+  'Send a notification when any selected event occurs.':
+    'Send a notification when any selected event occurs.',
+  'This channel is missing. Choose another destination.':
+    'This channel is missing. Choose another destination.',
+  'This channel is off. Enable it in Channels to receive notifications.':
+    'This channel is off. Enable it in Channels to receive notifications.',
+  'Test channel': 'Test channel',
+  'Sending...': 'Sending...',
+  'Sends a sample notification to this destination.':
+    'Sends a sample notification to this destination.',
+  'Test delivered': 'Test delivered',
+  'Delivery failed': 'Delivery failed',
+  'Failed to send test notification': 'Failed to send test notification',
+  'Inheriting Global rules': 'Inheriting Global rules',
+  'Workspace override': 'Workspace override',
+  'Configure workspace rules to choose different events or destinations.':
+    'Configure workspace rules to choose different events or destinations.',
+  'These rules replace Global defaults for this workspace.':
+    'These rules replace Global defaults for this workspace.',
+  'Configure workspace': 'Configure workspace',
+  'Use Global rules': 'Use Global rules',
+  'Notification rules': 'Notification rules',
+  '{count} rule': '{count} rule',
+  '{count} rules': '{count} rules',
+  'Rule settings': 'Rule settings',
+  'Turn off all rules': 'Turn off all rules',
+  'Turn on all rules': 'Turn on all rules',
+  'All rules are off for this scope. Notifications will not be sent.':
+    'All rules are off for this scope. Notifications will not be sent.',
+  'No notification rules yet': 'No notification rules yet',
+  'Add a rule to choose a destination and the events to send.':
+    'Add a rule to choose a destination and the events to send.',
+  'One rule per channel. Select multiple events for each destination.':
+    'One rule per channel. Select multiple events for each destination.',
+  'All changes saved': 'All changes saved',
+  'Rules take effect after saving.': 'Rules take effect after saving.',
+  'Global rules saved': 'Global rules saved',
+  'Workspace rules saved': 'Workspace rules saved',
+  'Workspace now inherits Global rules': 'Workspace now inherits Global rules',
+  'Failed to resume the scheduler': 'Failed to resume the scheduler',
+  'Failed to update the scheduler pause state':
+    'Failed to update the scheduler pause state',
+  'Log options': 'Log options',
+  'Lines per page': 'Lines per page',
+  'Live output for the submitted DAG run.':
+    'Live output for the submitted DAG run.',
+  'Loading run...': 'Loading run...',
+  Pause: 'Pause',
+  'Pause scheduled runs for every DAG? Manual, webhook, and sub-DAG runs keep working.':
+    'Pause scheduled runs for every DAG? Manual, webhook, and sub-DAG runs keep working.',
+  'Pause Scheduler': 'Pause Scheduler',
+  'Pause scheduler-driven run creation': 'Pause scheduler-driven run creation',
+  'Pause the scheduler': 'Pause the scheduler',
+  'paused by {user}': 'paused by {user}',
+  'Please try again or check the server connection.':
+    'Please try again or check the server connection.',
+  'Queued scheduled runs are dropped and catch-up windows are discarded. Nothing replays on resume.':
+    'Queued scheduled runs are dropped and catch-up windows are discarded. Nothing replays on resume.',
+  Resume: 'Resume',
+  'Resume scheduled runs for every DAG? Schedules pick up from the next tick.':
+    'Resume scheduled runs for every DAG? Schedules pick up from the next tick.',
+  'Resume Scheduler': 'Resume Scheduler',
+  'Resume scheduler-driven run creation':
+    'Resume scheduler-driven run creation',
+  'Resume the scheduler': 'Resume the scheduler',
+  'Run progress': 'Run progress',
+  'Run progress stack': 'Run progress stack',
+  'Run output': 'Run output',
+  'Scheduler is paused. No scheduled runs will start.':
+    'Scheduler is paused. No scheduled runs will start.',
+  Visualization: 'Visualization',
+  'Open run progress for {dagRunId}': 'Open run progress for {dagRunId}',
+  'Dismiss run progress': 'Dismiss run progress',
+  'Step output': 'Step output',
+  'Output for {step}': 'Output for {step}',
+  '{count} failed': '{count} failed',
+  'Back to live': 'Back to live',
+  'Reading output': 'Reading output',
+  'New output available': 'New output available',
+  'Waiting for execution...': 'Waiting for execution...',
+  'Waiting for output...': 'Waiting for output...',
+  'No output recorded.': 'No output recorded.',
+  'Connection interrupted. Retrying...': 'Connection interrupted. Retrying...',
+  'Step details': 'Step details',
+  'View details': 'View details',
   ' (custom)': ' (custom)',
   ' • Auto-refresh is disabled after loading older events':
     ' • Auto-refresh is disabled after loading older events',
@@ -92,6 +227,8 @@ const english = {
   'All loaded DAG runs are displayed.': 'All loaded DAG runs are displayed.',
   'All outcomes': 'All outcomes',
   'All requests have been submitted': 'All requests have been submitted',
+  'All artifacts': 'All artifacts',
+  'All runs': 'All runs',
   'All Statuses': 'All Statuses',
   'All workflows': 'All workflows',
   'All workflows are displayed.': 'All workflows are displayed.',
@@ -168,6 +305,7 @@ const english = {
   by: 'by',
   'By request': 'By request',
   'By:': 'By:',
+  'Bypass step preconditions': 'Bypass step preconditions',
   bytes: 'bytes',
   'Calling:': 'Calling:',
   Cancel: 'Cancel',
@@ -304,7 +442,9 @@ const english = {
   'Current owner:': 'Current owner:',
   'Current time': 'Current time',
   Custom: 'Custom',
+  'Custom...': 'Custom...',
   'Custom Destinations': 'Custom Destinations',
+  'Custom lines per page': 'Custom lines per page',
   'Custom range': 'Custom range',
   'Custom run IDs are disabled.': 'Custom run IDs are disabled.',
   'Customize events': 'Customize events',
@@ -328,6 +468,7 @@ const english = {
   'DAG-Run-ID': 'DAG-Run-ID',
   'DAG-Run-Name': 'DAG-Run-Name',
   'DAG:': 'DAG:',
+  'DAGRun Error': 'DAGRun Error',
   'DAGRun Precondition Unmet': 'DAGRun Precondition Unmet',
   'DAGRun-ID': 'DAGRun-ID',
   'DAGRun-Name': 'DAGRun-Name',
@@ -387,6 +528,8 @@ const english = {
   'Delete Wiki': 'Delete Wiki',
   'Delete Wiki page': 'Delete Wiki page',
   'Delete workflow': 'Delete workflow',
+  'Delete artifact view?': 'Delete artifact view?',
+  'Delete run view?': 'Delete run view?',
   'Delete workflow view?': 'Delete workflow view?',
   'Deleting...': 'Deleting...',
   Delivered: 'Delivered',
@@ -448,6 +591,8 @@ const english = {
   'e.g. production-server': 'e.g. production-server',
   'Each row groups this many days, scrolling back in time.':
     'Each row groups this many days, scrolling back in time.',
+  'Each channel can have one route per scope. Edit its events above, or add another channel.':
+    'Each channel can have one route per scope. Edit its events above, or add another channel.',
   Edit: 'Edit',
   'Edit API Key': 'Edit API Key',
   'Edit Profile': 'Edit Profile',
@@ -765,6 +910,8 @@ const english = {
     'Manage user accounts and their roles',
   'Manage views…': 'Manage views…',
   'Manage webhooks across all DAGs': 'Manage webhooks across all DAGs',
+  'Manage artifact views': 'Manage artifact views',
+  'Manage run views': 'Manage run views',
   'Manage workflow views': 'Manage workflow views',
   'managed by': 'managed by',
   'Managed by': 'Managed by',
@@ -852,6 +999,12 @@ const english = {
   'No executor ran.': 'No executor ran.',
   'No files yet': 'No files yet',
   'No human tasks are waiting.': 'No human tasks are waiting.',
+  'This DAG-run is queued or running. Open tasks become editable once it is waiting.':
+    'This DAG-run is queued or running. Open tasks become editable once it is waiting.',
+  'Request changes': 'Request changes',
+  'Requesting changes…': 'Requesting changes…',
+  '{step} and the steps that depend on it run again with your feedback. This task reopens afterward.':
+    '{step} and the steps that depend on it run again with your feedback. This task reopens afterward.',
   'No incident connections configured.': 'No incident connections configured.',
   'No incident connections selected.': 'No incident connections selected.',
   'No inherited route is configured for this DAG.':
@@ -880,6 +1033,8 @@ const english = {
     'No running, retrying, or failed steps at the moment.',
   'No runs': 'No runs',
   'No runs on': 'No runs on',
+  'No saved artifact views yet.': 'No saved artifact views yet.',
+  'No saved run views yet.': 'No saved run views yet.',
   'No saved workflow views yet.': 'No saved workflow views yet.',
   'No schedule': 'No schedule',
   'No schedule defined': 'No schedule defined',
@@ -949,6 +1104,18 @@ const english = {
     'OpenCode has not emitted any timeline events yet.',
   'OpenCode managed session': 'OpenCode managed session',
   'OpenCode needs an answer': 'OpenCode needs an answer',
+  'No timeline events yet.': 'No timeline events yet.',
+  'The browser step needs an answer': 'The browser step needs an answer',
+  'Answer deadline: {time}': 'Answer deadline: {time}',
+  'Browser session': 'Browser session',
+  'Start this browser step over?': 'Start this browser step over?',
+  'This closes the browser if it is still open and runs the step again from its first operation.':
+    'This closes the browser if it is still open and runs the step again from its first operation.',
+  'The computer step needs an answer': 'The computer step needs an answer',
+  'Computer session': 'Computer session',
+  'Start this computer step over?': 'Start this computer step over?',
+  'This runs the step again from its first operation. Windows the step opened stay as they are.':
+    'This runs the step again from its first operation. Windows the step opened stay as they are.',
   'Opens on final failure and resolves on recovery.':
     'Opens on final failure and resolves on recovery.',
   Operations: 'Operations',
@@ -1208,7 +1375,13 @@ const english = {
   'Save Source DAG:': 'Save Source DAG:',
   'Save the current name and label filters, plus the sort order, for this remote and workspace.':
     'Save the current name and label filters, plus the sort order, for this remote and workspace.',
+  'Save the current DAG name, file name, and date filters for this remote and workspace.':
+    'Save the current DAG name, file name, and date filters for this remote and workspace.',
+  'Save the current name, run ID, status, label, and date filters for this remote and workspace.':
+    'Save the current name, run ID, status, label, and date filters for this remote and workspace.',
   'Save view': 'Save view',
+  'Save artifact view': 'Save artifact view',
+  'Save run view': 'Save run view',
   'Save workflow view': 'Save workflow view',
   'Saving...': 'Saving...',
   'Scanning...': 'Scanning...',
@@ -1251,6 +1424,8 @@ const english = {
   'Select an action to inspect its configuration.':
     'Select an action to inspect its configuration.',
   'Select an artifact': 'Select an artifact',
+  'Select at least one event before saving.':
+    'Select at least one event before saving.',
   'Select attribution': 'Select attribution',
   'Select channel': 'Select channel',
   'Select connection': 'Select connection',
@@ -1295,6 +1470,8 @@ const english = {
   'Since startup': 'Since startup',
   'Size:': 'Size:',
   'Skip TLS verification': 'Skip TLS verification',
+  'Skip precondition checks for the retried steps. Workflow-level preconditions still apply.':
+    'Skip precondition checks for the retried steps. Workflow-level preconditions still apply.',
   skipped: 'skipped',
   Skipped: 'Skipped',
   'Slack message template': 'Slack message template',
@@ -1687,6 +1864,7 @@ const english = {
   'No runs on {date}': 'No runs on {date}',
   'Page {page}': 'Page {page}',
   'Page {page} of {total}': 'Page {page} of {total}',
+  'of {total}': 'of {total}',
   'Partially succeeded': 'Partially succeeded',
   'Processing {count} request using the existing DAG-run API.':
     'Processing {count} request using the existing DAG-run API.',
@@ -1897,6 +2075,10 @@ const english = {
     'You have unsaved changes in {page}. Discard changes?',
   '“{name}” will be removed for everyone with access to this workspace scope. Workflows are not affected.':
     '“{name}” will be removed for everyone with access to this workspace scope. Workflows are not affected.',
+  '“{name}” will be removed for everyone with access to this workspace scope. Artifacts are not affected.':
+    '“{name}” will be removed for everyone with access to this workspace scope. Artifacts are not affected.',
+  '“{name}” will be removed for everyone with access to this workspace scope. Runs are not affected.':
+    '“{name}” will be removed for everyone with access to this workspace scope. Runs are not affected.',
   attachment: 'attachment',
   attachments: 'attachments',
   'Audit ID': 'Audit ID',
@@ -2083,12 +2265,157 @@ const english = {
   '(unchanged)': '(unchanged)',
   'Next run': 'Next run',
   'Copy MCP setup prompt': 'Copy MCP setup prompt',
+  'Profile tokens': 'Profile tokens',
+  "Give each caller its own token. Requests with a profile token always run with that token's profile, and an {header} header naming another profile is rejected.":
+    "Give each caller its own token. Requests with a profile token always run with that token's profile, and an {header} header naming another profile is rejected.",
+  'No profile tokens.': 'No profile tokens.',
+  'Token name': 'Token name',
+  'Runtime profile': 'Runtime profile',
+  'Create token': 'Create token',
+  'Last used:': 'Last used:',
+  'Profile tokens are ignored while authentication is HMAC only.':
+    'Profile tokens are ignored while authentication is HMAC only.',
+  'Revoke Profile Token': 'Revoke Profile Token',
+  'Applications using this token will immediately lose access.':
+    'Applications using this token will immediately lose access.',
 } as const;
 
 export type StaticMessage = keyof typeof english;
 export type StaticTranslationValues = Record<string, string | number>;
 
 const chinese = {
+  'Artifact preview': '产物预览',
+  'Task artifacts': '任务产物',
+  'Referenced artifacts are not available for this DAG run yet.':
+    '此次 DAG 运行尚无可用的引用产物。',
+  'Open DAG run': '打开 DAG 运行',
+  'Back to files': '返回文件列表',
+  '↑↓ / j k navigate · ←→ folders · Enter preview': '↑↓ / j k 导航 · ←→ 文件夹 · Enter 预览',
+  '↑↓ / j k navigate · ←→ folders · Enter preview · / filter': '↑↓ / j k 导航 · ←→ 文件夹 · Enter 预览 · / 筛选',
+  'Incoming webhook': '传入 Webhook',
+  'Bot destination': '机器人通知目标',
+  'Webhook destination': 'Webhook 通知目标',
+  'Channel actions for {channel}': '{channel} 的通道操作',
+  'Delete channel': '删除通道',
+  '{count} channel': '{count} 个通道',
+  '{count} channels': '{count} 个通道',
+  'Create reusable destinations, then choose events in Rules.':
+    '创建可复用的通知目标，然后在“规则”中选择事件。',
+  'View rules': '查看规则',
+  'Search channels': '搜索通道',
+  'No matching channels': '没有匹配的通道',
+  'Try a different name or provider.': '请尝试其他名称或提供商。',
+  'Add a channel to create your first notification destination.':
+    '添加通道以创建第一个通知目标。',
+  'Edit channel': '编辑通道',
+  'Save a destination, then use it in notification rules.':
+    '保存通知目标，然后在通知规则中使用。',
+  'Create channel': '创建通道',
+  'Email delivery': '邮件发送',
+  'Shared sender for email channels.': '邮件通道共用的发件设置。',
+  'Configure email delivery before testing an email channel.':
+    '测试邮件通道前，请先配置邮件发送。',
+  'Adding a channel does not send notifications. Set up a rule to start delivery.':
+    '添加通道不会发送通知。请设置规则以开始发送。',
+  'Go to Rules': '前往规则',
+  'Choose where workflow updates go and when they are sent.':
+    '选择工作流通知的发送目标和触发时机。',
+  'Applies to': '适用范围',
+  'Global defaults': '全局默认规则',
+  'Used unless a workspace or workflow has its own rules.':
+    '工作区或工作流未配置独立规则时使用。',
+  'Workspace rules apply unless a workflow has its own rules.':
+    '工作流未配置独立规则时使用工作区规则。',
+  'Add rule': '添加规则',
+  'Choose a destination for this rule.': '为此规则选择通知目标。',
+  'Every channel already has a rule. Edit an existing rule or create another channel.':
+    '所有通道都已有规则。请编辑现有规则或创建其他通道。',
+  'Rule for {channel}': '{channel} 的规则',
+  'Rule actions for {channel}': '{channel} 的规则操作',
+  'Delete rule': '删除规则',
+  'Notify on': '通知事件',
+  'Send a notification when any selected event occurs.':
+    '发生任一所选事件时发送通知。',
+  'This channel is missing. Choose another destination.':
+    '此通道不存在。请选择其他通知目标。',
+  'This channel is off. Enable it in Channels to receive notifications.':
+    '此通道已关闭。请在“通道”中启用以接收通知。',
+  'Test channel': '测试通道',
+  'Sending...': '正在发送...',
+  'Sends a sample notification to this destination.':
+    '向此目标发送一条测试通知。',
+  'Test delivered': '测试通知已送达',
+  'Delivery failed': '发送失败',
+  'Failed to send test notification': '测试通知发送失败',
+  'Inheriting Global rules': '继承全局规则',
+  'Workspace override': '工作区覆盖规则',
+  'Configure workspace rules to choose different events or destinations.':
+    '配置工作区规则以选择不同的事件或通知目标。',
+  'These rules replace Global defaults for this workspace.':
+    '这些规则将替代此工作区的全局默认规则。',
+  'Configure workspace': '配置工作区',
+  'Use Global rules': '使用全局规则',
+  'Notification rules': '通知规则',
+  '{count} rule': '{count} 条规则',
+  '{count} rules': '{count} 条规则',
+  'Rule settings': '规则设置',
+  'Turn off all rules': '关闭所有规则',
+  'Turn on all rules': '启用所有规则',
+  'All rules are off for this scope. Notifications will not be sent.':
+    '此范围内的所有规则均已关闭，不会发送通知。',
+  'No notification rules yet': '尚无通知规则',
+  'Add a rule to choose a destination and the events to send.':
+    '添加规则以选择通知目标和要发送的事件。',
+  'One rule per channel. Select multiple events for each destination.':
+    '每个通道一条规则，可为每个目标选择多个事件。',
+  'All changes saved': '所有更改已保存',
+  'Rules take effect after saving.': '规则将在保存后生效。',
+  'Global rules saved': '全局规则已保存',
+  'Workspace rules saved': '工作区规则已保存',
+  'Workspace now inherits Global rules': '工作区现已继承全局规则',
+  'Failed to resume the scheduler': '恢复调度器失败',
+  'Failed to update the scheduler pause state': '更新调度器暂停状态失败',
+  'Log options': '日志选项',
+  'Lines per page': '每页行数',
+  'Live output for the submitted DAG run.': '已提交 DAG 运行的实时输出。',
+  'Loading run...': '正在加载运行...',
+  Pause: '暂停',
+  'Pause scheduled runs for every DAG? Manual, webhook, and sub-DAG runs keep working.':
+    '要暂停所有 DAG 的定时运行吗？手动、Webhook 和子 DAG 的运行不受影响。',
+  'Pause Scheduler': '暂停调度器',
+  'Pause scheduler-driven run creation': '暂停由调度器触发的运行',
+  'Pause the scheduler': '暂停调度器',
+  'paused by {user}': '由 {user} 暂停',
+  'Please try again or check the server connection.':
+    '请重试或检查服务器连接。',
+  'Queued scheduled runs are dropped and catch-up windows are discarded. Nothing replays on resume.':
+    '排队中的定时运行会被丢弃，追赶窗口也会被清除。恢复后不会重放。',
+  Resume: '恢复',
+  'Resume scheduled runs for every DAG? Schedules pick up from the next tick.':
+    '要恢复所有 DAG 的定时运行吗？调度将从下一个周期开始生效。',
+  'Resume Scheduler': '恢复调度器',
+  'Resume scheduler-driven run creation': '恢复由调度器触发的运行',
+  'Resume the scheduler': '恢复调度器',
+  'Run progress': '运行进度',
+  'Run progress stack': '运行进度堆栈',
+  'Run output': '运行输出',
+  'Scheduler is paused. No scheduled runs will start.':
+    '调度器已暂停。不会启动任何定时运行。',
+  Visualization: '可视化',
+  'Open run progress for {dagRunId}': '打开 {dagRunId} 的运行进度',
+  'Dismiss run progress': '关闭运行进度',
+  'Step output': '步骤输出',
+  'Output for {step}': '{step} 的输出',
+  '{count} failed': '{count} 个失败',
+  'Back to live': '返回实时输出',
+  'Reading output': '正在查看输出',
+  'New output available': '有新输出',
+  'Waiting for execution...': '等待执行...',
+  'Waiting for output...': '等待输出...',
+  'No output recorded.': '暂无输出记录。',
+  'Connection interrupted. Retrying...': '连接已中断，正在重试...',
+  'Step details': '步骤详情',
+  'View details': '查看详情',
   ' (custom)': '（自定义）',
   ' • Auto-refresh is disabled after loading older events':
     ' • 加载较早事件后，自动刷新将禁用',
@@ -2174,6 +2501,8 @@ const chinese = {
   'All loaded DAG runs are displayed.': '已显示全部已加载的 DAG 运行',
   'All outcomes': '全部结果',
   'All requests have been submitted': '所有请求已提交',
+  'All artifacts': '所有产物',
+  'All runs': '所有运行',
   'All Statuses': '全部状态',
   'All workflows': '所有工作流',
   'All workflows are displayed.': '已显示全部工作流',
@@ -2250,6 +2579,7 @@ const chinese = {
   by: '由',
   'By request': '按请求',
   'By:': '由:',
+  'Bypass step preconditions': '跳过步骤前置条件',
   bytes: '字节',
   'Calling:': '调用:',
   Cancel: '取消',
@@ -2386,7 +2716,9 @@ const chinese = {
   'Current owner:': '当前所有者:',
   'Current time': '当前时间',
   Custom: '自定义',
+  'Custom...': '自定义...',
   'Custom Destinations': '自定义目标',
+  'Custom lines per page': '自定义每页行数',
   'Custom range': '自定义范围',
   'Custom run IDs are disabled.': '自定义运行 ID 已禁用。',
   'Customize events': '自定义事件',
@@ -2410,6 +2742,7 @@ const chinese = {
   'DAG-Run-ID': 'DAG-Run-ID',
   'DAG-Run-Name': 'DAG-Run-Name',
   'DAG:': 'DAG：',
+  'DAGRun Error': 'DAGRun 错误',
   'DAGRun Precondition Unmet': 'DAGRun 前置条件未满足',
   'DAGRun-ID': 'DAGRun-ID',
   'DAGRun-Name': 'DAGRun-Name',
@@ -2467,6 +2800,8 @@ const chinese = {
   'Delete Wiki': '删除 Wiki',
   'Delete Wiki page': '删除 Wiki 页面',
   'Delete workflow': '删除工作流',
+  'Delete artifact view?': '删除产物视图？',
+  'Delete run view?': '删除运行视图？',
   'Delete workflow view?': '删除工作流视图？',
   'Deleting...': '删除中...',
   Delivered: '已送达',
@@ -2525,6 +2860,8 @@ const chinese = {
   'e.g. production-server': '例如: production-server',
   'Each row groups this many days, scrolling back in time.':
     '每行分组这么多天，向后滚动时间。',
+  'Each channel can have one route per scope. Edit its events above, or add another channel.':
+    '每个通道在每个作用域内只能有一条路由。请在上方编辑事件，或添加另一个通道。',
   Edit: '编辑',
   'Edit API Key': '编辑 API 密钥',
   'Edit Profile': '编辑个人资料',
@@ -2833,6 +3170,8 @@ const chinese = {
   'Manage user accounts and their roles': '管理用户账户及其角色',
   'Manage views…': '管理视图…',
   'Manage webhooks across all DAGs': '跨所有 DAG 管理 Webhook',
+  'Manage artifact views': '管理产物视图',
+  'Manage run views': '管理运行视图',
   'Manage workflow views': '管理工作流视图',
   'managed by': '由...管理',
   'Managed by': '由...管理',
@@ -2916,6 +3255,12 @@ const chinese = {
   'No executor ran.': '没有执行器运行。',
   'No files yet': '暂无文件',
   'No human tasks are waiting.': '没有等待中的人工任务。',
+  'This DAG-run is queued or running. Open tasks become editable once it is waiting.':
+    '此 DAG 运行正在排队或运行中。进入等待状态后即可编辑待处理任务。',
+  'Request changes': '请求修改',
+  'Requesting changes…': '正在请求修改…',
+  '{step} and the steps that depend on it run again with your feedback. This task reopens afterward.':
+    '{step} 及依赖它的步骤将根据你的反馈重新运行，之后此任务会重新打开。',
   'No incident connections configured.': '未配置事件连接。',
   'No incident connections selected.': '未选择事件连接。',
   'No inherited route is configured for this DAG.': '此 DAG 未配置继承的路由。',
@@ -2942,6 +3287,8 @@ const chinese = {
     '当前没有正在运行、重试或失败的步骤。',
   'No runs': '暂无运行',
   'No runs on': '没有',
+  'No saved artifact views yet.': '尚未保存产物视图。',
+  'No saved run views yet.': '尚未保存运行视图。',
   'No saved workflow views yet.': '尚未保存工作流视图。',
   'No schedule': '无调度',
   'No schedule defined': '未定义计划',
@@ -3010,6 +3357,18 @@ const chinese = {
     'OpenCode 尚未发出任何时间线事件。',
   'OpenCode managed session': 'OpenCode 托管会话',
   'OpenCode needs an answer': 'OpenCode 需要回答',
+  'No timeline events yet.': '暂无时间线事件。',
+  'The browser step needs an answer': '浏览器步骤需要回答',
+  'Answer deadline: {time}': '回答截止：{time}',
+  'Browser session': '浏览器会话',
+  'Start this browser step over?': '要重新开始此浏览器步骤吗？',
+  'This closes the browser if it is still open and runs the step again from its first operation.':
+    '如果浏览器仍处于打开状态，将关闭它，并从第一个操作重新运行此步骤。',
+  'The computer step needs an answer': '计算机步骤需要回答',
+  'Computer session': '计算机会话',
+  'Start this computer step over?': '要重新开始此计算机步骤吗？',
+  'This runs the step again from its first operation. Windows the step opened stay as they are.':
+    '将从第一个操作重新运行此步骤。此步骤打开的窗口将保持原样。',
   'Opens on final failure and resolves on recovery.':
     '在最终失败时打开，并在恢复时解决。',
   Operations: '操作',
@@ -3267,7 +3626,13 @@ const chinese = {
   'Save Source DAG:': '保存源 DAG：',
   'Save the current name and label filters, plus the sort order, for this remote and workspace.':
     '保存此远程和工作区的当前名称和标签筛选条件以及排序顺序。',
+  'Save the current DAG name, file name, and date filters for this remote and workspace.':
+    '保存此远程和工作区的当前 DAG 名称、文件名和日期筛选条件。',
+  'Save the current name, run ID, status, label, and date filters for this remote and workspace.':
+    '保存此远程和工作区的当前名称、运行 ID、状态、标签和日期筛选条件。',
   'Save view': '保存视图',
+  'Save artifact view': '保存产物视图',
+  'Save run view': '保存运行视图',
   'Save workflow view': '保存工作流视图',
   'Saving...': '保存中...',
   'Scanning...': '扫描中...',
@@ -3307,6 +3672,7 @@ const chinese = {
   'Select all loaded workflows': '选择所有已加载工作流',
   'Select an action to inspect its configuration.': '选择操作以检查其配置。',
   'Select an artifact': '选择产物',
+  'Select at least one event before saving.': '保存前请至少选择一个事件。',
   'Select attribution': '选择归属',
   'Select channel': '选择频道',
   'Select connection': '选择连接',
@@ -3350,6 +3716,8 @@ const chinese = {
   'Since startup': '自启动以来',
   'Size:': '大小：',
   'Skip TLS verification': '跳过 TLS 验证',
+  'Skip precondition checks for the retried steps. Workflow-level preconditions still apply.':
+    '跳过所重试步骤的前置条件检查。工作流级前置条件仍然适用。',
   skipped: '已跳过',
   Skipped: '已跳过',
   'Slack message template': 'Slack 消息模板',
@@ -3729,6 +4097,7 @@ const chinese = {
   'No runs on {date}': '{date} 没有运行记录',
   'Page {page}': '第 {page} 页',
   'Page {page} of {total}': '第 {page} 页，共 {total} 页',
+  'of {total}': '共 {total} 页',
   'Partially succeeded': '部分成功',
   'Processing {count} request using the existing DAG-run API.':
     '正在使用现有 DAG 运行 API 处理 {count} 个请求。',
@@ -3933,6 +4302,10 @@ const chinese = {
     '{page}中有未保存的更改。要放弃更改吗？',
   '“{name}” will be removed for everyone with access to this workspace scope. Workflows are not affected.':
     '将为有权访问此工作区范围的所有人移除“{name}”。工作流不受影响。',
+  '“{name}” will be removed for everyone with access to this workspace scope. Artifacts are not affected.':
+    '将为有权访问此工作区范围的所有人移除“{name}”。产物不受影响。',
+  '“{name}” will be removed for everyone with access to this workspace scope. Runs are not affected.':
+    '将为有权访问此工作区范围的所有人移除“{name}”。运行不受影响。',
   attachment: '附件',
   attachments: '附件',
   'Audit ID': '审计 ID',
@@ -4113,9 +4486,160 @@ const chinese = {
   '(unchanged)': '（不变）',
   'Next run': '下次运行',
   'Copy MCP setup prompt': '复制 MCP 配置提示词',
+  'Profile tokens': '配置文件令牌',
+  "Give each caller its own token. Requests with a profile token always run with that token's profile, and an {header} header naming another profile is rejected.":
+    '为每个调用方提供独立的令牌。使用配置文件令牌的请求始终以该令牌的配置文件运行，指定其他配置文件的 {header} 标头会被拒绝。',
+  'No profile tokens.': '没有配置文件令牌。',
+  'Token name': '令牌名称',
+  'Runtime profile': '运行时配置文件',
+  'Create token': '创建令牌',
+  'Last used:': '最后使用:',
+  'Profile tokens are ignored while authentication is HMAC only.':
+    '认证方式为仅 HMAC 时，配置文件令牌会被忽略。',
+  'Revoke Profile Token': '撤销配置文件令牌',
+  'Applications using this token will immediately lose access.':
+    '使用此令牌的应用将立即失去访问权限。',
 } as const satisfies Record<StaticMessage, string>;
 
 const japanese = {
+  'Artifact preview': '成果物プレビュー',
+  'Task artifacts': 'タスク成果物',
+  'Referenced artifacts are not available for this DAG run yet.':
+    'この DAG 実行では参照された成果物はまだ利用できません。',
+  'Open DAG run': 'DAG 実行を開く',
+  'Back to files': 'ファイル一覧に戻る',
+  '↑↓ / j k navigate · ←→ folders · Enter preview': '↑↓ / j k 移動 · ←→ フォルダー · Enter プレビュー',
+  '↑↓ / j k navigate · ←→ folders · Enter preview · / filter': '↑↓ / j k 移動 · ←→ フォルダー · Enter プレビュー · / 絞り込み',
+  'Incoming webhook': '受信用 Webhook',
+  'Bot destination': 'Bot の通知先',
+  'Webhook destination': 'Webhook の通知先',
+  'Channel actions for {channel}': '{channel} のチャネル操作',
+  'Delete channel': 'チャネルを削除',
+  '{count} channel': '{count} 個のチャネル',
+  '{count} channels': '{count} 個のチャネル',
+  'Create reusable destinations, then choose events in Rules.':
+    '再利用できる通知先を作成し、「ルール」でイベントを選択します。',
+  'View rules': 'ルールを表示',
+  'Search channels': 'チャネルを検索',
+  'No matching channels': '一致するチャネルがありません',
+  'Try a different name or provider.':
+    '別の名前またはプロバイダーで検索してください。',
+  'Add a channel to create your first notification destination.':
+    'チャネルを追加して、最初の通知先を作成してください。',
+  'Edit channel': 'チャネルを編集',
+  'Save a destination, then use it in notification rules.':
+    '通知先を保存すると、通知ルールで使用できます。',
+  'Create channel': 'チャネルを作成',
+  'Email delivery': 'メール配信',
+  'Shared sender for email channels.': 'メールチャネルで共有する送信設定です。',
+  'Configure email delivery before testing an email channel.':
+    'メールチャネルをテストする前に、メール配信を設定してください。',
+  'Adding a channel does not send notifications. Set up a rule to start delivery.':
+    'チャネルの追加だけでは通知は送信されません。配信を開始するにはルールを設定してください。',
+  'Go to Rules': 'ルールへ',
+  'Choose where workflow updates go and when they are sent.':
+    'ワークフローの通知先と通知するタイミングを設定します。',
+  'Applies to': '適用範囲',
+  'Global defaults': 'グローバルのデフォルト',
+  'Used unless a workspace or workflow has its own rules.':
+    'ワークスペースやワークフローに個別のルールがない場合に適用されます。',
+  'Workspace rules apply unless a workflow has its own rules.':
+    'ワークフローに個別のルールがない場合にワークスペースのルールを適用します。',
+  'Add rule': 'ルールを追加',
+  'Choose a destination for this rule.':
+    'このルールの通知先を選択してください。',
+  'Every channel already has a rule. Edit an existing rule or create another channel.':
+    'すべてのチャネルにルールが設定されています。既存のルールを編集するか、別のチャネルを作成してください。',
+  'Rule for {channel}': '{channel} のルール',
+  'Rule actions for {channel}': '{channel} のルール操作',
+  'Delete rule': 'ルールを削除',
+  'Notify on': '通知するイベント',
+  'Send a notification when any selected event occurs.':
+    '選択したいずれかのイベントが発生したときに通知します。',
+  'This channel is missing. Choose another destination.':
+    'このチャネルは見つかりません。別の通知先を選択してください。',
+  'This channel is off. Enable it in Channels to receive notifications.':
+    'このチャネルは無効です。通知を受け取るには「チャネル」で有効にしてください。',
+  'Test channel': 'チャネルをテスト',
+  'Sending...': '送信中...',
+  'Sends a sample notification to this destination.':
+    'この通知先にテスト通知を送信します。',
+  'Test delivered': 'テスト通知を送信しました',
+  'Delivery failed': '送信に失敗しました',
+  'Failed to send test notification': 'テスト通知の送信に失敗しました',
+  'Inheriting Global rules': 'グローバルのルールを継承中',
+  'Workspace override': 'ワークスペースの個別設定',
+  'Configure workspace rules to choose different events or destinations.':
+    '異なるイベントや通知先を使用するには、ワークスペースのルールを設定してください。',
+  'These rules replace Global defaults for this workspace.':
+    'このワークスペースでは、グローバルのデフォルトの代わりにこれらのルールを適用します。',
+  'Configure workspace': 'ワークスペースを設定',
+  'Use Global rules': 'グローバルのルールを使用',
+  'Notification rules': '通知ルール',
+  '{count} rule': '{count} 件のルール',
+  '{count} rules': '{count} 件のルール',
+  'Rule settings': 'ルールの設定',
+  'Turn off all rules': 'すべてのルールを無効にする',
+  'Turn on all rules': 'すべてのルールを有効にする',
+  'All rules are off for this scope. Notifications will not be sent.':
+    'この範囲ではすべてのルールが無効です。通知は送信されません。',
+  'No notification rules yet': '通知ルールはまだありません',
+  'Add a rule to choose a destination and the events to send.':
+    'ルールを追加して、通知先と通知するイベントを選択してください。',
+  'One rule per channel. Select multiple events for each destination.':
+    'チャネルごとに1つのルールを設定できます。通知先ごとに複数のイベントを選択できます。',
+  'All changes saved': 'すべての変更を保存済み',
+  'Rules take effect after saving.': 'ルールは保存後に適用されます。',
+  'Global rules saved': 'グローバルのルールを保存しました',
+  'Workspace rules saved': 'ワークスペースのルールを保存しました',
+  'Workspace now inherits Global rules':
+    'ワークスペースにグローバルのルールを適用しました',
+  'Failed to resume the scheduler': 'スケジューラの再開に失敗しました',
+  'Failed to update the scheduler pause state':
+    'スケジューラの一時停止状態の更新に失敗しました',
+  'Log options': 'ログ表示設定',
+  'Lines per page': 'ページあたりの行数',
+  'Live output for the submitted DAG run.': '送信したDAG実行のライブ出力です。',
+  'Loading run...': '実行を読み込み中...',
+  Pause: '一時停止',
+  'Pause scheduled runs for every DAG? Manual, webhook, and sub-DAG runs keep working.':
+    'すべての DAG のスケジュール実行を一時停止しますか？手動、Webhook、サブ DAG の実行は影響を受けません。',
+  'Pause Scheduler': 'スケジューラを一時停止',
+  'Pause scheduler-driven run creation':
+    'スケジューラによる実行の作成を一時停止します',
+  'Pause the scheduler': 'スケジューラを一時停止',
+  'paused by {user}': '{user} が一時停止',
+  'Please try again or check the server connection.':
+    '再試行するか、サーバー接続を確認してください。',
+  'Queued scheduled runs are dropped and catch-up windows are discarded. Nothing replays on resume.':
+    'キュー内のスケジュール実行は破棄され、キャッチアップ期間も失われます。再開しても再実行されません。',
+  Resume: '再開',
+  'Resume scheduled runs for every DAG? Schedules pick up from the next tick.':
+    'すべての DAG のスケジュール実行を再開しますか？次のティックからスケジュールが再開されます。',
+  'Resume Scheduler': 'スケジューラを再開',
+  'Resume scheduler-driven run creation':
+    'スケジューラによる実行の作成を再開します',
+  'Resume the scheduler': 'スケジューラを再開',
+  'Run progress': '実行の進捗',
+  'Run progress stack': '実行の進捗スタック',
+  'Run output': '実行出力',
+  'Scheduler is paused. No scheduled runs will start.':
+    'スケジューラは一時停止中です。スケジュール実行は開始されません。',
+  Visualization: '可視化',
+  'Open run progress for {dagRunId}': '{dagRunId} の実行進捗を開く',
+  'Dismiss run progress': '実行進捗を閉じる',
+  'Step output': 'ステップ出力',
+  'Output for {step}': '{step} の出力',
+  '{count} failed': '{count} 件失敗',
+  'Back to live': 'ライブに戻る',
+  'Reading output': '出力を閲覧中',
+  'New output available': '新しい出力があります',
+  'Waiting for execution...': '実行待ち...',
+  'Waiting for output...': '出力待ち...',
+  'No output recorded.': '出力は記録されていません。',
+  'Connection interrupted. Retrying...': '接続が切れました。再接続中...',
+  'Step details': 'ステップ詳細',
+  'View details': '詳細を見る',
   ' (custom)': '（カスタム）',
   ' • Auto-refresh is disabled after loading older events':
     ' • 古いイベントを読み込んだ後、自動更新は無効になります',
@@ -4204,6 +4728,8 @@ const japanese = {
     '読み込まれたすべてのDAG実行が表示されています。',
   'All outcomes': 'すべての結果',
   'All requests have been submitted': 'すべてのリクエストが送信されました',
+  'All artifacts': 'すべての成果物',
+  'All runs': 'すべてのラン',
   'All Statuses': 'すべてのステータス',
   'All workflows': 'すべてのワークフロー',
   'All workflows are displayed.': 'すべてのワークフローが表示されています。',
@@ -4280,6 +4806,7 @@ const japanese = {
   by: '作成者:',
   'By request': 'リクエストごと',
   'By:': '作成者:',
+  'Bypass step preconditions': 'ステップの前提条件をバイパス',
   bytes: 'バイト',
   'Calling:': '呼び出し中:',
   Cancel: 'キャンセル',
@@ -4419,7 +4946,9 @@ const japanese = {
   'Current owner:': '現在の所有者:',
   'Current time': '現在時刻',
   Custom: 'カスタム',
+  'Custom...': 'カスタム...',
   'Custom Destinations': 'カスタム宛先',
+  'Custom lines per page': 'ページあたりのカスタム行数',
   'Custom range': 'カスタム範囲',
   'Custom run IDs are disabled.': 'カスタム実行IDは無効です。',
   'Customize events': 'イベントをカスタマイズ',
@@ -4445,6 +4974,7 @@ const japanese = {
   'DAG-Run-ID': 'DAG-Run-ID',
   'DAG-Run-Name': 'DAG-Run-Name',
   'DAG:': 'DAG：',
+  'DAGRun Error': 'DAGRun エラー',
   'DAGRun Precondition Unmet': 'DAGRun の前提条件が未充足',
   'DAGRun-ID': 'DAGRun-ID',
   'DAGRun-Name': 'DAGRun-Name',
@@ -4504,6 +5034,8 @@ const japanese = {
   'Delete Wiki': 'Wiki を削除',
   'Delete Wiki page': 'Wiki ページを削除',
   'Delete workflow': 'ワークフローを削除',
+  'Delete artifact view?': '成果物ビューを削除しますか？',
+  'Delete run view?': 'ランビューを削除しますか？',
   'Delete workflow view?': 'ワークフロービューを削除しますか？',
   'Deleting...': '削除中...',
   Delivered: '配信済み',
@@ -4563,6 +5095,8 @@ const japanese = {
   'e.g. production-server': '例: production-server',
   'Each row groups this many days, scrolling back in time.':
     '各行はこの日数をグループ化し、過去にスクロールします。',
+  'Each channel can have one route per scope. Edit its events above, or add another channel.':
+    '各スコープでチャネルごとに設定できるルートは1つです。上のイベントを編集するか、別のチャネルを追加してください。',
   Edit: '編集',
   'Edit API Key': 'APIキーを編集',
   'Edit Profile': 'プロフィールを編集',
@@ -4882,6 +5416,8 @@ const japanese = {
     'ユーザーアカウントとそのロールを管理',
   'Manage views…': 'ビューの管理…',
   'Manage webhooks across all DAGs': 'すべてのDAGのWebhookを管理',
+  'Manage artifact views': '成果物ビューを管理',
+  'Manage run views': 'ランビューを管理',
   'Manage workflow views': 'ワークフロービューを管理',
   'managed by': '管理者:',
   'Managed by': '管理者:',
@@ -4973,6 +5509,12 @@ const japanese = {
   'No executor ran.': 'エグゼキューターが実行されていません。',
   'No files yet': 'まだファイルがありません',
   'No human tasks are waiting.': '待機中の人間タスクはありません。',
+  'This DAG-run is queued or running. Open tasks become editable once it is waiting.':
+    'この DAG 実行はキュー待ちまたは実行中です。待機状態になると未完了のタスクを編集できます。',
+  'Request changes': '修正を依頼',
+  'Requesting changes…': '修正を依頼中…',
+  '{step} and the steps that depend on it run again with your feedback. This task reopens afterward.':
+    '{step} とそれに依存するステップがフィードバックを受けて再実行され、その後このタスクが再び開きます。',
   'No incident connections configured.':
     'インシデント接続が設定されていません。',
   'No incident connections selected.': 'インシデント接続が選択されていません。',
@@ -5004,6 +5546,8 @@ const japanese = {
     '現在、実行中、再試行中、または失敗したステップはありません。',
   'No runs': '実行なし',
   'No runs on': 'に実行はありません',
+  'No saved artifact views yet.': '保存された成果物ビューはまだありません。',
+  'No saved run views yet.': '保存されたランビューはまだありません。',
   'No saved workflow views yet.':
     '保存されたワークフロービューはまだありません。',
   'No schedule': 'スケジュールなし',
@@ -5074,6 +5618,18 @@ const japanese = {
     'OpenCode はまだタイムラインイベントを出力していません。',
   'OpenCode managed session': 'OpenCode 管理セッション',
   'OpenCode needs an answer': 'OpenCode は回答が必要です',
+  'No timeline events yet.': 'タイムラインイベントはまだありません。',
+  'The browser step needs an answer': 'ブラウザステップは回答が必要です',
+  'Answer deadline: {time}': '回答期限: {time}',
+  'Browser session': 'ブラウザセッション',
+  'Start this browser step over?': 'このブラウザステップを最初からやり直しますか？',
+  'This closes the browser if it is still open and runs the step again from its first operation.':
+    'ブラウザが開いたままの場合は閉じ、最初の操作からステップを再実行します。',
+  'The computer step needs an answer': 'コンピューターステップは回答が必要です',
+  'Computer session': 'コンピューターセッション',
+  'Start this computer step over?': 'このコンピューターステップを最初からやり直しますか？',
+  'This runs the step again from its first operation. Windows the step opened stay as they are.':
+    '最初の操作からステップを再実行します。ステップが開いたウィンドウはそのまま残ります。',
   'Opens on final failure and resolves on recovery.':
     '最終的な失敗時に開き、回復時に解決されます。',
   Operations: '操作',
@@ -5336,7 +5892,13 @@ const japanese = {
   'Save Source DAG:': 'ソース DAG を保存：',
   'Save the current name and label filters, plus the sort order, for this remote and workspace.':
     'このリモートとワークスペースの現在の名前とラベルのフィルター、および並べ替え順序を保存します。',
+  'Save the current DAG name, file name, and date filters for this remote and workspace.':
+    'このリモートとワークスペースの現在の DAG 名、ファイル名、日付のフィルターを保存します。',
+  'Save the current name, run ID, status, label, and date filters for this remote and workspace.':
+    'このリモートとワークスペースの現在の名前、ランID、ステータス、ラベル、日付のフィルターを保存します。',
   'Save view': 'ビューを保存',
+  'Save artifact view': '成果物ビューを保存',
+  'Save run view': 'ランビューを保存',
   'Save workflow view': 'ワークフロービューを保存',
   'Saving...': '保存中...',
   'Scanning...': 'スキャン中...',
@@ -5381,6 +5943,8 @@ const japanese = {
   'Select an action to inspect its configuration.':
     '設定を確認するにはアクションを選択してください。',
   'Select an artifact': '成果物を選択',
+  'Select at least one event before saving.':
+    '保存する前にイベントを1つ以上選択してください。',
   'Select attribution': '帰属を選択',
   'Select channel': 'チャネルを選択',
   'Select connection': '接続を選択',
@@ -5425,6 +5989,8 @@ const japanese = {
   'Since startup': '起動以来',
   'Size:': 'サイズ:',
   'Skip TLS verification': 'TLS 検証をスキップ',
+  'Skip precondition checks for the retried steps. Workflow-level preconditions still apply.':
+    '再試行されるステップの前提条件チェックをスキップします。ワークフローレベルの前提条件は引き続き適用されます。',
   skipped: 'スキップ',
   Skipped: 'スキップ済み',
   'Slack message template': 'Slack メッセージテンプレート',
@@ -5819,6 +6385,7 @@ const japanese = {
   'No runs on {date}': '{date} の実行はありません',
   'Page {page}': '{page} ページ',
   'Page {page} of {total}': '{total} ページ中 {page} ページ',
+  'of {total}': '/ {total}',
   'Partially succeeded': '一部成功',
   'Processing {count} request using the existing DAG-run API.':
     '既存の DAG 実行 API で {count} 件のリクエストを処理中です。',
@@ -6030,6 +6597,10 @@ const japanese = {
     '{page}に未保存の変更があります。変更を破棄しますか？',
   '“{name}” will be removed for everyone with access to this workspace scope. Workflows are not affected.':
     'このワークスペーススコープにアクセスできる全員から「{name}」を削除します。ワークフローには影響しません。',
+  '“{name}” will be removed for everyone with access to this workspace scope. Artifacts are not affected.':
+    'このワークスペーススコープにアクセスできる全員から「{name}」を削除します。成果物には影響しません。',
+  '“{name}” will be removed for everyone with access to this workspace scope. Runs are not affected.':
+    'このワークスペーススコープにアクセスできる全員から「{name}」を削除します。ランには影響しません。',
   attachment: '添付ファイル',
   attachments: '添付ファイル',
   'Audit ID': '監査 ID',
@@ -6217,6 +6788,19 @@ const japanese = {
   '(unchanged)': '（変更なし）',
   'Next run': '次の実行',
   'Copy MCP setup prompt': 'MCP セットアップ用プロンプトをコピー',
+  'Profile tokens': 'プロファイルトークン',
+  "Give each caller its own token. Requests with a profile token always run with that token's profile, and an {header} header naming another profile is rejected.":
+    '呼び出し元ごとに専用のトークンを発行します。プロファイルトークンを使うリクエストは常にそのトークンのプロファイルで実行され、別のプロファイルを指定する {header} ヘッダーは拒否されます。',
+  'No profile tokens.': 'プロファイルトークンはありません。',
+  'Token name': 'トークン名',
+  'Runtime profile': 'ランタイムプロファイル',
+  'Create token': 'トークンを作成',
+  'Last used:': '最終使用:',
+  'Profile tokens are ignored while authentication is HMAC only.':
+    '認証方式が HMAC のみの間、プロファイルトークンは無視されます。',
+  'Revoke Profile Token': 'プロファイルトークンを失効',
+  'Applications using this token will immediately lose access.':
+    'このトークンを使っているアプリケーションは直ちにアクセスできなくなります。',
 } as const satisfies Record<StaticMessage, string>;
 
 export const staticMessages = {

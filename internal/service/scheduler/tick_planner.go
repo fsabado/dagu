@@ -17,29 +17,24 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
 )
 
 // DAGChangeType identifies the kind of DAG lifecycle event.
-type DAGChangeType int
+type DAGChangeType = persis.DAGChangeType
 
 const (
-	DAGChangeAdded DAGChangeType = iota
-	DAGChangeUpdated
-	DAGChangeDeleted
+	DAGChangeAdded   = persis.DAGChangeAdded
+	DAGChangeUpdated = persis.DAGChangeUpdated
+	DAGChangeDeleted = persis.DAGChangeDeleted
 )
 
-// DAGChangeEvent represents a DAG lifecycle event emitted by the EntryReader.
-type DAGChangeEvent struct {
-	DAGEntry
-	Type DAGChangeType
-}
+// DAGChangeEvent represents a DAG lifecycle event.
+type DAGChangeEvent = persis.DAGChangeEvent
 
 // DAGEntry pairs a DAG definition with its stable persistence identity.
-type DAGEntry struct {
-	DefinitionID string
-	DAG          *ir.DAG
-}
+type DAGEntry = persis.DAGEntry
 
 const deletedWatermarkGrace = 2 * time.Minute
 
@@ -81,6 +76,9 @@ type EnqueueFunc func(ctx context.Context, entry DAGEntry, runID string, trigger
 // IsQueuedFunc checks if a DAG has any pending queued items.
 type IsQueuedFunc func(ctx context.Context, dag *ir.DAG) (bool, error)
 
+// HasGlobalQueueFunc reports whether a DAG names a configured queue.
+type HasGlobalQueueFunc func(dag *ir.DAG) bool
+
 // RunExistsFunc checks whether a durable dag-run record already exists.
 type RunExistsFunc func(ctx context.Context, dag *ir.DAG, runID string) (bool, error)
 
@@ -106,6 +104,9 @@ type TickPlannerConfig struct {
 	Enqueue EnqueueFunc
 	// IsQueued checks if a DAG has any pending queued items.
 	IsQueued IsQueuedFunc
+	// HasGlobalQueue reports a DAG whose queue is configured. Its scheduled
+	// runs wait for queue capacity instead of starting as the schedule fires.
+	HasGlobalQueue HasGlobalQueueFunc
 	// RunExists checks whether a durable dag-run record already exists.
 	RunExists RunExistsFunc
 }
@@ -757,10 +758,14 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 		return false
 	}
 	if running {
+		logger.Info(ctx, "Skipping job because the DAG is running",
+			tag.DAG(dag.Name),
+			tag.ScheduledTime(scheduledTime),
+		)
 		return false
 	}
 
-	// Guard 1b: isQueued — prevent live run while a catchup run is queued.
+	// Guard 1b: isQueued, a queued run of any trigger keeps the DAG busy, as a running one does.
 	// On error, conservatively skip (assume busy) to avoid duplicates.
 	queued, qErr := tp.cfg.IsQueued(ctx, dag)
 	if qErr != nil {
@@ -771,6 +776,10 @@ func (tp *TickPlanner) shouldRun(ctx context.Context, dag *ir.DAG, scheduledTime
 		return false
 	}
 	if queued {
+		logger.Info(ctx, "Skipping job because a run of the DAG is queued",
+			tag.DAG(dag.Name),
+			tag.ScheduledTime(scheduledTime),
+		)
 		return false
 	}
 
@@ -1548,6 +1557,16 @@ func (tp *TickPlanner) recomputeBuffer(ctx context.Context, entry DAGEntry, acti
 	return watermarkAdvanced
 }
 
+// queuesRun reports a scheduled run the queue admits rather than one the
+// scheduler starts as its schedule fires, so the queue's capacity paces every
+// run of the DAGs that share it.
+func (tp *TickPlanner) queuesRun(dag *ir.DAG) bool {
+	return tp.cfg.QueuesEnabled &&
+		tp.cfg.Enqueue != nil &&
+		tp.cfg.HasGlobalQueue != nil &&
+		tp.cfg.HasGlobalQueue(dag)
+}
+
 // DispatchRun dispatches a PlannedRun using the configured dispatch functions.
 func (tp *TickPlanner) DispatchRun(ctx context.Context, run PlannedRun) {
 	logger.Info(ctx, "Dispatching planned run",
@@ -1635,6 +1654,8 @@ func (tp *TickPlanner) DispatchRun(ctx context.Context, run PlannedRun) {
 				tp.advanceDAGWatermark(run.DAG.Name, run.ScheduledTime)
 				return
 			}
+			err = tp.cfg.Enqueue(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
+		} else if tp.queuesRun(run.DAG) {
 			err = tp.cfg.Enqueue(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)
 		} else {
 			err = tp.cfg.Dispatch(ctx, run.DAGEntry, run.RunID, run.TriggerType, run.ScheduledTime)

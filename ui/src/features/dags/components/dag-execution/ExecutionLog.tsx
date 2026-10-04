@@ -7,13 +7,14 @@
  * @module features/dags/components/dag-execution
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Download } from 'lucide-react';
+import { Download, FileArchive } from 'lucide-react';
 import { components, Status } from '../../../../api/v1/schema';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ReloadButton } from '@/components/ui/reload-button';
 import { Switch } from '@/components/ui/switch';
-import { downloadFromUrl } from '@/lib/download';
+import { downloadFromUrl, downloadFromForm } from '@/lib/download';
+import { useSimpleToast } from '@/components/ui/simple-toast';
 import { useConfig } from '../../../../contexts/ConfigContext';
 import { useRemoteNode } from '../../../../contexts/RemoteNodeContext';
 import { useUserPreferences } from '../../../../contexts/UserPreference';
@@ -24,8 +25,13 @@ import { AnsiLine } from '@/lib/ansi';
 import { parseSchedulerLogLine } from '@/lib/scheduler-log';
 import LoadingIndicator from '@/components/ui/loading-indicator';
 import { ActivityLine } from './ActivityLine';
+import LogPageSizeSelect from './LogPageSizeSelect';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
+
+// Largest tail size streamed over SSE; larger page sizes fall back to REST
+// polling so a live stream does not push very large payloads on every update.
+const MAX_SSE_TAIL_LINES = 10000;
 
 // Extended Log type with pagination fields
 interface LogWithPagination {
@@ -59,10 +65,12 @@ type Props = {
 function ExecutionLog({ name, dagRunId, dagRun }: Props) {
   const remoteNode = useRemoteNode();
   const config = useConfig();
+  const { showToast } = useSimpleToast();
   const { preferences, updatePreference } = useUserPreferences();
   const [viewMode, setViewMode] = useState<'tail' | 'head' | 'page'>('tail');
   const [pageSize, setPageSize] = useState(1000);
   const [currentPage, setCurrentPage] = useState(1);
+  const [pageInput, setPageInput] = useState<number | ''>(1);
   const [jumpToLine, setJumpToLine] = useState<number | ''>('');
   const [displayMode, setDisplayMode] = useState<'activity' | 'raw'>(
     'activity'
@@ -95,7 +103,11 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
     dagRun.rootDAGRunId !== dagRun.dagRunId;
 
   // SSE is used for tail mode with live updates (not supported for sub-DAG runs)
-  const useSSE = viewMode === 'tail' && isLiveMode && !isSubDAGRun;
+  const useSSE =
+    viewMode === 'tail' &&
+    isLiveMode &&
+    !isSubDAGRun &&
+    pageSize <= MAX_SSE_TAIL_LINES;
   const sseResult = useDAGRunLogsSSE(
     name,
     dagRunId,
@@ -231,6 +243,11 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
     };
   }, [viewMode, currentPage, pageSize]);
 
+  // Keep the page-jump input in sync with the applied page
+  useEffect(() => {
+    setPageInput(currentPage);
+  }, [currentPage]);
+
   function handleViewModeChange(mode: 'tail' | 'head' | 'page'): void {
     if (mode === viewMode) return;
     setViewMode(mode);
@@ -295,6 +312,32 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
     }
   }, [config.apiURL, name, dagRunId, dagRun, isSubDAGRun, remoteNode]);
 
+  const handleDownloadStepLogs = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const endpoint = isSubDAGRun
+          ? `${config.apiURL}/dag-runs/${dagRun?.rootDAGRunName}/${dagRun?.rootDAGRunId}/sub-dag-runs/${dagRun?.dagRunId}/steps/log/download`
+          : `${config.apiURL}/dag-runs/${name}/${dagRunId}/steps/log/download`;
+        const url = new URL(endpoint, window.location.origin);
+        url.searchParams.set('remoteNode', remoteNode);
+        downloadFromForm(url.toString());
+        showToast('Download requested. Check your browser downloads.', {
+          variant: 'info',
+        });
+      } catch (err) {
+        showToast(
+          err instanceof Error ? err.message : 'Could not request download',
+          { variant: 'error' }
+        );
+      } finally {
+        button.disabled = false;
+      }
+    },
+    [config.apiURL, name, dagRunId, dagRun, isSubDAGRun, remoteNode, showToast]
+  );
+
   // Show loading indicator only on initial load
   if (isLoading && !cachedData && isInitialLoad.current) {
     return <LoadingIndicator />;
@@ -336,6 +379,15 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
   const totalPages = calculateTotalPages(effectiveTotalLines, pageSize);
   const showNavigation = effectiveTotalLines > lines.length || hasMore;
   const activityLines = lines.map(parseSchedulerLogLine);
+
+  function handlePageJump(): void {
+    if (pageInput === '' || !Number.isFinite(pageInput)) {
+      return;
+    }
+    const page = Math.min(Math.max(Math.floor(pageInput), 1), totalPages);
+    setPageInput(page);
+    handlePageChange(page);
+  }
 
   function getLineNumber(index: number): number {
     switch (viewMode) {
@@ -401,28 +453,14 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
                 </Button>
               </div>
 
-              <select
-                className="h-7 flex-shrink-0 rounded-md border border-border bg-surface px-2 text-xs text-foreground focus:border-ring focus:outline-none"
-                value={pageSize}
-                onChange={(e) => setPageSize(Number(e.target.value))}
+              <LogPageSizeSelect
+                pageSize={pageSize}
                 disabled={isNavigating}
-              >
-                <option value="100">
-                  <I18nText text={'100 lines'} />
-                </option>
-                <option value="500">
-                  <I18nText text={'500 lines'} />
-                </option>
-                <option value="1000">
-                  <I18nText text={'1000 lines'} />
-                </option>
-                <option value="5000">
-                  <I18nText text={'5000 lines'} />
-                </option>
-                <option value="10000">
-                  <I18nText text={'10000 lines'} />
-                </option>
-              </select>
+                onPageSizeChange={(size) => {
+                  setPageSize(size);
+                  setCurrentPage(1);
+                }}
+              />
             </>
           )}
 
@@ -464,6 +502,19 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
                 title="Download full log"
               >
                 <Download className="h-4 w-4" />
+              </Button>
+            </I18nProps>
+
+            {/* Download step log archive */}
+            <I18nProps>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleDownloadStepLogs}
+                disabled={isNavigating}
+                title="Download step logs (ZIP)"
+              >
+                <FileArchive className="h-4 w-4" />
               </Button>
             </I18nProps>
 
@@ -511,12 +562,43 @@ function ExecutionLog({ name, dagRunId, dagRun }: Props) {
             >
               <I18nText text={'Previous'} />
             </Button>
-            <span className="text-xs">
-              <I18nText
-                text="Page {page} of {total}"
-                values={{ page: currentPage, total: totalPages }}
-              />
+            <span className="flex items-center gap-1 text-xs">
+              <I18nText text={'Page'} />
+              <I18nProps>
+                <Input
+                  aria-label="Page"
+                  type="number"
+                  min={1}
+                  max={totalPages}
+                  value={pageInput}
+                  onChange={(e) =>
+                    setPageInput(
+                      e.target.value === '' ? '' : Number(e.target.value)
+                    )
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !isNavigating) {
+                      handlePageJump();
+                    }
+                  }}
+                  className="w-16 h-6 px-1 text-xs"
+                  disabled={isNavigating}
+                />
+              </I18nProps>
+              <I18nText text="of {total}" values={{ total: totalPages }} />
             </span>
+            <Button
+              size="sm"
+              onClick={handlePageJump}
+              disabled={
+                isNavigating ||
+                pageInput === '' ||
+                (pageInput as number) < 1 ||
+                (pageInput as number) > totalPages
+              }
+            >
+              <I18nText text={'Go'} />
+            </Button>
             <Button
               size="sm"
               onClick={() =>

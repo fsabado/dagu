@@ -240,6 +240,169 @@ func TestRetryPlan_RebindsStepsFromRestoredDAG(t *testing.T) {
 	require.Equal(t, []string{"CONTAINER_ENV=from-container"}, rebound.Container.Env)
 }
 
+// Opened human tasks keep the prompt and artifacts resolved when they opened;
+// the restored DAG step only holds the unresolved templates.
+func TestRetryPlan_KeepsOpenedHumanTaskSnapshot(t *testing.T) {
+	t.Parallel()
+
+	template := &ir.HumanTaskConfig{
+		Prompt:    "Review ${params.target}",
+		Artifacts: []string{"reports/${params.target}.md"},
+	}
+	resolved := &ir.HumanTaskConfig{
+		Prompt:    "Review production",
+		Artifacts: []string{"reports/production.md"},
+	}
+	dag := &ir.DAG{Steps: []ir.Step{
+		{Name: "waiting", HumanTask: template},
+		{Name: "completed", HumanTask: template},
+	}}
+	waiting := runtime.NodeWithData(runtime.NodeData{
+		Step:  ir.Step{Name: "waiting", HumanTask: resolved},
+		State: runtime.NodeState{Status: ir.NodeWaiting},
+	})
+	completed := runtime.NodeWithData(runtime.NodeData{
+		Step: ir.Step{Name: "completed", HumanTask: resolved},
+		State: runtime.NodeState{
+			Status:         ir.NodeSucceeded,
+			HumanTaskInput: []byte(`{}`),
+		},
+	})
+
+	_, err := runtime.CreateRetryPlan(context.Background(), dag, waiting, completed)
+	require.NoError(t, err)
+
+	require.Equal(t, ir.NodeWaiting, waiting.State().Status)
+	require.Equal(t, resolved, waiting.Step().HumanTask)
+	require.Equal(t, resolved, completed.Step().HumanTask)
+}
+
+// A resume re-runs failed steps and everything after them. Steps reset that
+// way stay in the same push-back cycle, so they keep its iteration, feedback,
+// history, and previous stdout.
+func TestRetryPlan_KeepsPushBackContext(t *testing.T) {
+	t.Parallel()
+
+	pushBack := runtime.NodeState{
+		ApprovalIteration:      1,
+		PushBackInputs:         map[string]string{"feedback": "add tests"},
+		PushBackHistory:        []ir.PushBackEntry{{Iteration: 1, By: "alice", Inputs: map[string]string{"feedback": "add tests"}}},
+		PushBackPreviousStdout: "/logs/review.out",
+	}
+	dag := &ir.DAG{Steps: []ir.Step{
+		{Name: "implement"},
+		{Name: "lint"},
+		{Name: "review", Depends: []string{"implement", "lint"}},
+	}}
+	failedState := pushBack
+	failedState.Status = ir.NodeFailed
+	implement := runtime.NodeWithData(runtime.NodeData{Step: ir.Step{Name: "implement"}, State: failedState})
+	resetState := pushBack
+	resetState.Status = ir.NodeNotStarted
+	review := runtime.NodeWithData(runtime.NodeData{
+		Step:  ir.Step{Name: "review", Depends: []string{"implement", "lint"}},
+		State: resetState,
+	})
+
+	_, err := runtime.CreateRetryPlan(context.Background(), dag, implement, makeNode("lint", ir.NodeFailed), review)
+	require.NoError(t, err)
+
+	for _, node := range []*runtime.Node{implement, review} {
+		state := node.State()
+		require.Equal(t, ir.NodeNotStarted, state.Status, node.Name())
+		require.Equal(t, pushBack.ApprovalIteration, state.ApprovalIteration, node.Name())
+		require.Equal(t, pushBack.PushBackInputs, state.PushBackInputs, node.Name())
+		require.Equal(t, pushBack.PushBackHistory, state.PushBackHistory, node.Name())
+		require.Equal(t, pushBack.PushBackPreviousStdout, state.PushBackPreviousStdout, node.Name())
+	}
+}
+
+func TestStepRetryPlan_KeepsPushBackContext(t *testing.T) {
+	t.Parallel()
+
+	state := runtime.NodeState{
+		Status:            ir.NodeSucceeded,
+		ApprovalIteration: 2,
+		PushBackInputs:    map[string]string{"feedback": "rename it"},
+		PushBackHistory:   []ir.PushBackEntry{{Iteration: 2, Inputs: map[string]string{"feedback": "rename it"}}},
+	}
+	dag := &ir.DAG{Steps: []ir.Step{{Name: "implement"}}}
+	implement := runtime.NodeWithData(runtime.NodeData{Step: ir.Step{Name: "implement"}, State: state})
+
+	_, err := runtime.CreateStepRetryPlan(dag, []*runtime.Node{implement}, "implement")
+	require.NoError(t, err)
+
+	retried := implement.State()
+	require.Equal(t, ir.NodeNotStarted, retried.Status)
+	require.Equal(t, 2, retried.ApprovalIteration)
+	require.Equal(t, state.PushBackInputs, retried.PushBackInputs)
+	require.Equal(t, state.PushBackHistory, retried.PushBackHistory)
+}
+
+func TestRetryPlan_ResetHumanTaskUsesTemplate(t *testing.T) {
+	t.Parallel()
+
+	template := &ir.HumanTaskConfig{Prompt: "Review ${params.target}"}
+	dag := &ir.DAG{Steps: []ir.Step{
+		{Name: "build"},
+		{Name: "review", Depends: []string{"build"}, HumanTask: template},
+	}}
+	review := runtime.NodeWithData(runtime.NodeData{
+		Step: ir.Step{
+			Name:      "review",
+			Depends:   []string{"build"},
+			HumanTask: &ir.HumanTaskConfig{Prompt: "Review production"},
+		},
+		State: runtime.NodeState{Status: ir.NodeWaiting},
+	})
+
+	_, err := runtime.CreateRetryPlan(context.Background(), dag, makeNode("build", ir.NodeFailed), review)
+	require.NoError(t, err)
+
+	require.Equal(t, ir.NodeNotStarted, review.State().Status)
+	require.Equal(t, template, review.Step().HumanTask)
+}
+
+// A downstream step retry reopens completed human tasks from the template so
+// they resolve again; tasks outside the selection keep their snapshot.
+func TestStepRetryPlan_DownstreamReopensHumanTaskFromTemplate(t *testing.T) {
+	t.Parallel()
+
+	template := &ir.HumanTaskConfig{
+		Prompt:    "Review ${params.target}",
+		Artifacts: []string{"reports/${params.target}.md"},
+	}
+	resolved := &ir.HumanTaskConfig{
+		Prompt:    "Review production",
+		Artifacts: []string{"reports/production.md"},
+	}
+	dag := &ir.DAG{Steps: []ir.Step{
+		{Name: "build"},
+		{Name: "review", Depends: []string{"build"}, HumanTask: template},
+		{Name: "audit", HumanTask: template},
+	}}
+	completed := runtime.NodeState{Status: ir.NodeSucceeded, HumanTaskInput: []byte(`{}`)}
+	review := runtime.NodeWithData(runtime.NodeData{
+		Step:  ir.Step{Name: "review", Depends: []string{"build"}, HumanTask: resolved},
+		State: completed,
+	})
+	audit := runtime.NodeWithData(runtime.NodeData{
+		Step:  ir.Step{Name: "audit", HumanTask: resolved},
+		State: completed,
+	})
+	nodes := []*runtime.Node{makeNode("build", ir.NodeSucceeded), review, audit}
+
+	_, err := runtime.CreateStepRetryPlanWithOptions(dag, nodes, "build", runtime.StepRetryPlanOptions{
+		IncludeDownstream: true,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, ir.NodeNotStarted, review.State().Status)
+	require.Equal(t, template, review.Step().HumanTask)
+	require.Equal(t, ir.NodeSucceeded, audit.State().Status)
+	require.Equal(t, resolved, audit.Step().HumanTask)
+}
+
 func TestStepRetryPlan_RebindsStepsFromRestoredDAG(t *testing.T) {
 	t.Parallel()
 
@@ -515,6 +678,74 @@ func TestStepRetryPlan_IncludeDownstream(t *testing.T) {
 			for _, n := range nodes {
 				require.Equal(t, tt.wantStatus[n.Name()], n.State().Status, "status mismatch for %s", n.Name())
 				require.Equal(t, tt.wantSkippedByRetry[n.Name()], n.State().SkippedByRetry, "SkippedByRetry mismatch for %s", n.Name())
+			}
+		})
+	}
+}
+
+func TestStepRetryPlan_BypassPreconditions(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{Steps: []ir.Step{
+		{Name: "A"},
+		{Name: "B", Depends: []string{"A"}},
+		{Name: "C", Depends: []string{"B"}},
+		{Name: "D", Depends: []string{"A"}},
+		{Name: "E", Depends: []string{"B", "D"}},
+	}}
+
+	tests := []struct {
+		name              string
+		step              string
+		includeDownstream bool
+		bypassPrecond     bool
+		wantBypass        map[string]bool
+	}{
+		{
+			name:              "target and reset descendants bypass",
+			step:              "B",
+			includeDownstream: true,
+			bypassPrecond:     true,
+			wantBypass: map[string]bool{
+				"A": false, "B": true, "C": true, "D": false, "E": true,
+			},
+		},
+		{
+			name:          "target only bypass without downstream",
+			step:          "B",
+			bypassPrecond: true,
+			wantBypass: map[string]bool{
+				"A": false, "B": true, "C": false, "D": false, "E": false,
+			},
+		},
+		{
+			name:              "no bypass leaves all unset",
+			step:              "B",
+			includeDownstream: true,
+			wantBypass: map[string]bool{
+				"A": false, "B": false, "C": false, "D": false, "E": false,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			nodes := []*runtime.Node{
+				makeNode("A", ir.NodeSucceeded),
+				makeNode("B", ir.NodeFailed, "A"),
+				makeNode("C", ir.NodeSucceeded, "B"),
+				makeNode("D", ir.NodeSkipped, "A"),
+				makeNode("E", ir.NodeSkipped, "B", "D"),
+			}
+			p, err := runtime.CreateStepRetryPlanWithOptions(dag, nodes, tt.step, runtime.StepRetryPlanOptions{
+				IncludeDownstream:   tt.includeDownstream,
+				BypassPreconditions: tt.bypassPrecond,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, p)
+			for _, n := range nodes {
+				require.Equal(t, tt.wantBypass[n.Name()], n.BypassPreconditions(), "bypass mismatch for %s", n.Name())
 			}
 		})
 	}

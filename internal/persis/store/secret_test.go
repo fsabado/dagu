@@ -295,6 +295,24 @@ func TestSecretResolveValue_Disabled(t *testing.T) {
 	assert.ErrorIs(t, err, secret.ErrDisabled)
 }
 
+// ReadValue returns the value like ResolveValue but leaves the record unchanged.
+func TestSecretReadValue(t *testing.T) {
+	ctx := context.Background()
+	s := newSecretStore(t)
+	sec := newSecret("ws", "db-pass")
+	require.NoError(t, s.Create(ctx, sec, &secret.WriteValueInput{Value: "plaintext", CreatedBy: "alice"}))
+	before, err := s.GetByID(ctx, sec.ID)
+	require.NoError(t, err)
+
+	value, meta, err := s.ReadValue(ctx, sec.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "plaintext", value)
+	assert.Equal(t, 1, meta.Version)
+	after, err := s.GetByID(ctx, sec.ID)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
 func TestSecretIndexRebuiltOnStartup(t *testing.T) {
 	ctx := context.Background()
 	col := testutil.NewMemoryBackend().Collection("secrets")

@@ -927,7 +927,8 @@ paths:
       description: |
         Validates a DAG YAML specification without persisting any changes.
 
-        Returns a list of validation errors. When the spec can be partially parsed,
+        Returns separate lists of validation errors and non-fatal warnings.
+        When the spec can be partially parsed,
         the response may also include parsed DAG details built with error-tolerant loading.
       operationId: "validateDAGSpec"
       tags:
@@ -965,6 +966,12 @@ paths:
                   errors:
                     type: array
                     description: "List of validation errors"
+                    items:
+                      type: string
+                  warnings:
+                    type: array
+                    description: "Non-fatal spec warnings; these do not affect valid"
+                    x-go-type-skip-optional-pointer: true
                     items:
                       type: string
                 required:
@@ -1010,6 +1017,12 @@ paths:
                   errors:
                     type: array
                     description: "List of errors encountered during the request"
+                    items:
+                      type: string
+                  warnings:
+                    type: array
+                    description: "Non-fatal spec warnings"
+                    x-go-type-skip-optional-pointer: true
                     items:
                       type: string
                   spec:
@@ -1082,7 +1095,8 @@ paths:
                   type: string
                   description: "Optional DAG name override to use for the created dag-run"
                 profile:
-                  $ref: "#/components/schemas/RuntimeProfileOverride"
+                  allOf:
+                    - $ref: "#/components/schemas/RuntimeProfileOverride"
                   description: "Runtime profile override. Omit to use the DAG default profile, set to an empty string to run without a profile, or set to a profile name to override the DAG default."
                 singleton:
                   type: boolean
@@ -1093,11 +1107,48 @@ paths:
                   description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
-                  $ref: "#/components/schemas/Labels"
+                  allOf:
+                    - $ref: "#/components/schemas/Labels"
                   description: "Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
+                steps:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    minLength: 1
+                  description: "Run only these steps, by step name or ID, in a new DAG-run of the current definition. Every other step is recorded as skipped and does not run. Not supported for agent DAGs."
+                outputsFromRunId:
+                  allOf:
+                    - $ref: "#/components/schemas/DAGRunId"
+                    - description: "Finished DAG-run of the same DAG whose step outputs and work directory are carried into the skipped steps. Outputs come only from steps that succeeded there. Requires steps."
+                outputs:
+                  type: object
+                  description: "Outputs of skipped steps, keyed by step name or ID and then by output name. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId. Requires steps."
+                  additionalProperties:
+                    type: object
+                    additionalProperties:
+                      type: string
                 tags:
-                  $ref: "#/components/schemas/Tags"
+                  allOf:
+                    - $ref: "#/components/schemas/Tags"
+                  deprecated: true
                   description: "Deprecated alias for `labels`; mutually exclusive with `labels`."
+              not:
+                anyOf:
+                  - type: object
+                    required:
+                      - outputsFromRunId
+                    not:
+                      type: object
+                      required:
+                        - steps
+                  - type: object
+                    required:
+                      - outputs
+                    not:
+                      type: object
+                      required:
+                        - steps
       responses:
         "200":
           description: "A successful response"
@@ -1167,7 +1218,8 @@ paths:
                   type: string
                   description: "Optional DAG name override to use for the created dag-run"
                 profile:
-                  $ref: "#/components/schemas/RuntimeProfileOverride"
+                  allOf:
+                    - $ref: "#/components/schemas/RuntimeProfileOverride"
                   description: "Runtime profile override. Omit to use the DAG default profile, set to an empty string to run without a profile, or set to a profile name to override the DAG default."
                 singleton:
                   type: boolean
@@ -1178,10 +1230,13 @@ paths:
                   description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
-                  $ref: "#/components/schemas/Labels"
+                  allOf:
+                    - $ref: "#/components/schemas/Labels"
                   description: "Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
                 tags:
-                  $ref: "#/components/schemas/Tags"
+                  allOf:
+                    - $ref: "#/components/schemas/Tags"
+                  deprecated: true
                   description: "Deprecated alias for `labels`; mutually exclusive with `labels`."
                 timeout:
                   type: integer
@@ -1253,7 +1308,8 @@ paths:
                   type: string
                   description: "Optional DAG name override to use for the queued dag-run"
                 profile:
-                  $ref: "#/components/schemas/RuntimeProfileOverride"
+                  allOf:
+                    - $ref: "#/components/schemas/RuntimeProfileOverride"
                   description: "Runtime profile override. Omit to use the DAG default profile, set to an empty string to run without a profile, or set to a profile name to override the DAG default."
                 queue:
                   type: string
@@ -1267,10 +1323,13 @@ paths:
                   description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
-                  $ref: "#/components/schemas/Labels"
+                  allOf:
+                    - $ref: "#/components/schemas/Labels"
                   description: "Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
                 tags:
-                  $ref: "#/components/schemas/Tags"
+                  allOf:
+                    - $ref: "#/components/schemas/Tags"
+                  deprecated: true
                   description: "Deprecated alias for `labels`; mutually exclusive with `labels`."
       responses:
         "200":
@@ -1397,6 +1456,12 @@ paths:
                   errors:
                     type: array
                     description: "List of errors in the spec"
+                    items:
+                      type: string
+                  warnings:
+                    type: array
+                    description: "Non-fatal spec warnings"
+                    x-go-type-skip-optional-pointer: true
                     items:
                       type: string
                   valueReferenceNotices:
@@ -1565,6 +1630,50 @@ paths:
                     type: array
                 required:
                   - errors
+        "404":
+          description: "DAG not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dags/{fileName}/browser-cache:
+    delete:
+      summary: "Clear a DAG's browser replay cache"
+      description: "Removes the recorded act operations that the DAG's browser steps replay on later runs, so the next run asks the model again. Only the cache on the node that serves the request is cleared; in distributed mode it is kept on the worker that ran the step. Operator or above."
+      operationId: "clearDAGBrowserCache"
+      tags:
+        - "dags"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGFileName"
+        - name: step
+          in: query
+          required: false
+          description: "Clear only this step: its ID, or its name when the step has no ID. Omit to clear every step."
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+      responses:
+        "200":
+          description: "Replay cache cleared"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DAGBrowserCacheClearResult"
+        "403":
+          description: "Forbidden - insufficient permissions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           description: "DAG not found"
           content:
@@ -1816,6 +1925,42 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /artifacts:
+    get:
+      summary: "List recent DAG-run artifacts"
+      description: "Returns root DAG-runs that produced artifacts, newest first, each with its files. Child runs are reached through their root."
+      operationId: "listArtifacts"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/Workspace"
+        - $ref: "#/components/parameters/DateTimeFrom"
+        - $ref: "#/components/parameters/DateTimeTo"
+        - $ref: "#/components/parameters/ArtifactDAGName"
+        - $ref: "#/components/parameters/ArtifactFileName"
+        - $ref: "#/components/parameters/ArtifactListLimit"
+        - $ref: "#/components/parameters/ArtifactListCursor"
+      responses:
+        "200":
+          description: "A successful response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactListResponse"
+        "400":
+          description: "Invalid cursor, file name pattern, or pagination parameters"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dags/labels:
     get:
       summary: "List all available DAG labels"
@@ -1946,7 +2091,8 @@ paths:
                   type: string
                   description: "Optional name to use when the spec omits a name"
                 profile:
-                  $ref: "#/components/schemas/RuntimeProfileOverride"
+                  allOf:
+                    - $ref: "#/components/schemas/RuntimeProfileOverride"
                   description: "Runtime profile to apply to this DAG-run. Set to an empty string or omit to run without a profile."
                 params:
                   type: string
@@ -1964,13 +2110,50 @@ paths:
                   description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
-                  $ref: "#/components/schemas/Labels"
+                  allOf:
+                    - $ref: "#/components/schemas/Labels"
                   description: "Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
+                steps:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    minLength: 1
+                  description: "Run only these steps, by step name or ID, in a new DAG-run of the current definition. Every other step is recorded as skipped and does not run. Not supported for agent DAGs."
+                outputsFromRunId:
+                  allOf:
+                    - $ref: "#/components/schemas/DAGRunId"
+                    - description: "Finished DAG-run of the same DAG whose step outputs and work directory are carried into the skipped steps. Outputs come only from steps that succeeded there. Requires steps."
+                outputs:
+                  type: object
+                  description: "Outputs of skipped steps, keyed by step name or ID and then by output name. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId. Requires steps."
+                  additionalProperties:
+                    type: object
+                    additionalProperties:
+                      type: string
                 tags:
-                  $ref: "#/components/schemas/Tags"
+                  allOf:
+                    - $ref: "#/components/schemas/Tags"
+                  deprecated: true
                   description: "Deprecated alias for `labels`; mutually exclusive with `labels`."
               required:
                 - spec
+              not:
+                anyOf:
+                  - type: object
+                    required:
+                      - outputsFromRunId
+                    not:
+                      type: object
+                      required:
+                        - steps
+                  - type: object
+                    required:
+                      - outputs
+                    not:
+                      type: object
+                      required:
+                        - steps
       responses:
         "200":
           description: "Run created and started"
@@ -2029,7 +2212,8 @@ paths:
                   type: string
                   description: "Optional name to use when the spec omits a name"
                 profile:
-                  $ref: "#/components/schemas/RuntimeProfileOverride"
+                  allOf:
+                    - $ref: "#/components/schemas/RuntimeProfileOverride"
                   description: "Runtime profile to apply to this queued DAG-run. Set to an empty string or omit to run without a profile."
                 params:
                   type: string
@@ -2050,10 +2234,13 @@ paths:
                   description: "If true, execute eligible build steps without reusing prior materializations"
                   default: false
                 labels:
-                  $ref: "#/components/schemas/Labels"
+                  allOf:
+                    - $ref: "#/components/schemas/Labels"
                   description: "Additional labels to apply to the DAG-run. Mutually exclusive with `tags`; the server returns HTTP 400 if both are set."
                 tags:
-                  $ref: "#/components/schemas/Tags"
+                  allOf:
+                    - $ref: "#/components/schemas/Tags"
+                  deprecated: true
                   description: "Deprecated alias for `labels`; mutually exclusive with `labels`."
               required:
                 - spec
@@ -2762,20 +2949,32 @@ paths:
                 includeDownstream:
                   type: boolean
                   description: "Optional. When true, retry the selected step and every reachable descendant. Requires stepName. Unrelated branches keep their existing status."
+                bypassPreconditions:
+                  type: boolean
+                  description: "Optional. When true, skip step precondition evaluation for the steps reset by this retry. Requires stepName. DAG-level preconditions and lifecycle handlers still apply."
                 subDAGRunId:
                   allOf:
                     - $ref: "#/components/schemas/DAGRunId"
                     - description: "Optional. Persisted child DAG-run containing the step. Requires stepName; the path and dagRunId remain the root DAG-run."
               not:
                 allOf:
-                  - type: object
-                    required:
-                      - includeDownstream
-                    properties:
-                      includeDownstream:
-                        type: boolean
-                        enum:
-                          - true
+                  - anyOf:
+                      - type: object
+                        required:
+                          - includeDownstream
+                        properties:
+                          includeDownstream:
+                            type: boolean
+                            enum:
+                              - true
+                      - type: object
+                        required:
+                          - bypassPreconditions
+                        properties:
+                          bypassPreconditions:
+                            type: boolean
+                            enum:
+                              - true
                   - not:
                       type: object
                       required:
@@ -2793,7 +2992,7 @@ paths:
   /dag-runs/{name}/{dagRunId}/human-tasks/{stepId}/complete:
     post:
       summary: "Complete a waiting human task"
-      description: "Validates typed input against the stored human-task form, completes the step atomically, and queues the same DAG-run when no manual steps remain waiting."
+      description: "Validates typed input against the stored human-task form, completes the step atomically, and queues the same DAG-run when no manual steps remain waiting or when the completion unblocks a step. A step counts as unblocked only when every dependency lets it run, it declares no build inputs, and no step in the run is failed, aborted, rejected, or retrying."
       operationId: "completeHumanTask"
       tags:
         - "dag-runs"
@@ -2853,10 +3052,80 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /dag-runs/{name}/{dagRunId}/human-tasks/{stepId}/push-back:
+    post:
+      summary: "Push a waiting human task back to its rewind target"
+      description: "Validates feedback against the stored push-back form of a human task that declares with.push_back, then atomically resets the rewind target and every step depending on it, including the task, with the feedback as push-back context. The push-back is stored before the same DAG-run is queued. The run is queued when no manual step remains waiting or when the rewind target can run and no step in the run is failed, aborted, rejected, or retrying. Repeating an identical push-back before the task opens again only retries the queue."
+      operationId: "pushBackHumanTask"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunConcreteId"
+        - $ref: "#/components/parameters/HumanTaskStepId"
+        - name: expectedIteration
+          in: query
+          description: "Push-back iteration of the task the caller reviewed. When it differs from the task's current push-back iteration, the request fails with 409 and changes nothing."
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+      requestBody:
+        required: true
+        description: "Typed feedback input. The JSON request body is limited to 16 MiB."
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HumanTaskInput"
+      responses:
+        "200":
+          description: "Human task pushed back"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanTaskPushBackResponse"
+        "400":
+          description: "Malformed or invalid feedback, or the task does not declare push-back"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "DAG-run or human task not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Human task is not open, is at a different push-back iteration, was already pushed back with different feedback, or the run changed concurrently"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "Feedback exceeds the 16 MiB request-body limit"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "The push-back was stored, but the DAG-run retry could not be queued; retry the same request or the resume endpoint"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dag-runs/{name}/{dagRunId}/human-tasks/resume:
     post:
       summary: "Queue a completed human-task checkpoint for resume"
-      description: "Queues a retry for a completed human-task checkpoint without requiring the previously submitted form values."
+      description: "Queues a retry for a completed human-task checkpoint or a stored human-task push-back without requiring the previously submitted form values or feedback."
       operationId: "resumeHumanTaskDAGRun"
       tags:
         - "dag-runs"
@@ -2878,7 +3147,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "409":
-          description: "The DAG-run still has waiting steps or no recoverable human-task checkpoint"
+          description: "Manual steps are still waiting and no step is ready to run, or the DAG-run has no recoverable human-task checkpoint"
           content:
             application/json:
               schema:
@@ -2992,6 +3261,99 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /dag-runs/{name}/{dagRunId}/steps/log/download:
+    get:
+      summary: "Download step logs as ZIP of a DAG-run"
+      description: |
+        Downloads stdout and stderr for the steps and lifecycle handlers of this
+        DAG-run only. Logs from nested DAG-runs are not included.
+        Returns a streaming ZIP archive with no size limit. Each available log is
+        stored as <index>-<step-name>/stdout.log or stderr.log, in run order.
+        Missing files are skipped. Each file includes only the bytes present when
+        it is opened; subsequent log growth is excluded.
+      operationId: "downloadDAGRunStepLogs"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+      responses:
+        "200":
+          description: "ZIP archive of step log files"
+          headers:
+            Content-Disposition:
+              schema:
+                type: "string"
+              description: "Attachment filename"
+          content:
+            application/zip:
+              schema:
+                type: "string"
+                format: "binary"
+        "404":
+          description: "DAG-run not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    post:
+      summary: "Download step logs as ZIP of a DAG-run"
+      description: |
+        Browser form download of the same streaming ZIP returned by GET.
+        The optional token field supplies a bearer credential when the
+        Authorization header is absent. Normal authentication and run visibility
+        checks apply. Tokens in the URL are not accepted.
+      operationId: "downloadDAGRunStepLogsForm"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                token:
+                  type: string
+                  writeOnly: true
+                  description: "Bearer credential for browser form downloads"
+      responses:
+        "200":
+          description: "ZIP archive of step log files"
+          headers:
+            Content-Disposition:
+              schema:
+                type: "string"
+              description: "Attachment filename"
+          content:
+            application/zip:
+              schema:
+                type: "string"
+                format: "binary"
+        "404":
+          description: "DAG-run not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dag-runs/{name}/{dagRunId}/steps/{stepName}/messages:
     get:
       summary: "Retrieve chat messages for a step"
@@ -3069,10 +3431,60 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /dag-runs/{name}/{dagRunId}/resume:
+    post:
+      summary: "Resume work after a saved approval"
+      description: "Retries resume admission for a root run without changing its approvals or inputs. Already queued or running resumes are not dispatched again."
+      operationId: "resumeDAGRun"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+      responses:
+        "200":
+          description: "Resume accepted or already in progress"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dagRunId:
+                    $ref: "#/components/schemas/DAGRunId"
+                  resumed:
+                    type: boolean
+                    description: "Whether execution has been accepted"
+                required: [dagRunId, resumed]
+        "404":
+          description: "DAG-run not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Run has no approved work ready to resume or its state changed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Approval remains saved but resume admission failed; retry this endpoint"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dag-runs/{name}/{dagRunId}/steps/{stepName}/approve:
     post:
       summary: "Approve a waiting step"
-      description: "Approves a step that is in Waiting status, optionally providing input parameters that will be available as environment variables in subsequent steps"
+      description: "Approves a waiting step and requests resume when work is ready. Approval and inputs remain saved if resume admission fails; use the run resume endpoint to retry without approving again."
       operationId: "approveDAGRunStep"
       tags:
         - "dag-runs"
@@ -3094,6 +3506,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApproveStepResponse"
+        "409":
+          description: "Run state changed before resume admission"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Approval was saved but resume admission failed; use the run resume endpoint"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "400":
           description: "Step is not in Waiting status or required inputs missing"
           content:
@@ -3673,6 +4097,111 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/log/download:
+    get:
+      summary: "Download step logs as ZIP of a sub DAG-run"
+      description: |
+        Downloads stdout and stderr for the steps and lifecycle handlers of this
+        sub DAG-run only. Logs from nested DAG-runs are not included.
+        Returns a streaming ZIP archive with no size limit. Each available log is
+        stored as <index>-<step-name>/stdout.log or stderr.log, in run order.
+        Missing files are skipped. Each file includes only the bytes present when
+        it is opened; subsequent log growth is excluded.
+      operationId: "downloadSubDAGRunStepLogs"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+        - name: "subDAGRunId"
+          in: "path"
+          required: true
+          schema:
+            type: "string"
+          description: "ID of the sub DAG-run to download the step logs for"
+      responses:
+        "200":
+          description: "ZIP archive of step log files"
+          headers:
+            Content-Disposition:
+              schema:
+                type: "string"
+              description: "Attachment filename"
+          content:
+            application/zip:
+              schema:
+                type: "string"
+                format: "binary"
+        "404":
+          description: "Sub DAG-run not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    post:
+      summary: "Download step logs as ZIP of a sub DAG-run"
+      description: |
+        Browser form download of the same streaming ZIP returned by GET.
+        The optional token field supplies a bearer credential when the
+        Authorization header is absent. Normal authentication and run visibility
+        checks apply. Tokens in the URL are not accepted.
+      operationId: "downloadSubDAGRunStepLogsForm"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunId"
+        - name: "subDAGRunId"
+          in: "path"
+          required: true
+          schema:
+            type: "string"
+          description: "ID of the sub DAG-run to download the step logs for"
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                token:
+                  type: string
+                  writeOnly: true
+                  description: "Bearer credential for browser form downloads"
+      responses:
+        "200":
+          description: "ZIP archive of step log files"
+          headers:
+            Content-Disposition:
+              schema:
+                type: "string"
+              description: "Attachment filename"
+          content:
+            application/zip:
+              schema:
+                type: "string"
+                format: "binary"
+        "404":
+          description: "Sub DAG-run not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/messages:
     get:
       summary: "Retrieve chat messages for a step in a sub DAG-run"
@@ -4166,6 +4695,65 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /services/scheduler/pause:
+    get:
+      summary: "Get scheduler pause state"
+      description: "Returns whether scheduler-driven run creation is currently paused, and who paused it. Readable by any authenticated user so the reason a schedule stopped is visible to everyone."
+      operationId: "getSchedulerPauseState"
+      tags:
+        - "system"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+      responses:
+        "200":
+          description: "A successful response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SchedulerPauseState"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Pause or resume the scheduler"
+      description: |
+        Pauses or resumes scheduler-driven run creation for every DAG at once. Admin only.
+
+        Pausing has the same effect as suspending every DAG by hand. Manual, webhook, and sub-DAG runs keep working. Queued scheduler-managed runs are aborted and dequeued, catch-up windows are discarded rather than deferred, and nothing replays on resume. One-off schedules stay pending and fire late once the scheduler resumes.
+      operationId: "updateSchedulerPauseState"
+      tags:
+        - "system"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paused:
+                  type: boolean
+                  description: "Pause state to set for the scheduler"
+                reason:
+                  type: string
+                  maxLength: 512
+                  description: "Operator-facing explanation shown while paused"
+              required:
+                - paused
+      responses:
+        "200":
+          description: "A successful response"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /services/coordinator:
     get:
       summary: "Get coordinator service status"
@@ -4289,7 +4877,7 @@ paths:
           required: false
           schema:
             type: string
-          description: "Bearer token for webhook authentication (e.g., 'Bearer dagu_wh_...'). Required only when the webhook auth mode includes token authentication."
+          description: "Bearer token for webhook authentication (e.g., 'Bearer dagu_wh_...'). Accepts the webhook's default token or one of its profile tokens. Required only when the webhook auth mode includes token authentication."
         - name: X-Dagu-Signature
           in: header
           required: false
@@ -4308,7 +4896,7 @@ paths:
           required: false
           schema:
             $ref: "#/components/schemas/RuntimeProfileName"
-          description: "Runtime profile selected for this DAG run. The profile must be allowed by the webhook profile-selection policy. Omit the header to use the DAG's default profile resolution."
+          description: "Runtime profile selected for this DAG run. With the default token, the profile must be allowed by the webhook profile-selection policy; omit the header to use the DAG's default profile resolution. With a profile token, the run always uses the token's profile; the header may be omitted or must name that profile."
       requestBody:
         required: false
         content:
@@ -4335,7 +4923,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: "Forbidden - webhook disabled or not configured"
+          description: "Forbidden - webhook disabled or not configured, or the requested runtime profile is not allowed for the token"
           content:
             application/json:
               schema:
@@ -4826,6 +5414,49 @@ paths:
                 $ref: "#/components/schemas/Error"
         "409":
           description: "Notification channel is used by a DAG"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Forbidden - insufficient permissions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /notification-channels/{channelId}/test:
+    post:
+      summary: "Test notification channel"
+      description: "Sends a sample failure notification to one saved channel, including disabled channels. Does not require a workflow or change notification rules. Developer, manager, or admin only."
+      operationId: "testNotificationChannel"
+      tags:
+        - "notifications"
+      security:
+        - apiToken: []
+        - basicAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - name: channelId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: "Channel test delivery attempted"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestDAGNotificationResponse"
+        "404":
+          description: "Notification channel not found"
           content:
             application/json:
               schema:
@@ -5433,6 +6064,97 @@ paths:
                 $ref: "#/components/schemas/Error"
         "404":
           description: "No webhook or runtime profile found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dags/{fileName}/webhook/profile-tokens:
+    post:
+      summary: "Create webhook profile token"
+      description: |
+        Creates an additional webhook token bound to one runtime profile.
+        Requests authenticated with it always run with that profile.
+        Returns the new token, which is only shown once. Not available when
+        the webhook auth mode is `hmac_only`. Admin only.
+      operationId: "createDAGWebhookProfileToken"
+      tags:
+        - "webhooks"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGFileName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookProfileTokenCreateRequest"
+      responses:
+        "201":
+          description: "Profile token created successfully"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookCreateResponse"
+        "400":
+          description: "Invalid name, unavailable runtime profile, unsupported auth mode, or token limit reached"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Insufficient permissions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "No webhook or runtime profile found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Unexpected error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /dags/{fileName}/webhook/profile-tokens/{tokenId}:
+    delete:
+      summary: "Revoke webhook profile token"
+      description: |
+        Revokes a webhook profile token. The token becomes invalid
+        immediately. Admin only.
+      operationId: "revokeDAGWebhookProfileToken"
+      tags:
+        - "webhooks"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGFileName"
+        - $ref: "#/components/parameters/WebhookProfileTokenId"
+      responses:
+        "200":
+          description: "Profile token revoked successfully"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDetails"
+        "403":
+          description: "Insufficient permissions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "No webhook or profile token found"
           content:
             application/json:
               schema:
@@ -9672,6 +10394,15 @@ components:
         type: string
         minLength: 1
 
+    WebhookProfileTokenId:
+      name: tokenId
+      in: path
+      description: unique identifier of the webhook profile token
+      required: true
+      schema:
+        type: string
+        minLength: 1
+
     PerPage:
       name: perPage
       in: query
@@ -9712,6 +10443,45 @@ components:
       required: false
       schema:
         $ref: "#/components/schemas/WikiPagePath"
+
+    ArtifactDAGName:
+      name: name
+      in: query
+      description: "Filter by DAG names containing this value"
+      required: false
+      schema:
+        type: string
+
+    ArtifactFileName:
+      name: fileName
+      in: query
+      description: >-
+        Select files by path. A value containing glob metacharacters (* ? [ {)
+        is matched as a glob against the path relative to the DAG-run artifact
+        directory; any other value is matched as a case-insensitive substring
+        of that path. A run is returned only if at least one file matches, and
+        only the matching files are listed for it.
+      required: false
+      schema:
+        type: string
+
+    ArtifactListLimit:
+      name: limit
+      in: query
+      description: "Number of runs to return (default 100, max 500)"
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+
+    ArtifactListCursor:
+      name: cursor
+      in: query
+      description: "Opaque cursor returned by the previous artifact list response"
+      required: false
+      schema:
+        type: string
 
     SearchCursor:
       name: cursor
@@ -9994,6 +10764,7 @@ components:
       schema:
         type: integer
         minimum: 1
+        maximum: 10000
 
     Head:
       name: head
@@ -10003,6 +10774,7 @@ components:
       schema:
         type: integer
         minimum: 1
+        maximum: 10000
 
     Offset:
       name: offset
@@ -10255,7 +11027,7 @@ components:
           description: "The approved step name"
         resumed:
           type: boolean
-          description: "Whether the DAG run was re-enqueued for execution"
+          description: "Whether resume execution was accepted, directly or through a queue"
       required:
         - dagRunId
         - stepName
@@ -10502,7 +11274,7 @@ components:
 
     HumanTaskConfig:
       type: object
-      description: "Resolved human-task instructions and optional normalized input form"
+      description: "Resolved human-task instructions with optional normalized input form and artifact references"
       properties:
         prompt:
           type: string
@@ -10511,11 +11283,32 @@ components:
           type: object
           additionalProperties: true
           description: "Normalized flat JSON Schema for typed completion input"
+        artifacts:
+          type: array
+          items:
+            type: string
+          description: "Artifact-relative paths in the current root DAG run"
+        pushBack:
+          $ref: "#/components/schemas/HumanTaskPushBackConfig"
       required:
         - prompt
 
+    HumanTaskPushBackConfig:
+      type: object
+      description: "Push-back configuration of a human task"
+      properties:
+        rewindTo:
+          type: string
+          description: "Name of the upstream step that runs again first after a push-back"
+        form:
+          type: object
+          additionalProperties: true
+          description: "Normalized flat JSON Schema for typed push-back feedback. Omitted when push-back accepts no input."
+      required:
+        - rewindTo
+
     HumanTaskInput:
-      description: "Typed human-task completion input. An empty object acknowledges a task without a form."
+      description: "Typed human-task input: completion values or push-back feedback. An empty object supplies no values, which acknowledges a task without a form."
       type: object
       additionalProperties: true
 
@@ -10537,6 +11330,9 @@ components:
         remainingWaitingSteps:
           type: integer
           minimum: 0
+        resumeRequested:
+          type: boolean
+          description: "True when this request found the DAG-run waiting and ready to resume, whether it queued the resume or a concurrent request queued it first; false if the run keeps waiting or has already left waiting"
       required:
         - dagName
         - dagRunId
@@ -10544,6 +11340,43 @@ components:
         - alreadyCompleted
         - queued
         - remainingWaitingSteps
+        - resumeRequested
+
+    HumanTaskPushBackResponse:
+      type: object
+      description: "Result of pushing back one human task"
+      properties:
+        dagName:
+          $ref: "#/components/schemas/DAGName"
+        dagRunId:
+          $ref: "#/components/schemas/DAGRunId"
+        stepId:
+          type: string
+        rewindTo:
+          type: string
+          description: "Name of the step that runs again first"
+        iteration:
+          type: integer
+          minimum: 1
+          description: "Push-back iteration the push-back recorded"
+        alreadyPushedBack:
+          type: boolean
+          description: "Whether identical feedback had already pushed the task back and the task has not opened again since"
+        queued:
+          type: boolean
+          description: "Whether this request durably queued the DAG-run retry"
+        resumeRequested:
+          type: boolean
+          description: "True when the DAG-run was ready to resume after the push-back, whether this request queued the resume or a concurrent request queued it first; false if the run keeps waiting"
+      required:
+        - dagName
+        - dagRunId
+        - stepId
+        - rewindTo
+        - iteration
+        - alreadyPushedBack
+        - queued
+        - resumeRequested
 
     HumanTaskResumeResponse:
       type: object
@@ -10719,6 +11552,11 @@ components:
           $ref: "#/components/schemas/WebhookHMACDetails"
         profileSelection:
           $ref: "#/components/schemas/WebhookProfileSelectionDetails"
+        profileTokens:
+          type: array
+          description: "Additional tokens, each bound to one runtime profile. Remote nodes running versions without profile tokens omit the field."
+          items:
+            $ref: "#/components/schemas/WebhookProfileToken"
         createdAt:
           type: string
           format: date-time
@@ -10780,6 +11618,54 @@ components:
           description: "Runtime profile names accepted through X-Dagu-Profile. An empty list disables caller selection."
           items:
             $ref: "#/components/schemas/RuntimeProfileName"
+
+    WebhookProfileToken:
+      type: object
+      description: "Webhook token bound to one runtime profile (token not included)"
+      required:
+        - id
+        - name
+        - tokenPrefix
+        - profile
+        - createdAt
+      properties:
+        id:
+          type: string
+          description: "Unique identifier for the profile token"
+        name:
+          type: string
+          description: "Label identifying the caller that holds the token"
+        tokenPrefix:
+          type: string
+          description: "Leading characters of the token for identification"
+        profile:
+          $ref: "#/components/schemas/RuntimeProfileName"
+        createdAt:
+          type: string
+          format: date-time
+          description: "When the profile token was created"
+        createdBy:
+          type: string
+          description: "User ID who created the profile token"
+        lastUsedAt:
+          type: string
+          format: date-time
+          description: "When the profile token last authorized a request"
+
+    WebhookProfileTokenCreateRequest:
+      type: object
+      description: "Request to create a webhook profile token"
+      required:
+        - name
+        - profile
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: "Label identifying the caller that will hold the token"
+        profile:
+          $ref: "#/components/schemas/RuntimeProfileName"
 
     WebhookProfileSelectionRequest:
       type: object
@@ -11505,7 +12391,8 @@ components:
           type: string
           description: "DAG file identifier these settings apply to"
         profile:
-          $ref: "#/components/schemas/RuntimeProfileName"
+          allOf:
+            - $ref: "#/components/schemas/RuntimeProfileName"
           description: "Default runtime profile used when a DAG run does not provide an explicit profile override"
         updatedAt:
           type: string
@@ -11519,8 +12406,21 @@ components:
       description: "Request to replace DAG settings. Omit `profile` to clear the DAG default profile."
       properties:
         profile:
-          $ref: "#/components/schemas/RuntimeProfileName"
+          allOf:
+            - $ref: "#/components/schemas/RuntimeProfileName"
           description: "Default runtime profile used when a DAG run does not provide an explicit profile override"
+
+    DAGBrowserCacheClearResult:
+      type: object
+      description: "Browser steps whose replay cache was removed"
+      required:
+        - steps
+      properties:
+        steps:
+          type: array
+          description: "Keys of the steps whose recorded act operations were removed: the requested step, or every cleared step with step names in their file-safe form. Empty when there was nothing to clear."
+          items:
+            type: string
 
     DAGNotificationSettings:
       type: object
@@ -12030,16 +12930,20 @@ components:
           description: total number of pages
         nextPage:
           type: integer
-          description: next page number
+          description: next page number, clamped to totalPages on the last page
         prevPage:
           type: integer
           description: previous page number
+        hasNextPage:
+          type: boolean
+          description: whether a page follows the current one
       required:
         - totalRecords
         - currentPage
         - totalPages
         - nextPage
         - prevPage
+        - hasNextPage
 
     DAGRunId:
       type: string
@@ -12187,7 +13091,8 @@ components:
           format: date-time
           description: "RFC 3339 timestamp with explicit offset for one-off schedules"
         profile:
-          $ref: "#/components/schemas/RuntimeProfileName"
+          allOf:
+            - $ref: "#/components/schemas/RuntimeProfileName"
           description: "Runtime profile name that activates this schedule entry"
 
     Status:
@@ -12317,6 +13222,25 @@ components:
         - host
         - status
         - startedAt
+
+    SchedulerPauseState:
+      type: object
+      description: "Cluster-wide scheduler pause state"
+      properties:
+        paused:
+          type: boolean
+          description: "Whether scheduler-driven run creation is currently paused"
+        pausedAt:
+          type: string
+          description: "RFC3339 timestamp when the scheduler was paused"
+        pausedBy:
+          type: string
+          description: "User who paused the scheduler"
+        reason:
+          type: string
+          description: "Operator-facing explanation shown while paused"
+      required:
+        - paused
 
     CoordinatorStatusResponse:
       type: object
@@ -12767,6 +13691,31 @@ components:
         - message
         - checkedAt
 
+    DAGRunProcess:
+      type: object
+      description: >-
+        Operating system process executing a DAG-run on the host that served this response.
+        Present only while the DAG-run is running on that host; absent for queued, waiting and
+        finished DAG-runs, and for DAG-runs executed by a remote worker, because in those cases
+        there is no local process to look at. The process may have exited since the status was
+        recorded, so treat pid as valid only when the live process with that pid reports
+        startedAtMs as its creation time.
+      properties:
+        pid:
+          type: integer
+          description: "Process ID of the process executing the DAG-run"
+        startedAtMs:
+          type: integer
+          format: "int64"
+          description: >-
+            Creation time of that process as a Unix timestamp in milliseconds, as reported by the
+            host operating system. Compare it against the creation time of the live process with
+            this pid before attributing anything to the DAG-run; operating systems reuse pids, and
+            a pid alone cannot identify a process.
+      required:
+        - pid
+        - startedAtMs
+
     DAGRunSummary:
       type: object
       description: "Current status of a DAG-run"
@@ -12811,11 +13760,14 @@ components:
           type: string
           description: "Runtime parameters passed to the DAG-run in JSON format"
         profileName:
-          $ref: "#/components/schemas/RuntimeProfileName"
+          allOf:
+            - $ref: "#/components/schemas/RuntimeProfileName"
           description: "Runtime profile selected for this DAG-run."
         workerId:
           type: string
           description: "ID of the worker that executed this DAG-run ('local' for local execution)"
+        process:
+          $ref: "#/components/schemas/DAGRunProcess"
         triggerType:
           $ref: "#/components/schemas/TriggerType"
         triggerActor:
@@ -12894,6 +13846,9 @@ components:
               description: "List of preconditions that must be met before the DAG-run can start"
               items:
                 $ref: "#/components/schemas/Condition"
+            error:
+              type: string
+              description: "Top-level error recorded for the DAG-run, such as a definition build failure that prevented the run from starting"
             agentTasks:
               type: array
               description: "Goal progress of an agent DAG-run. Absent for other DAG types."
@@ -12908,16 +13863,87 @@ components:
               type: boolean
               description: "Whether this DAG-run still has a usable source file on disk, so reschedule can load the current spec from that file instead of the stored historical YAML snapshot."
             sourceFileName:
-              $ref: "#/components/schemas/DAGFileName"
+              allOf:
+                - $ref: "#/components/schemas/DAGFileName"
               description: "File name of the source DAG definition, derived from the DAG-run's source file path. Only set when the source file still exists on disk. Can be used to navigate to the DAG definition page."
             humanTaskResumePending:
               type: boolean
               description: "Whether completed human-task input is durable but the same DAG-run still needs its retry queued"
+            approvalResumePending:
+              type: boolean
+              description: "Whether a root run has a saved approval and ready work whose resume still needs to be accepted"
           required:
             - rootDAGRunName
             - rootDAGRunId
             - log
             - nodes
+
+    ArtifactListFile:
+      type: object
+      description: "One file within a DAG-run's artifact directory"
+      properties:
+        path:
+          type: string
+          description: "Path of the file relative to the DAG-run artifact directory"
+        size:
+          type: integer
+          format: int64
+          description: "Size of the file in bytes"
+      required:
+        - path
+        - size
+
+    ArtifactListItem:
+      type: object
+      description: "One root DAG-run and the artifact files it produced"
+      properties:
+        name:
+          $ref: "#/components/schemas/DAGName"
+        dagRunId:
+          $ref: "#/components/schemas/DAGRunId"
+        createdAt:
+          type: string
+          description: >-
+            RFC 3339 timestamp of when the DAG-run was created. This is what
+            fromDate and toDate bound and what the listing is ordered by; for a
+            run that waited in a queue it precedes startedAt.
+        startedAt:
+          type: string
+          description: "RFC 3339 timestamp of when the DAG-run started"
+        files:
+          type: array
+          description: >-
+            Files in the run's artifact directory, sorted by path. With
+            fileName set, only the matching files. At most 100 are returned;
+            see filesTruncated.
+          items:
+            $ref: "#/components/schemas/ArtifactListFile"
+        filesTruncated:
+          type: boolean
+          description: >-
+            True when the run holds more files than were returned. Which files
+            were returned is then not defined; the per-run artifact endpoint
+            serves the full tree.
+      required:
+        - name
+        - dagRunId
+        - createdAt
+        - files
+        - filesTruncated
+
+    ArtifactListResponse:
+      type: object
+      description: "Page of root DAG-runs that produced artifacts, newest first"
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactListItem"
+        nextCursor:
+          type: string
+          description: "Opaque cursor for the next page; absent when the last page was returned"
+      required:
+        - items
 
     ArtifactNodeType:
       type: string
@@ -13356,6 +14382,9 @@ components:
               type: string
         createdAt:
           type: string
+        expiresAt:
+          type: string
+          description: "RFC 3339 time after which an answer fails the step. Set for browser asks."
         respondedAt:
           type: string
         respondedBy:
@@ -13427,7 +14456,7 @@ components:
 
     PushBackHistoryEntry:
       type: object
-      description: "One push-back event recorded for an approval step"
+      description: "One push-back event recorded for an approval step or a human task"
       properties:
         iteration:
           type: integer
@@ -14191,13 +15220,18 @@ components:
       properties:
         condition:
           type: string
-          description: "Value or command text to evaluate. When `expected` is omitted, this runs as a command check. When `expected` is set, this is value-resolved and compared as data."
+          description: "Value or command text to evaluate. When `expected` and `expectedAny` are omitted, this runs as a command check. When either is set, this is value-resolved and compared as data."
         eval:
           type: string
           description: "Dynamic value expression to evaluate and compare with `expected`. Valid only when `expected` is set and `condition` is omitted."
         expected:
           type: string
           description: "Expected result for a value-match precondition. When set, Dagu compares the actual value from `condition` or `eval` instead of using command exit status."
+        expectedAny:
+          type: array
+          items:
+            type: string
+          description: "Alternative expected results for a value-match precondition, set instead of `expected`. The condition is met when any of them matches. Set on a step that a router lists under several routes."
         negate:
           type: boolean
           description: "If true, inverts the condition result (run when condition does NOT match)"
@@ -15099,7 +16133,8 @@ components:
           format: date-time
           description: "When the conflict was detected"
         previousStatus:
-          $ref: "#/components/schemas/SyncStatus"
+          allOf:
+            - $ref: "#/components/schemas/SyncStatus"
           description: "Status before transitioning to missing"
         missingAt:
           type: string
@@ -15619,7 +16654,8 @@ components:
         description:
           type: string
         defaultProfile:
-          $ref: "#/components/schemas/RuntimeProfileOverride"
+          allOf:
+            - $ref: "#/components/schemas/RuntimeProfileOverride"
           description: "Workspace default runtime profile. Only valid for workspace defaults. Empty string clears the setting; omit to leave it unchanged."
 
     SetRuntimeProfileVariableRequest:
@@ -15726,7 +16762,8 @@ components:
         workspace:
           $ref: "#/components/schemas/WorkspaceName"
         defaultProfile:
-          $ref: "#/components/schemas/RuntimeProfileName"
+          allOf:
+            - $ref: "#/components/schemas/RuntimeProfileName"
           description: "Workspace default runtime profile used when a run and DAG do not select a profile."
         description:
           type: string
@@ -15913,6 +16950,34 @@ components:
         - desc
       description: "Direction used to sort workflows."
 
+    RunDateMode:
+      type: string
+      enum:
+        - preset
+        - specific
+        - custom
+      description: "Date range mode applied by an Executions page view."
+
+    RunDatePreset:
+      type: string
+      enum:
+        - today
+        - yesterday
+        - last7days
+        - last30days
+        - thisWeek
+        - thisMonth
+        - all
+      description: "Relative date preset applied by an Executions or Artifacts page view. 'all' applies no date bound and is accepted only for artifact views."
+
+    RunSpecificPeriod:
+      type: string
+      enum:
+        - date
+        - month
+        - year
+      description: "Period granularity applied by an Executions page view."
+
     ViewSpec:
       type: object
       required:
@@ -15929,6 +16994,8 @@ components:
           enum:
             - kanban
             - workflow
+            - run
+            - artifact
           default: kanban
           description: "Saved view type."
         workspace:
@@ -15953,6 +17020,36 @@ components:
           type: string
           maxLength: 255
           description: "DAG name substring filter. Empty matches any."
+        fileName:
+          type: string
+          maxLength: 255
+          description: "Artifact file name filter: a glob when it contains wildcards, otherwise a substring. Empty matches any."
+        dagRunId:
+          type: string
+          maxLength: 64
+          description: "DAG run ID filter. Empty matches any."
+        runStatus:
+          type: string
+          maxLength: 16
+          description: "Run status filter: 'all' or a status number. Empty matches any."
+        dateMode:
+          $ref: "#/components/schemas/RunDateMode"
+        datePreset:
+          $ref: "#/components/schemas/RunDatePreset"
+        specificPeriod:
+          $ref: "#/components/schemas/RunSpecificPeriod"
+        specificValue:
+          type: string
+          maxLength: 16
+          description: "Date, month, or year value applied in specific mode."
+        fromDate:
+          type: string
+          maxLength: 32
+          description: "Custom range start (YYYY-MM-DDTHH:mm)."
+        toDate:
+          type: string
+          maxLength: 32
+          description: "Custom range end (YYYY-MM-DDTHH:mm)."
         intervalDays:
           type: integer
           minimum: 1
@@ -16006,6 +17103,9 @@ components:
             type: string
         dagName:
           type: string
+        fileName:
+          type: string
+          description: "Artifact file name filter. Empty matches any."
         intervalDays:
           type: integer
         columns:
@@ -16024,6 +17124,27 @@ components:
         activeOnly:
           type: boolean
           description: "Whether the view only includes scheduled, unsuspended workflows."
+        dagRunId:
+          type: string
+          description: "DAG run ID filter. Empty matches any."
+        runStatus:
+          type: string
+          description: "Run status filter: 'all' or a status number."
+        dateMode:
+          $ref: "#/components/schemas/RunDateMode"
+        datePreset:
+          $ref: "#/components/schemas/RunDatePreset"
+        specificPeriod:
+          $ref: "#/components/schemas/RunSpecificPeriod"
+        specificValue:
+          type: string
+          description: "Date, month, or year value applied in specific mode."
+        fromDate:
+          type: string
+          description: "Custom range start (YYYY-MM-DDTHH:mm)."
+        toDate:
+          type: string
+          description: "Custom range end (YYYY-MM-DDTHH:mm)."
         isDefault:
           type: boolean
         createdBy:

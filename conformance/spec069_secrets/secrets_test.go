@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/dagucloud/dagu/v2/conformance/harness"
@@ -27,6 +28,20 @@ func TestEnvProviderMasksValue(t *testing.T) {
 	result.ExpectExitCode(0)
 	require.Contains(t, result.Stdout(), "*******")
 	require.NotContains(t, result.Stdout(), "supersecret123")
+}
+
+// Masking keeps a final line that has no trailing newline, in the step log
+// and in a stdout redirect file.
+func TestMaskedLogKeepsFinalLine(t *testing.T) {
+	t.Parallel()
+
+	dagu := harness.NewRunner(t)
+	result := dagu.RunWithEnv([]string{"SOURCE_SECRET_VALUE=supersecret123"}, "start", "log_unterminated_line.yaml")
+	result.ExpectExitCode(0)
+	require.Contains(t, result.Stdout(), "hello world")
+	require.Contains(t, result.Stdout(), "tail *******")
+	require.NotContains(t, result.Stdout(), "supersecret123")
+	dagu.ExpectTextFileContent("tail.out", "tail *******")
 }
 
 func TestEnvProviderMissingVariable(t *testing.T) {
@@ -56,6 +71,31 @@ func TestFileProviderMissingFile(t *testing.T) {
 	result := dagu.Run("start", "file_missing.yaml")
 	result.ExpectNonZeroExitCode()
 	result.ExpectStderrContains("secret file not found")
+}
+
+// A later step of the same run reads a published output with the secret
+// intact. A retry reuses the succeeded step's stored output, which holds the
+// mask, including for a secret that JSON escapes.
+func TestStepOutputMaskedOnRetry(t *testing.T) {
+	t.Parallel()
+
+	for _, fixture := range []string{"step_output_retry.yaml", "step_output_retry_escaped.yaml"} {
+		t.Run(fixture, func(t *testing.T) {
+			t.Parallel()
+
+			const runID = "spec069-step-output"
+			dagu := harness.NewRunner(t)
+			env := []string{"DAGU_HOME=" + filepath.Join(t.TempDir(), "dagu")}
+
+			dagu.RunWithEnv(env, "start", "--run-id="+runID, fixture).ExpectNonZeroExitCode()
+			dagu.ExpectTextFileContent("received.out", "real\n")
+
+			dagu.WriteFile("ready", "")
+			dagu.RunWithEnv(env, "retry", "--run-id="+runID, fixture).ExpectExitCode(0)
+			dagu.ExpectTextFileContent("received.out", "real\n*******\n")
+			dagu.ExpectTextFileContent("logins.out", "login\n")
+		})
+	}
 }
 
 func TestUnknownProvider(t *testing.T) {

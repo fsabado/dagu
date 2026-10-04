@@ -64,6 +64,7 @@ import DAGEditorWithDocs from './DAGEditorWithDocs';
 import { parseValidationMarkers } from './validationMarkers';
 import { AgentSpecOverview } from './AgentSpecOverview';
 import ExternalChangeDialog from './ExternalChangeDialog';
+import { useEditorScrollAnchor } from './useEditorScrollAnchor';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -121,6 +122,10 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
   // Reference to the main container div
   const containerRef = React.useRef<HTMLDivElement>(null);
 
+  // Keeps the YAML editor still while the live preview above it resizes
+  const { anchorRef: editorSectionRef, contentRef: previewRef } =
+    useEditorScrollAnchor();
+
   // Reference to save function and refresh callback for keyboard shortcut
   const saveHandlerRef = React.useRef<(() => Promise<void>) | null>(null);
   const refreshCallbackRef = React.useRef<(() => void) | null>(null);
@@ -166,6 +171,7 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
       : {
           dag: next.dag,
           errors: next.errors ?? [],
+          warnings: next.warnings ?? [],
           valueReferenceNotices: data?.valueReferenceNotices ?? [],
           spec: next.spec,
         }
@@ -192,6 +198,8 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
     hasUnsavedChanges: localHasUnsavedChanges,
     conflict,
     resolveConflict,
+    beginSave,
+    cancelSave,
     markAsSaved,
     discardChanges,
   } = useContentEditor({
@@ -203,11 +211,15 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
 
   // Live server-side validation of the edited buffer. Cleared whenever the
   // buffer stops being dirty (save or discard), which also clears the markers.
+  // Kept while the next check is pending so the preview above the editor does
+  // not flip back to the saved spec on every keystroke.
   const [liveValidation, setLiveValidation] = React.useState<{
     errors: string[];
+    warnings: string[];
     dag?: components['schemas']['DAGDetails'];
   } | null>(null);
   const [isValidating, setIsValidating] = React.useState(false);
+  const [isSaving, setIsSaving] = React.useState(false);
   const validateSeqRef = React.useRef(0);
 
   React.useEffect(() => {
@@ -232,7 +244,11 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
           }
           setIsValidating(false);
           if (!requestError && result) {
-            setLiveValidation({ errors: result.errors ?? [], dag: result.dag });
+            setLiveValidation({
+              errors: result.errors ?? [],
+              warnings: result.warnings ?? [],
+              dag: result.dag,
+            });
           } else {
             // A failed request leaves the buffer's validity unknown; stale
             // results from an older buffer would misreport it.
@@ -380,6 +396,9 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
 
   // Save handler function
   const handleSave = React.useCallback(async () => {
+    if (isSaving) {
+      return;
+    }
     if (currentValue == null) {
       showError('No changes to save', 'Make some edits before saving.');
       return;
@@ -387,56 +406,69 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
 
     // Save current scroll position before any operations that might cause re-render
     saveScrollPosition();
+    beginSave(currentValue);
 
-    const { data: responseData, error } = await client.PUT(
-      '/dags/{fileName}/spec',
-      {
-        params: {
-          path: {
-            fileName: fileName,
+    setIsSaving(true);
+    try {
+      const { data: responseData, error } = await client.PUT(
+        '/dags/{fileName}/spec',
+        {
+          params: {
+            path: {
+              fileName: fileName,
+            },
+            query: {
+              remoteNode,
+            },
           },
-          query: {
-            remoteNode,
+          body: {
+            spec: currentValue,
           },
-        },
-        body: {
-          spec: currentValue,
-        },
+        }
+      );
+
+      if (error) {
+        cancelSave();
+        showError(
+          error.message || 'Failed to save spec',
+          'Please check the YAML syntax and try again.'
+        );
+        return;
       }
-    );
 
-    if (error) {
-      showError(
-        error.message || 'Failed to save spec',
-        'Please check the YAML syntax and try again.'
-      );
-      return;
+      if (responseData?.errors?.length) {
+        cancelSave();
+        // Feed the rejected save into the same markers/panel as live validation.
+        setLiveValidation((prev) => ({
+          errors: responseData.errors,
+          warnings: prev?.warnings ?? [],
+          dag: prev?.dag,
+        }));
+        showError(
+          'The spec was not saved',
+          undefined,
+          'Validation errors',
+          responseData.errors
+        );
+        return;
+      }
+
+      // Mark as saved to prevent false conflict detection on our own save
+      markAsSaved(currentValue);
+
+      // Revalidate SWR cache from server as safety net
+      mutateSpec();
+
+      // Show success toast notification
+      showToast('Changes saved successfully');
+    } catch {
+      cancelSave();
+      showError('Failed to save spec', 'Please try again.');
+    } finally {
+      setIsSaving(false);
     }
-
-    if (responseData?.errors?.length) {
-      // Feed the rejected save into the same markers/panel as live validation.
-      setLiveValidation((prev) => ({
-        errors: responseData.errors,
-        dag: prev?.dag,
-      }));
-      showError(
-        'The spec was not saved',
-        undefined,
-        'Validation errors',
-        responseData.errors
-      );
-      return;
-    }
-
-    // Mark as saved to prevent false conflict detection on our own save
-    markAsSaved(currentValue);
-
-    // Revalidate SWR cache from server as safety net
-    mutateSpec();
-
-    // Show success toast notification
-    showToast('Changes saved successfully');
   }, [
+    isSaving,
     currentValue,
     fileName,
     remoteNode,
@@ -444,6 +476,8 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
     saveScrollPosition,
     showError,
     showToast,
+    beginSave,
+    cancelSave,
     markAsSaved,
     mutateSpec,
   ]);
@@ -504,6 +538,10 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
   if (isLoading) {
     return <LoadingIndicator />;
   }
+
+  const warnings = localHasUnsavedChanges
+    ? (liveValidation?.warnings ?? [])
+    : (data?.warnings ?? []);
 
   // Check if we have local DAGs
   const hasLocalDags = localDags && localDags.length > 0;
@@ -623,6 +661,23 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
     );
   };
 
+  const renderValidationStatus = () => {
+    if (isValidating) {
+      return <I18nText text={'Validating...'} />;
+    }
+    if (!liveValidation) {
+      return null;
+    }
+    const count = liveValidation.errors.length;
+    if (count > 0) {
+      return ts(count === 1 ? '{count} issue' : '{count} issues', { count });
+    }
+    if (liveValidation.warnings.length > 0) {
+      return <I18nText text={'Valid with warnings'} />;
+    }
+    return <I18nText text={'Valid'} />;
+  };
+
   return (
     <DAGContext.Consumer>
       {(props) => {
@@ -638,22 +693,7 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
                     : 'text-xs text-muted-foreground'
                 }
               >
-                {isValidating ? (
-                  <I18nText text={'Validating...'} />
-                ) : liveValidation ? (
-                  liveValidation.errors.length > 0 ? (
-                    ts(
-                      liveValidation.errors.length === 1
-                        ? '{count} issue'
-                        : '{count} issues',
-                      { count: liveValidation.errors.length }
-                    )
-                  ) : (
-                    <I18nText text={'Valid'} />
-                  )
-                ) : (
-                  ''
-                )}
+                {renderValidationStatus()}
               </span>
             )}
             {valueReferenceNotices.length > 0 && (
@@ -697,7 +737,7 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
                   <Button
                     id="save-config"
                     title="Save changes (Ctrl+S / Cmd+S)"
-                    disabled={!localHasUnsavedChanges}
+                    disabled={isSaving || !localHasUnsavedChanges}
                     onClick={async () => {
                       await handleSave();
                       props.refresh();
@@ -726,69 +766,95 @@ function DAGSpec({ fileName, localDags, editorHints }: Props) {
                 className="flex min-h-0 flex-1 flex-col space-y-6 pb-8"
                 ref={containerRef}
               >
-                {hasLocalDags && (
-                  <div className="flex-shrink-0">
-                    <div className="overflow-x-auto -mx-2 px-2 scrollbar-thin scrollbar-thumb-gray-300">
-                      <Tabs className="w-max min-w-full">
-                        <Tab
-                          isActive={activeTab === 'parent'}
-                          onClick={() => handleActiveTabChange('parent')}
-                          className="cursor-pointer whitespace-nowrap"
-                        >
-                          {data?.dag?.name} <I18nText text={'(Parent)'} />
-                        </Tab>
-                        {localDags?.map(
-                          (localDag: components['schemas']['LocalDag']) => (
-                            <Tab
-                              key={localDag.name}
-                              isActive={activeTab === localDag.name}
-                              onClick={() =>
-                                handleActiveTabChange(localDag.name)
-                              }
-                              className="cursor-pointer whitespace-nowrap"
-                            >
-                              {localDag.name}
-                            </Tab>
-                          )
-                        )}
-                      </Tabs>
+                <div ref={previewRef} className="flex-shrink-0 space-y-6">
+                  {warnings.length > 0 && (
+                    <div
+                      role="status"
+                      className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200"
+                    >
+                      <div className="mb-2 flex items-center gap-2 font-medium">
+                        <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+                        <I18nText text={'Warnings'} />
+                      </div>
+                      <ul className="list-disc space-y-1 pl-5">
+                        {warnings.map((warning) => (
+                          <li
+                            key={warning}
+                            className="whitespace-normal break-words"
+                          >
+                            {warning}
+                          </li>
+                        ))}
+                      </ul>
                     </div>
-                  </div>
-                )}
+                  )}
+                  {hasLocalDags && (
+                    <div className="flex-shrink-0">
+                      <div className="overflow-x-auto -mx-2 px-2 scrollbar-thin scrollbar-thumb-gray-300">
+                        <Tabs className="w-max min-w-full">
+                          <Tab
+                            isActive={activeTab === 'parent'}
+                            onClick={() => handleActiveTabChange('parent')}
+                            className="cursor-pointer whitespace-nowrap"
+                          >
+                            {data?.dag?.name} <I18nText text={'(Parent)'} />
+                          </Tab>
+                          {localDags?.map(
+                            (localDag: components['schemas']['LocalDag']) => (
+                              <Tab
+                                key={localDag.name}
+                                isActive={activeTab === localDag.name}
+                                onClick={() =>
+                                  handleActiveTabChange(localDag.name)
+                                }
+                                className="cursor-pointer whitespace-nowrap"
+                              >
+                                {localDag.name}
+                              </Tab>
+                            )
+                          )}
+                        </Tabs>
+                      </div>
+                    </div>
+                  )}
 
-                {(() => {
-                  if (activeTab === 'parent') {
-                    // While the buffer is dirty, preview the live validation
-                    // result instead of the saved spec.
-                    const previewDag = liveValidation?.dag ?? data?.dag;
-                    const previewErrors = liveValidation
-                      ? liveValidation.errors
-                      : data?.errors;
+                  {(() => {
+                    if (activeTab === 'parent') {
+                      // While the buffer is dirty, preview the live validation
+                      // result instead of the saved spec.
+                      const previewDag = liveValidation?.dag ?? data?.dag;
+                      const previewErrors = liveValidation
+                        ? liveValidation.errors
+                        : data?.errors;
+                      return (
+                        previewDag && (
+                          <div className="flex-shrink-0">
+                            {renderDAGContent(previewDag, previewErrors)}
+                          </div>
+                        )
+                      );
+                    }
+                    const selectedLocalDag = localDags?.find(
+                      (ld: components['schemas']['LocalDag']) =>
+                        ld.name === activeTab
+                    );
                     return (
-                      previewDag && (
+                      selectedLocalDag?.dag && (
                         <div className="flex-shrink-0">
-                          {renderDAGContent(previewDag, previewErrors)}
+                          {renderDAGContent(
+                            selectedLocalDag.dag,
+                            selectedLocalDag.errors
+                          )}
                         </div>
                       )
                     );
-                  }
-                  const selectedLocalDag = localDags?.find(
-                    (ld: components['schemas']['LocalDag']) =>
-                      ld.name === activeTab
-                  );
-                  return (
-                    selectedLocalDag?.dag && (
-                      <div className="flex-shrink-0">
-                        {renderDAGContent(
-                          selectedLocalDag.dag,
-                          selectedLocalDag.errors
-                        )}
-                      </div>
-                    )
-                  );
-                })()}
+                  })()}
+                </div>
 
-                <section className="flex-shrink-0 space-y-3">
+                <section
+                  ref={editorSectionRef}
+                  className="flex-shrink-0 space-y-3"
+                >
                   <h2 className="text-lg font-semibold text-foreground">
                     <I18nText text={'YAML'} />
                   </h2>

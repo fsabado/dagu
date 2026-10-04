@@ -107,7 +107,7 @@ func initStores(ctx context.Context, cfg *config.Config, backend persis.Backend,
 	}
 
 	if cfg.Server.Audit.Enabled {
-		auditStore, err := fileaudit.New(filepath.Join(cfg.Paths.AdminLogsDir, "audit"), cfg.Server.Audit.RetentionDays)
+		auditStore, err := fileaudit.New(fileaudit.Dir(cfg.Paths.AdminLogsDir), cfg.Server.Audit.RetentionDays)
 		if err != nil {
 			return fmt.Errorf("failed to initialize audit service: failed to create audit store: %w", err)
 		}

@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/artifactpath"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
@@ -27,9 +28,11 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/eventstore"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/launcher"
 	"github.com/dagucloud/dagu/v2/internal/license"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	fileartifact "github.com/dagucloud/dagu/v2/internal/persis/file/artifact"
 	filebaseconfig "github.com/dagucloud/dagu/v2/internal/persis/file/baseconfig"
 	"github.com/dagucloud/dagu/v2/internal/proc"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
@@ -83,6 +86,17 @@ func (c *Context) WithEventSource(service string) *Context {
 		Service:  service,
 		Instance: c.EventSourceInstance,
 	}))
+}
+
+// withSignalPropagation returns a context carrying a launcher.ProcessRegistry
+// when signal_handling.enable_propagation is enabled. Supervising commands use
+// the registry to forward shutdown signals to the process groups of DAG-run
+// subprocesses they launched. When disabled the context is returned unchanged.
+func (c *Context) withSignalPropagation(ctx context.Context) context.Context {
+	if c == nil || c.Config == nil || !c.Config.SignalHandling.EnablePropagation {
+		return ctx
+	}
+	return launcher.ContextWithProcessRegistry(ctx, launcher.NewProcessRegistry())
 }
 
 func (c *Context) withEvent(service *eventstore.Service) *Context {
@@ -290,6 +304,7 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 	// Initialize caches shared by long-running process roles.
 	var dagCache *fileutil.Cache[*ir.DAG]
 	var dagRunStatusCache *fileutil.Cache[*ir.DAGRunStatus]
+	var artifactRecordCache *fileutil.Cache[*fileartifact.Record]
 	var caches []fileutil.CacheMetrics
 
 	switch cmd.Name() {
@@ -301,12 +316,18 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 		dagRunStatusCache = hc
 		dagCache = fileutil.NewCache[*ir.DAG]("dag_definition", limits.DAG.Limit, limits.DAG.TTL)
 		dagCache.StartEviction(ctx)
-		caches = append(caches, dagCache, hc)
+		// Artifact index records are read once per listed run and are far
+		// smaller than a status, so the DAG-run limits are a safe bound.
+		ac := fileutil.NewCache[*fileartifact.Record]("artifact_record", limits.DAGRun.Limit, limits.DAGRun.TTL)
+		ac.StartEviction(ctx)
+		artifactRecordCache = ac
+		caches = append(caches, dagCache, hc, ac)
 	}
 
 	persistence, err := newFilePersistence(ctx, cfg, backend, filePersistenceOptions{
-		DAGCache:          dagCache,
-		DAGRunStatusCache: dagRunStatusCache,
+		DAGCache:            dagCache,
+		DAGRunStatusCache:   dagRunStatusCache,
+		ArtifactRecordCache: artifactRecordCache,
 	})
 	if err != nil {
 		return nil, err
@@ -509,19 +530,20 @@ func (c *Context) NewCoordinatorClient() (coordinator.Client, error) {
 func (c *Context) SubWorkflowRunnerFactory() func(context.Context) (runtimeexec.SubWorkflowRunner, error) {
 	stores := c.runtimeStores()
 	return coordinator.NewSubWorkflowRunnerFactory(coordinator.SubWorkflowRunnerConfig{
-		DAGRunMgr:         c.DAGRunMgr,
-		DAGRepository:     c.Persistence.DAGRepository,
-		DAGRunRepository:  c.Persistence.DAGRunRepository,
-		QueueStore:        c.Persistence.QueueStore,
-		StateStore:        c.Persistence.StateStore,
-		SecretStore:       stores.SecretStore,
-		ProfileStore:      stores.ProfileStore,
-		ServiceRegistry:   c.Persistence.ServiceRegistry,
-		PeerConfig:        c.Config.Core.Peer,
-		DefaultExecMode:   c.Config.DefaultExecMode,
-		WorkerID:          "local",
-		DAGRunLogDir:      c.Config.Paths.LogDir,
-		DAGRunArtifactDir: c.Config.Paths.ArtifactDir,
+		DAGRunMgr:          c.DAGRunMgr,
+		DAGRepository:      c.Persistence.DAGRepository,
+		DAGRunRepository:   c.Persistence.DAGRunRepository,
+		QueueStore:         c.Persistence.QueueStore,
+		StateStore:         c.Persistence.StateStore,
+		SecretStore:        stores.SecretStore,
+		ProfileStore:       stores.ProfileStore,
+		ServiceRegistry:    c.Persistence.ServiceRegistry,
+		PeerConfig:         c.Config.Core.Peer,
+		WorkspaceBundleDir: workspacebundle.StoreDir(c.Config.Paths.DataDir),
+		DefaultExecMode:    c.Config.DefaultExecMode,
+		WorkerID:           "local",
+		DAGRunLogDir:       c.Config.Paths.LogDir,
+		DAGRunArtifactDir:  c.Config.Paths.ArtifactDir,
 	})
 }
 
@@ -593,7 +615,7 @@ func (c *Context) GenArtifactDir(dag *ir.DAG, dagRunID string) (string, error) {
 		dagArtifactDir = dag.Artifacts.Dir
 	}
 
-	return logpath.GenerateDir(c, c.Config.Paths.ArtifactDir, dagArtifactDir, dag.Name, dagRunID)
+	return artifactpath.NewRunDir(c, c.Config.Paths.ArtifactDir, dagArtifactDir, dag.Name, dagRunID, time.Now())
 }
 
 // NewCommand creates a new command instance with the given cobra command and run function.
@@ -651,15 +673,16 @@ type signalListener interface {
 // listenSignals subscribes to SIGINT and SIGTERM signals and forwards them to the provided listener.
 // It also listens for context cancellation and signals the listener with an os.Interrupt.
 func listenSignals(ctx context.Context, listener signalListener) {
-	go func() {
-		if signalctx.OSSignalsDisabled(ctx) {
+	if signalctx.OSSignalsDisabled(ctx) {
+		go func() {
 			<-ctx.Done()
 			listener.Signal(ctx, os.Interrupt)
-			return
-		}
-
-		signalChan := make(chan os.Signal, 1)
-		signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+		}()
+		return
+	}
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
 		defer signal.Stop(signalChan)
 
 		select {

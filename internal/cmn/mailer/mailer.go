@@ -6,13 +6,21 @@ package mailer
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
 	"net"
+	"net/http"
+	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,12 +35,24 @@ import (
 
 // Client is a mailer that sends emails.
 type Client struct {
-	host     string
-	port     string
-	username string
-	password string
-	token    func(context.Context) (*oauth2.Token, error)
+	host          string
+	port          string
+	username      string
+	password      string
+	token         func(context.Context) (*oauth2.Token, error)
+	security      string
+	skipTLSVerify bool
+	// requireAttachments makes every listed attachment mandatory.
+	requireAttachments bool
 }
+
+// Security modes for Config.Security.
+const (
+	// SecurityTLS connects with TLS from the first byte.
+	SecurityTLS = "tls"
+	// SecurityStartTLS upgrades a plain connection and fails without STARTTLS.
+	SecurityStartTLS = "starttls"
+)
 
 // Config is a config for SMTP mailer.
 type Config struct {
@@ -41,15 +61,27 @@ type Config struct {
 	Username string
 	Password string
 	Token    func(context.Context) (*oauth2.Token, error)
+	// Security is SecurityTLS, SecurityStartTLS, or empty to use STARTTLS
+	// whenever an authenticated session's server offers it.
+	Security string
+	// SkipTLSVerify accepts any server certificate.
+	SkipTLSVerify bool
+	// RequireAttachments fails a send whose listed attachment cannot be read,
+	// and attaches empty files as they are. Without it, such files are skipped,
+	// which suits optional attachments such as step logs.
+	RequireAttachments bool
 }
 
 func New(cfg Config) *Client {
 	return &Client{
-		host:     cfg.Host,
-		port:     cfg.Port,
-		username: cfg.Username,
-		password: cfg.Password,
-		token:    cfg.Token,
+		host:               cfg.Host,
+		port:               cfg.Port,
+		username:           cfg.Username,
+		password:           cfg.Password,
+		token:              cfg.Token,
+		security:           cfg.Security,
+		skipTLSVerify:      cfg.SkipTLSVerify,
+		requireAttachments: cfg.RequireAttachments,
 	}
 }
 
@@ -57,10 +89,17 @@ var (
 	replacer = strings.NewReplacer(
 		"\r\n", "", "\r", "", "\n", "", "%0a", "", "%0d", "",
 	)
-	boundary     = "==simple-boundary-dagu-mailer"
 	errFileEmpty = errors.New("file is empty")
 	mailTimeout  = 30 * time.Second
 	maxHeaderLen = 256
+	// maxReferences bounds the References header of a reply.
+	maxReferences = 10
+)
+
+const (
+	// fallbackMessageIDDomain is used when the sender address carries no usable
+	// domain.
+	fallbackMessageIDDomain = "dagu.local"
 )
 
 // SendMail sends an email.
@@ -83,33 +122,70 @@ func (m *Client) SendWithRecipients(
 	subject, body string,
 	attachments []string,
 ) error {
+	return m.SendMessage(ctx, Message{
+		From: from, To: to, Cc: cc, Bcc: bcc, Subject: subject, Body: body, Attachments: attachments,
+	})
+}
+
+// Message is an email to send.
+type Message struct {
+	From        string
+	To          []string
+	Cc          []string
+	Bcc         []string
+	Subject     string
+	Body        string
+	Attachments []string
+	// InReplyTo and References thread the message as a reply. They hold
+	// Message-IDs without angle brackets; References lists the thread's
+	// earlier messages, oldest first.
+	InReplyTo  string
+	References []string
+}
+
+// SendMessage sends msg.
+func (m *Client) SendMessage(ctx context.Context, msg Message) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(ctx, mailTimeout)
 	defer cancel()
 
-	logger.Info(ctx, "Sending email", slog.Any("to", to), tag.Subject(subject))
+	logger.Info(ctx, "Sending email", slog.Any("to", msg.To), tag.Subject(msg.Subject))
 	if m.username == "" && m.password == "" && m.token == nil {
-		return m.send(ctx, from, to, cc, bcc, subject, body, attachments, false)
+		return m.send(ctx, msg, false)
 	}
-	return m.send(ctx, from, to, cc, bcc, subject, body, attachments, true)
+	return m.send(ctx, msg, true)
 }
 
-func (m *Client) send(
-	ctx context.Context,
-	from string,
-	to []string,
-	cc []string,
-	bcc []string,
-	subject, body string,
-	attachments []string,
-	useAuth bool,
-) error {
+// Compose returns msg as the RFC 5322 message SendMessage delivers. Bcc
+// recipients are not part of it.
+func (m *Client) Compose(msg Message) ([]byte, error) {
+	return m.composeMessage(sanitizeAddresses(msg.To), sanitizeAddresses(msg.Cc),
+		sanitizeHeaderField(msg.From), sanitizeHeaderField(msg.Subject), processEmailBody(msg.Body),
+		msg.Attachments, threadHeaders(msg.InReplyTo, msg.References))
+}
+
+func (m *Client) send(ctx context.Context, msg Message, useAuth bool) error {
+	// The message is built before connecting, so attachments are read once and
+	// a problem with one stops the send before the server sees anything.
+	recipients := sanitizeAddresses(append(append(append([]string{}, msg.To...), msg.Cc...), msg.Bcc...))
+	safeFrom := sanitizeHeaderField(msg.From)
+	payload, err := m.Compose(msg)
+	if err != nil {
+		return fmt.Errorf("failed to compose email: %w", err)
+	}
+
 	dialer := &net.Dialer{
 		Timeout: mailTimeout,
 	}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(m.host, m.port))
+	address := net.JoinHostPort(m.host, m.port)
+	var conn net.Conn
+	if m.security == SecurityTLS {
+		conn, err = (&tls.Dialer{NetDialer: dialer, Config: m.tlsConfig()}).DialContext(ctx, "tcp", address)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", address)
+	}
 	if err != nil {
 		return err
 	}
@@ -137,11 +213,6 @@ func (m *Client) send(
 		}
 	}
 
-	recipients := sanitizeAddresses(append(append(append([]string{}, to...), cc...), bcc...))
-	to = sanitizeAddresses(to)
-	cc = sanitizeAddresses(cc)
-	safeFrom := sanitizeHeaderField(from)
-	safeSubject := sanitizeHeaderField(subject)
 	if err := c.Mail(safeFrom); err != nil {
 		return fmt.Errorf("MAIL FROM failed: %w", err)
 	}
@@ -155,8 +226,6 @@ func (m *Client) send(
 	if err != nil {
 		return fmt.Errorf("DATA command failed: %w", err)
 	}
-
-	payload := m.composeMail(to, cc, safeFrom, safeSubject, processEmailBody(body), attachments)
 	_, err = wc.Write(payload)
 	if err != nil {
 		return fmt.Errorf("failed to write email body: %w", err)
@@ -205,22 +274,31 @@ func (m *Client) prepareSession(ctx context.Context, c *smtp.Client) error {
 		return fmt.Errorf("HELO failed: %w", err)
 	}
 
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		tlsConfig := &tls.Config{
-			ServerName: m.host,
-			MinVersion: tls.VersionTLS12,
+	if m.security != SecurityTLS {
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(m.tlsConfig()); err != nil {
+				return fmt.Errorf("STARTTLS failed: %w", err)
+			}
+		} else if m.security == SecurityStartTLS {
+			return errors.New("SMTP server does not offer STARTTLS")
+		} else if m.token != nil {
+			return errors.New("SMTP OAuth requires STARTTLS")
 		}
-		if err := c.StartTLS(tlsConfig); err != nil {
-			return fmt.Errorf("STARTTLS failed: %w", err)
-		}
-	} else if m.token != nil {
-		return errors.New("SMTP OAuth requires STARTTLS")
 	}
 
 	if err := m.authenticate(ctx, c); err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 	return nil
+}
+
+func (m *Client) tlsConfig() *tls.Config {
+	return &tls.Config{
+		ServerName: m.host,
+		MinVersion: tls.VersionTLS12,
+		// Operators opt in per server, for self-signed certificates.
+		InsecureSkipVerify: m.skipTLSVerify, //nolint:gosec
+	}
 }
 
 // authenticate tries LOGIN auth first, then falls back to PLAIN auth.
@@ -320,7 +398,7 @@ func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 }
 
 func (*Client) composeHeader(
-	to []string, cc []string, from string, subject string,
+	to []string, cc []string, from string, subject string, contentType string, thread string,
 ) string {
 	to = sanitizeAddresses(to)
 	cc = sanitizeAddresses(cc)
@@ -333,12 +411,11 @@ func (*Client) composeHeader(
 	return header +
 		"From: " + from + "\r\n" +
 		"Subject: " + subject + "\r\n" +
-		"Content-Type: multipart/mixed;\r\n" +
-		"  boundary=\"" + boundary + "\"\r\n\r\n" +
-		"\r\n\r\n" +
-		"--" + boundary + "\r\n" +
-		"Content-Type: text/html; charset=\"UTF-8\"\r\n" +
-		"Content-Transfer-Encoding: base64\r\n"
+		"Date: " + time.Now().Format(time.RFC1123Z) + "\r\n" +
+		"Message-ID: " + newMessageID(from) + "\r\n" +
+		thread +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: " + contentType + "\r\n"
 }
 
 func (m *Client) composeMail(
@@ -346,16 +423,221 @@ func (m *Client) composeMail(
 	cc []string,
 	from, subject, body string,
 	attachments []string,
-) []byte {
+) ([]byte, error) {
+	return m.composeMessage(to, cc, from, subject, body, attachments, "")
+}
+
+// composeMessage builds the message; thread holds the reply headers, if any.
+func (m *Client) composeMessage(
+	to []string,
+	cc []string,
+	from, subject, body string,
+	attachments []string,
+	thread string,
+) ([]byte, error) {
+	loadedAttachments, err := loadAttachments(attachments, m.requireAttachments)
+	if err != nil {
+		return nil, err
+	}
+	if len(loadedAttachments) == 0 {
+		return m.composeSinglePartMail(to, cc, from, subject, body, thread)
+	}
+	return m.composeMultipartMail(to, cc, from, subject, body, loadedAttachments, thread)
+}
+
+// threadHeaders returns the In-Reply-To and References lines of a reply to
+// the message inReplyTo. A Message-ID that could break the header is left
+// out, and long threads keep their first message and the newest ones.
+func threadHeaders(inReplyTo string, references []string) string {
+	if !safeMessageID(inReplyTo) {
+		return ""
+	}
+	ids := make([]string, 0, len(references)+1)
+	for _, id := range references {
+		if safeMessageID(id) && id != inReplyTo {
+			ids = append(ids, "<"+id+">")
+		}
+	}
+	ids = append(ids, "<"+inReplyTo+">")
+	if len(ids) > maxReferences {
+		ids = append(ids[:1], ids[len(ids)-maxReferences+1:]...)
+	}
+	return "In-Reply-To: <" + inReplyTo + ">\r\n" +
+		"References: " + strings.Join(ids, " ") + "\r\n"
+}
+
+// safeMessageID reports whether id, without angle brackets, can be written
+// into a header as it is.
+func safeMessageID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		if r <= ' ' || r > '~' || r == '<' || r == '>' {
+			return false
+		}
+	}
+	return true
+}
+
+type attachment struct {
+	name        string
+	contentType string
+	data        []byte
+}
+
+// loadAttachments reads the listed files. Unless require is set, files that
+// are unreadable or empty are skipped.
+func loadAttachments(fileNames []string, require bool) ([]attachment, error) {
+	attachments := make([]attachment, 0, len(fileNames))
+	for _, fileName := range fileNames {
+		data, err := readFile(fileName)
+		switch {
+		case err == nil:
+		case require && errors.Is(err, errFileEmpty):
+			data = []byte{}
+		case require:
+			return nil, fmt.Errorf("attachment %q: %w", fileName, err)
+		default:
+			continue
+		}
+		name := filepath.Base(fileName)
+		attachments = append(attachments, attachment{
+			name:        name,
+			contentType: attachmentContentType(name, data),
+			data:        data,
+		})
+	}
+	return attachments, nil
+}
+
+// attachmentContentType takes the type from the file name, or from the
+// content when the name implies none.
+func attachmentContentType(name string, data []byte) string {
+	if contentType := mime.TypeByExtension(filepath.Ext(name)); contentType != "" {
+		return contentType
+	}
+	return http.DetectContentType(data)
+}
+
+func (m *Client) composeSinglePartMail(
+	to []string,
+	cc []string,
+	from, subject, body string,
+	thread string,
+) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteString(m.composeHeader(to, cc, from, subject))
+	contentType := mime.FormatMediaType("text/html", map[string]string{"charset": "UTF-8"})
+	buf.WriteString(m.composeHeader(to, cc, from, subject, contentType, thread))
+	buf.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+	if err := writeBase64(&buf, []byte(body)); err != nil {
+		return nil, err
+	}
 	buf.WriteString("\r\n")
-	buf.WriteString(base64.StdEncoding.EncodeToString([]byte(body)))
-	buf.Write(addAttachments(attachments))
-	buf.WriteString("\r\n--")
-	buf.WriteString(boundary)
-	buf.WriteString("--\r\n")
-	return buf.Bytes()
+	return buf.Bytes(), nil
+}
+
+func (m *Client) composeMultipartMail(
+	to []string,
+	cc []string,
+	from, subject, body string,
+	attachments []attachment,
+	thread string,
+) ([]byte, error) {
+	var content bytes.Buffer
+	writer := multipart.NewWriter(&content)
+
+	bodyHeader := make(textproto.MIMEHeader)
+	bodyHeader.Set("Content-Type", mime.FormatMediaType("text/html", map[string]string{"charset": "UTF-8"}))
+	bodyHeader.Set("Content-Transfer-Encoding", "base64")
+	bodyPart, err := writer.CreatePart(bodyHeader)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeBase64(bodyPart, []byte(body)); err != nil {
+		return nil, err
+	}
+
+	for _, attachment := range attachments {
+		attachmentHeader := make(textproto.MIMEHeader)
+		attachmentHeader.Set("Content-Type", attachment.contentType)
+		attachmentHeader.Set("Content-Transfer-Encoding", "base64")
+		attachmentHeader.Set(
+			"Content-Disposition",
+			mime.FormatMediaType("attachment", map[string]string{"filename": attachment.name}),
+		)
+		part, err := writer.CreatePart(attachmentHeader)
+		if err != nil {
+			return nil, err
+		}
+		if err := writeBase64(part, attachment.data); err != nil {
+			return nil, err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
+	contentType := mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": writer.Boundary()})
+	var message bytes.Buffer
+	message.WriteString(m.composeHeader(to, cc, from, subject, contentType, thread))
+	message.WriteString("\r\n")
+	message.Write(content.Bytes())
+	return message.Bytes(), nil
+}
+
+func newMessageID(from string) string {
+	domain := messageIDDomain(from)
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), domain)
+	}
+	return "<" + hex.EncodeToString(random[:]) + "@" + domain + ">"
+}
+
+// messageIDDomain derives the Message-ID right-hand side from the sender
+// address. Spam filters score a Message-ID aligned with the From domain more
+// favorably than an unrelated literal.
+func messageIDDomain(from string) string {
+	address := from
+	if parsed, err := mail.ParseAddress(from); err == nil {
+		address = parsed.Address
+	}
+	index := strings.LastIndex(address, "@")
+	if index < 0 {
+		return fallbackMessageIDDomain
+	}
+	domain := strings.TrimRight(address[index+1:], ">")
+	if !isDotAtom(domain) {
+		return fallbackMessageIDDomain
+	}
+	return domain
+}
+
+// isDotAtom reports whether value is usable unquoted in a structured header
+// field, per the dot-atom production of RFC 5322.
+func isDotAtom(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r <= ' ' || r >= 0x7f || strings.ContainsRune(`()<>[]:;@\,"`, r) {
+			return false
+		}
+	}
+	return true
+}
+
+func writeBase64(w io.Writer, data []byte) error {
+	encoded := base64.StdEncoding.EncodeToString(data)
+	for len(encoded) > 76 {
+		if _, err := io.WriteString(w, encoded[:76]+"\r\n"); err != nil {
+			return err
+		}
+		encoded = encoded[76:]
+	}
+	_, err := io.WriteString(w, encoded)
+	return err
 }
 
 func newlineToBrTag(body string) string {
@@ -377,25 +659,6 @@ func processEmailBody(body string) string {
 		return newlineToBrTag(body)
 	}
 	return body
-}
-
-func addAttachments(attachments []string) []byte {
-	var buf bytes.Buffer
-	for _, fileName := range attachments {
-		data, err := readFile(fileName)
-		if err == nil {
-			_, _ = fmt.Fprintf(&buf, "\r\n--%s\r\n", boundary)
-			_, _ = buf.WriteString("Content-Type: text/plain\r\n")
-			_, _ = buf.WriteString("Content-Transfer-Encoding: base64\r\n")
-			_, _ = buf.WriteString(
-				"Content-Disposition: attachment; filename=" +
-					filepath.Base(fileName) + "\r\n",
-			)
-			_, _ = buf.WriteString("\r\n")
-			_, _ = buf.WriteString(base64.StdEncoding.EncodeToString(data))
-		}
-	}
-	return buf.Bytes()
 }
 
 func readFile(fileName string) (data []byte, err error) {

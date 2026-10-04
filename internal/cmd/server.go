@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
@@ -69,6 +68,7 @@ func newServer(ctx *Context, rs *resource.Service, stores frontend.Stores, opts 
 		Config:               ctx.Config,
 		DAGRepository:        ctx.Persistence.DAGRepository,
 		DAGRunRepository:     ctx.Persistence.DAGRunRepository,
+		ArtifactRepository:   ctx.Persistence.ArtifactRepository,
 		ProcRepository:       ctx.Persistence.ProcRepository,
 		QueueStore:           ctx.Persistence.QueueStore,
 		DAGRunManager:        ctx.DAGRunMgr,
@@ -77,6 +77,7 @@ func newServer(ctx *Context, rs *resource.Service, stores frontend.Stores, opts 
 		DAGRunLeaseStore:     ctx.Persistence.DAGRunLeaseStore,
 		WorkerHeartbeatStore: ctx.Persistence.WorkerHeartbeatStore,
 		SchedulerStateStore:  ctx.Persistence.SchedulerStateStore,
+		SchedulerPauseStore:  ctx.Persistence.SchedulerPauseStore,
 		Caches:               ctx.Caches,
 		LicenseManager:       ctx.LicenseManager,
 		ResourceService:      rs,
@@ -91,13 +92,14 @@ func newServer(ctx *Context, rs *resource.Service, stores frontend.Stores, opts 
 func runServer(ctx *Context, _ []string, serverOpts ...frontend.ServerOption) error {
 	// Create a context that will be cancelled on interrupt signal.
 	// This must be created BEFORE server initialization so auth provider init can be cancelled.
-	signalCtx, stop := signal.NotifyContext(ctx.Context, syscall.SIGINT, syscall.SIGTERM)
+	signalCtx, stop := notifyShutdownContext(ctx.Context, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// Create a signal-aware context for services
-	serviceCtx := ctx.WithContext(signalCtx)
+	serviceCtx := ctx.WithContext(ctx.withSignalPropagation(signalCtx))
 	openCodeHost := opencodehost.New(signalCtx, ctx.Config.OpenCode)
 	cleanupCancel, cleanupDone := startLocalAgentSessionCleanup(signalCtx, ctx.Persistence, openCodeHost)
+	startBrowserReaper(signalCtx, ctx.Config.Paths.DataDir, ctx.Persistence.DAGRunRepository)
 	var tunnelService *tunnel.Service
 	var resourceService *resource.Service
 	defer func() {
@@ -177,7 +179,7 @@ func runServer(ctx *Context, _ []string, serverOpts ...frontend.ServerOption) er
 	}
 
 	err = server.Serve(serviceCtx)
-	stop() // Restore default signal handling while deferred cleanup runs.
+	stop() // Let a second SIGINT end deferred cleanup; SIGTERM stays absorbed.
 	if err != nil {
 		return fmt.Errorf("failed to start server: %w", err)
 	}

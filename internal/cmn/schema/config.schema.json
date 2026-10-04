@@ -194,6 +194,9 @@
     "opencode": {
       "$ref": "#/definitions/OpenCodeDef"
     },
+    "browser": {
+      "$ref": "#/definitions/BrowserDef"
+    },
     "proc": {
       "$ref": "#/definitions/ProcDef"
     },
@@ -239,6 +242,9 @@
       "description": "Default execution mode for DAGs. 'local' runs DAGs on the server process, 'distributed' dispatches to workers.",
       "enum": ["local", "distributed"],
       "default": "local"
+    },
+    "signal_handling": {
+      "$ref": "#/definitions/SignalHandlingDef"
     },
     "tunnel": {
       "$ref": "#/definitions/TunnelDef"
@@ -1125,6 +1131,18 @@
         }
       }
     },
+    "BrowserDef": {
+      "type": "object",
+      "description": "Browsers that browser steps start on this host.",
+      "additionalProperties": false,
+      "properties": {
+        "sandbox": {
+          "type": "boolean",
+          "description": "Keep Chromium's sandbox on for every browser started on this host. Set to false only where the sandbox cannot start; pages are then isolated from the host only by the operating system user.",
+          "default": true
+        }
+      }
+    },
     "WorkerDef": {
       "type": "object",
       "description": "Worker process configuration for distributed execution.",
@@ -1262,6 +1280,18 @@
         "stale_threshold": {
           "type": "string",
           "description": "Duration after which a process heartbeat is considered stale. Default: '90s'."
+        }
+      }
+    },
+    "SignalHandlingDef": {
+      "type": "object",
+      "description": "Signal handling options for supervising processes (server, scheduler, start-all).",
+      "additionalProperties": false,
+      "properties": {
+        "enable_propagation": {
+          "type": "boolean",
+          "description": "Forward shutdown signals (SIGINT, SIGTERM) received by a supervising process to the process groups of running DAG-run subprocesses it launched. Default: false.",
+          "default": false
         }
       }
     },

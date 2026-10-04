@@ -14,6 +14,8 @@ import (
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/llm"
+	"github.com/dagucloud/dagu/v2/internal/llm/claudemodel"
+	"github.com/dagucloud/dagu/v2/internal/llm/providers/chatcontent"
 )
 
 const (
@@ -131,7 +133,7 @@ func (p *Provider) buildRequestBody(req *llm.ChatRequest, stream bool) ([]byte, 
 	for i, m := range req.Messages {
 		messages[i] = message{
 			Role:    string(m.Role),
-			Content: m.Content,
+			Content: chatcontent.Content(m.Content, m.Images),
 		}
 		if m.Name != "" {
 			messages[i].Name = m.Name
@@ -224,6 +226,9 @@ func (p *Provider) buildRequestBody(req *llm.ChatRequest, stream bool) ([]byte, 
 	// Add tool choice if specified
 	if req.ToolChoice != "" {
 		chatReq.ToolChoice = req.ToolChoice
+		if claudeRejectsForcedChoice(req) {
+			chatReq.ToolChoice = "auto"
+		}
 	}
 
 	// Append web search plugin if enabled.
@@ -239,6 +244,20 @@ func (p *Provider) buildRequestBody(req *llm.ChatRequest, stream bool) ([]byte, 
 	}
 
 	return json.Marshal(chatReq)
+}
+
+// claudeRejectsForcedChoice reports whether a request forces tool use on a
+// Claude model that refuses it: every Claude model while reasoning, and
+// models from Claude 5 on.
+func claudeRejectsForcedChoice(req *llm.ChatRequest) bool {
+	if req.ToolChoice == "auto" || req.ToolChoice == "none" {
+		return false
+	}
+	if _, ok := claudemodel.Parse(req.Model); !ok {
+		return false
+	}
+	thinking := req.Thinking != nil && req.Thinking.Enabled
+	return thinking || !claudemodel.ForcedToolChoiceSupported(req.Model)
 }
 
 func (p *Provider) doRequest(ctx context.Context, body []byte) (io.ReadCloser, error) {
@@ -322,7 +341,7 @@ func (p *Provider) streamResponse(ctx context.Context, body io.ReadCloser, event
 
 type message struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content"`
+	Content    any        `json:"content"`
 	Name       string     `json:"name,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []toolCall `json:"tool_calls,omitempty"`

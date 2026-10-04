@@ -138,7 +138,7 @@ run: ${FE_BUNDLE_JS}
 
 # server build the binary and start the server.
 .PHONY: run-server
-run-server: golangci-lint bin
+run-server: bin
 	@printf '%b\n' "${COLOR_GREEN}Starting the server...${COLOR_RESET}"
 	${LOCAL_BIN_DIR}/${APP_BIN_NAME} server
 
@@ -441,6 +441,8 @@ fmt:
 	@${LOCAL_BIN_DIR}/golangci-lint run --fix ./...
 	@printf '%b\n' "${COLOR_GREEN}Running linter with --fix (GOOS=windows)...${COLOR_RESET}"
 	@GOOS=windows ${LOCAL_BIN_DIR}/golangci-lint run --fix ./...
+	@printf '%b\n' "${COLOR_GREEN}Running linter with --fix (GOOS=darwin)...${COLOR_RESET}"
+	@GOOS=darwin ${LOCAL_BIN_DIR}/golangci-lint run --fix ./...
 
 # check verifies code style without modifying files (for CI).
 .PHONY: check
@@ -455,6 +457,8 @@ check:
 	@${LOCAL_BIN_DIR}/golangci-lint run --timeout=10m ./...
 	@printf '%b\n' "${COLOR_GREEN}Running linter (GOOS=windows)...${COLOR_RESET}"
 	@GOOS=windows ${LOCAL_BIN_DIR}/golangci-lint run --timeout=10m ./...
+	@printf '%b\n' "${COLOR_GREEN}Running linter (GOOS=darwin)...${COLOR_RESET}"
+	@GOOS=darwin ${LOCAL_BIN_DIR}/golangci-lint run --timeout=10m ./...
 
 # golangci-lint run linting tool.
 .PHONY: golangci-lint

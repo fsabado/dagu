@@ -100,13 +100,21 @@ func (oc *OutputCoordinator) setupMasker(ctx context.Context, _ NodeData) error 
 	return nil
 }
 
-func (oc *OutputCoordinator) setup(ctx context.Context, data NodeData) error {
+func (oc *OutputCoordinator) setup(ctx context.Context, data NodeData) (err error) {
 	// This attempt gets its own writers, so the closed latch from the previous
 	// one must not survive: it guards every flush path, and a set latch would
 	// drop this attempt's buffered output on teardown.
 	oc.mu.Lock()
 	oc.closed = false
 	oc.mu.Unlock()
+
+	// A node that fails to prepare is never torn down, so release what was
+	// opened here.
+	defer func() {
+		if err != nil {
+			_ = oc.closeResources()
+		}
+	}()
 
 	if err := oc.setupMasker(ctx, data); err != nil {
 		return fmt.Errorf("failed to setup masker: %w", err)
@@ -117,12 +125,19 @@ func (oc *OutputCoordinator) setup(ctx context.Context, data NodeData) error {
 	if err := oc.setupStdoutRedirect(ctx, data); err != nil {
 		return err
 	}
-	return oc.setupStderrRedirect(ctx, data)
+	if err := oc.setupStderrRedirect(ctx, data); err != nil {
+		return err
+	}
+	return oc.checkArtifactRedirects(data)
 }
 
 func (oc *OutputCoordinator) setupExecutorIO(ctx context.Context, cmd executor.Executor, data NodeData) error {
 	oc.mu.Lock()
 	defer oc.mu.Unlock()
+
+	if err := oc.resetArtifactRedirects(data); err != nil {
+		return err
+	}
 
 	var stdout io.Writer = os.Stdout
 	if oc.stdoutWriter != nil {
@@ -295,14 +310,18 @@ func (oc *OutputCoordinator) closeResources() error {
 		oc.stderrFile,
 		oc.stdoutRedirectFile,
 		oc.StderrRedirectFile,
-		oc.outputReader,
-		oc.stderrOutputReader,
 	} {
 		if f != nil {
 			if err := f.Sync(); err != nil {
 				lastErr = err
 			}
 			_ = f.Close()
+		}
+	}
+	// Capture readers are pipes; syncing them fails and hides capture errors.
+	for _, reader := range []*os.File{oc.outputReader, oc.stderrOutputReader} {
+		if reader != nil {
+			_ = reader.Close()
 		}
 	}
 	return lastErr
@@ -316,18 +335,13 @@ func (oc *OutputCoordinator) setupStdoutRedirect(ctx context.Context, data NodeD
 		return nil
 	}
 
-	file, err := oc.setupFile(ctx, data.Step.Stdout, data)
+	file, err := oc.setupFile(ctx, data.Step.Stdout, data.Step.StdoutArtifact != "")
 	if err != nil {
 		return fmt.Errorf("failed to setup stdout file: %w", err)
 	}
 
 	oc.stdoutRedirectFile = file
-	// Wrap with MaskingWriter if masker is available
-	var writer io.Writer = oc.stdoutRedirectFile
-	if oc.masker != nil {
-		writer = masking.NewMaskingWriter(oc.stdoutRedirectFile, oc.masker)
-	}
-	oc.stdoutRedirectWriter = newSafeBufferedWriter(writer)
+	oc.stdoutRedirectWriter = oc.newRedirectWriter(file)
 
 	return nil
 }
@@ -340,19 +354,78 @@ func (oc *OutputCoordinator) setupStderrRedirect(ctx context.Context, data NodeD
 		return nil
 	}
 
-	file, err := oc.setupFile(ctx, data.Step.Stderr, data)
+	file, err := oc.setupFile(ctx, data.Step.Stderr, data.Step.StderrArtifact != "")
 	if err != nil {
 		return fmt.Errorf("failed to setup stderr file: %w", err)
 	}
 
 	oc.StderrRedirectFile = file
-	// Wrap with MaskingWriter if masker is available
-	var writer io.Writer = oc.StderrRedirectFile
-	if oc.masker != nil {
-		writer = masking.NewMaskingWriter(oc.StderrRedirectFile, oc.masker)
-	}
-	oc.stderrRedirectWriter = newSafeBufferedWriter(writer)
+	oc.stderrRedirectWriter = oc.newRedirectWriter(file)
 
+	return nil
+}
+
+// newRedirectWriter returns a buffered writer for a redirect file, masking
+// secrets when a masker is available.
+func (oc *OutputCoordinator) newRedirectWriter(file *os.File) io.Writer {
+	var writer io.Writer = file
+	if oc.masker != nil {
+		writer = masking.NewMaskingWriter(file, oc.masker)
+	}
+	return newSafeBufferedWriter(writer)
+}
+
+// resetArtifactRedirects empties artifact redirects so that an artifact holds
+// only the output of the latest attempt. Plain redirects keep appending.
+func (oc *OutputCoordinator) resetArtifactRedirects(data NodeData) error {
+	if data.Step.StdoutArtifact != "" && oc.stdoutRedirectFile != nil {
+		if err := truncateFile(oc.stdoutRedirectFile); err != nil {
+			return fmt.Errorf("failed to reset stdout artifact: %w", err)
+		}
+		// A fresh writer drops any partial line the previous attempt left buffered.
+		oc.stdoutRedirectWriter = oc.newRedirectWriter(oc.stdoutRedirectFile)
+	}
+	if data.Step.StderrArtifact != "" && oc.StderrRedirectFile != nil {
+		if err := truncateFile(oc.StderrRedirectFile); err != nil {
+			return fmt.Errorf("failed to reset stderr artifact: %w", err)
+		}
+		oc.stderrRedirectWriter = oc.newRedirectWriter(oc.StderrRedirectFile)
+	}
+	return nil
+}
+
+func truncateFile(file *os.File) error {
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+	_, err := file.Seek(0, io.SeekStart)
+	return err
+}
+
+// checkArtifactRedirects rejects an artifact redirect that shares its file
+// with the other stream's redirect. Artifacts are rewritten from the start on
+// each attempt, so the two streams would overwrite each other.
+func (oc *OutputCoordinator) checkArtifactRedirects(data NodeData) error {
+	oc.mu.Lock()
+	defer oc.mu.Unlock()
+
+	if data.Step.StdoutArtifact == "" && data.Step.StderrArtifact == "" {
+		return nil
+	}
+	if oc.stdoutRedirectFile == nil || oc.StderrRedirectFile == nil {
+		return nil
+	}
+	stdoutInfo, err := oc.stdoutRedirectFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat stdout file: %w", err)
+	}
+	stderrInfo, err := oc.StderrRedirectFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat stderr file: %w", err)
+	}
+	if os.SameFile(stdoutInfo, stderrInfo) {
+		return fmt.Errorf("stdout and stderr cannot write to the same artifact file %q; use 'log_output: merged' instead", data.Step.Stdout)
+	}
 	return nil
 }
 
@@ -432,7 +505,7 @@ func (oc *OutputCoordinator) setupLocalWriters(_ context.Context, data NodeData)
 	return nil
 }
 
-func (oc *OutputCoordinator) setupFile(ctx context.Context, filePath string, _ NodeData) (*os.File, error) {
+func (oc *OutputCoordinator) setupFile(ctx context.Context, filePath string, artifact bool) (*os.File, error) {
 	absFilePath := filePath
 	if !filepath.IsAbs(absFilePath) {
 		dir := GetEnv(ctx).WorkingDir
@@ -440,7 +513,13 @@ func (oc *OutputCoordinator) setupFile(ctx context.Context, filePath string, _ N
 		absFilePath = filepath.Clean(absFilePath)
 	}
 
-	file, err := fileutil.OpenOrCreateFile(absFilePath)
+	open := fileutil.OpenOrCreateFile
+	if artifact {
+		// Keep existing content until an attempt starts, and avoid append mode:
+		// Windows does not allow truncating an append-mode file.
+		open = fileutil.OpenOrCreateFileForRandomWrite
+	}
+	file, err := open(absFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file %q: %w", absFilePath, err)
 	}
@@ -477,6 +556,12 @@ func (oc *OutputCoordinator) capturedOutput(ctx context.Context) (string, error)
 
 		// Wait for the concurrent reader to finish
 		output, err := oc.outputCapture.wait()
+		if oc.outputReader != nil {
+			if closeErr := oc.outputReader.Close(); closeErr != nil {
+				logger.Error(ctx, "Failed to close pipe reader", tag.Error(closeErr))
+			}
+			oc.outputReader = nil
+		}
 		if err != nil {
 			return "", err
 		}
@@ -494,14 +579,6 @@ func (oc *OutputCoordinator) capturedOutput(ctx context.Context) (string, error)
 
 		// Mark as captured for caching
 		oc.outputCaptured = true
-
-		// Close the reader
-		if oc.outputReader != nil {
-			if err := oc.outputReader.Close(); err != nil {
-				logger.Error(ctx, "Failed to close pipe reader", tag.Error(err))
-			}
-			oc.outputReader = nil
-		}
 
 		return oc.outputData, nil
 	}
@@ -580,6 +657,12 @@ func (oc *OutputCoordinator) capturedStderr(ctx context.Context) (string, error)
 		}
 
 		output, err := oc.stderrCapture.wait()
+		if oc.stderrOutputReader != nil {
+			if closeErr := oc.stderrOutputReader.Close(); closeErr != nil {
+				logger.Error(ctx, "Failed to close stderr pipe reader", tag.Error(closeErr))
+			}
+			oc.stderrOutputReader = nil
+		}
 		if err != nil {
 			return "", err
 		}
@@ -590,12 +673,6 @@ func (oc *OutputCoordinator) capturedStderr(ctx context.Context) (string, error)
 		}
 
 		oc.stderrOutputCaptured = true
-		if oc.stderrOutputReader != nil {
-			if err := oc.stderrOutputReader.Close(); err != nil {
-				logger.Error(ctx, "Failed to close stderr pipe reader", tag.Error(err))
-			}
-			oc.stderrOutputReader = nil
-		}
 		return oc.stderrOutputData, nil
 	}
 

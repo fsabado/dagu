@@ -184,6 +184,64 @@ func TestDAGWritesAllowedWhenGitSyncDisabled(t *testing.T) {
 	server.Client().Delete("/api/v1/dags/test_dag_gitsync_disabled").ExpectStatus(http.StatusNoContent).Send(t)
 }
 
+func TestDAGSpecWarnings(t *testing.T) {
+	server := test.SetupServer(t)
+	for _, tc := range []struct {
+		name     string
+		root     string
+		step     string
+		warnings int
+	}{
+		{name: "implicit", warnings: 1},
+		{name: "explicit", root: "working_dir: ./repo\n"},
+		{name: "container", root: "working_dir: ./repo\n", step: "    container: {image: alpine}\n", warnings: 1},
+		{name: "container_explicit", step: "    container: {image: alpine, working_dir: /repo}\n"},
+		{name: "existing_warning", root: "working_dir: ./repo\nmax_active_runs: 3\n", warnings: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "warning_" + tc.name
+			definition := tc.root + `steps:
+  - id: review
+    action: harness.run
+    with:
+      provider: claude
+      prompt: Review this repository.
+` + tc.step
+			response := server.Client().Post("/api/v1/dags/validate", api.ValidateDAGSpecJSONRequestBody{
+				Name: &name, Spec: definition,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var validation api.ValidateDAGSpec200JSONResponse
+			response.Unmarshal(t, &validation)
+			require.True(t, validation.Valid)
+			require.Empty(t, validation.Errors)
+			require.Len(t, validation.Warnings, tc.warnings)
+
+			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+				Name: name, Spec: &definition,
+			}).ExpectStatus(http.StatusCreated).Send(t)
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			var saved api.GetDAGSpec200JSONResponse
+			response.Unmarshal(t, &saved)
+			require.Empty(t, saved.Errors)
+			require.Equal(t, validation.Warnings, saved.Warnings)
+
+			// The details response also supplies the editor's live SSE updates.
+			response = server.Client().Get("/api/v1/dags/" + name).ExpectStatus(http.StatusOK).Send(t)
+			var details api.GetDAGDetails200JSONResponse
+			response.Unmarshal(t, &details)
+			require.Empty(t, details.Errors)
+			require.Equal(t, validation.Warnings, details.Warnings)
+
+			response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: definition + "\n# saved\n",
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var updated api.UpdateDAGSpec200JSONResponse
+			response.Unmarshal(t, &updated)
+			require.Empty(t, updated.Errors)
+		})
+	}
+}
+
 func TestDAGSpecInheritsBaseGraphType(t *testing.T) {
 	server := test.SetupServer(t)
 
@@ -870,6 +928,36 @@ steps:
 		require.NoError(t, err)
 		require.Equal(t, "from-host|", apiStatusOutputValue(t, latestStatus, "RESULT"))
 	})
+}
+
+func TestDAGQuotedEquals(t *testing.T) {
+	server := test.SetupServer(t)
+	const dagName = "quoted_equals"
+	server.CreateDAGFile(t, server.Config.Paths.DAGsDir, dagName, []byte(`params: default
+steps:
+  - id: print
+    run: echo ok
+`))
+
+	for _, endpoint := range []string{"start", "enqueue"} {
+		t.Run(endpoint, func(t *testing.T) {
+			params := `"a=b bare c=\"x y\""`
+			runID := "quoted-equals-" + endpoint
+			var body any = api.ExecuteDAGJSONRequestBody{Params: &params, DagRunId: &runID}
+			if endpoint == "enqueue" {
+				body = api.EnqueueDAGDAGRunJSONRequestBody{Params: &params, DagRunId: &runID}
+			}
+			server.Client().Post("/api/v1/dags/"+dagName+"/"+endpoint, body).
+				ExpectStatus(http.StatusOK).Send(t)
+
+			var details api.GetDAGRunDetails200JSONResponse
+			require.Eventually(t, func() bool {
+				return getJSONWhenAvailable(t, server, "/api/v1/dag-runs/"+dagName+"/"+runID, &details) &&
+					details.DagRunDetails.Params != nil
+			}, dagRunEventuallyTimeout(5*time.Second), 100*time.Millisecond)
+			require.Equal(t, `1=a=b bare c="x y"`, *details.DagRunDetails.Params)
+		})
+	}
 }
 
 func TestListDAGsMatchesFileNameWhenDagNameDiffers(t *testing.T) {
@@ -1580,6 +1668,43 @@ steps:
 	_, ok := respObj.(api.UpdateDAGSuspensionState200Response)
 	require.True(t, ok, "expected 200 response, got %T", respObj)
 	require.Equal(t, []string{dag.FileName()}, notified)
+}
+
+func TestLegacySuspensionViaAPI(t *testing.T) {
+	t.Parallel()
+	helper := test.Setup(t, test.WithStatusPersistence())
+	dag := helper.DAG(t, "name: legacy-suspended\nsteps: []\n")
+	legacy := helper.Config.Paths.SuspendFlagsDirLegacy
+	require.NoError(t, os.MkdirAll(legacy, 0o750))
+	flag := filepath.Join(legacy, dag.FileName()+".suspend")
+	require.NoError(t, os.WriteFile(flag, nil, 0o600))
+	apiImpl := localapi.New(
+		helper.DAGRepository, helper.DAGRunRepository, helper.QueueStore,
+		helper.ProcRepository, helper.DAGRunMgr, helper.Config,
+		nil, helper.ServiceRegistry, nil, nil,
+	)
+	ctx := context.Background()
+	for _, suspended := range []bool{true, false} {
+		if !suspended {
+			resp, err := apiImpl.UpdateDAGSuspensionState(ctx, api.UpdateDAGSuspensionStateRequestObject{
+				FileName: dag.FileName(),
+				Body:     &api.UpdateDAGSuspensionStateJSONRequestBody{Suspend: false},
+			})
+			require.NoError(t, err)
+			require.IsType(t, api.UpdateDAGSuspensionState200Response{}, resp)
+		}
+		resp, err := apiImpl.ListDAGs(ctx, api.ListDAGsRequestObject{})
+		require.NoError(t, err)
+		list, ok := resp.(*api.ListDAGs200JSONResponse)
+		require.True(t, ok)
+		require.Len(t, list.Dags, 1)
+		assert.Equal(t, suspended, list.Dags[0].Suspended)
+	}
+	require.NoFileExists(t, flag)
+	require.NoError(t, helper.DAGRepository.MigrateSuspensionState(ctx))
+	suspended, err := helper.DAGRepository.IsSuspended(ctx, dag.FileName())
+	require.NoError(t, err)
+	assert.False(t, suspended)
 }
 
 func TestGetDAGDetails_EditorHintsIncludeInheritedLegacyDefinitions(t *testing.T) {

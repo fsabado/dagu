@@ -6,6 +6,7 @@ package runtime_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"syscall"
 	"testing"
@@ -92,6 +93,12 @@ func withStdout(stdout string) stepOption {
 	}
 }
 
+func withStdin(stdin string) stepOption {
+	return func(step *ir.Step) {
+		step.Stdin = stdin
+	}
+}
+
 func withEnvVars(envs ...string) stepOption {
 	return func(step *ir.Step) {
 		step.Env = append(step.Env, envs...)
@@ -114,6 +121,12 @@ func parseCommand(command string) ir.CommandEntry {
 func withCommand(command string) stepOption {
 	return func(step *ir.Step) {
 		step.Commands = []ir.CommandEntry{parseCommand(command)}
+	}
+}
+
+func withShell(shell string) stepOption {
+	return func(step *ir.Step) {
+		step.Shell = shell
 	}
 }
 
@@ -346,16 +359,8 @@ func (ph planHelper) assertRun(t *testing.T, expectedStatus ir.Status) runResult
 
 	ctx := runtime.NewContext(ph.Context, dag, ph.cfg.DAGRunID, logFilePath)
 
-	var doneNodes []*runtime.Node
-	progressCh := make(chan *runtime.Node)
-
-	done := make(chan struct{})
-	go func() {
-		for node := range progressCh {
-			doneNodes = append(doneNodes, node)
-		}
-		done <- struct{}{}
-	}()
+	progressCh := make(chan runtime.ProgressUpdate)
+	drained := drainProgress(progressCh)
 
 	err := ph.runner.Run(ctx, ph.Plan, progressCh)
 
@@ -365,8 +370,12 @@ func (ph planHelper) assertRun(t *testing.T, expectedStatus ir.Status) runResult
 	case ir.Succeeded, ir.Aborted, ir.Waiting, ir.Rejected:
 		require.NoError(t, err)
 
-	case ir.Failed, ir.PartiallySucceeded:
+	case ir.Failed:
 		require.Error(t, err)
+
+	case ir.PartiallySucceeded:
+		// A failed step allowed to continue reports an error; a step an
+		// executor marked partially succeeded does not.
 
 	case ir.Running, ir.NotStarted, ir.Queued:
 		t.Errorf("unexpected status %s", expectedStatus)
@@ -376,13 +385,9 @@ func (ph planHelper) assertRun(t *testing.T, expectedStatus ir.Status) runResult
 	require.Equal(t, expectedStatus.String(), ph.runner.Status(ctx, ph.Plan).String(),
 		"expected status %s, got %s", expectedStatus, ph.runner.Status(ctx, ph.Plan))
 
-	// wait for items of nodeCompletedChan to be processed
-	<-done
-	close(done)
-
 	return runResult{
 		planHelper: ph,
-		Done:       doneNodes,
+		Done:       <-drained,
 		Error:      err,
 	}
 }
@@ -548,6 +553,21 @@ func waitForNodeRepeatScheduled(plan *runtime.Plan, name string, timeout time.Du
 	}
 }
 
+// waitForFile reports whether path exists before the timeout expires.
+func waitForFile(path string, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		select {
+		case <-deadline:
+			return false
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // waitForHandlerNodeStatus polls until the runner's handler node for the given
 // handler type reaches the specified status or the timeout expires.
 func waitForHandlerNodeStatus(r *runtime.Runner, handler ir.HandlerType, status ir.NodeStatus, timeout time.Duration) {
@@ -562,6 +582,22 @@ func waitForHandlerNodeStatus(r *runtime.Runner, handler ir.HandlerType, status 
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// drainProgress consumes progress updates until ch is closed, acknowledging
+// each one so the runner is never left waiting on a durability ack. The
+// returned channel yields the nodes seen, in order, once ch is drained.
+func drainProgress(ch chan runtime.ProgressUpdate) <-chan []*runtime.Node {
+	drained := make(chan []*runtime.Node, 1)
+	go func() {
+		var nodes []*runtime.Node
+		for update := range ch {
+			update.Ack(nil)
+			nodes = append(nodes, update.Node)
+		}
+		drained <- nodes
+	}()
+	return drained
 }
 
 func init() {

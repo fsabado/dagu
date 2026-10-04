@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
@@ -46,6 +47,7 @@ func ValidateSteps(dag *ir.DAG) error {
 	resolveForeachStepDependencies(dag.Steps)
 	validateDependenciesExist(dag, stepNames, &errs)
 	validateApprovalRewindTargets(dag, stepNames, &errs)
+	validateHumanTaskRewindTargets(dag, stepNames, &errs)
 	validateBuildSteps(dag, &errs)
 
 	for _, step := range dag.Steps {
@@ -290,7 +292,7 @@ func validateNoAttemptOutputCondition(errs *ir.ErrorList, field string, conditio
 	}
 	if containsAttemptOutputReference(condition.Condition) ||
 		containsAttemptOutputReference(condition.Eval) ||
-		containsAttemptOutputReference(condition.Expected) {
+		slices.ContainsFunc(condition.ExpectedPatterns(), containsAttemptOutputReference) {
 		*errs = append(*errs, ir.NewValidationError(field, condition,
 			fmt.Errorf("path output references are available only during executor attempts")))
 	}
@@ -426,6 +428,32 @@ func validateApprovalRewindTargets(dag *ir.DAG, stepNames map[string]struct{}, e
 		if !isUpstreamDependency(stepByName, step.Name, target) {
 			*errs = append(*errs, ir.NewValidationError("approval.rewind_to", target,
 				fmt.Errorf("step %s approval.rewind_to must reference the step itself or an upstream dependency", step.Name)))
+		}
+	}
+}
+
+func validateHumanTaskRewindTargets(dag *ir.DAG, stepNames map[string]struct{}, errs *ir.ErrorList) {
+	stepByName := make(map[string]ir.Step, len(dag.Steps))
+	for _, step := range dag.Steps {
+		stepByName[step.Name] = step
+	}
+
+	for _, step := range dag.Steps {
+		if step.HumanTask == nil || step.HumanTask.PushBack == nil {
+			continue
+		}
+		target := step.HumanTask.PushBack.RewindTo
+		var err error
+		switch _, exists := stepNames[target]; {
+		case !exists:
+			err = fmt.Errorf("step %s with.push_back.rewind_to references non-existent step %s", step.Name, target)
+		case target == step.Name:
+			err = fmt.Errorf("step %s with.push_back.rewind_to must reference an upstream dependency, not the task itself", step.Name)
+		case !isUpstreamDependency(stepByName, step.Name, target):
+			err = fmt.Errorf("step %s with.push_back.rewind_to must reference an upstream dependency", step.Name)
+		}
+		if err != nil {
+			*errs = append(*errs, ir.NewValidationError("with.push_back.rewind_to", target, err))
 		}
 	}
 }
@@ -631,6 +659,11 @@ func resolveStepDependencies(dag *ir.DAG) {
 		if dag.Steps[i].Approval != nil {
 			if name, exists := idToName[dag.Steps[i].Approval.RewindTo]; exists {
 				dag.Steps[i].Approval.RewindTo = name
+			}
+		}
+		if task := dag.Steps[i].HumanTask; task != nil && task.PushBack != nil {
+			if name, exists := idToName[task.PushBack.RewindTo]; exists {
+				task.PushBack.RewindTo = name
 			}
 		}
 	}

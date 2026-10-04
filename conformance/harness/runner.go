@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -25,6 +26,8 @@ import (
 type Runner struct {
 	t   *testing.T
 	dir string
+	// commandTimeout replaces the platform default budget when set.
+	commandTimeout time.Duration
 }
 
 // Result captures a completed Dagu command invocation.
@@ -92,16 +95,31 @@ func NewRunner(t *testing.T) *Runner {
 	return r
 }
 
+// WithCommandTimeout gives each of the runner's commands timeout instead of
+// the platform default, for commands that start slow subsystems such as a
+// browser. DAGU_CONFORMANCE_COMMAND_TIMEOUT still takes precedence.
+func (r *Runner) WithCommandTimeout(timeout time.Duration) *Runner {
+	r.commandTimeout = timeout
+	return r
+}
+
 // Run executes the configured Dagu binary inside the isolated project.
 func (r *Runner) Run(args ...string) *Result {
 	r.t.Helper()
-	return r.run(nil, args...)
+	return r.run(nil, nil, args...)
 }
 
 // RunWithEnv executes the configured Dagu binary with extra environment entries.
 func (r *Runner) RunWithEnv(env []string, args ...string) *Result {
 	r.t.Helper()
-	return r.run(env, args...)
+	return r.run(env, nil, args...)
+}
+
+// RunWithStdin executes the configured Dagu binary with the supplied input and
+// extra environment entries. The caller retains ownership of stdin.
+func (r *Runner) RunWithStdin(env []string, stdin io.Reader, args ...string) *Result {
+	r.t.Helper()
+	return r.run(env, stdin, args...)
 }
 
 // StartWithEnv starts the configured Dagu binary and returns without waiting.
@@ -159,10 +177,23 @@ func (p *Process) Done() <-chan struct{} {
 	return p.done
 }
 
-// Stop terminates the command and waits for it to exit.
+// Stop terminates the command and waits for it to exit. A graceful shutdown
+// is requested first so the managed process can reap children and settle
+// persisted state before its temp directory is removed; teardown falls back
+// to a force kill of the process group if the process does not exit within
+// the grace window.
 func (p *Process) Stop() {
 	p.t.Helper()
 	p.stopOnce.Do(func() {
+		_, _ = p.proc.Stop(cmdutil.StopRequest{
+			Intent: cmdutil.GracefulTermination(nil),
+			Reason: cmdutil.StopReasonShutdown,
+		})
+		select {
+		case <-p.done:
+			return
+		case <-time.After(stopGracePeriod):
+		}
 		_, _ = p.proc.Stop(cmdutil.StopRequest{
 			Intent: cmdutil.ForceTermination(),
 			Reason: cmdutil.StopReasonShutdown,
@@ -170,6 +201,10 @@ func (p *Process) Stop() {
 	})
 	<-p.done
 }
+
+// stopGracePeriod bounds how long a managed process gets to shut down
+// gracefully before its process group is force-killed.
+const stopGracePeriod = 5 * time.Second
 
 // FailureOutput returns captured output after the command exits.
 func (p *Process) FailureOutput() string {
@@ -182,10 +217,13 @@ func (p *Process) FailureOutput() string {
 	}
 }
 
-func (r *Runner) run(extraEnv []string, args ...string) *Result {
+func (r *Runner) run(extraEnv []string, stdin io.Reader, args ...string) *Result {
 	r.t.Helper()
 
 	timeout := commandTimeout(r.t)
+	if r.commandTimeout > 0 && os.Getenv("DAGU_CONFORMANCE_COMMAND_TIMEOUT") == "" {
+		timeout = r.commandTimeout
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -195,6 +233,7 @@ func (r *Runner) run(extraEnv []string, args ...string) *Result {
 	cmd := exec.CommandContext(ctx, daguBinary(r.t), args...) //nolint:gosec
 	cmd.Dir = r.dir
 	cmd.Env = appendEnv(append(isolatedEnv(r.t), "PWD="+r.dir), extraEnv...)
+	cmd.Stdin = stdin
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 

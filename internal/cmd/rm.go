@@ -29,8 +29,9 @@ Flags:
   -f, --force         Skip confirmation prompt
       --dry-run       Preview what would be deleted without deleting
 
-Active runs are never deleted from history. Definition deletion is refused
-while the DAG has alive processes.
+Active runs are never deleted from history. Deleting all history also clears
+the replay caches of the DAG's browser and computer steps on this host.
+Definition deletion is refused while the DAG has alive processes.
 
 With --definition, identify the DAG by filename, stem, or configured path.
 
@@ -148,6 +149,17 @@ func executeRm(ctx *Context, opts rmOptions) error {
 				fmt.Printf("Successfully removed %d run(s) for DAG %q\n", len(runIDs), opts.dagName)
 			}
 		}
+		if removesReplayCaches(opts) {
+			for _, cache := range replayCaches(ctx) {
+				steps, err := cache.store.Clear(opts.dagName, "")
+				if err != nil {
+					return fmt.Errorf("failed to clear %s replay cache for %q: %w", cache.kind, opts.dagName, err)
+				}
+				if !ctx.Quiet && len(steps) > 0 {
+					fmt.Printf("Removed %s replay cache for %d step(s) of DAG %q\n", cache.kind, len(steps), opts.dagName)
+				}
+			}
+		}
 	}
 
 	if opts.deleteDef {
@@ -173,6 +185,8 @@ func buildRmActionDesc(opts rmOptions) string {
 			parts = append(parts, fmt.Sprintf("history older than %d days for DAG %q", *opts.retentionDays, opts.dagName))
 		case opts.olderThan != "":
 			parts = append(parts, fmt.Sprintf("history older than %s for DAG %q", opts.olderThan, opts.dagName))
+		case removesReplayCaches(opts):
+			parts = append(parts, fmt.Sprintf("all history and replay caches for DAG %q", opts.dagName))
 		default:
 			parts = append(parts, fmt.Sprintf("all history for DAG %q", opts.dagName))
 		}
@@ -208,10 +222,32 @@ func previewRm(ctx *Context, opts rmOptions) error {
 		}
 	}
 
+	if removesReplayCaches(opts) {
+		for _, cache := range replayCaches(ctx) {
+			steps, err := cache.store.Steps(opts.dagName)
+			if err != nil {
+				return fmt.Errorf("failed to check %s replay cache for %q: %w", cache.kind, opts.dagName, err)
+			}
+			if len(steps) > 0 {
+				fmt.Printf("Dry run: Would also delete %s replay cache for %d step(s) of DAG %q\n", cache.kind, len(steps), opts.dagName)
+			}
+		}
+	}
+
 	if opts.deleteDef && !ctx.Quiet {
 		fmt.Printf("Dry run: Would also delete DAG definition %q\n", opts.dagName)
 	}
 	return nil
+}
+
+// removesReplayCaches reports whether the command deletes all of the DAG's
+// history, which also clears the replay caches of its browser and computer
+// steps. A nil retention (rm) and a retention of zero days (cleanup's
+// default) both mean all history. A positive retention or an older-than
+// filter keeps the caches.
+func removesReplayCaches(opts rmOptions) bool {
+	allHistory := opts.retentionDays == nil || *opts.retentionDays == 0
+	return opts.deleteHist && opts.olderThan == "" && allHistory
 }
 
 func removeHistory(ctx *Context, opts rmOptions) ([]string, error) {

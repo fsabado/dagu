@@ -24,33 +24,49 @@ func NewReferenceResolver(store Store, workspace string) *ReferenceResolver {
 }
 
 func (r *ReferenceResolver) ResolveReference(ctx context.Context, ref secretref.Ref) (string, error) {
-	if r == nil || r.store == nil {
-		return "", fmt.Errorf("secret store is not configured")
-	}
-	sec, err := r.getByRef(ctx, ref.Ref)
+	sec, err := r.lookup(ctx, ref)
 	if err != nil {
-		return "", err
-	}
-	if err := ensureResolvable(sec); err != nil {
 		return "", err
 	}
 	value, _, err := r.store.ResolveValue(ctx, sec.ID)
 	return value, err
 }
 
-func (r *ReferenceResolver) CheckReferenceAccessibility(ctx context.Context, ref secretref.Ref) error {
-	if r == nil || r.store == nil {
-		return fmt.Errorf("secret store is not configured")
-	}
-	sec, err := r.getByRef(ctx, ref.Ref)
+// ReadReference returns the secret ref resolves to and its current value,
+// like ResolveReference, without recording the resolution on the secret.
+func (r *ReferenceResolver) ReadReference(ctx context.Context, ref secretref.Ref) (*Secret, string, error) {
+	sec, err := r.lookup(ctx, ref)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	if err := ensureResolvable(sec); err != nil {
+	value, _, err := r.store.ReadValue(ctx, sec.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	return sec, value, nil
+}
+
+func (r *ReferenceResolver) CheckReferenceAccessibility(ctx context.Context, ref secretref.Ref) error {
+	sec, err := r.lookup(ctx, ref)
+	if err != nil {
 		return err
 	}
 	_, err = r.store.GetCurrentVersion(ctx, sec.ID)
 	return err
+}
+
+func (r *ReferenceResolver) lookup(ctx context.Context, ref secretref.Ref) (*Secret, error) {
+	if r == nil || r.store == nil {
+		return nil, fmt.Errorf("secret store is not configured")
+	}
+	sec, err := r.getByRef(ctx, ref.Ref)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureResolvable(sec); err != nil {
+		return nil, err
+	}
+	return sec, nil
 }
 
 func (r *ReferenceResolver) getByRef(ctx context.Context, ref string) (*Secret, error) {

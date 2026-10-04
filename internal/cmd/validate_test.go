@@ -26,6 +26,21 @@ steps:
 		})
 	})
 
+	t.Run("HarnessWorkingDirWarning", func(t *testing.T) {
+		th.LoggingOutput.Reset()
+		dagFile := th.CreateDAGFile(t, "harness_warning.yaml", `steps:
+  - id: review
+    action: harness.run
+    with:
+      provider: claude
+      prompt: Review this repository.
+`)
+		th.RunCommand(t, cmd.Validate(), test.CmdTest{
+			Args:        []string{"validate", dagFile},
+			ExpectedOut: []string{"working_dir", "review"},
+		})
+	})
+
 	t.Run("StateExpectedVersionExpression", func(t *testing.T) {
 		dagFile := th.CreateDAGFile(t, "state_expected_version.yaml", `
 steps:
@@ -245,6 +260,56 @@ steps:
 		})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "Validation failed")
+	})
+
+	t.Run("EmptyDocumentBetweenDocumentsFails", func(t *testing.T) {
+		// spec002 rejects an empty document wherever it appears, even when
+		// every other document is valid.
+		dagFile := th.CreateDAGFile(t, "empty_doc_between.yaml", `
+steps:
+  - run: echo ok
+---
+---
+name: child
+steps:
+  - run: echo child
+`)
+
+		err := th.RunCommandWithError(t, cmd.Validate(), test.CmdTest{
+			Args: []string{"validate", dagFile},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "document 2")
+		require.Contains(t, err.Error(), "empty")
+	})
+
+	t.Run("TrailingEmptyDocumentFails", func(t *testing.T) {
+		// Validate is stricter than the loader: an empty document in the
+		// stream is a spec violation, even after a trailing `---`.
+		dagFile := th.CreateDAGFile(t, "trailing_empty_doc.yaml", `
+steps:
+  - run: echo ok
+---
+`)
+
+		err := th.RunCommandWithError(t, cmd.Validate(), test.CmdTest{
+			Args: []string{"validate", dagFile},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "document 2")
+		require.Contains(t, err.Error(), "empty")
+	})
+
+	t.Run("OnlyEmptyDocumentsFails", func(t *testing.T) {
+		dagFile := th.CreateDAGFile(t, "only_empty_docs.yaml", `---
+---
+`)
+
+		err := th.RunCommandWithError(t, cmd.Validate(), test.CmdTest{
+			Args: []string{"validate", dagFile},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "empty")
 	})
 
 	t.Run("InvalidYAML", func(t *testing.T) {

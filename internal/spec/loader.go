@@ -18,6 +18,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/buildenv"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/cmn/yamlutil"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/spec/types"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
@@ -260,7 +261,7 @@ func loadYAMLWithOptsAndNotices(
 	opts buildOpts,
 	valueReferenceNotices *cmnvalue.ValueReferenceNoticeCollector,
 ) (*ir.DAG, error) {
-	baseDef, baseRaw, err := loadBaseDefinition(opts)
+	base, err := loadBaseDefinition(opts)
 	if err != nil {
 		return loadYAMLFailure(opts, err)
 	}
@@ -269,7 +270,7 @@ func loadYAMLWithOptsAndNotices(
 	if valueReferenceNotices != nil {
 		bc.valueReferenceNotices = valueReferenceNotices
 	}
-	dags, err := loadDAGsFromData(bc, data, "", baseDef, baseRaw)
+	dags, err := loadDAGsFromData(bc, data, "", base)
 	if err != nil {
 		return loadYAMLFailure(opts, err)
 	}
@@ -401,12 +402,12 @@ func loadDAG(ctx buildContext, nameOrPath string) (*ir.DAG, error) {
 }
 
 func loadDAGData(ctx buildContext, data []byte, filePath string) (*ir.DAG, error) {
-	baseDef, baseRaw, err := loadBaseDefinition(ctx.opts)
+	base, err := loadBaseDefinition(ctx.opts)
 	if err != nil {
 		return loadDAGFailure(ctx, filePath, err)
 	}
 
-	dags, err := loadDAGsFromData(ctx, data, filePath, baseDef, baseRaw)
+	dags, err := loadDAGsFromData(ctx, data, filePath, base)
 	if err != nil {
 		return loadDAGFailure(ctx, filePath, err)
 	}
@@ -439,6 +440,9 @@ func assembleLoadedDAGs(dags []*ir.DAG, emptyErr error) (*ir.DAG, error) {
 	mainDAG := dags[0]
 	if err := attachLocalDAGs(mainDAG, dags[1:]); err != nil {
 		return nil, err
+	}
+	for _, localDAG := range dags[1:] {
+		mainDAG.BuildWarnings = append(mainDAG.BuildWarnings, localDAG.BuildWarnings...)
 	}
 
 	return mainDAG, nil
@@ -494,15 +498,17 @@ type dagDocument struct {
 }
 
 // loadDAGsFromData builds DAGs from every non-empty YAML document in the input.
-func loadDAGsFromData(ctx buildContext, data []byte, filePath string, baseDef *dag, baseRaw []byte) ([]*ir.DAG, error) {
+func loadDAGsFromData(ctx buildContext, data []byte, filePath string, base *baseDefinition) ([]*ir.DAG, error) {
 	docs, err := decodeDocuments(data)
 	if err != nil {
 		return nil, err
 	}
 
-	fileBaseDef, fileBaseRaw := baseDef, baseRaw
+	fileBase := base
+	fileWorkspace := ""
 	if len(docs) > 0 {
-		fileBaseDef, fileBaseRaw, err = loadEffectiveBaseDefinition(ctx.opts, docs[0].data, baseDef, baseRaw)
+		fileWorkspace = workspaceNameFromDocument(docs[0].data)
+		fileBase, err = loadEffectiveBaseDefinition(ctx.opts, docs[0].data, base)
 		if err != nil {
 			return nil, fmt.Errorf("failed to process document %d: %w", docs[0].index, err)
 		}
@@ -510,18 +516,21 @@ func loadDAGsFromData(ctx buildContext, data []byte, filePath string, baseDef *d
 
 	dags := make([]*ir.DAG, 0, len(docs))
 	for _, doc := range docs {
-		docBaseDef, docBaseRaw := fileBaseDef, fileBaseRaw
-		if doc.index == 0 || workspaceNameFromDocument(doc.data) != "" {
-			docBaseDef, docBaseRaw, err = loadEffectiveBaseDefinition(ctx.opts, doc.data, baseDef, baseRaw)
+		docBase := fileBase
+		baseWorkspace := fileWorkspace
+		if name := workspaceNameFromDocument(doc.data); doc.index != 0 && name != "" {
+			baseWorkspace = name
+			docBase, err = loadEffectiveBaseDefinition(ctx.opts, doc.data, base)
 			if err != nil {
 				return nil, fmt.Errorf("failed to process document %d: %w", doc.index, err)
 			}
 		}
 
-		dag, err := processDAGDocument(buildDocumentContext(ctx, doc.index), doc.data, docBaseDef, docBaseRaw, filePath, data)
+		dag, err := processDAGDocument(buildDocumentContext(ctx, doc.index), doc.data, docBase, filePath, data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to process document %d: %w", doc.index, err)
 		}
+		dag.BaseConfigWorkspace = &baseWorkspace
 		dags = append(dags, dag)
 	}
 	if err := validateUniqueNames(dags); err != nil {
@@ -532,6 +541,7 @@ func loadDAGsFromData(ctx buildContext, data []byte, filePath string, baseDef *d
 
 // decodeDocuments splits a YAML stream into non-empty manifest documents.
 func decodeDocuments(data []byte) ([]dagDocument, error) {
+	data = yamlutil.ClearEmptyDocumentSeparators(data)
 	file, err := parser.ParseBytes(data, 0)
 	if err != nil {
 		return nil, err
@@ -574,61 +584,38 @@ func decodeDocuments(data []byte) ([]dagDocument, error) {
 }
 
 // loadBaseDefinition loads and decodes the optional base manifest.
-func loadBaseDefinition(opts buildOpts) (*dag, []byte, error) {
-	if opts.Has(buildFlagOnlyMetadata) {
-		return nil, nil, nil
-	}
-
-	baseRaw, description, err := readBaseDefinitionData(opts)
-	if err != nil || len(baseRaw) == 0 {
-		return nil, nil, err
-	}
-
-	baseDef, err := decodeDefinitionData(baseRaw, description)
+func loadBaseDefinition(opts buildOpts) (*baseDefinition, error) {
+	source, description, err := readBaseDefinitionData(opts)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return baseDef, baseRaw, nil
+	return source.decode(description)
 }
 
-// readBaseDefinitionData returns the raw bytes and label for the base manifest.
-func readBaseDefinitionData(opts buildOpts) ([]byte, string, error) {
+// readBaseDefinitionData returns the source and label for the base manifest.
+func readBaseDefinitionData(opts buildOpts) (*baseConfigSource, string, error) {
 	if len(opts.BaseConfigContent) > 0 {
-		return opts.BaseConfigContent, "embedded base config", nil
+		return parseBaseConfig(opts.BaseConfigContent), "embedded base config", nil
 	}
 	if opts.Base == "" {
 		return nil, "", nil
 	}
 
-	baseRaw, err := fileutil.ReadFile(opts.Base)
+	source, err := baseConfigFiles.load(opts.Base, fileutil.ReadFile)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, "", nil
 		}
 		return nil, "", fmt.Errorf("failed to read base config: %w", err)
 	}
-	return baseRaw, "base config", nil
-}
-
-// decodeDefinitionData parses manifest data into the internal dag definition.
-func decodeDefinitionData(data []byte, description string) (*dag, error) {
-	raw, err := unmarshalData(data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal %s: %w", description, err)
-	}
-	def, err := decode(raw)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode %s: %w", description, err)
-	}
-	return def, nil
+	return source, "base config", nil
 }
 
 // processDAGDocument processes a single DAG document from the YAML file.
 func processDAGDocument(
 	ctx buildContext,
 	doc map[string]any,
-	baseDef *dag,
-	baseRaw []byte,
+	base *baseDefinition,
 	filePath string,
 	fullData []byte,
 ) (*ir.DAG, error) {
@@ -637,6 +624,10 @@ func processDAGDocument(
 		return nil, err
 	}
 
+	var baseDef *dag
+	if base != nil {
+		baseDef = base.definition
+	}
 	docCtx, _, err := prepareDocumentContext(ctx, baseDef, spec)
 	if err != nil {
 		return nil, err
@@ -650,8 +641,8 @@ func processDAGDocument(
 	if err != nil {
 		return nil, err
 	}
-	if len(baseRaw) > 0 {
-		dag.BaseConfigData = baseRaw
+	if base != nil {
+		dag.BaseConfigData = slices.Clone(base.source.raw)
 	}
 	applyHistoryRetentionOverride(dag, spec.HistRetentionDays != nil, spec.HistRetentionRuns != nil)
 
@@ -667,20 +658,20 @@ func processDAGDocument(
 // loadEffectiveBaseDefinition returns the base definition that applies to a document.
 // Embedded base configs are already effective for distributed workers, so local
 // workspace config files are only considered when loading from filesystem state.
-func loadEffectiveBaseDefinition(opts buildOpts, doc map[string]any, baseDef *dag, baseRaw []byte) (*dag, []byte, error) {
-	workspaceRaw, err := readWorkspaceBaseDefinitionData(opts, doc)
+func loadEffectiveBaseDefinition(opts buildOpts, doc map[string]any, base *baseDefinition) (*baseDefinition, error) {
+	override, err := readWorkspaceBaseDefinitionData(opts, doc)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if len(workspaceRaw) == 0 {
-		return baseDef, baseRaw, nil
+	if override == nil || len(override.raw) == 0 {
+		return base, nil
 	}
-	return mergeBaseDefinitionData(baseRaw, workspaceRaw)
+	return mergeBaseDefinitionData(base, override)
 }
 
-// readWorkspaceBaseDefinitionData returns raw per-workspace base config data for a named workspace DAG.
-func readWorkspaceBaseDefinitionData(opts buildOpts, doc map[string]any) ([]byte, error) {
-	if opts.Has(buildFlagOnlyMetadata) || opts.WorkspaceBaseConfigDir == "" || len(opts.BaseConfigContent) > 0 {
+// readWorkspaceBaseDefinitionData returns the base source for a named workspace DAG.
+func readWorkspaceBaseDefinitionData(opts buildOpts, doc map[string]any) (*baseConfigSource, error) {
+	if opts.WorkspaceBaseConfigDir == "" || len(opts.BaseConfigContent) > 0 {
 		return nil, nil
 	}
 
@@ -689,14 +680,14 @@ func readWorkspaceBaseDefinitionData(opts buildOpts, doc map[string]any) ([]byte
 		return nil, nil
 	}
 
-	data, err := fileutil.ReadFile(filepath.Join(opts.WorkspaceBaseConfigDir, workspaceName, workspace.BaseConfigFileName))
+	source, err := baseConfigFiles.load(filepath.Join(opts.WorkspaceBaseConfigDir, workspaceName, workspace.BaseConfigFileName), fileutil.ReadFile)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to read workspace base config %q: %w", workspaceName, err)
 	}
-	return data, nil
+	return source, nil
 }
 
 func workspaceNameFromDocument(doc map[string]any) string {
@@ -749,39 +740,30 @@ func labelsValueFromRaw(raw any) (types.LabelsValue, bool) {
 	return labels, true
 }
 
-func mergeBaseDefinitionData(baseRaw, overrideRaw []byte) (*dag, []byte, error) {
-	if len(baseRaw) == 0 {
-		def, err := decodeDefinitionData(overrideRaw, "workspace base config")
-		return def, overrideRaw, err
+func mergeBaseDefinitionData(base *baseDefinition, override *baseConfigSource) (*baseDefinition, error) {
+	if base == nil {
+		return override.decode("workspace base config")
 	}
-	if len(overrideRaw) == 0 {
-		def, err := decodeDefinitionData(baseRaw, "base config")
-		return def, baseRaw, err
+	if override.err != nil {
+		return nil, fmt.Errorf("failed to unmarshal workspace base config: %w", override.err)
 	}
 
-	baseMap, err := unmarshalData(baseRaw)
+	mergedMap, err := mergeDefinitionMaps(base.source.values, override.values)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to unmarshal base config: %w", err)
-	}
-	overrideMap, err := unmarshalData(overrideRaw)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to unmarshal workspace base config: %w", err)
-	}
-
-	mergedMap, err := mergeDefinitionMaps(baseMap, overrideMap)
-	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	def, err := decode(mergedMap)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to decode merged base config: %w", err)
+		return nil, fmt.Errorf("failed to decode merged base config: %w", err)
 	}
-
 	mergedRaw, err := yaml.Marshal(mergedMap)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to marshal merged base config: %w", err)
+		return nil, fmt.Errorf("failed to marshal merged base config: %w", err)
 	}
-	return def, mergedRaw, nil
+	return &baseDefinition{
+		definition: def,
+		source:     &baseConfigSource{raw: mergedRaw, values: mergedMap},
+	}, nil
 }
 
 func mergeDefinitionMaps(base, override map[string]any) (map[string]any, error) {
@@ -807,6 +789,10 @@ func mergeDefinitionMaps(base, override map[string]any) (map[string]any, error) 
 			merged[key] = cloneAny(overrideValue)
 			continue
 		}
+		if key == "mail_accounts" && ok && baseIsMap && overrideIsMap {
+			merged[key] = mergeMailAccountMaps(baseMap, overrideMap)
+			continue
+		}
 		if ok && baseIsMap && overrideIsMap {
 			mergedNested, err := mergeDefinitionMaps(baseMap, overrideMap)
 			if err != nil {
@@ -818,6 +804,25 @@ func mergeDefinitionMaps(base, override map[string]any) (map[string]any, error) 
 		merged[key] = cloneAny(overrideValue)
 	}
 	return merged, nil
+}
+
+// mergeMailAccountMaps replaces each base account whose address matches an
+// override entry, comparing addresses case-insensitively.
+func mergeMailAccountMaps(base, override map[string]any) map[string]any {
+	merged := cloneMap(base)
+	for overrideKey, account := range override {
+		for baseKey := range merged {
+			if mailAccountKey(baseKey) == mailAccountKey(overrideKey) {
+				delete(merged, baseKey)
+			}
+		}
+		merged[overrideKey] = cloneAny(account)
+	}
+	return merged
+}
+
+func mailAccountKey(address string) string {
+	return strings.ToLower(strings.TrimSpace(address))
 }
 
 func smtpMapUsesOAuth(value map[string]any) bool {
@@ -891,6 +896,9 @@ func buildDocumentBase(ctx buildContext, baseDef *dag) (*ir.DAG, *defaults, erro
 	baseDAG, err := buildBaseDAG(ctx, baseDef)
 	if err != nil {
 		return nil, nil, err
+	}
+	if ctx.opts.Has(buildFlagOnlyMetadata) {
+		return baseDAG, nil, nil
 	}
 
 	baseDefaults, err := decodeDefaults(baseDef.Defaults)
@@ -1110,6 +1118,23 @@ func (*mergeTransformer) Transformer(
 		}
 	}
 
+	if typ == reflect.TypeFor[ir.MailAccounts]() {
+		return func(dst, src reflect.Value) error {
+			if !dst.CanSet() || !src.IsValid() || src.IsNil() {
+				return nil
+			}
+			merged := ir.MailAccounts{}
+			if !dst.IsNil() {
+				merged = dst.Interface().(ir.MailAccounts).Clone()
+			}
+			for address, account := range src.Interface().(ir.MailAccounts) {
+				merged[address] = account.Clone()
+			}
+			dst.Set(reflect.ValueOf(merged))
+			return nil
+		}
+	}
+
 	if typ == reflect.TypeFor[ir.HarnessDefinitions]() {
 		return func(dst, src reflect.Value) error {
 			if !dst.CanSet() || !src.IsValid() || src.IsNil() {
@@ -1297,6 +1322,10 @@ func typedUnionDecodeHook() mapstructure.DecodeHookFunc {
 		// Handle types.BackoffValue
 		if to == reflect.TypeFor[types.BackoffValue]() {
 			return decodeViaYAML[types.BackoffValue](data)
+		}
+		// Handle types.PassEnvValue
+		if to == reflect.TypeFor[types.PassEnvValue]() {
+			return decodeViaYAML[types.PassEnvValue](data)
 		}
 		return data, nil
 	}

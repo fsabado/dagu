@@ -229,4 +229,152 @@ describe('AgentSessionTab', () => {
     expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
     expect(screen.getByText('Implementation running')).toBeInTheDocument();
   });
+
+  it('shows a browser question with its deadline and screenshot thumbnails', async () => {
+    const GET = vi.fn().mockResolvedValue({
+      data: new Blob(['png'], { type: 'image/png' }),
+      response: new Response(),
+    });
+    useClientMock.mockReturnValue({ GET, POST: vi.fn() } as never);
+    const createObjectURL = vi.fn(() => 'blob:screenshot');
+    Object.assign(URL, { createObjectURL, revokeObjectURL: vi.fn() });
+
+    const login = {
+      step: { name: 'login' },
+      status: NodeStatus.Waiting,
+      agentSession: {
+        provider: 'browser',
+        state: AgentSessionState.waiting,
+        events: [
+          {
+            sequence: 1,
+            id: 'browser-1-1',
+            type: 'tool',
+            name: 'goto',
+            content: 'https://portal.example.com',
+            files: ['browser/login/01-goto.png'],
+          },
+        ],
+        interactions: [
+          {
+            id: 'ask-1-1',
+            kind: 'question',
+            status: 'pending',
+            questions: [
+              {
+                header: 'Browser input',
+                question: 'Enter the code sent to your phone',
+                custom: true,
+              },
+            ],
+            expiresAt: new Date(Date.now() + 42 * 60 * 1000).toISOString(),
+          },
+        ],
+      },
+    };
+    renderAgentSessions([login as never]);
+
+    expect(
+      screen.getByText('The browser step needs an answer')
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('Enter the code sent to your phone')
+    ).toBeInTheDocument();
+    expect(screen.getByText('in 42 minutes')).toBeInTheDocument();
+    expect(screen.getByText('Browser session')).toBeInTheDocument();
+    expect(
+      await screen.findByRole('img', { name: '01-goto.png' })
+    ).toHaveAttribute('src', 'blob:screenshot');
+    expect(GET).toHaveBeenCalledWith(
+      '/dag-runs/{name}/{dagRunId}/artifacts/download',
+      expect.objectContaining({
+        params: {
+          path: { name: 'agent-workflow', dagRunId: 'run-1' },
+          query: { remoteNode: 'local', path: 'browser/login/01-goto.png' },
+        },
+      })
+    );
+
+    fireEvent.click(
+      screen.getByRole('button', { name: /Start clean session/ })
+    );
+    expect(
+      screen.getByText('Start this browser step over?')
+    ).toBeInTheDocument();
+  });
+
+  it('shows a computer question with screenshot thumbnails', async () => {
+    const GET = vi.fn().mockResolvedValue({
+      data: new Blob(['png'], { type: 'image/png' }),
+      response: new Response(),
+    });
+    useClientMock.mockReturnValue({ GET, POST: vi.fn() } as never);
+    Object.assign(URL, {
+      createObjectURL: vi.fn(() => 'blob:screen'),
+      revokeObjectURL: vi.fn(),
+    });
+
+    const post = {
+      step: { name: 'post' },
+      status: NodeStatus.Waiting,
+      agentSession: {
+        provider: 'computer',
+        state: AgentSessionState.waiting,
+        events: [
+          {
+            sequence: 1,
+            id: 'computer-1-1',
+            type: 'tool',
+            name: 'act',
+            content: 'Open the invoice',
+            files: ['computer/post/01-act.png'],
+          },
+        ],
+        interactions: [
+          {
+            id: 'ask-1-1',
+            kind: 'question',
+            status: 'pending',
+            questions: [
+              {
+                header: 'Computer input',
+                question: 'Approve posting?',
+                custom: true,
+              },
+            ],
+          },
+        ],
+      },
+    };
+    renderAgentSessions([post as never]);
+
+    expect(
+      screen.getByText('The computer step needs an answer')
+    ).toBeInTheDocument();
+    expect(screen.getByText('Computer session')).toBeInTheDocument();
+    expect(
+      await screen.findByRole('img', { name: '01-act.png' })
+    ).toHaveAttribute('src', 'blob:screen');
+
+    fireEvent.click(
+      screen.getByRole('button', { name: /Start clean session/ })
+    );
+    expect(
+      screen.getByText('Start this computer step over?')
+    ).toBeInTheDocument();
+  });
+
+  it('does not offer a restart for providers that cannot restart', () => {
+    const other = agentNode(
+      'review',
+      AgentSessionState.failed,
+      NodeStatus.Failed
+    );
+    other.agentSession.provider = 'other';
+    renderAgentSessions([other]);
+
+    expect(
+      screen.queryByRole('button', { name: /Start clean session/ })
+    ).not.toBeInTheDocument();
+  });
 });

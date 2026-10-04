@@ -1007,6 +1007,160 @@ steps:
             type: object
 `,
 		},
+		{
+			name: "ArtifactsList",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review the generated reports
+      artifacts:
+        - changes.diff
+        - reports/test-report.html
+`,
+			valid: true,
+		},
+		{
+			name: "RejectArtifactsNonString",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      artifacts:
+        - changes.diff
+        - 1
+`,
+		},
+		{
+			name: "RejectAbsoluteArtifactPath",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      artifacts:
+        - /etc/passwd
+`,
+		},
+		{
+			name: "RejectArtifactParentSegment",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      artifacts:
+        - reports/../../secret
+`,
+		},
+		{
+			name: "AllowsUnresolvedReferenceArtifact",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      artifacts:
+        - "${params.OUT}/report.html"
+`,
+			valid: true,
+		},
+		{
+			name: "RejectArtifactsDuplicate",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      artifacts:
+        - changes.diff
+        - changes.diff
+`,
+		},
+		{
+			name: "PushBackWithFeedbackForm",
+			spec: `
+steps:
+  - id: implement
+    run: echo implement
+  - id: review
+    depends: implement
+    action: human.task
+    with:
+      prompt: Review
+      push_back:
+        rewind_to: implement
+        form:
+          type: object
+          required: [feedback]
+          properties:
+            feedback:
+              type: string
+`,
+			valid: true,
+		},
+		{
+			name: "PushBackWithoutForm",
+			spec: `
+steps:
+  - id: implement
+    run: echo implement
+  - id: review
+    depends: implement
+    action: human.task
+    with:
+      prompt: Review
+      push_back:
+        rewind_to: implement
+`,
+			valid: true,
+		},
+		{
+			name: "PushBackRequiresRewindTo",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      push_back: {}
+`,
+		},
+		{
+			name: "PushBackRejectsUnknownField",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      push_back:
+        rewind_to: implement
+        limit: 3
+`,
+		},
+		{
+			name: "PushBackFormRejectsAdditionalProperties",
+			spec: `
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: Review
+      push_back:
+        rewind_to: implement
+        form:
+          type: object
+          additionalProperties: true
+`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2321,6 +2475,61 @@ steps:
       - name: source
         path: source.txt
 `,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := resolved.Validate(mustParseYAMLDocument(t, tt.spec))
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestDAGSchemaStepStdin(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveDAGSchema(t)
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{
+			name: "stdin accepts a path",
+			spec: `
+steps:
+  - id: summarize
+    stdin: ${fetch.stdout}
+    run: cat
+`,
+		},
+		{
+			name: "stdin rejects a non-string",
+			spec: `
+steps:
+  - id: summarize
+    stdin:
+      artifact: in.txt
+    run: cat
+`,
+			wantErr: true,
+		},
+		{
+			name: "stdin is not allowed on a human task",
+			spec: `
+steps:
+  - id: approve
+    action: human.task
+    stdin: in.txt
+    with:
+      prompt: ok?
+`,
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {

@@ -20,7 +20,6 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/v2/internal/cmn/logpath"
 	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
@@ -204,11 +203,12 @@ func (h *remoteTaskHandler) handleRetry(ctx context.Context, task *coordinatorv1
 		owner:       owner,
 		profileName: profileName,
 		retry: &retryConfig{
-			target:            status,
-			stepName:          task.Step,
-			includeDownstream: task.IncludeDownstream,
-			triggerType:       queue.PreservedQueueTriggerType(status),
-			retryPath:         retryPath,
+			target:              status,
+			stepName:            task.Step,
+			includeDownstream:   task.IncludeDownstream,
+			bypassPreconditions: task.BypassPreconditions,
+			triggerType:         queue.PreservedQueueTriggerType(status),
+			retryPath:           retryPath,
 		},
 	}
 	logger.Info(ctx, "Using previous status from task for retry",
@@ -347,11 +347,12 @@ func sanitizeTaskLoadError(target string, loadErr error) string {
 
 // retryConfig holds retry-specific configuration
 type retryConfig struct {
-	target            *ir.DAGRunStatus
-	stepName          string
-	includeDownstream bool
-	triggerType       ir.TriggerType
-	retryPath         dagrun.RetryPath
+	target              *ir.DAGRunStatus
+	stepName            string
+	includeDownstream   bool
+	bypassPreconditions bool
+	triggerType         ir.TriggerType
+	retryPath           dagrun.RetryPath
 }
 
 type runHandlers struct {
@@ -403,7 +404,9 @@ func taskExtraEnvs(task *coordinatorv1.Task) []string {
 	if task == nil {
 		return nil
 	}
-	var envs []string
+	// Values passed by the parent step are applied first so run-managed
+	// transport values keep precedence.
+	envs := append([]string(nil), task.PassedEnvs...)
 	if task.ExternalStepRetry {
 		envs = append(envs, runenv.EnvKeyExternalStepRetry+"=1")
 	}
@@ -497,6 +500,10 @@ func (h *remoteTaskHandler) loadDAG(ctx context.Context, task *coordinatorv1.Tas
 		return nil, fmt.Errorf("failed to load DAG from %s: %w", tempFile, err)
 	}
 	dag.SourceFile = task.SourceFile
+	// An unlabeled legacy child still needs its parent's provenance; named workspaces are already known.
+	if task.BaseConfigWorkspace != nil || (dag.BaseConfigWorkspace != nil && *dag.BaseConfigWorkspace == "") {
+		dag.BaseConfigWorkspace = task.BaseConfigWorkspace
+	}
 
 	return &loadedTaskDAG{dag: dag, cleanup: cleanupFunc}, nil
 }
@@ -544,6 +551,9 @@ func (h *remoteTaskHandler) loadWorkspaceDAG(ctx context.Context, task *coordina
 		dag.Name = task.Target
 	}
 	dag.SourceFile = task.SourceFile
+	if task.BaseConfigWorkspace != nil || (dag.BaseConfigWorkspace != nil && *dag.BaseConfigWorkspace == "") {
+		dag.BaseConfigWorkspace = task.BaseConfigWorkspace
+	}
 
 	logger.Info(ctx, "Materialized task workspace",
 		tag.Target(task.Target),
@@ -569,6 +579,16 @@ type agentEnv struct {
 	cleanup     func()
 }
 
+// stagingPrefix names a staging directory after the run it serves, trimmed so
+// the random suffix MkdirTemp appends stays within a path segment.
+func stagingPrefix(dagRunID string) string {
+	const maxPrefixLen = 29
+	if len(dagRunID) > maxPrefixLen {
+		dagRunID = dagRunID[:maxPrefixLen]
+	}
+	return dagRunID + "-"
+}
+
 // createAgentEnv creates temporary directories for agent execution.
 // The cleanup function must be called after execution completes.
 // Includes workerID in path to prevent collisions with concurrent workers on the same host.
@@ -578,19 +598,23 @@ func (h *remoteTaskHandler) createAgentEnv(ctx context.Context, dag *ir.DAG, dag
 		return nil, fmt.Errorf("failed to create log directory: %w", err)
 	}
 
+	// Staging only. The coordinator assigns the durable path when it persists
+	// the reported status, so this name never needs to match the server tree.
+	//
+	// It does need to be unique. The worker tracks tasks by attempt, not by
+	// run, so two attempts of one run can execute here at once, and the
+	// cleanup below removes whatever it was given.
 	artifactDir := ""
 	if dag != nil && dag.ArtifactsEnabled() {
-		var err error
-		artifactDir, err = logpath.GenerateDir(
-			ctx,
-			filepath.Join(os.TempDir(), "dagu", "worker-artifacts", h.workerID),
-			"",
-			dag.Name,
-			dagRunID,
-		)
+		stagingRoot := filepath.Join(os.TempDir(), "dagu", "worker-artifacts", h.workerID)
+		if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
+			return nil, fmt.Errorf("failed to create artifact directory: %w", err)
+		}
+		dir, err := os.MkdirTemp(stagingRoot, stagingPrefix(dagRunID))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create artifact directory: %w", err)
 		}
+		artifactDir = dir
 	}
 
 	return &agentEnv{
@@ -726,24 +750,25 @@ func (h *remoteTaskHandler) executeDAGRun(
 	})
 
 	subWorkflowRunnerFactory := coordinator.NewSubWorkflowRunnerFactory(coordinator.SubWorkflowRunnerConfig{
-		Dispatcher:        h.coordinatorClient,
-		DAGRunMgr:         h.dagRunMgr,
-		DAGRepository:     h.dagRepository,
-		StateStore:        h.stateStore,
-		SecretStore:       runtimeStores.SecretStore,
-		SecretResolver:    secretResolver,
-		ProfileStore:      runtimeStores.ProfileStore,
-		ProfileResolver:   profileResolver,
-		ServiceRegistry:   h.serviceRegistry,
-		PeerConfig:        h.peerConfig,
-		DefaultExecMode:   h.config.DefaultExecMode,
-		StatusPusher:      statusPusher,
-		LogWriterFactory:  logStreamer,
-		ArtifactFinalizer: artifactUploader,
-		RemoteDAGLoader:   remoteDAGLoader,
-		WorkerID:          h.workerID,
-		DAGRunLogDir:      h.config.Paths.LogDir,
-		DAGRunArtifactDir: h.config.Paths.ArtifactDir,
+		Dispatcher:         h.coordinatorClient,
+		DAGRunMgr:          h.dagRunMgr,
+		DAGRepository:      h.dagRepository,
+		StateStore:         h.stateStore,
+		SecretStore:        runtimeStores.SecretStore,
+		SecretResolver:     secretResolver,
+		ProfileStore:       runtimeStores.ProfileStore,
+		ProfileResolver:    profileResolver,
+		ServiceRegistry:    h.serviceRegistry,
+		PeerConfig:         h.peerConfig,
+		WorkspaceBundleDir: workspacebundle.StoreDir(h.config.Paths.DataDir),
+		DefaultExecMode:    h.config.DefaultExecMode,
+		StatusPusher:       statusPusher,
+		LogWriterFactory:   logStreamer,
+		ArtifactFinalizer:  artifactUploader,
+		RemoteDAGLoader:    remoteDAGLoader,
+		WorkerID:           h.workerID,
+		DAGRunLogDir:       h.config.Paths.LogDir,
+		DAGRunArtifactDir:  h.config.Paths.ArtifactDir,
 	})
 
 	// Build agent options
@@ -783,6 +808,7 @@ func (h *remoteTaskHandler) executeDAGRun(
 		opts.RetryTarget = run.retry.target
 		opts.StepRetry = run.retry.stepName
 		opts.IncludeDownstream = run.retry.includeDownstream
+		opts.BypassPreconditions = run.retry.bypassPreconditions
 		opts.TriggerType = run.retry.triggerType
 		opts.RetryPath = run.retry.retryPath
 	}

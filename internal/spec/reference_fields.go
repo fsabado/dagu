@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/dagucloud/dagu/v2/internal/executor/registry"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -70,6 +71,7 @@ func (w *referenceFieldWalker) walkDAG(dag *ir.DAG) {
 	w.add(root.withPathValue("working_dir", dag.WorkingDir).withField(cmnvalue.DAGWorkingDirField("working_dir")))
 	w.walkConditions("preconditions", dag.Preconditions, root)
 	w.walkContainer("container", dag.Container, root)
+	w.walkSSH("ssh", dag.SSH, root)
 
 	for i := range dag.Steps {
 		w.walkStep(fmt.Sprintf("steps[%d]", i), dag.Steps[i])
@@ -100,18 +102,63 @@ func (w *referenceFieldWalker) walkStep(path string, step ir.Step) {
 	scriptCommand := registry.ScriptResolution(context.Background(), step)
 
 	w.add(base.withPathValue(path+".run", step.Script).withField(scriptReferenceField(path+".run", step, scriptCommand)))
+	if !literalJQFilter(step) {
+		w.walkStepCommands(path, step, base, command)
+	}
+	w.add(base.withPathValue(path+".shell", step.Shell).withField(cmnvalue.StepShellField(path + ".shell")))
+	for i, arg := range step.ShellArgs {
+		fieldPath := fmt.Sprintf("%s.shell_args[%d]", path, i)
+		w.add(base.withPathValue(fieldPath, arg).withField(cmnvalue.StepShellField(fieldPath)))
+	}
+
+	w.walkStringLeaves(path+".with", step.ExecutorConfig.Config, base.withField(cmnvalue.ExecutorConfigField(path+".with")))
+	if step.HumanTask != nil {
+		fieldPath := path + ".with.prompt"
+		w.add(base.withPathValue(fieldPath, step.HumanTask.Prompt).withField(cmnvalue.WorkflowField(fieldPath)))
+		for i, artifact := range step.HumanTask.Artifacts {
+			artifactPath := fmt.Sprintf("%s.with.artifacts[%d]", path, i)
+			w.add(base.withPathValue(artifactPath, artifact).withField(cmnvalue.StepArtifactOutputField(artifactPath)))
+		}
+	}
+	w.add(base.withPathValue(path+".working_dir", step.Dir).withField(cmnvalue.StepDirField(path + ".working_dir")))
+	w.walkEnvWith(path+".env", step.Env, base, cmnvalue.StepEnvField)
+	w.walkConditions(path+".preconditions", step.Preconditions, base)
+	w.walkRetryPolicy(path+".retry_policy", step.RetryPolicy, base)
+	w.walkRepeatPolicy(path+".repeat_policy", step.RepeatPolicy, base)
+	if step.RepeatPolicy.Condition != nil {
+		fieldPath := path + ".repeat_policy.condition"
+		w.add(base.withPathValue(fieldPath, step.RepeatPolicy.Condition.Condition).withField(cmnvalue.ConditionValueField(fieldPath)))
+		w.addNumericExpected(path+".repeat_policy.expected", step.RepeatPolicy.Condition.Expected, base)
+	}
+	w.walkSubDAG(path+".child_dag", step.SubDAG, base)
+	if step.Parallel != nil {
+		w.walkParallel(path+".parallel", step.Parallel, base)
+	}
+	if step.Foreach != nil {
+		w.walkForeach(path+".foreach", step.Foreach, base)
+	}
+	w.add(base.withPathValue(path+".stdin", step.Stdin).withField(cmnvalue.StepArtifactOutputField(path + ".stdin")))
+	w.add(base.withPathValue(path+".stdout", step.Stdout).withField(cmnvalue.StepArtifactOutputField(path + ".stdout")))
+	w.add(base.withPathValue(path+".stdout.artifact", step.StdoutArtifact).withField(cmnvalue.StepArtifactOutputField(path + ".stdout.artifact")))
+	w.add(base.withPathValue(path+".stderr", step.Stderr).withField(cmnvalue.StepArtifactOutputField(path + ".stderr")))
+	w.add(base.withPathValue(path+".stderr.artifact", step.StderrArtifact).withField(cmnvalue.StepArtifactOutputField(path + ".stderr.artifact")))
+	if step.StdoutOutputs != nil {
+		w.walkStdoutOutputs(path+".stdout.outputs", step.StdoutOutputs, base)
+	}
+	w.walkStructuredOutput(path+".output", step.StructuredOutput, base)
+	w.walkContainer(path+".container", step.Container, base)
+	w.walkLLM(path+".llm", step.LLM, base)
+	w.walkMessages(path+".messages", step.Messages, base)
+}
+
+func (w *referenceFieldWalker) walkStepCommands(path string, step ir.Step, base ReferenceField, command cmnvalue.CommandContext) {
 	w.add(base.withPathValue(path+".command", step.Command).withField(cmnvalue.DirectCommandField(path+".command", command)))
 	w.add(base.withPathValue(path+".cmd_with_args", step.CmdWithArgs).withField(cmnvalue.ShellCommandField(path+".cmd_with_args", command)))
 	w.add(base.withPathValue(path+".cmd_args_sys", step.CmdArgsSys).withField(cmnvalue.DirectCommandField(path+".cmd_args_sys", command)))
 	w.add(base.withPathValue(path+".shell_cmd_args", step.ShellCmdArgs).withField(cmnvalue.ShellCommandField(path+".shell_cmd_args", command)))
-	w.add(base.withPathValue(path+".shell", step.Shell).withField(cmnvalue.StepShellField(path + ".shell")))
 	for i, arg := range step.Args {
 		fieldPath := fmt.Sprintf("%s.args[%d]", path, i)
 		w.add(base.withPathValue(fieldPath, arg).withField(cmnvalue.DirectCommandField(fieldPath, command)))
-	}
-	for i, arg := range step.ShellArgs {
-		fieldPath := fmt.Sprintf("%s.shell_args[%d]", path, i)
-		w.add(base.withPathValue(fieldPath, arg).withField(cmnvalue.StepShellField(fieldPath)))
 	}
 	for i, cmd := range step.Commands {
 		noticePath := commandEntryNoticePath(path, i, len(step.Commands))
@@ -130,39 +177,6 @@ func (w *referenceFieldWalker) walkStep(path string, step ir.Step) {
 				withField(cmnvalue.DirectCommandField(argPath, command)))
 		}
 	}
-
-	w.walkStringLeaves(path+".with", step.ExecutorConfig.Config, base.withField(cmnvalue.ExecutorConfigField(path+".with")))
-	if step.HumanTask != nil {
-		fieldPath := path + ".with.prompt"
-		w.add(base.withPathValue(fieldPath, step.HumanTask.Prompt).withField(cmnvalue.WorkflowField(fieldPath)))
-	}
-	w.add(base.withPathValue(path+".working_dir", step.Dir).withField(cmnvalue.StepDirField(path + ".working_dir")))
-	w.walkEnvWith(path+".env", step.Env, base, cmnvalue.StepEnvField)
-	w.walkConditions(path+".preconditions", step.Preconditions, base)
-	w.walkRetryPolicy(path+".retry_policy", step.RetryPolicy, base)
-	w.walkRepeatPolicy(path+".repeat_policy", step.RepeatPolicy, base)
-	if step.RepeatPolicy.Condition != nil {
-		fieldPath := path + ".repeat_policy.condition"
-		w.add(base.withPathValue(fieldPath, step.RepeatPolicy.Condition.Condition).withField(cmnvalue.ConditionValueField(fieldPath)))
-	}
-	w.walkSubDAG(path+".child_dag", step.SubDAG, base)
-	if step.Parallel != nil {
-		w.walkParallel(path+".parallel", step.Parallel, base)
-	}
-	if step.Foreach != nil {
-		w.walkForeach(path+".foreach", step.Foreach, base)
-	}
-	w.add(base.withPathValue(path+".stdout", step.Stdout).withField(cmnvalue.StepArtifactOutputField(path + ".stdout")))
-	w.add(base.withPathValue(path+".stdout.artifact", step.StdoutArtifact).withField(cmnvalue.StepArtifactOutputField(path + ".stdout.artifact")))
-	w.add(base.withPathValue(path+".stderr", step.Stderr).withField(cmnvalue.StepArtifactOutputField(path + ".stderr")))
-	w.add(base.withPathValue(path+".stderr.artifact", step.StderrArtifact).withField(cmnvalue.StepArtifactOutputField(path + ".stderr.artifact")))
-	if step.StdoutOutputs != nil {
-		w.walkStdoutOutputs(path+".stdout.outputs", step.StdoutOutputs, base)
-	}
-	w.walkStructuredOutput(path+".output", step.StructuredOutput, base)
-	w.walkContainer(path+".container", step.Container, base)
-	w.walkLLM(path+".llm", step.LLM, base)
-	w.walkMessages(path+".messages", step.Messages, base)
 }
 
 func scriptReferenceField(path string, step ir.Step, command cmnvalue.CommandContext) cmnvalue.Field {
@@ -233,7 +247,22 @@ func (w *referenceFieldWalker) walkConditions(path string, conditions []*ir.Cond
 		w.add(base.withPathValue(fieldPath, condition.Condition).withField(cmnvalue.ConditionValueField(fieldPath)))
 		evalPath := fmt.Sprintf("%s[%d].eval", path, i)
 		w.add(base.withPathValue(evalPath, condition.Eval).withField(cmnvalue.ConditionEvalField(evalPath)))
+		w.addNumericExpected(fmt.Sprintf("%s[%d].expected", path, i), condition.Expected, base)
+		for j, expected := range condition.ExpectedAny {
+			w.addNumericExpected(fmt.Sprintf("%s[%d].expected_any[%d]", path, i, j), expected, base)
+		}
 	}
+}
+
+// addNumericExpected records expected only when it is a numeric comparison,
+// which is the one form that resolves a value reference. A literal or regex
+// pattern stays literal, so reporting it here would describe a resolution that
+// never happens.
+func (w *referenceFieldWalker) addNumericExpected(fieldPath, expected string, base ReferenceField) {
+	if !stringutil.HasNumericPrefix(expected) {
+		return
+	}
+	w.add(base.withPathValue(fieldPath, expected).withField(cmnvalue.ConditionValueField(fieldPath)))
 }
 
 func (w *referenceFieldWalker) walkEnvWith(path string, env []string, base ReferenceField, fieldForPath func(string) cmnvalue.Field) {
@@ -313,6 +342,10 @@ func (w *referenceFieldWalker) walkContainer(path string, container *ir.Containe
 		w.add(base.withPathValue(fieldPath, value).withField(cmnvalue.ContainerField(fieldPath)))
 	}
 	w.walkEnvWith(path+".env", container.Env, base, cmnvalue.ContainerEnvField)
+	for i, value := range container.EnvFile {
+		fieldPath := fmt.Sprintf("%s.env_file[%d]", path, i)
+		w.add(base.withPathValue(fieldPath, value).withField(cmnvalue.ContainerField(fieldPath)))
+	}
 	for i, value := range container.Command {
 		fieldPath := fmt.Sprintf("%s.command[%d]", path, i)
 		w.add(base.withPathValue(fieldPath, value).withField(cmnvalue.DirectCommandField(fieldPath, cmnvalue.CommandContext{Target: cmnvalue.CommandTargetDocker})))
@@ -320,6 +353,34 @@ func (w *referenceFieldWalker) walkContainer(path string, container *ir.Containe
 	for i, value := range container.Shell {
 		fieldPath := fmt.Sprintf("%s.shell[%d]", path, i)
 		w.add(base.withPathValue(fieldPath, value).withField(cmnvalue.ShellCommandField(fieldPath, cmnvalue.CommandContext{Target: cmnvalue.CommandTargetDocker, ShellConfigured: true})))
+	}
+}
+
+// walkSSH emits the DAG-level SSH fields that resolve with the steps[].with
+// rules. Shell arguments come from the ssh.shell value.
+func (w *referenceFieldWalker) walkSSH(path string, cfg *ir.SSHConfig, base ReferenceField) {
+	if cfg == nil {
+		return
+	}
+	add := func(fieldPath, value string) {
+		w.add(base.withPathValue(fieldPath, value).withField(cmnvalue.ExecutorConfigField(fieldPath)))
+	}
+	add(path+".user", cfg.User)
+	add(path+".host", cfg.Host)
+	add(path+".port", cfg.Port)
+	add(path+".key", cfg.Key)
+	add(path+".password", cfg.Password)
+	add(path+".known_host_file", cfg.KnownHostFile)
+	add(path+".shell", cfg.Shell)
+	for _, arg := range cfg.ShellArgs {
+		add(path+".shell", arg)
+	}
+	if cfg.Bastion != nil {
+		add(path+".bastion.host", cfg.Bastion.Host)
+		add(path+".bastion.port", cfg.Bastion.Port)
+		add(path+".bastion.user", cfg.Bastion.User)
+		add(path+".bastion.key", cfg.Bastion.Key)
+		add(path+".bastion.password", cfg.Bastion.Password)
 	}
 }
 

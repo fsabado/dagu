@@ -4,10 +4,14 @@
 package spec023_preconditions_test
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/conformance/harness"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidatePreconditions(t *testing.T) {
@@ -18,6 +22,8 @@ func TestValidatePreconditions(t *testing.T) {
 		"valid_empty_array.yaml",
 		"valid_missing_command_check.yaml",
 		"valid_eval_value_match.yaml",
+		// An undefined threshold is a notice, not a validation error.
+		"valid_numeric_threshold_undefined.yaml",
 	}
 	for _, file := range validCases {
 		t.Run(file, func(t *testing.T) {
@@ -121,6 +127,26 @@ func TestValidatePreconditions(t *testing.T) {
 			name:        "empty regex",
 			file:        "invalid_regex_empty.yaml",
 			stderrParts: []string{"preconditions", "expected", "regexp"},
+		},
+		{
+			name:        "empty numeric comparison",
+			file:        "invalid_numeric_empty.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
+		},
+		{
+			name:        "unsupported numeric operator",
+			file:        "invalid_numeric_operator.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
+		},
+		{
+			name:        "non-numeric operand",
+			file:        "invalid_numeric_operand.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
+		},
+		{
+			name:        "threshold mixes a reference with surrounding text",
+			file:        "invalid_numeric_interpolated_threshold.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
 		},
 	}
 	for _, tc := range invalidCases {
@@ -407,6 +433,12 @@ func TestRuntimeNegatedPreconditionsUnix(t *testing.T) {
 			exitCode:   1,
 			absentFile: "negate-invalid-regex.txt",
 		},
+		{
+			name:       "negation does not convert a non-numeric value into success",
+			file:       "negate_numeric_not_a_number_fails.yaml",
+			exitCode:   1,
+			absentFile: "negate-numeric-not-a-number.txt",
+		},
 	}
 
 	for _, tc := range cases {
@@ -462,6 +494,86 @@ func TestRuntimeCommandCheckDetailsUnix(t *testing.T) {
 		result := dagu.Run("start", "command_check_missing_command_skips.yaml")
 		result.ExpectExitCode(0)
 		dagu.ExpectNoFile("missing-command-ran.txt")
+	})
+
+	// A command check cut short by the workflow timeout is an interruption,
+	// not a not-met result: the gated step does not run, nothing is skipped,
+	// and the run fails as any workflow timeout does.
+	for _, tc := range []struct {
+		name string
+		file string
+	}{
+		{name: "timeout interrupts step command check", file: "command_check_timeout.yaml"},
+		{name: "timeout interrupts DAG command check", file: "dag_command_check_timeout.yaml"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dagu := harness.NewRunner(t)
+			env := []string{"DAGU_HOME=" + filepath.Join(t.TempDir(), "dagu")}
+			const runID = "spec023-condition-timeout"
+
+			result := dagu.RunWithEnv(env, "start", "--run-id="+runID, tc.file)
+			result.ExpectNonZeroExitCode()
+			dagu.ExpectNoFile("timeout-ran.txt")
+
+			status := dagu.RunWithEnv(env, "status", "--run-id="+runID, tc.file)
+			status.ExpectExitCode(0)
+			require.Contains(t, status.Stdout(), "Result: Failed")
+			require.NotContains(t, status.Stdout(), "[skipped]")
+		})
+	}
+
+	// Stopping the run interrupts a running command check: the run aborts
+	// without waiting for the check, and the gated step neither runs nor is
+	// skipped.
+	t.Run("stop interrupts command check", func(t *testing.T) {
+		t.Parallel()
+
+		dagu := harness.NewRunner(t)
+		env := []string{"DAGU_HOME=" + filepath.Join(t.TempDir(), "dagu")}
+		const (
+			runID = "spec023-condition-stop"
+			file  = "command_check_stop.yaml"
+		)
+
+		proc := dagu.StartWithEnv(env, "start", "--run-id="+runID, file)
+
+		deadline := time.Now().Add(harness.WaitTimeout(t))
+		for {
+			// Redirection creates the file before printf writes the marker.
+			content, err := os.ReadFile(dagu.ProjectPath("check-started.txt"))
+			if err == nil && string(content) == "started\n" {
+				break
+			}
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("reading start marker: %v", err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("command check never started: %s", proc.FailureOutput())
+			}
+			select {
+			case <-proc.Done():
+				t.Fatalf("dagu start exited before the command check started: %s", proc.FailureOutput())
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		stopResult := dagu.RunWithEnv(env, "stop", "--run-id="+runID, file)
+		stopResult.ExpectExitCode(0)
+
+		// The check sleeps longer than this wait, so only an interrupted check
+		// lets the run end in time.
+		select {
+		case <-proc.Done():
+		case <-time.After(harness.WaitTimeout(t)):
+			t.Fatal("dagu start did not exit after dagu stop returned")
+		}
+		dagu.ExpectNoFile("stop-ran.txt")
+
+		status := dagu.RunWithEnv(env, "status", "--run-id="+runID, file)
+		status.ExpectExitCode(0)
+		require.Contains(t, status.Stdout(), "Result: Aborted")
+		require.NotContains(t, status.Stdout(), "[skipped]")
 	})
 }
 
@@ -578,6 +690,98 @@ func TestRuntimePreconditionOutcomesUnix(t *testing.T) {
 			result.ExpectExitCode(tc.exitCode)
 			for _, file := range tc.absentFiles {
 				dagu.ExpectNoFile(file)
+			}
+		})
+	}
+}
+
+// A num: comparison that does not hold skips the step, but a value that is not
+// a number fails it, so that a numeric gate cannot silently stop gating.
+func TestRuntimeNumericValueMatchUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name       string
+		file       string
+		exitCode   int
+		outputFile string
+		absentFile string
+	}{
+		{
+			name:       "comparison holds and the step runs",
+			file:       "value_match_numeric_met.yaml",
+			exitCode:   0,
+			outputFile: "numeric-met-ran.txt",
+		},
+		{
+			name:       "comparison does not hold and the step is skipped",
+			file:       "value_match_numeric_not_met.yaml",
+			exitCode:   0,
+			absentFile: "numeric-not-met-ran.txt",
+		},
+		{
+			name:       "a value that is not a number fails the step",
+			file:       "value_match_numeric_not_a_number.yaml",
+			exitCode:   1,
+			absentFile: "numeric-not-a-number-ran.txt",
+		},
+		{
+			// Numeric matching is not line-based, so no line is considered on
+			// its own and the multi-line value is simply not a number.
+			name:       "a multi-line value fails the step",
+			file:       "value_match_numeric_multiline.yaml",
+			exitCode:   1,
+			absentFile: "numeric-multiline-ran.txt",
+		},
+		{
+			name:       "a threshold can come from a param",
+			file:       "value_match_numeric_threshold_reference.yaml",
+			exitCode:   0,
+			outputFile: "numeric-threshold-ran.txt",
+		},
+		{
+			name:       "a threshold can come from a scoped reference",
+			file:       "value_match_numeric_threshold_scoped.yaml",
+			exitCode:   0,
+			outputFile: "numeric-threshold-scoped-ran.txt",
+		},
+		{
+			name:       "a referenced threshold that is not met skips the step",
+			file:       "value_match_numeric_threshold_not_met.yaml",
+			exitCode:   0,
+			absentFile: "numeric-threshold-not-met-ran.txt",
+		},
+		{
+			name:       "a threshold that does not resolve to a number fails the step",
+			file:       "value_match_numeric_threshold_not_a_number.yaml",
+			exitCode:   1,
+			absentFile: "numeric-threshold-bad-ran.txt",
+		},
+		{
+			// A later not-met condition must not downgrade the numeric
+			// evaluation error into a skip.
+			name:       "an evaluation error outranks a later not-met condition",
+			file:       "numeric_error_outranks_not_met.yaml",
+			exitCode:   1,
+			absentFile: "numeric-error-outranks-ran.txt",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dagu := harness.NewRunner(t)
+			result := dagu.Run("start", tc.file)
+			result.ExpectExitCode(tc.exitCode)
+			if tc.outputFile != "" {
+				dagu.ExpectFileContent(tc.outputFile, "ran\n")
+			}
+			if tc.absentFile != "" {
+				dagu.ExpectNoFile(tc.absentFile)
 			}
 		})
 	}

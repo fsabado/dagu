@@ -391,8 +391,10 @@ func TestLoad_Env(t *testing.T) {
 			},
 		},
 		DefaultExecMode: ExecutionModeLocal,
-		Warnings:        nil,
-		Cache:           CacheModeNormal,
+		Warnings: []string{fmt.Sprintf(
+			"paths.suspend_flags_dir %q is outside paths.data_dir %q; suspension state may diverge across Dagu processes",
+			filepath.Join(testPaths, "suspend"), filepath.Join(testPaths, "data"))},
+		Cache: CacheModeNormal,
 	}
 
 	assert.Equal(t, expected, cfg)
@@ -570,6 +572,21 @@ func TestLoad_OpenCodeConfigFromEnv(t *testing.T) {
 	cfg := testLoad(t)
 	require.Equal(t, "/opt/opencode", cfg.OpenCode.Executable)
 	require.Equal(t, []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY"}, cfg.OpenCode.EnvPassthrough)
+}
+
+// The browser sandbox stays on unless the config file or the environment
+// turns it off.
+func TestLoad_BrowserSandbox(t *testing.T) {
+	require.False(t, testLoad(t).Browser.NoSandbox, "the sandbox is on by default")
+
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(configFile, []byte("browser:\n  sandbox: false\n"), 0o600))
+	require.True(t, testLoad(t, WithConfigFile(configFile)).Browser.NoSandbox)
+}
+
+func TestLoad_BrowserSandboxFromEnv(t *testing.T) {
+	t.Setenv("DAGU_BROWSER_SANDBOX", "false")
+	require.True(t, testLoad(t).Browser.NoSandbox)
 }
 
 func TestLoad_OpenCodeRejectsReservedPassthrough(t *testing.T) {
@@ -869,8 +886,10 @@ scheduler:
 			Interval:  5 * time.Second,
 		},
 		DefaultExecMode: ExecutionModeLocal,
-		Warnings:        nil,
-		Cache:           CacheModeNormal,
+		Warnings: []string{fmt.Sprintf(
+			"paths.suspend_flags_dir %q is outside paths.data_dir %q; suspension state may diverge across Dagu processes",
+			resolvedTestPath(t, "/var/dagu/suspend"), resolvedTestPath(t, "/var/dagu/data"))},
+		Cache: CacheModeNormal,
 	}
 
 	assert.Equal(t, expected, cfg)
@@ -1079,6 +1098,70 @@ paths:
 `)
 
 	assert.Equal(t, resolvedTestPath(t, "/custom/data/dag-state"), cfg.Paths.DAGStateDir)
+}
+
+func TestLoad_SuspendFlagsDir(t *testing.T) {
+	t.Run("defaults under data dir", func(t *testing.T) {
+		cfg := testLoad(t)
+
+		assert.Equal(t, filepath.Join(cfg.Paths.DataDir, "suspend"), cfg.Paths.SuspendFlagsDir)
+		// The pre-move default next to the data directory is recorded for migration.
+		assert.Equal(t,
+			filepath.Join(filepath.Dir(cfg.Paths.DataDir), "suspend"),
+			cfg.Paths.SuspendFlagsDirLegacy)
+		assert.NotContains(t, strings.Join(cfg.Warnings, "\n"), "suspend_flags_dir")
+	})
+
+	t.Run("derived from configured data dir", func(t *testing.T) {
+		appHome := t.TempDir()
+		configFile := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configFile, []byte(`
+paths:
+  data_dir: "/custom/data"
+`), 0600))
+
+		cfg := testLoad(t, WithAppHomeDir(appHome), WithConfigFile(configFile))
+
+		assert.Equal(t, resolvedTestPath(t, "/custom/data/suspend"), cfg.Paths.SuspendFlagsDir)
+		assert.Equal(t, filepath.Join(appHome, "suspend"), cfg.Paths.SuspendFlagsDirLegacy)
+		assert.NotContains(t, strings.Join(cfg.Warnings, "\n"), "suspend_flags_dir")
+	})
+
+	t.Run("explicit inside data dir", func(t *testing.T) {
+		cfg := loadFromYAML(t, `
+paths:
+  data_dir: "/custom/data"
+  suspend_flags_dir: "/custom/data/flags"
+`)
+
+		assert.Equal(t, resolvedTestPath(t, "/custom/data/flags"), cfg.Paths.SuspendFlagsDir)
+		assert.Empty(t, cfg.Paths.SuspendFlagsDirLegacy)
+		assert.NotContains(t, strings.Join(cfg.Warnings, "\n"), "suspend_flags_dir")
+	})
+
+	t.Run("explicit outside data dir warns", func(t *testing.T) {
+		cfg := loadFromYAML(t, `
+paths:
+  data_dir: "/custom/data"
+  suspend_flags_dir: "/custom/flags"
+`)
+
+		assert.Equal(t, resolvedTestPath(t, "/custom/flags"), cfg.Paths.SuspendFlagsDir)
+		assert.Empty(t, cfg.Paths.SuspendFlagsDirLegacy)
+		assert.Contains(t, strings.Join(cfg.Warnings, "\n"), "outside paths.data_dir")
+	})
+
+	t.Run("explicit from env", func(t *testing.T) {
+		cfg := loadWithEnv(t, `
+paths:
+  data_dir: "/custom/data"
+`, map[string]string{
+			"DAGU_SUSPEND_FLAGS_DIR": "/env/flags",
+		})
+
+		assert.Equal(t, resolvedTestPath(t, "/env/flags"), cfg.Paths.SuspendFlagsDir)
+		assert.Empty(t, cfg.Paths.SuspendFlagsDirLegacy)
+	})
 }
 
 func TestLoad_EdgeCases_Errors(t *testing.T) {
@@ -2561,5 +2644,80 @@ default_execution_mode: invalid
 `)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid default_execution_mode")
+	})
+}
+
+func TestLoad_SignalHandling(t *testing.T) {
+	t.Run("DefaultDisabled", func(t *testing.T) {
+		cfg := testLoad(t)
+		assert.False(t, cfg.SignalHandling.EnablePropagation)
+	})
+
+	t.Run("YAML", func(t *testing.T) {
+		cfg := loadFromYAML(t, `
+signal_handling:
+  enable_propagation: true
+`)
+		assert.True(t, cfg.SignalHandling.EnablePropagation)
+	})
+
+	t.Run("Environment", func(t *testing.T) {
+		cfg := loadWithEnv(t, "# empty", map[string]string{
+			"DAGU_SIGNAL_PROPAGATION": "true",
+		})
+		assert.True(t, cfg.SignalHandling.EnablePropagation)
+	})
+
+	t.Run("EnvironmentOverridesYAML", func(t *testing.T) {
+		cfg := loadWithEnv(t, `
+signal_handling:
+  enable_propagation: false
+`, map[string]string{
+			"DAGU_SIGNAL_PROPAGATION": "true",
+		})
+		assert.True(t, cfg.SignalHandling.EnablePropagation)
+	})
+
+	// The camelCase spelling is rejected in config.yaml like every other
+	// legacy key, but remains accepted in admin.yaml for compatibility.
+	t.Run("CamelCaseYAMLRejected", func(t *testing.T) {
+		err := loadWithErrorFromYAML(t, `
+signalHandling:
+  enablePropagation: true
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "signal_handling.enable_propagation")
+	})
+
+	t.Run("CamelCaseAdminYAML", func(t *testing.T) {
+		homeDir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(homeDir, "admin.yaml"), []byte(`
+signalHandling:
+  enablePropagation: true
+`), 0600))
+		cfg := testLoad(t, WithAppHomeDir(homeDir))
+		assert.True(t, cfg.SignalHandling.EnablePropagation)
+	})
+
+	for _, camelCase := range []bool{false, true} {
+		t.Run(fmt.Sprintf("EnvironmentDisablesAdmin/%t", camelCase), func(t *testing.T) {
+			homeDir := t.TempDir()
+			yaml := "signal_handling:\n  enable_propagation: true\n"
+			if camelCase {
+				yaml = "signalHandling:\n  enablePropagation: true\n"
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(homeDir, "admin.yaml"), []byte(yaml), 0600))
+			t.Setenv("DAGU_SIGNAL_PROPAGATION", "false")
+			cfg := testLoad(t, WithAppHomeDir(homeDir))
+			assert.False(t, cfg.SignalHandling.EnablePropagation)
+		})
+	}
+
+	t.Run("CanonicalDisablesLegacy", func(t *testing.T) {
+		homeDir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(homeDir, "admin.yaml"), []byte("signalHandling:\n  enablePropagation: true\n"), 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(homeDir, "config.yaml"), []byte("signal_handling:\n  enable_propagation: false\n"), 0600))
+		cfg := testLoad(t, WithAppHomeDir(homeDir))
+		assert.False(t, cfg.SignalHandling.EnablePropagation)
 	})
 }

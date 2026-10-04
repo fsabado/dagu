@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
@@ -253,6 +254,12 @@ func (m *StateManager) Load() (*State, error) {
 	}
 	normalizeTrackedItems(&state)
 
+	// Recheck content after loading; persisted stats may predate a same-tick edit.
+	for _, itemState := range state.Items {
+		itemState.LastStatModTime = nil
+		itemState.LastStatSize = nil
+	}
+
 	m.state = &state
 	return m.state, nil
 }
@@ -289,15 +296,8 @@ func (m *StateManager) Save(state *State) error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	// Write atomically using temp file
-	tmpPath := m.statePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+	if err := fileutil.WriteFileAtomic(m.statePath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write state file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, m.statePath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("failed to rename state file: %w", err)
 	}
 
 	m.state = state

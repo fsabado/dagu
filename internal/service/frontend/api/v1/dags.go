@@ -123,11 +123,15 @@ func (a *API) ValidateDAGSpecData(ctx context.Context, name, spec string) (*api.
 
 	details := toDAGDetails(dag)
 
-	return &api.ValidateDAGSpec200JSONResponse{
+	response := &api.ValidateDAGSpec200JSONResponse{
 		Valid:  len(errs) == 0,
 		Dag:    details,
 		Errors: errs,
-	}, dag, nil
+	}
+	if dag != nil {
+		response.Warnings = dag.BuildWarnings
+	}
+	return response, dag, nil
 }
 
 func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestObject) (api.CreateNewDAGResponseObject, error) {
@@ -271,7 +275,6 @@ func (a *API) GetDAGSpec(ctx context.Context, request api.GetDAGSpecRequestObjec
 		}
 	} else {
 		errs = append(errs, extractBuildErrors(dag.BuildErrors)...)
-		errs = append(errs, dag.BuildWarnings...)
 	}
 	if err := a.requireWorkspaceVisible(ctx, dagWorkspaceName(dag)); err != nil {
 		return nil, err
@@ -293,6 +296,7 @@ func (a *API) GetDAGSpec(ctx context.Context, request api.GetDAGSpecRequestObjec
 		Dag:                   details,
 		Spec:                  yamlSpec,
 		Errors:                errs,
+		Warnings:              dag.BuildWarnings,
 		ValueReferenceNotices: valueReferenceNotices,
 	}, nil
 }
@@ -533,6 +537,7 @@ func (a *API) getDAGDetailsData(ctx context.Context, fileName string) (api.GetDA
 		Suspended:    suspended,
 		LocalDags:    localDAGs,
 		Errors:       extractBuildErrors(dag.BuildErrors),
+		Warnings:     dag.BuildWarnings,
 		Spec:         &yamlSpec,
 		EditorHints:  a.buildDAGEditorHints(ctx, dag, fileName),
 	}, nil
@@ -1022,6 +1027,11 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 		}
 	}
 
+	selection, err := selectedStepsFromBody(request.Body.Steps, request.Body.OutputsFromRunId, request.Body.Outputs)
+	if err != nil {
+		return nil, err
+	}
+
 	dagRunId := valueOf(request.Body.DagRunId)
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
@@ -1069,7 +1079,18 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 		return nil, err
 	}
 
-	if _, err := a.startDAGRun(ctx, dag, params, dagRunId, nameOverride, labels, profileName, valueOf(request.Body.NoReuse)); err != nil {
+	if len(selection.steps) > 0 {
+		if err := a.startSelectedSteps(ctx, dag, selectedStepsStart{
+			selection:   selection,
+			params:      params,
+			dagRunID:    dagRunId,
+			labels:      labels,
+			profileName: profileName,
+			noReuse:     valueOf(request.Body.NoReuse),
+		}); err != nil {
+			return nil, err
+		}
+	} else if _, err := a.startDAGRun(ctx, dag, params, dagRunId, nameOverride, labels, profileName, valueOf(request.Body.NoReuse)); err != nil {
 		return nil, fmt.Errorf("error starting dag-run: %w", err)
 	}
 
@@ -1080,6 +1101,7 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	if params != "" {
 		detailsMap["params"] = params
 	}
+	addSelectedStepsAudit(detailsMap, selection)
 	a.logAudit(ctx, audit.CategoryDAG, "dag_execute", detailsMap)
 
 	return api.ExecuteDAG200JSONResponse{
@@ -1503,7 +1525,7 @@ func (a *API) dispatchStartToCoordinator(ctx context.Context, dag *ir.DAG, opts 
 	if opts.triggerActor != "" {
 		taskOpts = append(taskOpts, executor.WithTriggerActor(opts.triggerActor))
 	}
-	taskOpts = append(taskOpts, executor.WithBaseConfig(executor.ResolveBaseConfig(dag.BaseConfigData, a.config.Paths.BaseConfig)))
+	taskOpts = append(taskOpts, executor.WithBaseConfig(executor.ResolveBaseConfig(dag.BaseConfigData, a.config.Paths.BaseConfig), dag.BaseConfigWorkspace))
 	if dag.SourceFile != "" {
 		taskOpts = append(taskOpts, executor.WithSourceFile(dag.SourceFile))
 	}
@@ -2151,7 +2173,22 @@ func (a *API) nextRunProjection(ctx context.Context) func(*ir.DAG, time.Time) ti
 		}
 	}
 
-	return scheduler.NewNextRunProjection(location, schedulerState)
+	projection := scheduler.NewNextRunProjection(location, schedulerState)
+	if a.schedulerPauseStore == nil {
+		return projection
+	}
+	// A pause only reaches the persisted projection on the scheduler's next
+	// tick. Suppress it here so listings stop advertising a next run the moment
+	// the pause is recorded.
+	paused, err := a.schedulerPauseStore.IsPaused(ctx)
+	if err != nil {
+		logger.Warn(ctx, "Failed to read scheduler pause state for DAG next-run projection", tag.Error(err))
+		return projection
+	}
+	if paused {
+		return func(*ir.DAG, time.Time) time.Time { return time.Time{} }
+	}
+	return projection
 }
 
 // parseIntParam parses an integer string, returning defaultVal if parsing fails or value is <= 0.

@@ -121,6 +121,14 @@ func WithIncludeDownstream(enabled bool) TaskOption {
 	}
 }
 
+// WithBypassPreconditions requests that steps selected by a targeted retry
+// skip their preconditions.
+func WithBypassPreconditions(enabled bool) TaskOption {
+	return func(task *dispatch.DispatchTask) {
+		task.BypassPreconditions = enabled
+	}
+}
+
 // WithLabels sets additional labels (comma-separated) for the task.
 func WithLabels(labels string) TaskOption {
 	return func(task *dispatch.DispatchTask) {
@@ -162,11 +170,12 @@ func WithTriggerActor(actor string) TaskOption {
 	}
 }
 
-// WithBaseConfig sets the base config YAML content on the task.
+// WithBaseConfig sets the effective base configuration and optional workspace provenance.
 // This allows workers to apply base config without needing local base config files.
-func WithBaseConfig(content string) TaskOption {
+func WithBaseConfig(content string, workspace *string) TaskOption {
 	return func(task *dispatch.DispatchTask) {
 		task.BaseConfig = content
+		task.BaseConfigWorkspace = workspace
 	}
 }
 
@@ -185,6 +194,14 @@ func WithWorkspaceBundle(desc workspacebundle.Descriptor) TaskOption {
 func WithExternalStepRetry(enabled bool) TaskOption {
 	return func(task *dispatch.DispatchTask) {
 		task.ExternalStepRetry = enabled
+	}
+}
+
+// WithPassedEnv sets the resolved parent environment values the child run
+// receives through the step's pass_env field.
+func WithPassedEnv(envs []string) TaskOption {
+	return func(task *dispatch.DispatchTask) {
+		task.PassedEnv = append([]string(nil), envs...)
 	}
 }
 

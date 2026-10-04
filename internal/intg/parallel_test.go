@@ -352,6 +352,106 @@ func TestParallelExecution_WithOutput(t *testing.T) {
 	require.Equal(t, ir.NodeSucceeded, useOutputNode.Status)
 }
 
+// TestParallelExecution_ChildOutputsPropagation verifies that a parallel step
+// publishes each successful child run's output variables as a JSON array on
+// the step outputs channel, in parallel item order, and that a downstream step
+// addresses an entry by its index.
+func TestParallelExecution_ChildOutputsPropagation(t *testing.T) {
+	items := []string{"alpha", "beta"}
+	dagContent := fmt.Sprintf(`steps:
+  - id: fan_out
+    action: dag.run
+    with:
+      dag: child-out-vars
+    parallel:
+      items:
+%s
+  - id: collect_first
+    depends: fan_out
+    run: echo "${fan_out.outputs[0].CHILD_RESULT}"
+    output: FIRST
+  - id: collect_second
+    depends: fan_out
+    run: echo "${fan_out.outputs[1].CHILD_RESULT}"
+    output: SECOND
+`, yamlParallelItems("ITEM", items)) + `---
+name: child-out-vars
+params:
+  - ITEM: ""
+steps:
+  - run: echo "result-${ITEM}"
+    output: CHILD_RESULT
+`
+
+	th := test.Setup(t)
+	dag := th.DAG(t, dagContent)
+	agent := dag.Agent()
+	require.NoError(t, agent.Run(agent.Context))
+	dag.AssertLatestStatus(t, ir.Succeeded)
+
+	dagStatus, statusErr := dag.DAGRunMgr.GetLatestStatus(dag.Context, dag.DAG)
+	require.NoError(t, statusErr)
+	require.Len(t, dagStatus.Nodes, 3)
+
+	parallelNode := dagStatus.Nodes[0]
+	require.Equal(t, "fan_out", parallelNode.Step.ID)
+	require.Equal(t, ir.NodeSucceeded, parallelNode.Status)
+
+	expected := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		expected = append(expected, map[string]any{"CHILD_RESULT": "result-" + item})
+	}
+
+	require.NotNil(t, parallelNode.OutputsValue, "parallel step did not publish child outputs")
+	var published []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(*parallelNode.OutputsValue), &published))
+	require.Equal(t, expected, published)
+
+	require.Equal(t, "result-alpha", test.StatusOutputValue(t, &dagStatus, "FIRST"))
+	require.Equal(t, "result-beta", test.StatusOutputValue(t, &dagStatus, "SECOND"))
+}
+
+// A parallel step whose collected child outputs do not fit the run's output
+// budget still succeeds; only the step outputs channel stays empty.
+func TestParallelExecution_ChildOutputsExceedLimit(t *testing.T) {
+	// Larger than max_output_size once two children contribute, and a literal
+	// so the child command stays the same on every shell.
+	payload := strings.Repeat("x", 300)
+	dagContent := `max_output_size: 200
+steps:
+  - id: fan_out
+    action: dag.run
+    with:
+      dag: child-big-out
+    parallel:
+      items:
+        - ITEM: "alpha"
+        - ITEM: "beta"
+` + `---
+name: child-big-out
+params:
+  - ITEM: ""
+steps:
+  - run: echo "` + payload + `"
+    output: BIG_RESULT
+`
+
+	th := test.Setup(t)
+	dag := th.DAG(t, dagContent)
+	agent := dag.Agent()
+	require.NoError(t, agent.Run(agent.Context))
+	dag.AssertLatestStatus(t, ir.Succeeded)
+
+	dagStatus, statusErr := dag.DAGRunMgr.GetLatestStatus(dag.Context, dag.DAG)
+	require.NoError(t, statusErr)
+	require.Len(t, dagStatus.Nodes, 1)
+
+	parallelNode := dagStatus.Nodes[0]
+	require.Equal(t, ir.NodeSucceeded, parallelNode.Status)
+	require.Empty(t, parallelNode.Error)
+	require.Nil(t, parallelNode.OutputsValue)
+}
+
 func TestParallelExecution_RetryBackoffDoesNotBlockScheduling(t *testing.T) {
 	th := test.Setup(t, test.WithBuiltExecutable())
 

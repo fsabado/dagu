@@ -74,12 +74,12 @@ type dag struct {
 	Schedule types.ScheduleValue `yaml:"schedule,omitempty"`
 	// SkipIfSuccessful is the flag to skip the DAG on schedule when it is
 	// executed manually before the schedule.
-	SkipIfSuccessful bool `yaml:"skip_if_successful,omitempty"`
+	SkipIfSuccessful *bool `yaml:"skip_if_successful,omitempty"`
 	// CatchupWindow is the lookback horizon for missed intervals (e.g. "6h", "2d12h").
-	// If set, enables catch-up on scheduler restart. If omitted, no catch-up.
-	CatchupWindow string `yaml:"catchup_window,omitempty"`
-	// OverlapPolicy controls how multiple catch-up runs are handled: "skip" or "all".
-	OverlapPolicy string `yaml:"overlap_policy,omitempty"`
+	// An explicit empty string disables inherited catch-up.
+	CatchupWindow *string `yaml:"catchup_window,omitempty"`
+	// OverlapPolicy controls catch-up overlap: "skip", "all", or "latest".
+	OverlapPolicy *string `yaml:"overlap_policy,omitempty"`
 	// LogDir is the directory where the logs are stored.
 	LogDir string `yaml:"log_dir,omitempty"`
 	// Artifacts config controls optional DAG run artifact storage.
@@ -108,6 +108,8 @@ type dag struct {
 	Steps any `yaml:"steps,omitempty"` // []step or map[string]step
 	// SMTP is the SMTP configuration.
 	SMTP smtpConfig `yaml:"smtp,omitempty"`
+	// MailAccounts maps email addresses to the accounts mail actions use.
+	MailAccounts map[string]any `yaml:"mail_accounts,omitempty"`
 	// MailOn is the mail configuration.
 	MailOn *mailOn `yaml:"mail_on,omitempty"`
 	// ErrorMail is the mail configuration for error.
@@ -129,7 +131,7 @@ type dag struct {
 	// Preconditions is the condition to run the DAG.
 	Preconditions any `yaml:"preconditions,omitempty"`
 	// MaxActiveRuns is the maximum number of concurrent dag-runs.
-	MaxActiveRuns int `yaml:"max_active_runs,omitempty"`
+	MaxActiveRuns *int `yaml:"max_active_runs,omitempty"`
 	// MaxActiveSteps is the maximum number of concurrent steps.
 	MaxActiveSteps int `yaml:"max_active_steps,omitempty"`
 	// Params is the default parameters for the steps.
@@ -143,7 +145,7 @@ type dag struct {
 	// DeprecatedTags is the deprecated tags field for backward compatibility.
 	DeprecatedTags types.LabelsValue `yaml:"tags,omitempty"`
 	// Queue is the name of the queue to assign this DAG to.
-	Queue string `yaml:"queue,omitempty"`
+	Queue *string `yaml:"queue,omitempty"`
 	// RetryPolicy is the DAG-level retry policy.
 	RetryPolicy *dagRetryPolicy `yaml:"retry_policy,omitempty"`
 	// MaxOutputSize is the maximum size of the output for each step.
@@ -294,6 +296,9 @@ type container struct {
 	PullPolicy any `yaml:"pull_policy,omitempty"`
 	// Env specifies environment variables for the container.
 	Env any `yaml:"env,omitempty"` // Can be a map or struct
+	// EnvFile lists dotenv-syntax files whose variables are injected into the
+	// container environment. Accepts a string or []string.
+	EnvFile types.StringOrArray `yaml:"env_file,omitempty"`
 	// Volumes specifies the volumes to mount in the container.
 	Volumes []string `yaml:"volumes,omitempty"` // Map of volume names to volume definitions
 	// User is the user to run the container as.
@@ -601,6 +606,7 @@ var fullExecutionDefaultsStage = transformStage{
 	dagField("registry_auths", buildRegistryAuths, func(out *ir.DAG, v map[string]*ir.AuthConfig) { out.RegistryAuths = v }),
 	dagField("ssh", buildSSH, func(out *ir.DAG, v *ir.SSHConfig) { out.SSH = v }),
 	dagField("s3", buildS3, func(out *ir.DAG, v *ir.S3Config) { out.S3 = v }),
+	dagField("mail_accounts", buildMailAccounts, func(out *ir.DAG, v ir.MailAccounts) { out.MailAccounts = v }),
 	dagField("llm", buildLLM, func(out *ir.DAG, v *ir.LLMConfig) { out.LLM = v }),
 	dagField("redis", buildRedis, func(out *ir.DAG, v *ir.RedisConfig) { out.Redis = v }),
 	dagField("harnesses", buildHarnesses, func(out *ir.DAG, v ir.HarnessDefinitions) { out.Harnesses = v }),
@@ -672,6 +678,9 @@ type dagBuildState struct {
 	spec   *dag
 	result *ir.DAG
 	errs   ir.ErrorList
+	// ownEnv counts the DAG's own env entries before base-config entries are
+	// composed in front of them.
+	ownEnv int
 }
 
 func newDAGBuildState(ctx buildContext, spec *dag) *dagBuildState {
@@ -714,6 +723,7 @@ func (s *dagBuildState) prepareParamEnvStage() {
 
 func (s *dagBuildState) runFieldStages() {
 	s.errs = append(s.errs, runTransformers(s.ctx, s.spec, s.result)...)
+	s.ownEnv = len(s.result.Env)
 }
 
 func (s *dagBuildState) composeInheritedContext() {
@@ -819,6 +829,57 @@ func (s *dagBuildState) collectWarnings() {
 	for _, sched := range s.result.RestartSchedule {
 		s.result.BuildWarnings = append(s.result.BuildWarnings, sched.Warnings...)
 	}
+	if !s.ctx.opts.Has(buildFlagOnlyMetadata) {
+		s.result.BuildWarnings = append(s.result.BuildWarnings, harnessWorkingDirWarnings(s.result)...)
+	}
+}
+
+func harnessWorkingDirWarnings(dag *ir.DAG) []string {
+	var warnings []string
+	var visit func(ir.Step, string)
+	visit = func(step ir.Step, path string) {
+		if step.ExecutorConfig.Type == "harness" {
+			container := step.Container
+			if container == nil {
+				container = dag.Container
+			}
+			var message string
+			if container != nil {
+				if strings.TrimSpace(container.WorkingDir) == "" {
+					message = "has no explicit container.working_dir; set working_dir in the effective container configuration to choose the agent workspace"
+				}
+			} else if step.Dir == "" && dag.WorkingDir == "" {
+				message = "has no explicit working_dir; set working_dir on the step or DAG to choose the agent workspace"
+			}
+			if message != "" {
+				warnings = append(warnings, fmt.Sprintf("DAG %q: harness step %q %s", dag.Name, path, message))
+			}
+		}
+		if step.Foreach != nil {
+			for _, child := range step.Foreach.Steps {
+				visit(child, path+".foreach.steps."+child.Name)
+			}
+		}
+	}
+	for _, step := range dag.Steps {
+		visit(step, "steps."+step.Name)
+	}
+	for _, handler := range []struct {
+		name string
+		step *ir.Step
+	}{
+		{"init", dag.HandlerOn.Init},
+		{"failure", dag.HandlerOn.Failure},
+		{"success", dag.HandlerOn.Success},
+		{"abort", dag.HandlerOn.Abort},
+		{"exit", dag.HandlerOn.Exit},
+		{"wait", dag.HandlerOn.Wait},
+	} {
+		if handler.step != nil {
+			visit(*handler.step, "handler_on."+handler.name)
+		}
+	}
+	return warnings
 }
 
 func (s *dagBuildState) buildActionGraph() {
@@ -886,6 +947,11 @@ func (s *dagBuildState) capturePresolvedBuildEnv() {
 func (s *dagBuildState) markEnvEvaluated() {
 	s.result.EnvEvaluated = !s.ctx.opts.Has(buildFlagNoEval)
 	s.result.RuntimeResolved = s.ctx.opts.RuntimeResolved || (s.result.EnvEvaluated && len(s.result.Dotenv) == 0)
+	s.result.RootEnvSpan = ir.EnvSpan{}
+	if s.result.EnvEvaluated {
+		end := len(s.result.Env)
+		s.result.RootEnvSpan = ir.EnvSpan{Start: max(end-s.ownEnv, 0), End: end}
+	}
 }
 
 func (s *dagBuildState) finish() (*ir.DAG, error) {
@@ -912,8 +978,8 @@ func (d *dag) build(ctx buildContext) (*ir.DAG, error) {
 	state.composeInheritedContext()
 	state.resolveWorkerSelector()
 	state.markEnvEvaluated()
-	state.collectWarnings()
 	state.buildActionGraph()
+	state.collectWarnings()
 	state.validateResult()
 	state.capturePresolvedBuildEnv()
 	return state.finish()
@@ -933,6 +999,23 @@ func composeBuildDAGContext(base, current *ir.DAG, currentSpec *dag) (*ir.DAG, e
 		return nil, err
 	}
 	applyHistoryRetentionOverride(effective, currentSpec.HistRetentionDays != nil, currentSpec.HistRetentionRuns != nil)
+	// Built-in defaults must not replace inherited values, while explicit
+	// false and empty values must be able to disable inherited behavior.
+	if currentSpec.OverlapPolicy == nil {
+		effective.OverlapPolicy = base.OverlapPolicy
+	}
+	if currentSpec.MaxActiveRuns == nil {
+		effective.MaxActiveRuns = base.MaxActiveRuns
+	}
+	if currentSpec.SkipIfSuccessful != nil {
+		effective.SkipIfSuccessful = current.SkipIfSuccessful
+	}
+	if currentSpec.CatchupWindow != nil {
+		effective.CatchupWindow = current.CatchupWindow
+	}
+	if currentSpec.Queue != nil {
+		effective.Queue = current.Queue
+	}
 
 	return effective, nil
 }
@@ -1036,8 +1119,8 @@ func buildLabels(_ buildContext, d *dag) (ir.Labels, error) {
 }
 
 func buildMaxActiveRuns(_ buildContext, d *dag) (int, error) {
-	if d.MaxActiveRuns != 0 {
-		return d.MaxActiveRuns, nil
+	if d.MaxActiveRuns != nil && *d.MaxActiveRuns != 0 {
+		return *d.MaxActiveRuns, nil
 	}
 	return 1, nil // Default
 }
@@ -1047,7 +1130,10 @@ func buildMaxActiveSteps(_ buildContext, d *dag) (int, error) {
 }
 
 func buildQueue(_ buildContext, d *dag) (string, error) {
-	return strings.TrimSpace(d.Queue), nil
+	if d.Queue == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(*d.Queue), nil
 }
 
 func buildDAGRetryPolicy(_ buildContext, d *dag) (*ir.DAGRetryPolicy, error) {
@@ -1092,18 +1178,21 @@ func buildMaxOutputSize(_ buildContext, d *dag) (int, error) {
 }
 
 func buildSkipIfSuccessful(_ buildContext, d *dag) (bool, error) {
-	return d.SkipIfSuccessful, nil
+	return d.SkipIfSuccessful != nil && *d.SkipIfSuccessful, nil
 }
 
 func buildCatchupWindow(_ buildContext, d *dag) (time.Duration, error) {
-	if d.CatchupWindow == "" {
+	if d.CatchupWindow == nil || *d.CatchupWindow == "" {
 		return 0, nil
 	}
-	return ParseDuration(d.CatchupWindow)
+	return ParseDuration(*d.CatchupWindow)
 }
 
 func buildOverlapPolicy(_ buildContext, d *dag) (ir.OverlapPolicy, error) {
-	return ir.ParseOverlapPolicy(d.OverlapPolicy)
+	if d.OverlapPolicy == nil {
+		return ir.OverlapPolicySkip, nil
+	}
+	return ir.ParseOverlapPolicy(*d.OverlapPolicy)
 }
 
 func buildLogDir(_ buildContext, d *dag) (string, error) {
@@ -1113,7 +1202,12 @@ func buildLogDir(_ buildContext, d *dag) (string, error) {
 func buildArtifacts(_ buildContext, d *dag) (*ir.ArtifactsConfig, error) {
 	usesArtifactAction := dagUsesBuiltinArtifactAction(d)
 	usesArtifactOutput := dagUsesArtifactOutput(d)
-	autoEnable := dagReferencesRunArtifactsDir(d) || usesArtifactAction || usesArtifactOutput
+	// Browser and computer actions store screenshots, and browser downloads,
+	// as artifacts but still run, without them, when artifacts are disabled
+	// explicitly.
+	usesScreenAction := dagUsesBuiltinAction(d, browserActionPrefix) || dagUsesBuiltinAction(d, computerActionPrefix)
+	autoEnable := dagReferencesRunArtifactsDir(d) || usesArtifactAction || usesArtifactOutput || usesScreenAction ||
+		dagSavesMailAttachments(d) || dagKeepsXlsxArtifact(d)
 
 	if usesArtifactAction && d.Artifacts != nil && d.Artifacts.Enabled != nil && !*d.Artifacts.Enabled {
 		return nil, ir.NewValidationError(
@@ -1165,29 +1259,90 @@ func dagReferencesRunArtifactsDir(d *dag) bool {
 // Step names are searched like any other map key, so a step is detected
 // whichever name it is declared under.
 func dagUsesBuiltinArtifactAction(d *dag) bool {
+	return dagUsesBuiltinAction(d, artifactActionPrefix)
+}
+
+// dagUsesBuiltinAction reports whether the spec declares a builtin action
+// whose name starts with prefix.
+func dagUsesBuiltinAction(d *dag, prefix string) bool {
+	return dagDeclaresAction(d, func(action string, _ reflect.Value) bool {
+		return strings.HasPrefix(action, prefix)
+	})
+}
+
+// dagSavesMailAttachments reports whether a mail.search step writes
+// save_attachments: true literally.
+func dagSavesMailAttachments(d *dag) bool {
+	return dagDeclaresAction(d, func(action string, with reflect.Value) bool {
+		if action != "mail.search" {
+			return false
+		}
+		with, ok := derefForSearch(with)
+		if !ok || with.Kind() != reflect.Map {
+			return false
+		}
+		save, ok := derefForSearch(with.MapIndex(reflect.ValueOf("save_attachments")))
+		return ok && save.Kind() == reflect.Bool && save.Bool()
+	})
+}
+
+// dagKeepsXlsxArtifact reports whether an xlsx writer step may keep its
+// workbook as an artifact: artifact is literally true, or a value
+// reference such as ${params.KEEP} that is only known at run time. Storage
+// is enabled for the reference case so a value that resolves to true does
+// not fail the step.
+func dagKeepsXlsxArtifact(d *dag) bool {
+	return dagDeclaresAction(d, func(action string, with reflect.Value) bool {
+		if !strings.HasPrefix(action, "xlsx.") {
+			return false
+		}
+		with, ok := derefForSearch(with)
+		if !ok || with.Kind() != reflect.Map {
+			return false
+		}
+		keep, ok := derefForSearch(with.MapIndex(reflect.ValueOf("artifact")))
+		if !ok {
+			return false
+		}
+		if keep.Kind() == reflect.Bool {
+			return keep.Bool()
+		}
+		if keep.Kind() == reflect.String {
+			text := keep.String()
+			return cmnvalue.HasValueReference(text) || strings.EqualFold(strings.TrimSpace(text), "true")
+		}
+		return false
+	})
+}
+
+// actionMatcher reports whether a step declaring action, with its with
+// block, is the step being searched for.
+type actionMatcher func(action string, with reflect.Value) bool
+
+func dagDeclaresAction(d *dag, match actionMatcher) bool {
 	if d == nil {
 		return false
 	}
-	return artifactActionInStepContainer(reflect.ValueOf(d.Steps)) ||
-		artifactActionInStepContainer(reflect.ValueOf(d.HandlerOn)) ||
-		customStepSpecsUseBuiltinArtifactAction(d.StepTypes) ||
-		customStepSpecsUseBuiltinArtifactAction(d.Actions)
+	return actionInStepContainer(reflect.ValueOf(d.Steps), match) ||
+		actionInStepContainer(reflect.ValueOf(d.HandlerOn), match) ||
+		customStepSpecsUseBuiltinAction(d.StepTypes, match) ||
+		customStepSpecsUseBuiltinAction(d.Actions, match)
 }
 
-func customStepSpecsUseBuiltinArtifactAction(specs map[string]customStepTypeSpec) bool {
+func customStepSpecsUseBuiltinAction(specs map[string]customStepTypeSpec, match actionMatcher) bool {
 	for _, spec := range specs {
 		// A template is a single step declaration.
-		if artifactActionInStep(reflect.ValueOf(spec.Template)) {
+		if actionInStep(reflect.ValueOf(spec.Template), match) {
 			return true
 		}
 	}
 	return false
 }
 
-// artifactActionInStepContainer searches a value holding step declarations. In
+// actionInStepContainer searches a value holding step declarations. In
 // map form the keys name the steps, so they are not field names and carry no
 // meaning for this search.
-func artifactActionInStepContainer(v reflect.Value) bool {
+func actionInStepContainer(v reflect.Value, match actionMatcher) bool {
 	v, ok := derefForSearch(v)
 	if !ok {
 		return false
@@ -1196,7 +1351,7 @@ func artifactActionInStepContainer(v reflect.Value) bool {
 	if v.Kind() == reflect.Map {
 		iter := v.MapRange()
 		for iter.Next() {
-			if artifactActionInStep(iter.Value()) {
+			if actionInStep(iter.Value(), match) {
 				return true
 			}
 		}
@@ -1211,12 +1366,12 @@ func artifactActionInStepContainer(v reflect.Value) bool {
 			}
 			// A nested list declares steps that run at one position.
 			if item.Kind() == reflect.Slice || item.Kind() == reflect.Array {
-				if artifactActionInStepContainer(item) {
+				if actionInStepContainer(item, match) {
 					return true
 				}
 				continue
 			}
-			if artifactActionInStep(item) {
+			if actionInStep(item, match) {
 				return true
 			}
 		}
@@ -1230,7 +1385,7 @@ func artifactActionInStepContainer(v reflect.Value) bool {
 			if t.Field(i).PkgPath != "" {
 				continue
 			}
-			if artifactActionInStep(v.Field(i)) {
+			if actionInStep(v.Field(i), match) {
 				return true
 			}
 		}
@@ -1239,10 +1394,10 @@ func artifactActionInStepContainer(v reflect.Value) bool {
 	return false
 }
 
-// artifactActionInStep searches one step declaration. Within a step every
+// actionInStep searches one step declaration. Within a step every
 // params entry is a payload handed to a child DAG rather than step syntax,
 // and a steps entry opens a nested container whose keys name steps again.
-func artifactActionInStep(v reflect.Value) bool {
+func actionInStep(v reflect.Value, match actionMatcher) bool {
 	v, ok := derefForSearch(v)
 	if !ok {
 		return false
@@ -1253,7 +1408,7 @@ func artifactActionInStep(v reflect.Value) bool {
 		for iter.Next() {
 			key, value := iter.Key(), iter.Value()
 			if key.Kind() != reflect.String {
-				if artifactActionInStep(value) {
+				if actionInStep(value, match) {
 					return true
 				}
 				continue
@@ -1262,16 +1417,16 @@ func artifactActionInStep(v reflect.Value) bool {
 			case "params":
 				continue
 			case "steps":
-				if artifactActionInStepContainer(value) {
+				if actionInStepContainer(value, match) {
 					return true
 				}
 				continue
 			case "action":
-				if action, ok := reflectString(value); ok && strings.HasPrefix(action, "artifact.") {
+				if action, ok := reflectString(value); ok && match(action, v.MapIndex(reflect.ValueOf("with"))) {
 					return true
 				}
 			}
-			if artifactActionInStep(value) {
+			if actionInStep(value, match) {
 				return true
 			}
 		}
@@ -1280,7 +1435,7 @@ func artifactActionInStep(v reflect.Value) bool {
 
 	if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {
 		for i := range v.Len() {
-			if artifactActionInStep(v.Index(i)) {
+			if actionInStep(v.Index(i), match) {
 				return true
 			}
 		}
@@ -1299,16 +1454,16 @@ func artifactActionInStep(v reflect.Value) bool {
 			case "Params":
 				continue
 			case "Steps":
-				if artifactActionInStepContainer(field) {
+				if actionInStepContainer(field, match) {
 					return true
 				}
 				continue
 			case "Action":
-				if action, ok := reflectString(field); ok && strings.HasPrefix(action, "artifact.") {
+				if action, ok := reflectString(field); ok && match(action, v.FieldByName("With")) {
 					return true
 				}
 			}
-			if artifactActionInStep(field) {
+			if actionInStep(field, match) {
 				return true
 			}
 		}
@@ -2122,6 +2277,7 @@ func buildContainerField(ctx buildContext, raw any) (*ir.Container, error) {
 			ErrorUnused:      true,
 			WeaklyTypedInput: true,
 			TagName:          "yaml",
+			DecodeHook:       typedUnionDecodeHook(),
 		})
 		if err != nil {
 			return nil, ir.NewValidationError("container", nil,
@@ -2223,6 +2379,7 @@ func buildContainerFromSpec(_ buildContext, c *container) (*ir.Container, error)
 			User:       c.User,
 			WorkingDir: c.WorkingDir,
 			Env:        envs,
+			EnvFile:    c.EnvFile.Values(),
 			Shell:      c.Shell,
 		}, nil
 	}
@@ -2255,6 +2412,7 @@ func buildContainerFromSpec(_ buildContext, c *container) (*ir.Container, error)
 		Image:         c.Image,
 		PullPolicy:    pullPolicy,
 		Env:           envs,
+		EnvFile:       c.EnvFile.Values(),
 		Volumes:       c.Volumes,
 		User:          c.User,
 		WorkingDir:    c.WorkingDir,
@@ -3513,7 +3671,9 @@ func validateNoRouterForChainType(dag *ir.DAG, step *ir.Step) error {
 }
 
 // transformRouterSteps processes router-type steps and injects preconditions
-// into their target steps. It modifies the steps slice in place.
+// into their target steps. Each target gets one precondition per router, met
+// when any route listing that target matches. It modifies the steps slice in
+// place.
 func transformRouterSteps(steps []ir.Step) error {
 	// Build step index for lookup (using pointers to modify in place)
 	stepIndex := make(map[string]*ir.Step)
@@ -3529,41 +3689,43 @@ func transformRouterSteps(steps []ir.Step) error {
 		router := steps[i].Router
 		routerName := steps[i].Name
 
-		// Track targets to detect duplicates across routes
-		seenTargets := make(map[string]string) // target -> first pattern that used it
-
-		// For each route, inject precondition into target steps
+		// Collect each target's patterns in route order
+		var targetNames []string
+		patterns := make(map[string][]string)
 		for _, route := range router.Routes {
 			for _, targetName := range route.Targets {
-				// Check for duplicate target
-				if firstPattern, exists := seenTargets[targetName]; exists {
-					return ir.NewValidationError("routes", targetName,
-						fmt.Errorf("router %q: step %q is targeted by multiple routes (%q and %q); each step can only be a target of one route",
-							routerName, targetName, firstPattern, route.Pattern))
-				}
-				seenTargets[targetName] = route.Pattern
-
-				target, ok := stepIndex[targetName]
-				if !ok {
+				if _, ok := stepIndex[targetName]; !ok {
 					return ir.NewValidationError("routes", targetName,
 						fmt.Errorf("router %q references non-existent step %q", routerName, targetName))
 				}
-
-				// Inject precondition: check if value matches pattern
-				condition := &ir.Condition{
-					Condition: router.Value,
-					Expected:  route.Pattern,
+				if _, seen := patterns[targetName]; !seen {
+					targetNames = append(targetNames, targetName)
 				}
-				target.Preconditions = append(target.Preconditions, condition)
-
-				// Add router as dependency if not already present
-				if !slices.Contains(target.Depends, routerName) {
-					target.Depends = append(target.Depends, routerName)
+				if !slices.Contains(patterns[targetName], route.Pattern) {
+					patterns[targetName] = append(patterns[targetName], route.Pattern)
 				}
-
-				// Enable continueOn.skipped for proper flow
-				target.ContinueOn.Skipped = true
 			}
+		}
+
+		for _, targetName := range targetNames {
+			target := stepIndex[targetName]
+
+			// Inject precondition: check if value matches any of the patterns
+			condition := &ir.Condition{Condition: router.Value}
+			if targetPatterns := patterns[targetName]; len(targetPatterns) == 1 {
+				condition.Expected = targetPatterns[0]
+			} else {
+				condition.ExpectedAny = targetPatterns
+			}
+			target.Preconditions = append(target.Preconditions, condition)
+
+			// Add router as dependency if not already present
+			if !slices.Contains(target.Depends, routerName) {
+				target.Depends = append(target.Depends, routerName)
+			}
+
+			// Enable continueOn.skipped for proper flow
+			target.ContinueOn.Skipped = true
 		}
 
 		// Router itself allows downstream to continue

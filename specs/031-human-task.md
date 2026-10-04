@@ -14,8 +14,8 @@ This spec defines:
 - integration with the shared scalar-input schema
 - generated step outputs
 - the `waiting` checkpoint
-- the local completion command
-- atomic completion, idempotency, and resume
+- the local completion and push-back commands
+- atomic completion and push-back, idempotency, and resume
 - local and distributed root-run behavior
 - dry-run and error behavior
 
@@ -35,6 +35,10 @@ an executor process or distributed worker slot occupied.
 Declared form values become ordinary step outputs under
 `${steps.<id>.outputs.<property>}`. The completion command identifies the task
 by that explicit step `id`.
+
+A task that declares `with.push_back` can instead send the work back. A
+push-back runs an upstream step and every step that depends on it again with
+the operator's feedback, then opens the task again for another review.
 
 ## Related Specs
 
@@ -67,6 +71,13 @@ A waiting checkpoint is a finalized root-run state with overall status
 Resume continues the same logical root run under the same DAG-run ID while
 preserving completed nodes and outputs.
 
+The rewind target is the step named by `with.push_back.rewind_to`.
+
+A step's push-back iteration is the iteration of the last push-back that reset
+it, or `0` when no push-back has. A push-back records one more than the highest
+push-back iteration among the task and the steps it resets, so a step's
+iteration only increases.
+
 ## Behavior
 
 ### Step Shape
@@ -89,15 +100,38 @@ Fields owned by this spec:
 | `id` | Yes | Step identity used for completion and output references. |
 | `with.prompt` | Yes | Instructions for the operator. |
 | `with.form` | No | Flat typed input object. Omit for acknowledgement only. |
+| `with.artifacts` | No | Artifact-relative paths available as review context. |
+| `with.push_back` | No | Lets the operator push the task back to an upstream step. |
 
 Rules:
 
 - The step must define an explicit `id` accepted by Spec 009.
 - `name` does not satisfy the explicit `id` requirement.
-- `with` must be an object containing only `prompt` and optional `form`.
+- `with` must be an object containing only `prompt`, optional `form`, optional
+  `artifacts`, and optional `push_back`.
 - `with.prompt` must be a string containing a non-whitespace character before
   runtime value resolution.
 - `with.form: null` is invalid. Acknowledgement-only tasks omit `form`.
+- `with.artifacts`, when present, must be an array of unique, non-empty strings.
+  Each path is relative to the current root DAG run's artifact directory. The
+  authored text must not be absolute, home-relative, or contain
+  parent-directory segments.
+- `with.artifacts` entries are value-resolved with `with.prompt` when the task
+  opens, so an entry can name an artifact a dependency produced. Command
+  substitution is never run.
+- Each resolved path is re-checked against the same relative-path rules. A
+  resolved path that is empty, absolute, home-relative, or contains a
+  parent-directory segment fails the step without opening it.
+- Two entries that resolve to the same path contribute one artifact reference,
+  positioned at the first authored occurrence.
+- `with.artifacts` references artifacts that other steps in the run produce. It
+  does not itself enable artifact storage for the DAG, unlike the `artifact.*`
+  actions of Spec 051, and a DAG that stores no artifacts is still valid.
+- The waiting-task snapshot stores resolved artifact paths only; it never copies
+  artifact contents into human-task state. Missing or unavailable referenced
+  artifacts do not change task completion or resume semantics.
+- A human task without `artifacts` behaves exactly as it did before artifact
+  references were introduced.
 - A human task starts no command, executor, container, or child DAG.
 - `name`, `description`, `depends`, `working_dir`, `env`, `preconditions`, and
   `continue_on` retain their owning behavior.
@@ -126,8 +160,10 @@ value:
 process. `approval` is attached to another executable step and is outside this
 spec.
 
-A human task supports one completion result: validated input makes the step
-`succeeded`.
+A human task supports two results. Completion makes the step `succeeded` with
+validated input. Push-back, available when `with.push_back` is configured, runs
+the rewind target and the steps that depend on it again before the task opens
+again.
 
 ### Root DAG Boundary
 
@@ -161,10 +197,14 @@ Rules:
   the step to start.
 - Prompt resolution uses parameters, constants, environment values, built-in
   context, and dependency outputs defined by Specs 003, 006, and 007.
-- The resolved prompt is fixed for that open task.
+- `with.artifacts` entries are value-resolved in the same step, from the same
+  scope, and under the artifact path rules of this spec.
+- The resolved prompt and resolved artifact paths are fixed for that open task.
 - Changing the DAG file or process environment after the task opens does not
-  change the prompt observed by status or resume.
+  change the prompt or artifact paths observed by status or resume.
 - A prompt-resolution error fails the step without opening it.
+- An artifact-path resolution error, or a resolved path that is not a safe
+  relative artifact path, fails the step without opening it.
 - Form schemas and their metadata are literal and are not value-resolved.
 
 ### Form Integration
@@ -228,12 +268,34 @@ Canonical input and the generated-output object must each fit within the
 owning DAG's `max_output_size`. A size error occurs before completion changes
 the task.
 
+### Push-Back Configuration
+
+When present, `with.push_back` enables push-back for the task:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `rewind_to` | Yes | Step `id` or `name` that runs again first after a push-back. |
+| `form` | No | Flat feedback object. Omit when push-back accepts no input. |
+
+Rules:
+
+- `with.push_back` must be an object containing only `rewind_to` and optional
+  `form`. `with.push_back: null` is invalid.
+- `rewind_to` must be a non-empty string naming a step in the same DAG that the
+  task depends on directly or transitively. The task itself is invalid.
+- `with.push_back.form` follows Form Integration, except that
+  `additionalProperties` must be `false`. Omitting it means `false`.
+- `with.push_back.form: null` is invalid. Push-back without input omits `form`.
+- Feedback properties never become step outputs.
+- `with.push_back` is invalid in a `type: agent` DAG.
+- The push-back configuration is literal and is not value-resolved.
+
 ### Opening A Waiting Checkpoint
 
 When the step becomes ready, Dagu:
 
 1. evaluates preconditions
-2. resolves the prompt
+2. resolves the prompt and artifact paths
 3. changes the step to `waiting`
 4. continues independent ready or running branches
 5. finalizes the root run as `waiting` after no ordinary node remains ready or
@@ -265,7 +327,11 @@ identify:
 - overall status `Waiting`
 - each waiting human task's explicit step ID
 - each task's resolved prompt
+- each task's resolved artifact paths when the task declares any
 - each task's normalized form as JSON when a form exists
+- each task's rewind target when the task declares `with.push_back`
+- each task's normalized feedback form as JSON when it declares one
+- each task's push-back iteration when it is greater than `0`
 
 The displayed normalized form must:
 
@@ -279,7 +345,7 @@ remain omitted. Exact object-member order is not significant.
 
 ### Completion Command
 
-The only completion operation in this spec is:
+The completion operation is:
 
 ```sh
 dagu human-task complete [flags] <root-dag-name>
@@ -351,7 +417,7 @@ nothing to stderr:
 
 | Condition | Stdout |
 | --- | --- |
-| New completion; another node remains waiting | `Completed human task <step>; DAG-run remains waiting.` |
+| New completion; another node remains waiting and no step is unblocked | `Completed human task <step>; DAG-run remains waiting.` |
 | New completion; resume accepted | `Completed human task <step>; DAG-run queued for resume.` |
 | New completion; a concurrent request already queued resume | `Completed human task <step>; DAG-run was already queued for resume.` |
 | Identical repeat; no resume is needed | `Human task <step> was already completed.` |
@@ -402,12 +468,42 @@ Rules:
 
 After completion:
 
-- If any node remains `waiting`, the run remains `waiting` and no resume is
-  requested by that completion.
+- If the completion unblocks a step, Dagu requests resume automatically, even
+  while other nodes remain `waiting`. A step is unblocked when:
+  - it has not started and declares no build inputs
+  - every dependency succeeded, partially succeeded, or was skipped in a way
+    that lets dependents continue
+  - at least one dependency is a completed human task
+- A completion never unblocks a step while any node in the run is failed,
+  aborted, rejected, or retrying. Every resume re-runs those nodes, so they run
+  again once, at the resume requested after no node remains `waiting`.
+- Otherwise, if any node remains `waiting`, the run remains `waiting` and no
+  resume is requested by that completion.
 - If no node remains `waiting`, Dagu requests resume automatically.
 - Resume keeps the same DAG-run ID and uses the stored DAG snapshot.
 - Completed nodes, including human-task outputs, remain completed.
 - Downstream nodes become eligible according to their dependencies.
+- Tasks that remain open stay `waiting` with their stored prompt and artifact
+  paths. The resumed run returns to a `waiting` checkpoint after no ordinary
+  node remains ready or running.
+- While a resumed attempt is queued or running, completing another open task
+  fails with the run-not-waiting diagnostic. It succeeds once the run reaches
+  its next waiting checkpoint.
+- A resumed attempt checks DAG-level preconditions again (Spec 023) and runs
+  `handler_on.init` again. Each return to a waiting checkpoint runs
+  `handler_on.wait` again; `DAG_WAITING_STEPS` lists every step still waiting,
+  including open tasks.
+- If a resumed attempt ends before its next waiting checkpoint, the run leaves
+  `waiting` and open tasks can no longer be completed. This happens when the
+  queued resume is removed from the queue, `handler_on.init` fails, a DAG-level
+  precondition is not met, the attempt is stopped, or its process dies.
+  - Tasks that the attempt aborted or failed open again when the run is
+    retried, with their prompt and artifact paths resolved anew.
+  - Tasks left `waiting` stay open after a retry, with their stored prompt and
+    artifact paths.
+  - Completed task input is kept.
+- A completed human task that a later retry resets opens again with its prompt
+  and artifact paths resolved anew.
 - A later sequential human task can create another checkpoint in the same
   logical run.
 
@@ -426,6 +522,140 @@ Only one successful resume can result from those retries.
 After queueing succeeds, dispatch, launch, and execution follow the same
 asynchronous behavior as any other queued DAG-run.
 
+### Push-Back Command
+
+A task that declares `with.push_back` is pushed back with:
+
+```sh
+dagu human-task push-back [flags] <root-dag-name>
+```
+
+| Flag | Required | Meaning |
+| --- | --- | --- |
+| `--run-id`, `-r` | Yes | Owning root DAG-run ID. |
+| `--step` | Yes | Explicit human-task step ID. |
+| `--input key=value` | No | One string feedback input; repeat for multiple properties. |
+| `--inputs-json object` | No | One typed JSON feedback object. |
+| `--expected-iteration n` | No | Push-back iteration of the task the operator reviewed. |
+
+Rules:
+
+- The DAG name, run ID, `--step`, local-context, and run-snapshot rules of the
+  completion command apply.
+- `--input` and `--inputs-json` follow the completion parsing rules and are
+  validated against `with.push_back.form`. Omitting both supplies `{}`.
+- Feedback defaults and canonical feedback input follow Form Integration and
+  Canonical Input. Canonical feedback input must fit within the owning DAG's
+  `max_output_size`.
+- The recorded feedback values, encoded as one JSON object, must fit within
+  16 KiB (16384 bytes), because every rewound step receives them as
+  environment variables.
+- A new push-back requires the run to be `waiting` and the task to be open.
+- A task without `with.push_back` rejects push-back.
+- `--expected-iteration` must be a non-negative integer. When it differs from
+  the task's push-back iteration, the command fails with a conflict and changes
+  nothing. Until the task opens again after its own push-back, the iteration
+  that push-back started from is accepted.
+
+### Push-Back Effects
+
+A successful push-back atomically makes these observable changes:
+
+- the rewind target and every step that depends on it directly or
+  transitively, including the task, become not started; in a `type: build`
+  DAG, a step that consumes a declared output path of one of those steps
+  depends on it
+- those steps lose their previous status, outputs, completion input, and
+  approval decisions; human tasks and approval steps among them wait again when
+  they run
+- each of those steps records the new push-back iteration, the feedback, and the
+  task's push-back history followed by an entry for this push-back with its
+  iteration, operator, time, and feedback
+- other steps remain unchanged
+
+Feedback values are strings. A `string` property records its contents and any
+other scalar records its JSON text. Only properties present in canonical
+feedback input are recorded.
+
+When a reset step runs again, it observes the push-back context of Spec 017:
+`DAG_PUSHBACK`, `DAG_PUSHBACK_ITERATION`, `context.pushback.iteration`, and
+`DAG_PUSHBACK_PREVIOUS_STDOUT_FILE` when it produced stdout before. Each
+feedback value is also an environment variable named after its property, even
+on an approval step whose `approval.input` does not list that property. The
+same values are available when the reopened task resolves its prompt.
+
+The task opens again after its dependencies finish, with its prompt and
+artifact paths resolved anew. The reopened task can be completed or pushed back
+again.
+
+Input validation, the iteration check, and size checks occur before any change.
+
+### Push-Back Results
+
+A successful push-back writes exactly one of these lines to stdout and writes
+nothing to stderr. `<target>` is the name of the rewind target.
+
+| Condition | Stdout |
+| --- | --- |
+| Resume accepted | `Pushed back human task <step> to <target>; DAG-run queued for resume.` |
+| A concurrent request already queued resume | `Pushed back human task <step> to <target>; DAG-run was already queued for resume.` |
+| No resume requested | `Pushed back human task <step> to <target>; DAG-run remains waiting.` |
+| Identical repeat; the run still needs resume | `Human task <step> was already pushed back to <target>; DAG-run queued for resume.` |
+| Identical repeat; no resume is needed | `Human task <step> was already pushed back to <target>.` |
+
+Each line ends with one newline. Success exits zero. A failed push-back exits
+non-zero, writes no stdout, and writes a diagnostic to stderr without command
+usage text.
+
+### Push-Back Resume
+
+After a push-back, Dagu requests resume when:
+
+- no node remains `waiting`, or
+- the rewind target declares no build inputs, every dependency of the rewind
+  target succeeded, partially succeeded, or was skipped in a way that lets
+  dependents continue, and no node in the run is failed, aborted, rejected, or
+  retrying
+
+Otherwise the run remains `waiting` and the reset steps run at the next resume.
+Open tasks outside the reset steps keep their stored prompt and artifact paths.
+
+A push-back is durable before resume is requested. If queueing the resume
+fails:
+
+- the push-back remains stored and the task does not open again
+- the run stays `waiting` with its resume pending
+- the command exits non-zero and states that the task was pushed back but the
+  DAG-run could not be queued for resume
+- repeating the same push-back retries the resume without changing the
+  push-back
+
+Only one successful resume can result from those retries.
+
+If the run leaves `waiting` before this command queues the resume, an attempt
+that another request queued or started carries the push-back. A run that
+stopped instead makes the command fail with its status; the reset steps run
+when the run is retried.
+
+### Push-Back Idempotency And Concurrency
+
+Rules:
+
+- Each new push-back starts a new iteration.
+- Until the task opens again, repeating its push-back with the same canonical
+  feedback exits zero and does not change the push-back. It retries a pending
+  resume, and never starts another resume after the run leaves `waiting`.
+- Until the task opens again, a push-back with different canonical feedback
+  fails with a conflict.
+- After the task opens again, repeating a push-back pushes the task back again
+  unless `--expected-iteration` names the iteration the first command saw.
+- Concurrent completion and push-back of the same task produce exactly one
+  successful operation.
+- Two concurrent push-backs of the same task produce exactly one successful
+  push-back.
+- A push-back discards the completion input of every human task it resets,
+  including input stored before the push-back.
+
 ### Distributed Root Runs
 
 Rules:
@@ -438,6 +668,8 @@ Rules:
 - Resume is not forced to a local worker.
 - A different selected worker can execute the resumed attempt.
 - Generated outputs remain available when resume occurs on another worker.
+- Push-back uses the local CLI against the shared run store, and its resume
+  follows the same rules.
 
 Coordinator RPC shape, queue representation, and worker capability negotiation
 remain outside this spec.
@@ -446,12 +678,13 @@ remain outside this spec.
 
 Rules:
 
-- Dry run evaluates preconditions and resolves the prompt.
+- Dry run evaluates preconditions and resolves the prompt and artifact paths.
 - A successful dry-run human task becomes `succeeded` without entering
   `waiting`.
 - Dry run does not accept completion input or publish form outputs, including
   defaults.
 - Dry run starts no executor process for the human task.
+- A dry-run task never waits, so it accepts no push-back.
 
 ## Errors
 
@@ -468,14 +701,22 @@ Validation must fail without executing a step when:
 - `required` is not a unique list of declared property names
 - `additionalProperties` is not a boolean
 - a human task appears in `foreach.steps` or a handler
+- `with.push_back` is null, is not an object, or has a field other than
+  `rewind_to` and `form`
+- `rewind_to` is missing, empty, or not a string, names the task itself, or
+  names a step the task does not depend on
+- the feedback form violates Form Integration or sets `additionalProperties`
+  to `true`
+- `with.push_back` appears in a `type: agent` DAG
 
 The diagnostic must identify the invalid field path or unsupported step field.
 Validation must not value-resolve the prompt or form.
 
 ### Runtime Opening Errors
 
-The step fails without opening when prompt resolution fails or a precondition
-evaluation fails. A child-DAG invocation fails before creating child-run state
+The step fails without opening when prompt resolution fails, an artifact path
+fails to resolve to a safe relative artifact path, or a precondition evaluation
+fails. A child-DAG invocation fails before creating child-run state
 and identifies that human tasks are not permitted in child DAGs.
 
 ### Completion Error Diagnostics
@@ -506,14 +747,33 @@ Completion diagnostics must contain the listed information:
 The task and downstream steps remain unchanged for every failure before atomic
 completion.
 
+### Push-Back Error Diagnostics
+
+Push-back diagnostics contain the completion diagnostic content for the same
+failure class, with `human-task push-back` in place of `human-task complete`.
+They also contain:
+
+| Failure class | Required diagnostic content |
+| --- | --- |
+| Push-back not configured | step ID and `push_back` |
+| Invalid expected iteration | `--expected-iteration` |
+| Iteration mismatch | step ID, `iteration`, and the task's push-back iteration |
+| Completed task | step ID and `already completed` |
+| Different prior feedback | step ID and `different feedback` |
+| Resume queueing failure | step ID, `pushed back`, and `could not be queued for resume` |
+| Run left waiting before queueing | step ID, `left waiting`, and the run status |
+
+The task and every other step remain unchanged for every failure before atomic
+push-back.
+
 ### Abort, Timeout, And Cleanup
 
 - A human task has no executor process to signal or clean up.
 - Step retry, repeat, timeout, and signal fields are invalid.
 - An open task does not expire automatically.
-- A terminal or non-waiting run rejects a new completion.
-- Concurrent terminal-state and completion operations cannot partially
-  overwrite each other.
+- A terminal or non-waiting run rejects a new completion or push-back.
+- Concurrent terminal-state, completion, and push-back operations cannot
+  partially overwrite each other.
 - General run abort and deletion behavior is outside this spec.
 
 ## Examples
@@ -607,9 +867,85 @@ steps:
     run: printf 'deployed\n' > deployed.txt
 ```
 
-Completing `review_a` leaves the run waiting and does not create
-`deployed.txt`. Completing `review_b` requests one resume and creates the file
-once.
+Completing `review_a` leaves the run waiting because `deploy` also depends on
+`review_b`, and does not create `deployed.txt`. Completing `review_b` requests
+one resume and creates the file once.
+
+### Independent Task Branches
+
+```yaml
+steps:
+  - id: start
+    run: printf 'start\n'
+
+  - id: review_a
+    depends: start
+    action: human.task
+    with:
+      prompt: Confirm A
+
+  - id: after_a
+    depends: review_a
+    run: printf 'after_a\n' > after_a.txt
+
+  - id: review_b
+    depends: start
+    action: human.task
+    with:
+      prompt: Confirm B in ${DAG_RUN_ID}
+
+  - id: finish
+    depends: [after_a, review_b]
+    run: printf 'finished\n' > finished.txt
+```
+
+Completing `review_a` requests resume. The resumed run creates `after_a.txt`,
+returns to `waiting` on `review_b` with its stored prompt, and does not create
+`finished.txt`. Completing `review_b` requests another resume and creates
+`finished.txt` once.
+
+### Review Loop
+
+```yaml
+steps:
+  - id: implement
+    run: printf '%s:%s\n' "$DAG_PUSHBACK_ITERATION" "$feedback" >> attempts.txt
+
+  - id: review
+    depends: implement
+    action: human.task
+    with:
+      prompt: Review the implementation
+      push_back:
+        rewind_to: implement
+        form:
+          type: object
+          required: [feedback]
+          properties:
+            feedback:
+              type: string
+
+  - id: publish
+    depends: review
+    run: printf 'published\n' > published.txt
+```
+
+With run ID `spec031-review`, the first checkpoint leaves `attempts.txt`
+containing `:\n`. The command
+
+```sh
+dagu human-task push-back \
+  --run-id spec031-review \
+  --step review \
+  --input feedback=add-tests \
+  review-loop
+```
+
+prints `Pushed back human task review to implement; DAG-run queued for resume.`
+The resumed run appends `1:add-tests\n` to `attempts.txt` and returns to
+`waiting` with `review` open at push-back iteration `1`. Repeating the command
+with `--expected-iteration 0` fails with an iteration conflict. Completing
+`review` then creates `published.txt` once.
 
 ### Stored Form Snapshot
 

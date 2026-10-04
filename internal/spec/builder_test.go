@@ -1348,6 +1348,61 @@ steps:
 	})
 }
 
+func TestBuildStepStdin(t *testing.T) {
+	t.Parallel()
+
+	t.Run("StdinField", func(t *testing.T) {
+		t.Parallel()
+
+		data := []byte(`
+steps:
+  - id: fetch
+    run: echo data
+  - id: summarize
+    stdin: ${fetch.stdout}
+    run: cat
+    depends: fetch
+`)
+		dag, err := spec.LoadYAML(context.Background(), data)
+		require.NoError(t, err)
+		th := DAG{t: t, DAG: dag}
+		assert.Len(t, th.Steps, 2)
+		assert.Equal(t, "", th.Steps[0].Stdin)
+		assert.Equal(t, "${fetch.stdout}", th.Steps[1].Stdin)
+	})
+	t.Run("StdinRejectedForUnsupportedExecutor", func(t *testing.T) {
+		t.Parallel()
+
+		data := []byte(`
+steps:
+  - name: fetch
+    type: ssh
+    stdin: data.txt
+    command: cat
+    with:
+      host: example.com
+      user: test
+`)
+		_, err := spec.LoadYAML(context.Background(), data)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not support stdin field")
+	})
+	t.Run("StdinTrimmed", func(t *testing.T) {
+		t.Parallel()
+
+		data := []byte(`
+steps:
+  - name: reader
+    stdin: "  data.txt  "
+    run: cat
+`)
+		dag, err := spec.LoadYAML(context.Background(), data)
+		require.NoError(t, err)
+		th := DAG{t: t, DAG: dag}
+		assert.Equal(t, "data.txt", th.Steps[0].Stdin)
+	})
+}
+
 func TestBuildStepPreconditions(t *testing.T) {
 	t.Parallel()
 
@@ -1405,6 +1460,69 @@ steps:
 		assert.Len(t, th.Steps, 1)
 		assert.Len(t, th.Steps[0].Preconditions, 1)
 		assert.Equal(t, &ir.Condition{Condition: "${STATUS}", Expected: "success", Negate: true}, th.Steps[0].Preconditions[0])
+	})
+	t.Run("PreconditionNumericComparison", func(t *testing.T) {
+		t.Parallel()
+
+		data := []byte(`
+steps:
+  - name: "gate"
+    run: "echo ok"
+    preconditions:
+      - condition: "${CONFIDENCE}"
+        expected: "num:>=0.8"
+`)
+		dag, err := spec.LoadYAML(context.Background(), data)
+		require.NoError(t, err)
+		th := DAG{t: t, DAG: dag}
+		assert.Len(t, th.Steps, 1)
+		assert.Equal(t, &ir.Condition{Condition: "${CONFIDENCE}", Expected: "num:>=0.8"}, th.Steps[0].Preconditions[0])
+	})
+	t.Run("PreconditionNumericThresholdReference", func(t *testing.T) {
+		t.Parallel()
+
+		// Both reference forms resolve through different paths, so both are pinned.
+		for _, expected := range []string{
+			"num:>=${threshold}",
+			"num:>= ${params.threshold}",
+			// The same unqualified forms condition already accepts.
+			"num:>=$THRESHOLD",
+			"num:>=${env.THRESHOLD}",
+		} {
+			data := []byte(`
+steps:
+  - name: "gate"
+    run: "echo ok"
+    preconditions:
+      - condition: "0.9"
+        expected: "` + expected + `"
+`)
+			dag, err := spec.LoadYAML(context.Background(), data)
+			require.NoError(t, err, "expected %q should build", expected)
+			th := DAG{t: t, DAG: dag}
+			assert.Equal(t, expected, th.Steps[0].Preconditions[0].Expected)
+		}
+	})
+	t.Run("PreconditionInvalidNumericComparison", func(t *testing.T) {
+		t.Parallel()
+
+		// A threshold must be exactly one reference: interpolation reads like a typo.
+		for _, expected := range []string{
+			"num:", "num:0.8", "num:==0.8", "num:>=abc", "num:>=NaN",
+			"num:>=0.${threshold}", "num:>=${a}${b}", "num:=>${threshold}",
+		} {
+			data := []byte(`
+steps:
+  - name: "gate"
+    run: "echo ok"
+    preconditions:
+      - condition: "${CONFIDENCE}"
+        expected: "` + expected + `"
+`)
+			_, err := spec.LoadYAML(context.Background(), data)
+			require.Error(t, err, "expected %q should be rejected", expected)
+			assert.Contains(t, err.Error(), "expected numeric comparison is invalid")
+		}
 	})
 }
 
@@ -2642,6 +2760,27 @@ steps:
 		assert.True(t, dag.Steps[0].Container.IsExecMode())
 	})
 
+	t.Run("ContainerEnvFile", func(t *testing.T) {
+		t.Parallel()
+		yaml := `
+container:
+  image: alpine
+  env_file: .env.dag
+steps:
+  - name: step1
+    run: echo test
+    container:
+      image: alpine
+      env_file:
+        - .env.base
+        - .env.local
+`
+		dag, err := spec.LoadYAML(context.Background(), []byte(yaml))
+		require.NoError(t, err)
+		assert.Equal(t, []string{".env.dag"}, dag.Container.EnvFile)
+		assert.Equal(t, []string{".env.base", ".env.local"}, dag.Steps[0].Container.EnvFile)
+	})
+
 	// Error tests
 	errorTests := []struct {
 		name        string
@@ -2961,6 +3100,51 @@ steps:
 		step2 := dag.Steps[1]
 		assert.Equal(t, "command", step2.ExecutorConfig.Type)
 	})
+}
+
+func TestSFTPStepsCarryOnlyTransferConfig(t *testing.T) {
+	// sftp.* steps must not embed DAG-level ssh settings; the executor config
+	// carries only transfer fields so the runtime falls back to the DAG-level
+	// SSH client. Connection keys in `with` remain as an explicit override.
+	yaml := `
+ssh:
+  user: testuser
+  host: example.com
+  key: ~/.ssh/id_rsa
+steps:
+  - name: upload
+    action: sftp.upload
+    with:
+      source: /local/file
+      destination: /remote/file
+  - name: download
+    action: sftp.download
+    with:
+      source: /remote/file
+      destination: /local/file
+      host: override.example.com
+`
+	ctx := context.Background()
+	dag, err := spec.LoadYAML(ctx, []byte(yaml))
+	require.NoError(t, err)
+	require.Len(t, dag.Steps, 2)
+
+	upload := dag.Steps[0]
+	assert.Equal(t, "sftp", upload.ExecutorConfig.Type)
+	assert.Equal(t, map[string]any{
+		"direction":   "upload",
+		"source":      "/local/file",
+		"destination": "/remote/file",
+	}, upload.ExecutorConfig.Config)
+
+	download := dag.Steps[1]
+	assert.Equal(t, "sftp", download.ExecutorConfig.Type)
+	assert.Equal(t, map[string]any{
+		"direction":   "download",
+		"source":      "/remote/file",
+		"destination": "/local/file",
+		"host":        "override.example.com",
+	}, download.ExecutorConfig.Config)
 }
 
 func TestRedisInheritance(t *testing.T) {
@@ -3750,6 +3934,27 @@ steps:
 		assert.Equal(t, "from_file", envMap["LOAD_ENV_DOTENV_VAR"])
 		assert.Equal(t, "from_dag", envMap["LOAD_ENV_ENV_VAR"])
 		assert.Equal(t, "another_value", envMap["LOAD_ENV_ANOTHER_VAR"])
+	})
+
+	t.Run("LoadEnvAdjacentDotEnvFile", func(t *testing.T) {
+		// A .env file next to the DAG file is loaded even when the DAG does not
+		// declare dotenv.
+		tempDir := t.TempDir()
+		dagFile := filepath.Join(tempDir, "adjacent.yaml")
+		require.NoError(t, os.WriteFile(dagFile, []byte(`
+steps:
+  - run: echo hello
+`), 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(tempDir, ".env"), []byte("LOAD_ENV_ADJACENT_VAR=adjacent\n"), 0600))
+
+		dag, err := spec.Load(context.Background(), dagFile, spec.WithoutEval())
+		require.NoError(t, err)
+		require.NotNil(t, dag)
+
+		resolveDAGRuntimeEnv(t, dag)
+
+		envMap := envSliceMap(dag.Env)
+		assert.Equal(t, "adjacent", envMap["LOAD_ENV_ADJACENT_VAR"])
 	})
 
 	t.Run("LoadEnvWithMissingDotenvFile", func(t *testing.T) {

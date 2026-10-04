@@ -18,6 +18,7 @@ import { ProtectedRoute } from './components/ProtectedRoute';
 import { QueryFeedback } from './components/QueryFeedback';
 import { ErrorModalProvider } from '@/components/ui/error-modal';
 import { ToastProvider } from '@/components/ui/simple-toast';
+import RunProgressStack from '@/features/dags/components/dag-execution/RunProgressStack';
 import { AppBarContext } from './contexts/AppBarContext';
 import { AuthProvider, useCanAccessGitSync } from './contexts/AuthContext';
 import {
@@ -58,6 +59,7 @@ import { I18nText } from '@/i18n/I18nText';
 const AdministrationPage = React.lazy(() => import('./pages/administration'));
 const APIKeysPage = React.lazy(() => import('./pages/api-keys'));
 const APIDocsPage = React.lazy(() => import('./pages/api-docs'));
+const ArtifactsPage = React.lazy(() => import('./pages/artifacts'));
 const AuditLogsPage = React.lazy(() => import('./pages/audit-logs'));
 const BaseConfigPage = React.lazy(() => import('./pages/base-config'));
 const DAGRuns = React.lazy(() => import('./pages/dag-runs'));
@@ -104,6 +106,7 @@ const REMOTE_NODE_STORAGE_KEY = 'dagu-selected-remote-node';
 const STATIC_PAGE_TITLES = new Set([
   'API Docs',
   'API Keys',
+  'Artifacts',
   'Audit Logs',
   'Base Config',
   'Cockpit',
@@ -805,6 +808,10 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                                         element={<DAGRuns />}
                                       />
                                       <Route
+                                        path="/artifacts"
+                                        element={<ArtifactsPage />}
+                                      />
+                                      <Route
                                         path="/dag-runs/:name/:dagRunId"
                                         element={<DAGRunDetails />}
                                       />
@@ -929,6 +936,7 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                               }
                             />
                           </Routes>
+                          <RunProgressStack />
                         </BrowserRouter>
                       </QueryFeedback>
                     </ToastProvider>

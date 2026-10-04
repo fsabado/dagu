@@ -41,8 +41,13 @@ func TestParallelAbort(t *testing.T) {
 
 	deadline := time.Now().Add(harness.WaitTimeout(t))
 	for {
-		if _, err := os.Stat(dagu.ProjectPath("started-one.txt")); err == nil {
+		// Redirection creates the file before printf writes the marker.
+		content, err := os.ReadFile(dagu.ProjectPath("started-one.txt"))
+		if err == nil && string(content) == "started\n" {
 			break
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("reading start marker: %v", err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("item one never started: %s", proc.FailureOutput())
@@ -53,8 +58,6 @@ func TestParallelAbort(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	dagu.ExpectFileContent("started-one.txt", "started\n")
-
 	stopResult := dagu.RunWithEnv(env, "stop", "--run-id="+runID, "parallel_timeout_abort.yaml")
 	stopResult.ExpectExitCode(0)
 
@@ -88,4 +91,27 @@ func TestParallelPartial(t *testing.T) {
 	status := dagu.RunWithEnv(env, "status", "--run-id="+runID, "parallel_partially_succeeded.yaml")
 	status.ExpectExitCode(0)
 	require.Contains(t, status.Stdout(), "Partially Succeeded")
+}
+
+// The step outputs channel carries one entry per successful child DAG run in
+// parallel item order, and a failed child contributes no entry, so index N
+// addresses the Nth successful child rather than the Nth item.
+func TestParallelOutputsChannel(t *testing.T) {
+	t.Parallel()
+
+	dagu := harness.NewRunner(t)
+	// The failing child makes the fan-out report an error, which the parent
+	// tolerates through continue_on but still surfaces as a non-zero exit.
+	result := dagu.Run("start", "parallel_outputs_channel.yaml")
+	result.ExpectExitCode(1)
+
+	dagu.ExpectFileContains(
+		"parallel-outputs-channel.txt",
+		`[{"RESULT":"alpha"},{"RESULT":"gamma"}]`,
+	)
+	dagu.ExpectFileContains(
+		"parallel-outputs-refs.txt",
+		"first=alpha",
+		"second=gamma",
+	)
 }

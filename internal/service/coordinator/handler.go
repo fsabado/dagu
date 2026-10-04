@@ -18,12 +18,12 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/agentsession"
+	"github.com/dagucloud/dagu/v2/internal/cmn/artifactpath"
 	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
-	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/eventstore"
@@ -513,7 +513,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		if admissionToken != "" {
 			return nil, status.Error(codes.FailedPrecondition, "admission reservation requires dispatch task storage")
 		}
-		if err := h.ensureWaitingWorkerAvailability(req.Task.WorkerSelector, req.Task.TargetWorkerId); err != nil {
+		if err := h.ensureWaitingWorkerAvailability(ctx, req.Task.WorkerSelector, req.Task.TargetWorkerId); err != nil {
 			return nil, status.Error(dispatchErrorCode(err), err.Error())
 		}
 		if err := h.prepareDispatchTaskWorkspace(ctx, req.Task); err != nil {
@@ -531,7 +531,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 			h.ensureTaskAttemptMetadata(req.Task)
 		}
 
-		if err := h.dispatchToWaitingPoller(req.Task); err != nil {
+		if err := h.dispatchToWaitingPoller(ctx, req.Task); err != nil {
 			h.markPreparedAttemptDispatchFailed(ctx, req.Task, prepared, err)
 			return nil, status.Error(dispatchErrorCode(err), err.Error())
 		}
@@ -806,6 +806,10 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 		return nil, fmt.Errorf("failed to parse DAG definition: %w", err)
 	}
 	dag.SourceFile = task.SourceFile
+	// An unlabeled legacy child still needs its parent's provenance; named workspaces are already known.
+	if task.BaseConfigWorkspace != nil || (dag.BaseConfigWorkspace != nil && *dag.BaseConfigWorkspace == "") {
+		dag.BaseConfigWorkspace = task.BaseConfigWorkspace
+	}
 	labels := labelsForInitialStatus(task, dag)
 	task.Labels = strings.Join(labels, ",")
 
@@ -856,6 +860,14 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 				statusLabel = existingStatus.Status.String()
 			}
 			return nil, staleQueueDispatchError("latest attempt is " + statusLabel)
+		}
+	}
+	// A fresh start has no queue identity; an existing run keeps the queue it
+	// was enqueued into, which may be an override absent from the YAML.
+	if task.QueueName == "" {
+		task.QueueName = dag.ProcGroup()
+		if existingStatus != nil && existingStatus.ProcGroup != "" {
+			task.QueueName = existingStatus.ProcGroup
 		}
 	}
 	if existingStatus != nil && existingStatus.Status == ir.Queued {
@@ -965,6 +977,9 @@ func (h *Handler) createSubAttemptForTask(ctx context.Context, task *coordinator
 		return nil, fmt.Errorf("failed to parse DAG definition: %w", err)
 	}
 	dag.SourceFile = task.SourceFile
+	if task.BaseConfigWorkspace != nil || (dag.BaseConfigWorkspace != nil && *dag.BaseConfigWorkspace == "") {
+		dag.BaseConfigWorkspace = task.BaseConfigWorkspace
+	}
 	labels := labelsForInitialStatus(task, dag)
 	task.Labels = strings.Join(labels, ",")
 
@@ -1073,11 +1088,8 @@ func (h *Handler) prepareAttemptForDispatch(ctx context.Context, task *coordinat
 	return nil, nil
 }
 
-func (h *Handler) ensureWaitingWorkerAvailability(selector map[string]string, targetWorkerID string) error {
+func (h *Handler) ensureWaitingWorkerAvailability(ctx context.Context, selector map[string]string, targetWorkerID string) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	matched := false
 	for _, worker := range h.waitingPollers {
 		if targetWorkerID != "" && worker.workerID != targetWorkerID {
 			continue
@@ -1085,21 +1097,31 @@ func (h *Handler) ensureWaitingWorkerAvailability(selector map[string]string, ta
 		if !matchesSelector(worker.labels, selector) {
 			continue
 		}
-		matched = true
-		break
-	}
-	if matched {
+		h.mu.Unlock()
 		return nil
 	}
-	if len(selector) > 0 || targetWorkerID != "" {
-		return errNoMatchingWorkers
-	}
-	return errNoAvailableWorkers
+	h.mu.Unlock()
+	return h.waitingWorkerUnavailable(ctx, selector, targetWorkerID)
 }
 
-func (h *Handler) dispatchToWaitingPoller(task *coordinatorv1.Task) error {
+// Waiting pollers describe immediate capacity, not worker presence. Consult
+// fresh heartbeats before diagnosing a selector or target mismatch.
+func (h *Handler) waitingWorkerUnavailable(ctx context.Context, selector map[string]string, targetWorkerID string) error {
+	if len(selector) == 0 && targetWorkerID == "" {
+		return errNoAvailableWorkers
+	}
+	healthyWorkers, err := h.listHealthyWorkers(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list workers: %w", err)
+	}
+	if anyWorkerMatches(healthyWorkers, selector, targetWorkerID) {
+		return errNoAvailableWorkers
+	}
+	return errNoMatchingWorkers
+}
+
+func (h *Handler) dispatchToWaitingPoller(ctx context.Context, task *coordinatorv1.Task) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	matched := false
 	for pollerID, worker := range h.waitingPollers {
@@ -1113,15 +1135,17 @@ func (h *Handler) dispatchToWaitingPoller(task *coordinatorv1.Task) error {
 		select {
 		case worker.taskChan <- task:
 			delete(h.waitingPollers, pollerID)
+			h.mu.Unlock()
 			return nil
 		default:
 			delete(h.waitingPollers, pollerID)
 		}
 	}
-	if (len(task.WorkerSelector) > 0 || task.TargetWorkerId != "") && !matched {
-		return errNoMatchingWorkers
+	h.mu.Unlock()
+	if matched {
+		return errNoAvailableWorkers
 	}
-	return errNoAvailableWorkers
+	return h.waitingWorkerUnavailable(ctx, task.WorkerSelector, task.TargetWorkerId)
 }
 
 func dispatchErrorCode(err error) codes.Code {
@@ -1131,8 +1155,10 @@ func dispatchErrorCode(err error) codes.Code {
 		return codes.FailedPrecondition
 	case errors.As(err, &staleErr):
 		return codes.FailedPrecondition
-	default:
+	case errors.Is(err, errNoAvailableWorkers):
 		return codes.Unavailable
+	default:
+		return codes.Internal
 	}
 }
 
@@ -1638,13 +1664,23 @@ func restoreStaleLeaseFailure(status *ir.DAGRunStatus, lease *dispatch.DAGRunLea
 }
 
 func (h *Handler) listHealthyWorkers(ctx context.Context) ([]dispatch.WorkerHeartbeatRecord, error) {
+	var records []dispatch.WorkerHeartbeatRecord
 	if h.workerHeartbeatStore == nil {
-		return nil, nil
-	}
-
-	records, err := h.workerHeartbeatStore.List(ctx)
-	if err != nil {
-		return nil, err
+		h.mu.Lock()
+		for _, hb := range h.heartbeats {
+			records = append(records, dispatch.WorkerHeartbeatRecord{
+				WorkerID:        hb.workerID,
+				Labels:          hb.labels,
+				LastHeartbeatAt: hb.lastHeartbeatAt.UnixMilli(),
+			})
+		}
+		h.mu.Unlock()
+	} else {
+		var err error
+		records, err = h.workerHeartbeatStore.List(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now().UTC()
@@ -2351,34 +2387,18 @@ func (h *Handler) transformArtifactPaths(
 			return fmt.Errorf("read DAG for artifact path: DAG is nil")
 		}
 
-		baseDir := h.artifactDir
-		if dag.Artifacts != nil && dag.Artifacts.Dir != "" {
-			baseDir = dag.Artifacts.Dir
+		overrideDir := ""
+		if dag.Artifacts != nil {
+			overrideDir = dag.Artifacts.Dir
 		}
-		baseDir = strings.TrimSpace(baseDir)
-		if baseDir == "" {
-			return fmt.Errorf("artifact directory is not configured")
-		}
-		resolver := cmnvalue.NewResolver(cmnvalue.StaticScope{}, cmnvalue.RuntimeScope{})
-		baseDir, err = resolver.String(ctx, baseDir, cmnvalue.CoordinatorArtifactBaseDirField("artifacts.dir"))
+
+		// The worker directory is throwaway staging, so a fresh coordinator
+		// path is assigned rather than mirroring the reported name.
+		artifactDir, err := artifactpath.NewRunDir(ctx, h.artifactDir, overrideDir, dag.Name, incoming.DAGRunID, artifactRunTime(incoming))
 		if err != nil {
-			return fmt.Errorf("expand artifact directory: %w", err)
+			return fmt.Errorf("resolve artifact directory: %w", err)
 		}
-		baseDir = strings.TrimSpace(baseDir)
-		if baseDir == "" {
-			return fmt.Errorf("artifact directory is empty after expansion")
-		}
-
-		archiveName := filepath.Base(filepath.Clean(incoming.ArchiveDir))
-		if archiveName == "." || archiveName == string(filepath.Separator) || archiveName == "" {
-			return fmt.Errorf("invalid artifact directory %q", incoming.ArchiveDir)
-		}
-
-		incoming.ArchiveDir = filepath.Join(
-			baseDir,
-			fileutil.SafeName(dag.Name),
-			archiveName,
-		)
+		incoming.ArchiveDir = artifactDir
 	}
 	if incoming.ArchiveDir == "" {
 		return nil
@@ -2387,6 +2407,15 @@ func (h *Handler) transformArtifactPaths(
 		return fmt.Errorf("create artifact directory: %w", err)
 	}
 	return nil
+}
+
+// artifactRunTime reports the time that places a run in the artifact date
+// tree, falling back to now when the reported start time is unusable.
+func artifactRunTime(status *ir.DAGRunStatus) time.Time {
+	if startedAt, err := stringutil.ParseTime(status.StartedAt); err == nil && !startedAt.IsZero() {
+		return startedAt
+	}
+	return time.Now()
 }
 
 // persistChatMessages writes chat messages from status to the attempt.
@@ -3518,6 +3547,10 @@ func (h *Handler) RequestCancel(ctx context.Context, req *coordinatorv1.RequestC
 	return &coordinatorv1.RequestCancelResponse{Accepted: true}, nil
 }
 
+// notStartedCancellationReason is the run error shown to users for a run
+// canceled before any worker started it.
+const notStartedCancellationReason = "canceled before the run started"
+
 func finalizeNotStartedCancellation(ctx context.Context, attempt dagrun.Attempt) error {
 	if attempt == nil {
 		return nil
@@ -3534,7 +3567,7 @@ func finalizeNotStartedCancellation(ctx context.Context, attempt dagrun.Attempt)
 	finishedAt := stringutil.FormatTime(time.Now().UTC())
 	status.Status = ir.Aborted
 	status.FinishedAt = finishedAt
-	status.Error = context.Canceled.Error()
+	status.Error = notStartedCancellationReason
 	status.WorkerID = ""
 	status.PID = 0
 	status.PIDStartedAt = 0

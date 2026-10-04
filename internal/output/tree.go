@@ -5,6 +5,7 @@ package output
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,20 +190,28 @@ func (r *Renderer) renderStepContent(node *ir.Node, isLast bool, prefix string) 
 	hasError := node.Error != "" && node.Status == ir.NodeFailed
 	hasSubRuns := len(node.SubRuns) > 0
 	hasHumanTask := node.Status == ir.NodeWaiting && node.Step.HumanTask != nil
+	interactionDetails := agentInteractionDetails(node)
+	hasInteractions := len(interactionDetails) > 0
 	hasBuild := node.Build != nil
 
-	hasFollowingContent := hasOutput || hasError || hasSubRuns || hasHumanTask || hasBuild
+	hasFollowingContent := hasOutput || hasError || hasSubRuns || hasHumanTask || hasInteractions || hasBuild
 	wroteField := r.renderCommands(&buf, node, cPrefix, hasFollowingContent)
 
 	if hasBuild {
 		r.addFieldSpacing(&buf, wroteField, cPrefix)
-		buf.WriteString(r.renderBuild(node.Build, !hasOutput && !hasError && !hasSubRuns && !hasHumanTask, cPrefix))
+		buf.WriteString(r.renderBuild(node.Build, !hasOutput && !hasError && !hasSubRuns && !hasHumanTask && !hasInteractions, cPrefix))
 		wroteField = true
 	}
 
 	if hasHumanTask {
 		r.addFieldSpacing(&buf, wroteField, cPrefix)
-		buf.WriteString(r.renderHumanTask(node, !hasOutput && !hasError && !hasSubRuns, cPrefix))
+		buf.WriteString(r.renderHumanTask(node, !hasOutput && !hasError && !hasSubRuns && !hasInteractions, cPrefix))
+		wroteField = true
+	}
+
+	if hasInteractions {
+		r.addFieldSpacing(&buf, wroteField, cPrefix)
+		buf.WriteString(r.renderDetails(interactionDetails, !hasOutput && !hasError && !hasSubRuns, cPrefix))
 		wroteField = true
 	}
 
@@ -261,10 +270,65 @@ func (r *Renderer) renderHumanTask(node *ir.Node, isLastSection bool, prefix str
 		"step id: " + node.Step.ID,
 		"prompt: " + node.Step.HumanTask.Prompt,
 	}
+	if len(node.Step.HumanTask.Artifacts) > 0 {
+		details = append(details, "artifacts: "+strings.Join(node.Step.HumanTask.Artifacts, ", "))
+	}
 	if len(node.Step.HumanTask.Form) > 0 {
 		details = append(details, "form: "+string(node.Step.HumanTask.Form))
 	}
+	if pushBack := node.Step.HumanTask.PushBack; pushBack != nil {
+		details = append(details, "push back: rewind to "+pushBack.RewindTo)
+		if len(pushBack.Form) > 0 {
+			details = append(details, "push-back form: "+string(pushBack.Form))
+		}
+	}
+	if node.ApprovalIteration > 0 {
+		details = append(details, "push-back iteration: "+strconv.Itoa(node.ApprovalIteration))
+	}
+	return r.renderDetails(details, isLastSection, prefix)
+}
 
+// agentInteractionDetails describes the agent requests a waiting step needs answered.
+func agentInteractionDetails(node *ir.Node) []string {
+	if node.Status != ir.NodeWaiting || node.AgentSession == nil {
+		return nil
+	}
+	var details []string
+	for _, interaction := range node.AgentSession.Interactions {
+		if interaction.Status != ir.AgentInteractionPending {
+			continue
+		}
+		switch interaction.Kind {
+		case ir.AgentInteractionQuestion:
+			for _, question := range interaction.Questions {
+				details = append(details, "question: "+question.Question)
+			}
+		case ir.AgentInteractionPermission:
+			detail := "permission: " + interaction.Permission
+			if len(interaction.Patterns) > 0 {
+				detail += " (" + strings.Join(interaction.Patterns, ", ") + ")"
+			}
+			details = append(details, detail)
+		}
+		if interaction.ExpiresAt != "" {
+			details = append(details, "expires at: "+formatInteractionTime(interaction.ExpiresAt))
+		}
+	}
+	return details
+}
+
+// formatInteractionTime shows an RFC 3339 interaction time in local time,
+// like the run times in the header.
+func formatInteractionTime(value string) string {
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return value
+	}
+	return stringutil.FormatTime(t.Local())
+}
+
+// renderDetails renders one line per detail, splitting multi-line values.
+func (r *Renderer) renderDetails(details []string, isLastSection bool, prefix string) string {
 	var buf strings.Builder
 	var lines []string
 	for _, detail := range details {

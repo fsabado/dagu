@@ -598,6 +598,8 @@ Dagu includes built-in actions that run within the Dagu process or on the select
 | `http.request` | HTTP requests with headers, auth, and request bodies |
 | `chat.completion` | Run an LLM chat completion step |
 | `harness.run` | Run external coding-agent CLIs such as Claude Code, Codex, Gemini CLI, Cursor, and DeepSeek Harness |
+| `browser.extract` / `browser.run` | Automate websites in a local Chrome with natural-language actions, structured extraction, and human input |
+| `computer.extract` / `computer.run` | Automate desktop applications on macOS and Windows workers with natural-language tasks, screen extraction, and human input |
 | `postgres.query` / `postgres.import` | PostgreSQL queries and imports |
 | `sqlite.query` / `sqlite.import` | SQLite queries and imports |
 | `redis.<operation>` | Redis commands, pipelines, and Lua scripts |
@@ -611,6 +613,12 @@ Dagu includes built-in actions that run within the Dagu process or on the select
 | `wait.duration` / `wait.until` / `wait.file` / `wait.http` | Wait for time, file state, or HTTP readiness |
 | `human.task` | Wait for acknowledgement or typed operator input before downstream steps continue |
 | `mail.send` | Send email via SMTP |
+| `mail.search` | Find email in an IMAP or Gmail mailbox |
+| `mail.organize` | Mark, move, archive, or trash email |
+| `xlsx.read` / `xlsx.info` / `xlsx.list_sheets` | Read typed rows and describe `.xlsx` workbooks without a spreadsheet application |
+| `xlsx.write` / `xlsx.append` / `xlsx.update_rows` | Write reports, append rows, and write per-row results back into a workbook |
+| `xlsx.validate` / `xlsx.write_cells` / `xlsx.sheet` / `xlsx.convert` | Check rows against rules, fill template cells and formulas, manage sheets, and export a sheet to CSV, JSON, or JSONL |
+| `xlsx.extract` | Read fields out of a form-like sheet: a model names the cells, the engine reads their typed values, and a layout seen before with the same instruction and fields is read from a cache without a model call |
 | `template.render` | Text generation with template rendering |
 | `router.route` | Conditional step routing based on values and patterns |
 | `dag.run` | Invoke another DAG as a sub-workflow with params and dependencies |
@@ -745,6 +753,18 @@ JSON or text format logging (`DAGU_LOG_FORMAT`). Logs are stored per-run with se
 - Per-DAG webhook endpoints with token authentication
 - Delivery requires the event store, notification store, and writable notification state store
 
+SMTP inherited from global or workspace `base.yaml` is omitted from new run
+snapshots (`dag.json`). Retries, restarts, and queued runs use the current base
+SMTP configuration. Removing it disables email notifications unless the original
+DAG defines SMTP. Other base settings and the original DAG YAML remain captured.
+Runs without captured base configuration use the current base configuration in
+full; an explicitly empty captured configuration only reloads SMTP.
+
+SMTP written directly in DAG YAML, values stored in `env`, distributed task
+payloads, and workspace bundles are still retained. Existing history files and
+backups are not rewritten. Upgrade processes that read run snapshots (CLI, API,
+and scheduler) together so retries can reload base SMTP.
+
 Scoped notification routing is broken in v2.11.0-v2.11.2. Use v2.11.3 or later.
 
 ## Artifacts
@@ -813,7 +833,7 @@ See the [distributed execution documentation](https://docs.dagu.sh/server-admin/
 | `dagu cleanup <dag>` | Clean up old run data |
 | `dagu version` | Show version |
 
-The table lists the most common commands. The binary ships 31 in total, including `exec`, `ls`, `ps`, `rm`, `sync`, `schema`, `example`, `config`, `profile`, `context`, `license`, `upgrade`, and `completion`; run `dagu --help` or see the [CLI reference](https://docs.dagu.sh/getting-started/cli) for all of them.
+The table lists the most common commands. The binary ships 36 in total, including `exec`, `ls`, `ps`, `rm`, `prune-artifacts`, `sync`, `schema`, `example`, `config`, `profile`, `context`, `license`, `upgrade`, and `completion`; run `dagu --help` or see the [CLI reference](https://docs.dagu.sh/getting-started/cli) for all of them.
 
 ## Environment Variables
 
@@ -868,10 +888,30 @@ set or append the verified client address. Keep trusted proxy ranges narrow.
 | `DAGU_DAG_DISCOVERY_SYMLINKS` | `false` | Include recursive file symlinks and allow external targets |
 | `DAGU_LOG_DIR` | `~/.local/share/dagu/logs` | Log files |
 | `DAGU_DATA_DIR` | `~/.local/share/dagu/data` | Application state |
+| `DAGU_SUSPEND_FLAGS_DIR` | `{DAGU_DATA_DIR}/suspend` | DAG suspension flags |
 | `DAGU_TOOLS_DIR` | `{DAGU_DATA_DIR}/tools` | Managed DAG tool cache |
 | `DAGU_DAG_STATE_DIR` | `{DAGU_DATA_DIR}/dag-state` | Persistent DAG state files |
 | `DAGU_DAG_RUN_WORK_DIR` | `{DAGU_DATA_DIR}/dag-run-work` | Per-run working directories |
 | `DAGU_BASE_CONFIG` | - | Shared base configuration applied to all DAGs |
+
+Suspend flags default to `paths.data_dir/suspend`. Explicit
+`paths.suspend_flags_dir` settings, including environment variables and legacy
+configuration keys, retain their configured location and disable legacy fallback
+and migration. A path outside `data_dir` produces a warning because all server
+and scheduler processes must share the same suspension state.
+
+With the default path, flags in the previous default directory remain readable.
+After acquiring leadership, the scheduler copies them into `data_dir/suspend`
+before processing runs. Startup preserves the original flags. Suspending a DAG
+writes its new flag before removing its legacy flag; resuming removes both.
+Migration and state changes are serialized across processes.
+
+During upgrade, make the same legacy flags available to the server and scheduler;
+reconcile any private per-host flag directories first. Upgrade all processes
+together before changing suspension state. Older processes writing legacy flags
+are not supported alongside upgraded processes. Until scheduler migration has
+completed, include the legacy directory in backups. When rolling back, explicitly
+configure the older version to use the new shared suspend directory.
 
 Set the per-run work root in `config.yaml`, or use the corresponding environment variable above:
 
@@ -929,6 +969,7 @@ OIDC variables: `DAGU_AUTH_OIDC_CLIENT_ID`, `DAGU_AUTH_OIDC_CLIENT_SECRET`, `DAG
 | `DAGU_SCHEDULER_ZOMBIE_DETECTION_INTERVAL` | `45s` | Zombie run detection interval (`0` to disable) |
 | `DAGU_SCHEDULER_LOCK_STALE_THRESHOLD` | `30s` | HA lock stale threshold |
 | `DAGU_QUEUE_ENABLED` | `true` | Enable queue system |
+| `DAGU_SIGNAL_PROPAGATION` | `false` | Forward shutdown signals (`SIGINT`/`SIGTERM`) received by the server or scheduler to the process groups of running DAG-run subprocesses it launched |
 
 ### Coordinator / Worker
 
@@ -1018,7 +1059,7 @@ The embedded API is experimental and may change. See the [embedded API documenta
 
 ## Development
 
-**Prerequisites:** [Go 1.27+](https://go.dev/doc/install), [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation)
+**Prerequisites:** [Go (latest stable)](https://go.dev/doc/install), [Node.js (latest stable)](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation)
 
 ```sh
 git clone https://github.com/dagucloud/dagu.git && cd dagu
@@ -1027,7 +1068,11 @@ make test     # Run tests with race detection
 make lint     # Run golangci-lint
 ```
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow and code standards.
+For the local UI development loop, run `make run-server` from the repository
+root, then follow [`ui/README.md`](./ui/README.md). See
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) for a human-oriented repository map and
+[`CONTRIBUTING.md`](./CONTRIBUTING.md) for the focused first-PR workflow and
+code standards.
 
 ## Acknowledgements
 

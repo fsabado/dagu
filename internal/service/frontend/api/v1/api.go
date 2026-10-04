@@ -62,11 +62,12 @@ import (
 
 var _ api.StrictServerInterface = (*API)(nil)
 
-var loadBaseOpenAPISpec = sync.OnceValues(api.GetSwagger)
+var loadBaseOpenAPISpec = sync.OnceValues(api.GetSpec)
 
 type API struct {
 	dagRepository        *persis.DAGRepository
 	dagRunRepository     *persis.DAGRunRepository
+	artifactRepository   *persis.ArtifactRepository
 	dagRunMgr            runtime.Manager
 	queueStore           queue.QueueStore
 	procRepository       processRepository
@@ -102,6 +103,7 @@ type API struct {
 	workspaceStore       workspace.Store
 	leaseStaleThreshold  time.Duration
 	schedulerStateStore  schedulerstate.Store
+	schedulerPauseStore  schedulerstate.PauseStore
 	dagMutationNotifier  func(fileName string)
 	wikiMutationNotifier func()
 	baseConfigProvider   dagsettings.BaseConfigProvider
@@ -129,6 +131,7 @@ type NotificationService interface {
 	GetChannel(ctx context.Context, channelID string) (*notificationmodel.Channel, error)
 	SaveChannel(ctx context.Context, channel *notificationmodel.Channel, updatedBy string) (*notificationmodel.Channel, error)
 	DeleteChannel(ctx context.Context, channelID string) error
+	SendChannelTest(ctx context.Context, channelID string) ([]notificationservice.TestResult, error)
 	SendTest(ctx context.Context, dagName, targetID string, eventType eventstore.EventType) ([]notificationservice.TestResult, error)
 }
 
@@ -174,9 +177,11 @@ type AuthService interface {
 	EnableWebhookHMAC(ctx context.Context, dagName string, authMode auth.WebhookAuthMode, enforcementMode auth.WebhookHMACEnforcementMode) (*authservice.WebhookHMACSecretResult, error)
 	ConfigureWebhookHMAC(ctx context.Context, dagName string, authMode auth.WebhookAuthMode, enforcementMode auth.WebhookHMACEnforcementMode) (*auth.Webhook, error)
 	ConfigureWebhookProfiles(ctx context.Context, dagName string, allowedProfiles []string) (*auth.Webhook, error)
+	CreateWebhookProfileToken(ctx context.Context, dagName, name, profile, creatorID string) (*authservice.CreateWebhookResult, error)
+	RevokeWebhookProfileToken(ctx context.Context, dagName, tokenID string) (*auth.Webhook, error)
 	RegenerateWebhookHMACSecret(ctx context.Context, dagName string) (*authservice.WebhookHMACSecretResult, error)
 	DisableWebhookHMAC(ctx context.Context, dagName string) (*auth.Webhook, error)
-	AuthorizeWebhookRequest(ctx context.Context, input authservice.AuthorizeWebhookRequestInput) (*auth.Webhook, error)
+	AuthorizeWebhookRequest(ctx context.Context, input authservice.AuthorizeWebhookRequestInput) (*authservice.WebhookAuthorization, error)
 	ToggleWebhook(ctx context.Context, dagName string, enabled bool) (*auth.Webhook, error)
 	ValidateWebhookToken(ctx context.Context, dagName, token string) (*auth.Webhook, error)
 	HasWebhookStore() bool
@@ -304,6 +309,13 @@ func WithRemoteNodeStore(s remotenode.Store) APIOption {
 	}
 }
 
+// WithArtifactRepository returns an APIOption that sets the artifact repository.
+func WithArtifactRepository(ar *persis.ArtifactRepository) APIOption {
+	return func(a *API) {
+		a.artifactRepository = ar
+	}
+}
+
 // WithWorkspaceStore returns an APIOption that sets the workspace store.
 func WithWorkspaceStore(s workspace.Store) APIOption {
 	return func(a *API) {
@@ -322,6 +334,14 @@ func WithOIDCRoleMapping(load func() config.OIDCRoleMapping) APIOption {
 func WithSchedulerStateStore(store schedulerstate.Store) APIOption {
 	return func(a *API) {
 		a.schedulerStateStore = store
+	}
+}
+
+// WithSchedulerPauseStore sets the store holding the cluster-wide scheduler
+// pause flag.
+func WithSchedulerPauseStore(store schedulerstate.PauseStore) APIOption {
+	return func(a *API) {
+		a.schedulerPauseStore = store
 	}
 }
 
@@ -460,6 +480,7 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router, writeTimeout ti
 		r.Use(a.restAuditSeedMiddleware())
 		r.Use(frontendauth.ClientIPMiddleware())
 		r.Use(frontendauth.LoginRateLimitMiddleware(loginPath))
+		r.Use(stepLogDownloadFormAuth(mountedAPIPath))
 		r.Use(frontendauth.Middleware(authOptions))
 		r.Use(a.restAuditSubjectMiddleware())
 		r.Use(a.syncProxyAuthorization(mountedAPIPath))
@@ -467,6 +488,7 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router, writeTimeout ti
 		if a.config.Server.StrictValidation {
 			r.Use(a.createValidatorMiddleware(swagger))
 		}
+		r.Use(logDownloadDeadline(mountedAPIPath))
 		r.Use(WithRemoteNode(a.remoteNodeResolver, mountedAPIPath))
 		r.Use(WebhookRequestContextMiddleware(a.webhookMaxPayloadSize()))
 
@@ -475,6 +497,9 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router, writeTimeout ti
 			resetSyncWriteDeadline(writeTimeout),
 		}
 		options := api.StrictHTTPServerOptions{
+			RequestErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, _ error) {
+				a.handleError(w, r, ErrInvalidRequestBody)
+			},
 			ResponseErrorHandlerFunc: a.handleError,
 		}
 		handler := api.NewStrictHandlerWithOptions(a, middlewares, options)
@@ -1148,6 +1173,7 @@ func valueOf[T any](ptr *T) T {
 func toPagination[T any](paginatedResult pagination.PaginatedResult[T]) api.Pagination {
 	return api.Pagination{
 		CurrentPage:  paginatedResult.CurrentPage,
+		HasNextPage:  paginatedResult.HasNextPage,
 		NextPage:     paginatedResult.NextPage,
 		PrevPage:     paginatedResult.PrevPage,
 		TotalPages:   paginatedResult.TotalPages,

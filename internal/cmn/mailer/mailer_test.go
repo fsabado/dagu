@@ -14,9 +14,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"math/big"
+	"mime"
+	"mime/multipart"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"os"
 	"path/filepath"
@@ -504,14 +509,16 @@ func TestComposeMailSanitizesHeaders(t *testing.T) {
 	t.Parallel()
 
 	client := New(Config{})
-	payload := string(client.composeMail(
+	payloadBytes, err := client.composeMail(
 		[]string{"to@example.com\r\nX-Dagu-To: injected"},
 		nil,
 		"from@example.com\r\nX-Dagu-From: injected",
 		"subject\r\nX-Dagu-Subject: injected",
 		"body",
 		nil,
-	))
+	)
+	require.NoError(t, err)
+	payload := string(payloadBytes)
 
 	assert.NotContains(t, payload, "\r\nX-Dagu-To:")
 	assert.NotContains(t, payload, "\r\nX-Dagu-From:")
@@ -519,6 +526,150 @@ func TestComposeMailSanitizesHeaders(t *testing.T) {
 	assert.Contains(t, payload, "To: to@example.comX-Dagu-To: injected")
 	assert.Contains(t, payload, "From: from@example.comX-Dagu-From: injected")
 	assert.Contains(t, payload, "Subject: subjectX-Dagu-Subject: injected")
+}
+
+func TestComposeMailMessageIDUsesFromDomain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		from   string
+		suffix string
+	}{
+		{name: "bare address", from: "sender@example.com", suffix: "@example.com>"},
+		{name: "display name", from: "Daily Digest <sender@example.com>", suffix: "@example.com>"},
+		{name: "subdomain", from: "sender@mail.example.co.jp", suffix: "@mail.example.co.jp>"},
+		{name: "no domain", from: "sender", suffix: "@dagu.local>"},
+		{name: "empty domain", from: "sender@", suffix: "@dagu.local>"},
+	}
+
+	client := New(Config{})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			payload, err := client.composeMail(
+				[]string{"to@example.com"},
+				nil,
+				tt.from,
+				"subject",
+				"body",
+				nil,
+			)
+			require.NoError(t, err)
+
+			message, err := mail.ReadMessage(bytes.NewReader(payload))
+			require.NoError(t, err)
+			messageID := message.Header.Get("Message-ID")
+			require.True(t, strings.HasPrefix(messageID, "<"), "got %q", messageID)
+			assert.True(t, strings.HasSuffix(messageID, tt.suffix), "got %q", messageID)
+		})
+	}
+}
+
+func TestComposeMailWithoutAttachmentsIsSinglePart(t *testing.T) {
+	t.Parallel()
+
+	client := New(Config{})
+	body := "<!DOCTYPE html><html><body>Hello</body></html>"
+	payload, err := client.composeMail(
+		[]string{"to@example.com"},
+		nil,
+		"from@example.com",
+		"subject",
+		body,
+		nil,
+	)
+	require.NoError(t, err)
+
+	message, err := mail.ReadMessage(bytes.NewReader(payload))
+	require.NoError(t, err)
+	require.Equal(t, "1.0", message.Header.Get("MIME-Version"))
+	require.NotEmpty(t, message.Header.Get("Message-ID"))
+	_, err = mail.ParseDate(message.Header.Get("Date"))
+	require.NoError(t, err)
+
+	mediaType, params, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+	require.NoError(t, err)
+	assert.Equal(t, "text/html", mediaType)
+	assert.Empty(t, params["boundary"])
+
+	encodedBody, err := io.ReadAll(message.Body)
+	require.NoError(t, err)
+	decodedBody, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encodedBody)))
+	require.NoError(t, err)
+	assert.Equal(t, body, string(decodedBody))
+}
+
+func TestComposeMailWithoutReadableAttachmentsIsSinglePart(t *testing.T) {
+	t.Parallel()
+
+	client := New(Config{})
+	payload, err := client.composeMail(
+		[]string{"to@example.com"},
+		nil,
+		"from@example.com",
+		"subject",
+		"body",
+		[]string{filepath.Join(t.TempDir(), "missing.txt")},
+	)
+	require.NoError(t, err)
+
+	message, err := mail.ReadMessage(bytes.NewReader(payload))
+	require.NoError(t, err)
+	mediaType, params, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+	require.NoError(t, err)
+	assert.Equal(t, "text/html", mediaType)
+	assert.Empty(t, params["boundary"])
+}
+
+func TestComposeMailWithAttachmentsUsesUniqueBoundaries(t *testing.T) {
+	t.Parallel()
+
+	attachment := filepath.Join(t.TempDir(), "attachment.txt")
+	require.NoError(t, os.WriteFile(attachment, []byte("hello"), 0600))
+
+	client := New(Config{})
+	boundaries := make([]string, 2)
+	messageIDs := make([]string, 2)
+	for i := range boundaries {
+		payload, err := client.composeMail(
+			[]string{"to@example.com"},
+			nil,
+			"from@example.com",
+			"subject",
+			"body",
+			[]string{attachment},
+		)
+		require.NoError(t, err)
+		message, err := mail.ReadMessage(bytes.NewReader(payload))
+		require.NoError(t, err)
+		require.Equal(t, "1.0", message.Header.Get("MIME-Version"))
+		messageIDs[i] = message.Header.Get("Message-ID")
+		require.NotEmpty(t, messageIDs[i])
+		_, err = mail.ParseDate(message.Header.Get("Date"))
+		require.NoError(t, err)
+		mediaType, params, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+		require.NoError(t, err)
+		require.Equal(t, "multipart/mixed", mediaType)
+		boundaries[i] = params["boundary"]
+		require.NotEmpty(t, boundaries[i])
+
+		parts := multipart.NewReader(message.Body, boundaries[i])
+		partCount := 0
+		for {
+			_, err := parts.NextPart()
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+			partCount++
+		}
+		assert.Equal(t, 2, partCount)
+	}
+
+	assert.NotEqual(t, boundaries[0], boundaries[1])
+	assert.NotEqual(t, messageIDs[0], messageIDs[1])
 }
 
 func TestSanitizeHeaderFieldRemovesControlCharactersAndTruncates(t *testing.T) {
@@ -543,33 +694,91 @@ func TestComposeMailAttachmentTransferEncodingHeaderAppearsOncePerPart(t *testin
 	require.NoError(t, os.WriteFile(attachment, []byte("hello"), 0600))
 
 	client := New(Config{})
-	payload := string(client.composeMail(
+	payloadBytes, err := client.composeMail(
 		[]string{"to@example.com"},
 		nil,
 		"from@example.com",
 		"subject",
 		"body",
 		[]string{attachment},
-	))
+	)
+	require.NoError(t, err)
+	payload := string(payloadBytes)
 
 	require.Equal(t, 2, strings.Count(payload, "Content-Transfer-Encoding: base64"))
 }
 
-func TestComposeMailEndsWithClosingBoundary(t *testing.T) {
+func TestComposeMultipartMailEndsWithClosingBoundary(t *testing.T) {
 	t.Parallel()
 
+	attachment := filepath.Join(t.TempDir(), "attachment.txt")
+	require.NoError(t, os.WriteFile(attachment, []byte("hello"), 0600))
+
 	client := New(Config{})
-	payload := string(client.composeMail(
+	payload, err := client.composeMail(
 		[]string{"to@example.com"},
 		nil,
 		"from@example.com",
 		"subject",
 		"body",
-		nil,
-	))
+		[]string{attachment},
+	)
+	require.NoError(t, err)
+	message, err := mail.ReadMessage(bytes.NewReader(payload))
+	require.NoError(t, err)
+	_, params, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+	require.NoError(t, err)
+	boundary := params["boundary"]
+	require.NotEmpty(t, boundary)
 
-	require.True(t, strings.HasSuffix(payload, "--"+boundary+"--\r\n"))
-	require.NotContains(t, payload, "--"+boundary+"--\r\n\r\n")
+	require.True(t, strings.HasSuffix(string(payload), "--"+boundary+"--\r\n"))
+	require.NotContains(t, string(payload), "--"+boundary+"--\r\n\r\n")
+}
+
+// Attachments carry the type their name implies, or their content when the
+// name implies none, so a PDF report is not delivered as plain text.
+func TestComposeMultipartMailTypesAttachments(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	files := map[string][]byte{
+		"report.pdf":           []byte("%PDF-1.7 report"),
+		"chart.png":            []byte("\x89PNG\r\n\x1a\nchart"),
+		"step-output.dagu-log": []byte("step finished\n"),
+	}
+	var paths []string
+	for name, data := range files {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, data, 0600))
+		paths = append(paths, path)
+	}
+
+	payload, err := New(Config{}).composeMail(
+		[]string{"to@example.com"}, nil, "from@example.com", "subject", "body", paths,
+	)
+	require.NoError(t, err)
+
+	message, err := mail.ReadMessage(bytes.NewReader(payload))
+	require.NoError(t, err)
+	_, params, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+	require.NoError(t, err)
+	reader := multipart.NewReader(message.Body, params["boundary"])
+	types := map[string]string{}
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		if name := part.FileName(); name != "" {
+			types[name] = part.Header.Get("Content-Type")
+		}
+	}
+	assert.Equal(t, map[string]string{
+		"report.pdf":           "application/pdf",
+		"chart.png":            "image/png",
+		"step-output.dagu-log": "text/plain; charset=utf-8",
+	}, types)
 }
 
 func TestSendWithoutAuthSkipsStartTLS(t *testing.T) {
@@ -870,7 +1079,7 @@ func (m *Client) sendWithNoAuth(
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), mailTimeout)
 	defer cancel()
-	return m.send(ctx, from, to, nil, nil, subject, body, attachments, false)
+	return m.send(ctx, Message{From: from, To: to, Subject: subject, Body: body, Attachments: attachments}, false)
 }
 
 func (m *Client) sendWithAuth(
@@ -881,7 +1090,7 @@ func (m *Client) sendWithAuth(
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), mailTimeout)
 	defer cancel()
-	return m.send(ctx, from, to, nil, nil, subject, body, attachments, true)
+	return m.send(ctx, Message{From: from, To: to, Subject: subject, Body: body, Attachments: attachments}, true)
 }
 
 // mockSMTPServer creates a mock SMTP server for testing
@@ -1162,4 +1371,141 @@ func TestMailerTimeout(t *testing.T) {
 		err = mailer.Send(ctx, "from@example.com", []string{"to@example.com"}, "Subject", "Body", nil)
 		assert.Error(t, err)
 	})
+}
+
+func newTLSRecordingServer(t *testing.T) *smtpRecordingServer {
+	t.Helper()
+	server, err := newSMTPRecordingServer()
+	require.NoError(t, err)
+	server.listener = tls.NewListener(server.listener, &tls.Config{
+		Certificates: []tls.Certificate{newTestTLSCertificate(t)},
+		MinVersion:   tls.VersionTLS12,
+	})
+	t.Cleanup(func() { _ = server.Close() })
+	go server.Serve()
+	return server
+}
+
+func TestSendWithImplicitTLS(t *testing.T) {
+	t.Parallel()
+
+	server := newTLSRecordingServer(t)
+	host, port, err := net.SplitHostPort(server.Address())
+	require.NoError(t, err)
+	client := New(Config{
+		Host: host, Port: port, Username: "sender@example.com", Password: "secret",
+		Security: SecurityTLS, SkipTLSVerify: true,
+	})
+
+	err = client.Send(context.Background(), "sender@example.com", []string{"to@example.com"}, "Subject", "Body", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"to@example.com"}, server.RecordedRecipients())
+}
+
+func TestSendWithImplicitTLSVerifiesCertificate(t *testing.T) {
+	t.Parallel()
+
+	server := newTLSRecordingServer(t)
+	host, port, err := net.SplitHostPort(server.Address())
+	require.NoError(t, err)
+	client := New(Config{
+		Host: host, Port: port, Username: "sender@example.com", Password: "secret", Security: SecurityTLS,
+	})
+
+	err = client.Send(context.Background(), "sender@example.com", []string{"to@example.com"}, "Subject", "Body", nil)
+	var certErr *tls.CertificateVerificationError
+	require.ErrorAs(t, err, &certErr)
+	assert.Empty(t, server.RecordedRecipients())
+}
+
+func TestSendWithRequiredSTARTTLSRefusesPlainServer(t *testing.T) {
+	t.Parallel()
+
+	server, err := newSMTPRecordingServer()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Close() })
+	go server.Serve()
+	host, port, err := net.SplitHostPort(server.Address())
+	require.NoError(t, err)
+	client := New(Config{
+		Host: host, Port: port, Username: "sender@example.com", Password: "secret", Security: SecurityStartTLS,
+	})
+
+	err = client.Send(context.Background(), "sender@example.com", []string{"to@example.com"}, "Subject", "Body", nil)
+	require.ErrorContains(t, err, "SMTP server does not offer STARTTLS")
+	assert.Empty(t, server.RecordedRecipients())
+}
+
+// With RequireAttachments, a listed file that cannot be read fails the send
+// before the server sees anything, and an empty file is attached as it is.
+func TestSendRequireAttachments(t *testing.T) {
+	t.Parallel()
+
+	server, err := newSMTPRecordingServer()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Close() })
+	go server.Serve()
+	host, port, err := net.SplitHostPort(server.Address())
+	require.NoError(t, err)
+	client := New(Config{Host: host, Port: port, RequireAttachments: true})
+
+	missing := filepath.Join(t.TempDir(), "missing.pdf")
+	err = client.Send(context.Background(), "from@example.com", []string{"to@example.com"}, "Subject", "Body", []string{missing})
+	require.ErrorContains(t, err, fmt.Sprintf("attachment %q", missing))
+	assert.Empty(t, server.RecordedRecipients(), "nothing is sent")
+
+	empty := filepath.Join(t.TempDir(), "empty.csv")
+	require.NoError(t, os.WriteFile(empty, nil, 0600))
+	err = client.Send(context.Background(), "from@example.com", []string{"to@example.com"}, "Subject", "Body", []string{empty})
+	require.NoError(t, err)
+	bodies := server.RecordedDataBodies()
+	require.Len(t, bodies, 1)
+	assert.Contains(t, bodies[0], `filename=empty.csv`)
+}
+
+func TestSendMessageThreadsReply(t *testing.T) {
+	t.Parallel()
+
+	server, err := newSMTPRecordingServer()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Close() })
+	go server.Serve()
+	host, port, err := net.SplitHostPort(server.Address())
+	require.NoError(t, err)
+
+	err = New(Config{Host: host, Port: port}).SendMessage(context.Background(), Message{
+		From:       "support@example.com",
+		To:         []string{"carol@example.com"},
+		Subject:    "Re: Printer is down",
+		Body:       "On it.",
+		InReplyTo:  "question-2@example.com",
+		References: []string{"question-0@example.com", "question-1@example.com"},
+	})
+	require.NoError(t, err)
+
+	bodies := server.RecordedDataBodies()
+	require.Len(t, bodies, 1)
+	message, err := mail.ReadMessage(strings.NewReader(bodies[0]))
+	require.NoError(t, err)
+	assert.Equal(t, "<question-2@example.com>", message.Header.Get("In-Reply-To"))
+	assert.Equal(t, "<question-0@example.com> <question-1@example.com> <question-2@example.com>",
+		message.Header.Get("References"))
+}
+
+func TestThreadHeaders(t *testing.T) {
+	t.Parallel()
+
+	assert.Empty(t, threadHeaders("", []string{"a@example.com"}), "no reply without the answered Message-ID")
+	assert.Empty(t, threadHeaders("bad\r\nBcc: x@example.com", nil), "an ID that could break the header is dropped")
+	assert.Equal(t, "In-Reply-To: <b@example.com>\r\nReferences: <a@example.com> <b@example.com>\r\n",
+		threadHeaders("b@example.com", []string{"a@example.com", "bad id", "b@example.com"}))
+
+	// Long threads keep the first reference and the newest ones.
+	var references []string
+	for i := range 15 {
+		references = append(references, fmt.Sprintf("r%d@example.com", i))
+	}
+	header := threadHeaders("new@example.com", references)
+	assert.Contains(t, header, "References: <r0@example.com> <r7@example.com>")
+	assert.Equal(t, maxReferences, strings.Count(header, "<")-1, "In-Reply-To plus the kept references")
 }

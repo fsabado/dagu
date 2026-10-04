@@ -24,8 +24,11 @@ import (
 	filedagrun "github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/proc"
 	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -372,6 +375,31 @@ func TestQueueProcessorWaitsForMatchingWorkerBeforeDispatch(t *testing.T) {
 	require.Len(t, items, 1)
 }
 
+func TestQueueProcessorMissingSelectedWorker(t *testing.T) {
+	t.Parallel()
+
+	for _, stale := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Stale=%t", stale), func(t *testing.T) {
+			t.Parallel()
+			dispatcher := &queueConditionDispatcher{}
+			heartbeats := store.NewWorkerHeartbeatStore(file.NewCollection(filepath.Join(t.TempDir(), "heartbeats")))
+			f := newQueueConditionFixtureWithDispatcher(t, config.ExecutionModeDistributed, nil, dispatcher,
+				scheduler.WithWorkerHeartbeatStore(heartbeats))
+			f.dag.WorkerSelector = map[string]string{"type": "gpu"}
+			f.enqueueRun("waiting-run", nil)
+			if stale {
+				require.NoError(t, heartbeats.Upsert(f.ctx, dispatch.WorkerHeartbeatRecord{
+					WorkerID: "worker-1", Labels: f.dag.WorkerSelector,
+					LastHeartbeatAt: time.Now().Add(-time.Hour).UnixMilli(),
+				}))
+			}
+			f.processor.ProcessQueueItems(f.ctx, f.dag.Name)
+			requireQueuedConditions(t, f.readStatus("waiting-run"), noMatchingWorkerConditions()...)
+			require.Zero(t, dispatcher.callCount.Load())
+		})
+	}
+}
+
 func TestQueueProcessorWaitsForFreshWorkerBeforeDispatch(t *testing.T) {
 	t.Parallel()
 
@@ -624,6 +652,94 @@ func TestQueueProcessorRecordsNoAvailableWorkerCondition(t *testing.T) {
 	require.Equal(t, 1, f.casCount("waiting-run"))
 }
 
+// A fresh condition is an observation, not a latch: the same queue item must
+// recover from an old NoMatchingWorker diagnosis and dispatch when a poller returns.
+func TestQueueProcessorRecoversBusyWorker(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	heartbeats := store.NewWorkerHeartbeatStore(file.NewCollection(filepath.Join(t.TempDir(), "heartbeats")))
+	var h *coordinator.Handler
+	labels := map[string]string{"type": "gpu"}
+	dispatcher := &queueConditionDispatcher{dispatchFn: func(ctx context.Context, req dispatch.DispatchRequest) error {
+		task, err := convert.DispatchTaskToProto(req.Task)
+		if err != nil {
+			return err
+		}
+		_, err = h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: task})
+		return err
+	}}
+	f := newQueueConditionFixtureWithDispatcher(t, config.ExecutionModeDistributed, nil, dispatcher,
+		scheduler.WithWorkerHeartbeatStore(heartbeats),
+		scheduler.WithWorkerHeartbeatStaleThreshold(conditionTestStaleThreshold))
+	f.ctx = ctx
+	h = coordinator.NewHandler(coordinator.HandlerConfig{
+		DAGRunRepository:     f.dagRunRepository.repository,
+		WorkerHeartbeatStore: heartbeats, StaleHeartbeatThreshold: conditionTestStaleThreshold,
+	})
+	t.Cleanup(func() { h.Close(context.Background()) })
+	_, err := h.Heartbeat(ctx, &coordinatorv1.HeartbeatRequest{
+		WorkerId: "worker-1", Labels: labels,
+		Stats: &coordinatorv1.WorkerStats{TotalPollers: 1, BusyPollers: 1},
+	})
+	require.NoError(t, err)
+	f.dag.WorkerSelector = labels
+	f.dag.YamlData = []byte("name: queue-condition\nworker_selector:\n  type: gpu\nsteps:\n  - name: test\n    command: echo hello\n")
+	var oldConditions []ir.DAGRunCondition
+	for _, condition := range noMatchingWorkerConditions() {
+		oldConditions = append(oldConditions, ir.NewDAGRunCondition(
+			condition.conditionType, condition.status, condition.reason, condition.message, time.Now().UTC()))
+	}
+	attempt := f.enqueueRun("waiting-run", oldConditions)
+	before, err := f.queueStore.List(ctx, f.dag.Name)
+	require.NoError(t, err)
+	require.Len(t, before, 1)
+
+	f.processor.ProcessQueueItems(ctx, f.dag.Name)
+	requireQueuedConditions(t, f.readStatus("waiting-run"), noAvailableWorkerConditions()...)
+	waiting, err := f.queueStore.List(ctx, f.dag.Name)
+	require.NoError(t, err)
+	require.Len(t, waiting, 1)
+	require.Equal(t, before[0].ID(), waiting[0].ID())
+
+	// The worker can poll again. No reschedule, re-enqueue or condition aging.
+	polled := make(chan *coordinatorv1.PollResponse, 1)
+	pollErrors := make(chan error, 1)
+	go func() {
+		response, err := h.Poll(ctx, &coordinatorv1.PollRequest{
+			WorkerId: "worker-1", PollerId: "poller-1", Labels: labels,
+		})
+		if err != nil {
+			pollErrors <- err
+			return
+		}
+		f.updateStatus("waiting-run", func(runStatus *ir.DAGRunStatus) {
+			runStatus.Status = ir.Running
+			runStatus.WorkerID = "worker-1"
+		})
+		polled <- response
+	}()
+	// The normal fallback scan retries within 30 seconds even though the
+	// heartbeat labels and queue generation have not changed.
+	require.Eventually(t, func() bool {
+		f.processor.ProcessQueueItems(ctx, f.dag.Name)
+		items, err := f.queueStore.List(ctx, f.dag.Name)
+		return err == nil && len(items) == 0
+	}, 45*time.Second, 20*time.Millisecond)
+	select {
+	case response := <-polled:
+		require.Equal(t, "waiting-run", response.Task.DagRunId)
+		require.Equal(t, attempt.ID(), response.Task.AttemptId)
+		require.Equal(t, "worker-1", response.Task.WorkerId)
+	case err := <-pollErrors:
+		t.Fatalf("poll failed: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	require.Equal(t, ir.Running, f.readStatus("waiting-run").Status)
+}
+
 func TestQueueProcessorRecordsWorkerDispatchUnavailableCondition(t *testing.T) {
 	t.Parallel()
 
@@ -708,7 +824,6 @@ func TestQueueProcessorFinalizesLaunchFailure(t *testing.T) {
 func TestQueueProcessorPreservesRetryPublishedDuringFailureCleanup(t *testing.T) {
 	t.Parallel()
 
-	var hookedQueueStore *queueConditionQueueStore
 	f := newQueueConditionFixtureWithConfig(
 		t,
 		config.ExecutionModeLocal,
@@ -722,10 +837,6 @@ func TestQueueProcessorPreservesRetryPublishedDuringFailureCleanup(t *testing.T)
 					isRunAliveDelay:   50 * time.Millisecond,
 				}
 			},
-			queueStore: func(base queuedomain.QueueStore) queuedomain.QueueStore {
-				hookedQueueStore = &queueConditionQueueStore{QueueStore: base}
-				return hookedQueueStore
-			},
 		},
 	)
 	f.enqueueRun("waiting-run", nil)
@@ -735,8 +846,13 @@ func TestQueueProcessorPreservesRetryPublishedDuringFailureCleanup(t *testing.T)
 	originalItemID := items[0].ID()
 
 	runRef := ir.NewDAGRunRef(f.dag.Name, "waiting-run")
-	hookedQueueStore.beforeDelete = func(ctx context.Context) error {
-		attempt, err := f.dagRunRepository.FindAttempt(ctx, runRef)
+	f.dagRunRepository.setBeforeCompareAndSwap(func(ctx context.Context) error {
+		repository := persis.NewDAGRunRepository(
+			f.dagRunRepository.DAGRunStore,
+			nil,
+			persis.DAGRunRepositoryOptions{LatestStatusToday: false},
+		)
+		attempt, err := repository.FindAttempt(ctx, runRef)
 		if err != nil {
 			return err
 		}
@@ -744,7 +860,26 @@ func TestQueueProcessorPreservesRetryPublishedDuringFailureCleanup(t *testing.T)
 		if err != nil {
 			return err
 		}
-		queued, err := queuedomain.EnqueueRetry(ctx, f.dagRunRepository.repository, f.queueStore, f.dag, status, queuedomain.EnqueueRetryOptions{})
+		status.Status = ir.Failed
+		status.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := attempt.Open(ctx); err != nil {
+			return err
+		}
+		if err := attempt.Write(ctx, *status); err != nil {
+			_ = attempt.Close(ctx)
+			return err
+		}
+		if err := attempt.Close(ctx); err != nil {
+			return err
+		}
+		queued, err := queuedomain.EnqueueRetry(
+			ctx,
+			repository,
+			f.queueStore,
+			f.dag,
+			status,
+			queuedomain.EnqueueRetryOptions{Processes: releasedRunProcesses{}},
+		)
 		if err != nil {
 			return err
 		}
@@ -752,7 +887,7 @@ func TestQueueProcessorPreservesRetryPublishedDuringFailureCleanup(t *testing.T)
 			return errors.New("retry was not queued")
 		}
 		return nil
-	}
+	})
 
 	f.processor.ProcessQueueItems(f.ctx, f.dag.Name)
 
@@ -1308,18 +1443,22 @@ func (s *queueConditionDispatchTaskStore) HasOutstandingAttempt(_ context.Contex
 
 type queueConditionDispatcher struct {
 	dispatchErr error
+	dispatchFn  func(context.Context, dispatch.DispatchRequest) error
 	callCount   atomic.Int32
 	mu          sync.Mutex
 	runIDs      []string
 }
 
-func (d *queueConditionDispatcher) Dispatch(_ context.Context, req dispatch.DispatchRequest) error {
+func (d *queueConditionDispatcher) Dispatch(ctx context.Context, req dispatch.DispatchRequest) error {
 	d.callCount.Add(1)
 	d.mu.Lock()
 	if req.Task != nil {
 		d.runIDs = append(d.runIDs, req.Task.DAGRunID)
 	}
 	d.mu.Unlock()
+	if d.dispatchFn != nil {
+		return d.dispatchFn(ctx, req)
+	}
 	return d.dispatchErr
 }
 
@@ -1368,34 +1507,15 @@ func (s *fullListFailingQueueStore) List(context.Context, string) ([]queuedomain
 	return nil, errors.New("full queue listing disabled")
 }
 
-type queueConditionQueueStore struct {
-	queuedomain.QueueStore
-
-	once         sync.Once
-	beforeDelete func(context.Context) error
-}
-
-func (s *queueConditionQueueStore) DeleteByItemIDs(ctx context.Context, queueName string, itemIDs []string) (int, error) {
-	var hookErr error
-	s.once.Do(func() {
-		if s.beforeDelete != nil {
-			hookErr = s.beforeDelete(ctx)
-		}
-	})
-	if hookErr != nil {
-		return 0, hookErr
-	}
-	return s.QueueStore.DeleteByItemIDs(ctx, queueName, itemIDs)
-}
-
 type countingDAGRunStore struct {
 	persis.DAGRunStore
 	repository *persis.DAGRunRepository
 
-	mu                 sync.Mutex
-	casByRun           map[string]int
-	blankAttemptIDRuns map[string]struct{}
-	readDAGErrByRun    map[string]error
+	mu                       sync.Mutex
+	casByRun                 map[string]int
+	blankAttemptIDRuns       map[string]struct{}
+	readDAGErrByRun          map[string]error
+	beforeCompareAndSwapOnce func(context.Context) error
 }
 
 func newCountingDAGRunStore(store persis.DAGRunStore) *countingDAGRunStore {
@@ -1417,8 +1537,27 @@ func (s *countingDAGRunStore) CompareAndSwapLatestAttemptStatus(
 ) (*ir.DAGRunStatus, bool, error) {
 	s.mu.Lock()
 	s.casByRun[req.DAGRun.ID]++
+	before := s.beforeCompareAndSwapOnce
+	s.beforeCompareAndSwapOnce = nil
 	s.mu.Unlock()
+	if before != nil {
+		if err := before(ctx); err != nil {
+			return nil, false, err
+		}
+	}
 	return s.DAGRunStore.CompareAndSwapLatestAttemptStatus(ctx, req)
+}
+
+func (s *countingDAGRunStore) setBeforeCompareAndSwap(before func(context.Context) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.beforeCompareAndSwapOnce = before
+}
+
+type releasedRunProcesses struct{}
+
+func (releasedRunProcesses) IsAttemptAlive(context.Context, string, ir.DAGRunRef, string) (bool, error) {
+	return false, nil
 }
 
 func (s *countingDAGRunStore) FindAttempt(ctx context.Context, dagRun ir.DAGRunRef) (dagrun.Attempt, error) {

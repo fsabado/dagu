@@ -7,12 +7,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/spec"
@@ -256,7 +258,258 @@ steps:
 	})
 }
 
+// Inherited stdin must remain available to the caller, such as a shell loop.
+// These cases replace process stdin and must remain sequential.
+func TestRunPreservesStdin(t *testing.T) {
+	for _, commandName := range []string{"start", "enqueue"} {
+		t.Run(commandName, func(t *testing.T) {
+			th := test.SetupCommand(t)
+			dag := th.DAG(t, `params: VALUE=default
+steps:
+  - name: print
+    run: echo $VALUE
+`)
+			const input = "VALUE=from-stdin\n"
+			pipeCommandStdin(t, input)
+			command := cmd.Start()
+			if commandName == "enqueue" {
+				command = cmd.Enqueue()
+			}
+			th.RunCommand(t, command, test.CmdTest{
+				Args: []string{commandName, dag.Location},
+			})
+
+			status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+			require.NoError(t, err)
+			require.Equal(t, "VALUE=default", status.Params)
+			remaining, err := io.ReadAll(os.Stdin)
+			require.NoError(t, err)
+			require.Equal(t, input, string(remaining))
+		})
+	}
+}
+
+// Closed stdin must only fail commands that select it as their parameter source.
+// These cases replace process stdin and must remain sequential.
+func TestRunClosedStdin(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	require.NoError(t, stdin.Close())
+	original := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() { os.Stdin = original })
+
+	for _, commandName := range []string{"start", "enqueue"} {
+		t.Run(commandName, func(t *testing.T) {
+			for _, tt := range []struct {
+				name   string
+				flags  []string
+				dash   []string
+				params string
+				fails  bool
+			}{
+				{name: "Selected", flags: []string{"--params-stdin"}, fails: true},
+				{name: "Inherited", params: "VALUE=default"},
+				{name: "Flag", flags: []string{"--params-stdin", "--params=VALUE=flag"}, params: "VALUE=flag"},
+				{name: "EmptyFlag", flags: []string{"--params-stdin", "--params="}, params: "VALUE=default"},
+				{name: "Dash", flags: []string{"--params-stdin"}, dash: []string{"--", "VALUE=dash"}, params: "VALUE=dash"},
+				{name: "EmptyDash", flags: []string{"--params-stdin"}, dash: []string{"--"}, params: "VALUE=default"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					th := test.SetupCommand(t)
+					dag := th.DAG(t, "params: VALUE=default\nsteps:\n  - name: print\n    run: echo $VALUE\n")
+					args := append([]string{commandName, "--run-id=closed-stdin"}, tt.flags...)
+					args = append(args, dag.Location)
+					args = append(args, tt.dash...)
+					command := cmd.Start()
+					if commandName == "enqueue" {
+						command = cmd.Enqueue()
+					}
+					err := th.RunCommandWithError(t, command, test.CmdTest{Args: args})
+					if tt.fails {
+						require.ErrorContains(t, err, "params from stdin")
+						_, err = th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, "closed-stdin"))
+						require.ErrorIs(t, err, dagrun.ErrDAGRunIDNotFound)
+						return
+					}
+					require.NoError(t, err)
+					status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+					require.NoError(t, err)
+					require.Equal(t, tt.params, status.Params)
+				})
+			}
+		})
+	}
+}
+
+// TestCmdStart_StdinParams replaces the process-global os.Stdin, so the test
+// and its subtests must stay sequential to avoid feeding other commands.
+func TestCmdStart_StdinParams(t *testing.T) {
+	positionalDAG := `params: "p1 p2"
+steps:
+  - name: "1"
+    run: "echo \"params is $1 and $2\""
+`
+	namedDAG := `params: KEY1=default1 KEY2=default2
+steps:
+  - name: "1"
+    run: "echo $KEY1 $KEY2"
+`
+
+	t.Run("PipedPositionalParams", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, positionalDAG)
+		pipeCommandStdin(t, "s1 s2\n")
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args:        []string{"start", "--params-stdin", dag.Location},
+			ExpectedOut: []string{`params="[1=s1 2=s2]`},
+		})
+		assertLatestParams(t, th, dag.Location, "1=s1 2=s2")
+	})
+
+	for _, tt := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "Quoted", input: `"hello world"`, want: "1=hello world"},
+		{name: "EmptyValue", input: `""`, want: "1="},
+		{name: "QuotedSpaces", input: `" hello world "`, want: "1= hello world "},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			th := test.SetupCommand(t)
+			dag := th.DAG(t, "params: default\nsteps:\n  - name: print\n    run: echo ok\n")
+			pipeCommandStdin(t, tt.input)
+			th.RunCommand(t, cmd.Start(), test.CmdTest{
+				Args: []string{"start", "--params-stdin", dag.Location},
+			})
+			assertLatestParams(t, th, dag.Location, tt.want)
+		})
+	}
+
+	t.Run("PipedNamedParamsAcrossLines", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, namedDAG)
+		pipeCommandStdin(t, "KEY1=\"hello world\"\nKEY2=\"\"\n")
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--params-stdin", dag.Location},
+		})
+		assertLatestParams(t, th, dag.Location, "KEY1=hello world KEY2=")
+	})
+
+	t.Run("PipedJSONParams", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, `params: KEY=default
+steps:
+  - name: "1"
+    run: "echo $KEY"
+`)
+		pipeCommandStdin(t, `{"KEY":"v1"}`)
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--params-stdin", dag.Location},
+		})
+		assertLatestParams(t, th, dag.Location, "KEY=v1")
+	})
+
+	t.Run("EmptyStdinBehavesLikeNoParams", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, namedDAG)
+		pipeCommandStdin(t, "")
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--params-stdin", dag.Location},
+		})
+		assertLatestParams(t, th, dag.Location, "KEY1=default1 KEY2=default2")
+	})
+
+	t.Run("WhitespaceStdinBehavesLikeNoParams", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, namedDAG)
+		pipeCommandStdin(t, "  \n\t\n")
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--params-stdin", dag.Location},
+		})
+		assertLatestParams(t, th, dag.Location, "KEY1=default1 KEY2=default2")
+	})
+
+	t.Run("ParamsFlagTakesPrecedenceOverStdin", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, positionalDAG)
+		pipeCommandStdin(t, "s1 s2\n")
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--params-stdin", `--params="c1 c2"`, dag.Location},
+		})
+		assertLatestParams(t, th, dag.Location, "1=c1 2=c2")
+	})
+
+	t.Run("DashArgsTakePrecedenceOverStdin", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, positionalDAG)
+		pipeCommandStdin(t, "s1 s2\n")
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--params-stdin", dag.Location, "--", "d1", "d2"},
+		})
+		assertLatestParams(t, th, dag.Location, "1=d1 2=d2")
+	})
+
+	t.Run("RejectsTooManyPositionalFromStdin", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, positionalDAG)
+		pipeCommandStdin(t, "one two three\n")
+
+		err := th.RunCommandWithError(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--params-stdin", dag.Location},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "too many positional params: expected at most 2, got 3")
+	})
+}
+
+// pipeCommandStdin replaces process stdin with a pipe holding input until the
+// test ends. The caller must not be parallel.
+func pipeCommandStdin(t *testing.T, input string) {
+	t.Helper()
+
+	stdin, writer, err := os.Pipe()
+	require.NoError(t, err)
+	originalStdin := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+		require.NoError(t, stdin.Close())
+	})
+	_, err = writer.WriteString(input)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+}
+
+func assertLatestParams(t *testing.T, th test.Command, dagPath, want string) {
+	t.Helper()
+
+	dag, err := spec.Load(th.Context, dagPath)
+	require.NoError(t, err)
+	status, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag)
+	require.NoError(t, err)
+	require.Equal(t, ir.Succeeded, status.Status)
+	require.Equal(t, want, status.Params)
+}
+
 func TestCmdStart_FromRunID(t *testing.T) {
+	t.Run("RejectsStdinParams", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		err := th.RunCommandWithError(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--from-run-id=source", "--params-stdin", "dag.yaml"},
+		})
+		require.ErrorContains(t, err, "parameters cannot be provided when using --from-run-id")
+	})
+
 	t.Run("ReschedulesWithStoredParameters", func(t *testing.T) {
 		t.Parallel()
 
@@ -300,6 +553,206 @@ steps:
 		require.Equal(t, originalStatus.ParamsList, newStatus.ParamsList)
 	})
 
+}
+
+func TestCmdStart_Only(t *testing.T) {
+	const chainDAG = `steps:
+  - id: first
+    run: echo first
+  - name: second step
+    id: second
+    run: echo second
+  - id: third
+    run: echo third
+`
+	// consume echoes the value produce published through a legacy output
+	// variable, so the carried value shows up in consume's own output.
+	const outputsDAG = `steps:
+  - id: produce
+    run: echo from-source
+    output: VALUE
+  - id: consume
+    depends: produce
+    run: echo got-${VALUE}
+    output: RESULT
+`
+
+	t.Run("SkipsOthers", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, chainDAG)
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=only", "--only=third", dag.Location},
+		})
+
+		status := readRunStatus(t, th, dag.Name, "only")
+		require.Equal(t, ir.Succeeded, status.Status)
+		require.Equal(t, ir.TriggerTypeManual, status.TriggerType)
+		require.Equal(t, []ir.NodeStatus{ir.NodeSkipped, ir.NodeSkipped, ir.NodeSucceeded}, nodeStatuses(status))
+	})
+
+	t.Run("ByID", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, chainDAG)
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=only", "--only=second", dag.Location},
+		})
+
+		status := readRunStatus(t, th, dag.Name, "only")
+		require.Equal(t, []ir.NodeStatus{ir.NodeSkipped, ir.NodeSucceeded, ir.NodeSkipped}, nodeStatuses(status))
+	})
+
+	t.Run("OutputsFrom", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, outputsDAG)
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=source", dag.Location},
+		})
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=only", "--only=consume", "--outputs-from=source", dag.Location},
+		})
+
+		status := readRunStatus(t, th, dag.Name, "only")
+		require.Equal(t, []ir.NodeStatus{ir.NodeSkipped, ir.NodeSucceeded}, nodeStatuses(status))
+		require.Equal(t, "RESULT=got-from-source", outputVariable(t, status.Nodes[1], "RESULT"))
+	})
+
+	// A supplied output stands in for the skipped producer without any
+	// earlier run.
+	t.Run("SetsOutput", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, outputsDAG)
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=only", "--only=consume", "--output=produce.VALUE=given", dag.Location},
+		})
+
+		status := readRunStatus(t, th, dag.Name, "only")
+		require.Equal(t, []ir.NodeStatus{ir.NodeSkipped, ir.NodeSucceeded}, nodeStatuses(status))
+		require.Equal(t, "RESULT=got-given", outputVariable(t, status.Nodes[1], "RESULT"))
+	})
+
+	t.Run("OutputOverridesSource", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, outputsDAG)
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=source", dag.Location},
+		})
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=only", "--only=consume", "--outputs-from=source", "--output=produce.VALUE=given", dag.Location},
+		})
+
+		status := readRunStatus(t, th, dag.Name, "only")
+		require.Equal(t, "RESULT=got-given", outputVariable(t, status.Nodes[1], "RESULT"))
+	})
+
+	// A failed producer publishes no outputs, so none are carried into the
+	// selected step.
+	t.Run("FailedSource", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, `steps:
+  - id: produce
+    run: |
+      echo from-source
+      exit 1
+    output: VALUE
+  - id: consume
+    depends: produce
+    run: echo got-${VALUE}
+    output: RESULT
+`)
+		_ = th.RunCommandWithError(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=source", dag.Location},
+		})
+
+		th.RunCommand(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=only", "--only=consume", "--outputs-from=source", dag.Location},
+		})
+
+		status := readRunStatus(t, th, dag.Name, "only")
+		require.Equal(t, ir.NodeSucceeded, status.Nodes[1].Status)
+		require.NotContains(t, outputVariable(t, status.Nodes[1], "RESULT"), "from-source")
+	})
+
+	rejects := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "UnknownStep", args: []string{"--only=missing"}, wantErr: `unknown step "missing"`},
+		{name: "NeedsOnly", args: []string{"--outputs-from=source"}, wantErr: "--outputs-from requires --only"},
+		{name: "FromRunID", args: []string{"--only=first", "--from-run-id=source"}, wantErr: "--only cannot be combined with --from-run-id"},
+		{name: "SubDAGRun", args: []string{"--only=first", "--run-id=child", "--parent=parent:run", "--root=parent:run"}, wantErr: "--only cannot be combined with --parent"},
+		{name: "OutputNeedsOnly", args: []string{"--output=first.value=x"}, wantErr: "--output requires --only"},
+		{name: "OutputWithoutValue", args: []string{"--only=third", "--output=first.value"}, wantErr: `invalid --output "first.value": expected <step>.<name>=<value>`},
+		{name: "OutputWithoutName", args: []string{"--only=third", "--output=first=x"}, wantErr: `invalid --output "first": expected <step>.<name>=<value>`},
+		{name: "OutputTwice", args: []string{"--only=third", "--output=first.value=a", "--output=first.value=b"}, wantErr: `--output sets "first.value" more than once`},
+		{name: "OutputOfSelectedStep", args: []string{"--only=third", "--output=third.value=x"}, wantErr: `cannot set outputs of step "third": it is selected to run`},
+	}
+	for _, tt := range rejects {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			th := test.SetupCommand(t)
+			dag := th.DAG(t, chainDAG)
+
+			err := th.RunCommandWithError(t, cmd.Start(), test.CmdTest{
+				Args: append(append([]string{"start"}, tt.args...), dag.Location),
+			})
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+
+	t.Run("ActiveSource", func(t *testing.T) {
+		t.Parallel()
+		th := test.SetupCommand(t)
+		dag := th.DAG(t, outputsDAG)
+		attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dag.DAG, time.Now(), "source", persis.DAGRunCreateAttemptOptions{})
+		require.NoError(t, err)
+		status := ir.InitialStatus(dag.DAG)
+		status.DAGRunID = "source"
+		status.AttemptID = attempt.ID()
+		status.Status = ir.Queued
+		writeStatus(t, th.Context, attempt, status)
+
+		err = th.RunCommandWithError(t, cmd.Start(), test.CmdTest{
+			Args: []string{"start", "--run-id=only", "--only=consume", "--outputs-from=source", dag.Location},
+		})
+		require.ErrorContains(t, err, "outputs are reused only from a finished run")
+	})
+}
+
+func readRunStatus(t *testing.T, th test.Command, dagName, dagRunID string) *ir.DAGRunStatus {
+	t.Helper()
+	attempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dagName, dagRunID))
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(th.Context)
+	require.NoError(t, err)
+	return status
+}
+
+func nodeStatuses(status *ir.DAGRunStatus) []ir.NodeStatus {
+	statuses := make([]ir.NodeStatus, 0, len(status.Nodes))
+	for _, node := range status.Nodes {
+		statuses = append(statuses, node.Status)
+	}
+	return statuses
+}
+
+func outputVariable(t *testing.T, node *ir.Node, key string) string {
+	t.Helper()
+	require.NotNil(t, node.OutputVariables)
+	value, ok := node.OutputVariables.Load(key)
+	require.True(t, ok, "output variable %s not recorded", key)
+	return value.(string)
 }
 
 func TestCmdStart_DuplicateRunIDDoesNotOverwriteExistingAttempt(t *testing.T) {

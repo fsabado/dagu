@@ -120,7 +120,7 @@ func (r Resolver) resolveString(ctx context.Context, raw string, field Field) (s
 	policy := policyForField(field)
 	ctx = r.withRuntimeEnv(ctx)
 	resolved := raw
-	var protected map[string]string
+	var protected protectedReferences
 	if policy.strict {
 		var err error
 		resolved, protected, err = resolveBindings(ctx, raw, r.bindingScope(), field.path, r.notices)
@@ -130,12 +130,15 @@ func (r Resolver) resolveString(ctx context.Context, raw string, field Field) (s
 			}
 			return "", err
 		}
+		if protected.all != nil {
+			ctx = context.WithValue(ctx, protectedReferencesKey{}, protected)
+		}
 	}
 	evaluated, err := evalString(ctx, resolved, r.optionsFor(policy)...)
 	if err != nil {
 		return "", err
 	}
-	return restoreProtectedReferences(evaluated, protected), nil
+	return restoreProtectedReferences(evaluated, protected.all), nil
 }
 
 func (r Resolver) bindingScope() RuntimeScope {
@@ -230,6 +233,8 @@ func policyForField(field Field) resolverPolicy {
 		return resolverPolicy{strict: true, envVariables: envVariablesUser, options: []option{withOSExpansion(), withoutSubstitute()}}
 	case fieldRuntimeDAGEnv:
 		return resolverPolicy{strict: true, envVariables: envVariablesUser, options: []option{withoutSubstitute()}}
+	case fieldDAGEnvCompletion:
+		return resolverPolicy{strict: true, envVariables: envVariablesUser, options: []option{withoutSubstitute(), withoutDollarEscape()}}
 	case fieldStepEnv, fieldContainerEnv:
 		return resolverPolicy{strict: true, options: []option{withoutSubstitute()}}
 	case fieldDynamicParamEval:
@@ -343,7 +348,10 @@ func localCommandPolicyOptions(command CommandContext) []option {
 		return []option{withOSExpansion()}
 	}
 	opts := []option{withoutDollarEscape()}
-	if cmdutil.IsUnixLikeShell(shell[0]) || cmdutil.IsNixShell(shell[0]) || cmdutil.IsPowerShell(shell[0]) {
+	switch {
+	case cmdutil.IsPowerShell(shell[0]):
+		opts = append(opts, withoutExpandEnv(), withQuotedRefStyle(quotedRefPowerShell))
+	case cmdutil.IsUnixLikeShell(shell[0]) || cmdutil.IsNixShell(shell[0]):
 		opts = append(opts, withoutExpandEnv())
 	}
 	return opts

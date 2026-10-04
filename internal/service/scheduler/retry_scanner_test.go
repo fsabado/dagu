@@ -14,6 +14,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
 	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -188,7 +189,79 @@ func TestSuspendFlagName(t *testing.T) {
 	})
 }
 
-func TestRetryScannerScanEnqueuesRetry(t *testing.T) {
+type stubPauseStore struct {
+	paused bool
+	err    error
+}
+
+func (s stubPauseStore) IsPaused(context.Context) (bool, error) {
+	return s.paused, s.err
+}
+
+func (s stubPauseStore) Get(context.Context) (schedulerstate.Pause, error) {
+	return schedulerstate.Pause{Paused: s.paused}, s.err
+}
+
+func (stubPauseStore) Set(context.Context, bool, string, string) error {
+	return nil
+}
+
+func TestNewSuspensionChecker(t *testing.T) {
+	t.Parallel()
+
+	perDAG := func(_ context.Context, name string) (bool, error) {
+		return name == "suspended-dag", nil
+	}
+
+	t.Run("PauseSuspendsEveryDAG", func(t *testing.T) {
+		t.Parallel()
+
+		check := newSuspensionChecker(stubPauseStore{paused: true}, perDAG)
+
+		got, err := check(t.Context(), "running-dag")
+
+		require.NoError(t, err)
+		assert.True(t, got)
+	})
+
+	t.Run("FallsBackToPerDAGFlagWhenNotPaused", func(t *testing.T) {
+		t.Parallel()
+
+		check := newSuspensionChecker(stubPauseStore{}, perDAG)
+
+		running, err := check(t.Context(), "running-dag")
+		require.NoError(t, err)
+		assert.False(t, running)
+
+		suspended, err := check(t.Context(), "suspended-dag")
+		require.NoError(t, err)
+		assert.True(t, suspended)
+	})
+
+	t.Run("PropagatesPauseReadFailure", func(t *testing.T) {
+		t.Parallel()
+
+		readErr := errors.New("pause read failed")
+		check := newSuspensionChecker(stubPauseStore{err: readErr}, perDAG)
+
+		_, err := check(t.Context(), "running-dag")
+
+		assert.ErrorIs(t, err, readErr)
+	})
+
+	t.Run("WithoutPauseStoreUsesPerDAGFlag", func(t *testing.T) {
+		t.Parallel()
+
+		check := newSuspensionChecker(nil, perDAG)
+
+		got, err := check(t.Context(), "suspended-dag")
+
+		require.NoError(t, err)
+		assert.True(t, got)
+	})
+}
+
+func TestRetryScannerDefersLiveSource(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 3, 14, 14, 0, 0, 0, time.UTC)
@@ -216,6 +289,7 @@ func TestRetryScannerScanEnqueuesRetry(t *testing.T) {
 	queueStore.On("Enqueue", mock.Anything, dag.ProcGroup(), queuedomain.QueuePriorityLow, status.DAGRun()).
 		Return(nil).
 		Once()
+	processes := &sequenceRetryScannerProcesses{alive: []bool{true, false}}
 
 	scanner, err := NewRetryScanner(
 		store.repository(),
@@ -225,6 +299,12 @@ func TestRetryScannerScanEnqueuesRetry(t *testing.T) {
 		func() time.Time { return now },
 	)
 	require.NoError(t, err)
+	scanner.processes = processes
+
+	err = scanner.scan(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, store.mustStatus(status.DAGRun()).Status)
+	assert.Equal(t, 1, processes.calls)
 
 	err = scanner.scan(context.Background())
 	require.NoError(t, err)
@@ -234,10 +314,53 @@ func TestRetryScannerScanEnqueuesRetry(t *testing.T) {
 	assert.Equal(t, ir.TriggerTypeRetry, latest.TriggerType)
 	assert.NotEmpty(t, latest.QueuedAt)
 	assert.Equal(t, 2, latest.AutoRetryCount)
+	assert.Equal(t, 2, processes.calls)
 	assert.Equal(t, 0, store.latestAttemptCalls)
-	assert.Len(t, store.listCalls, 1)
+	assert.Len(t, store.listCalls, 2)
 
 	queueStore.AssertExpectations(t)
+}
+
+func TestRetryScannerLeavesFailedRunWhenLivenessFails(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 14, 14, 0, 0, 0, time.UTC)
+	dag := &ir.DAG{
+		Name:     "retry-dag",
+		Location: "/tmp/retry-dag.yaml",
+		RetryPolicy: &ir.DAGRetryPolicy{
+			Limit:       3,
+			Interval:    time.Minute,
+			MaxInterval: 10 * time.Minute,
+		},
+	}
+	status := &ir.DAGRunStatus{
+		Name:         dag.Name,
+		DAGRunID:     "run-1",
+		AttemptID:    "att-1",
+		Status:       ir.Failed,
+		FinishedAt:   now.Add(-3 * time.Minute).Format(time.RFC3339),
+		ScheduleTime: now.Add(-10 * time.Minute).Format(time.RFC3339),
+	}
+	store := newRetryScannerStore(dag, status)
+	queueStore := &testutil.MockQueueStore{}
+
+	scanner, err := NewRetryScanner(
+		store.repository(),
+		queueStore,
+		nil,
+		24*time.Hour,
+		func() time.Time { return now },
+	)
+	require.NoError(t, err)
+	scanner.processes = retryScannerProcesses{err: errors.New("proc store unavailable")}
+
+	require.NoError(t, scanner.scan(context.Background()))
+
+	latest := store.mustStatus(status.DAGRun())
+	assert.Equal(t, ir.Failed, latest.Status)
+	assert.Equal(t, 0, latest.AutoRetryCount)
+	queueStore.AssertNotCalled(t, "Enqueue", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
 func TestRetryScannerScanSkipsDisabledRetryPolicy(t *testing.T) {
@@ -689,6 +812,25 @@ type retryScannerStore struct {
 	latestAttemptCalls int
 	listCalls          []persis.DAGRunStatusQuery
 	findAttemptCalls   int
+}
+
+type retryScannerProcesses struct {
+	err error
+}
+
+func (p retryScannerProcesses) IsAttemptAlive(context.Context, string, ir.DAGRunRef, string) (bool, error) {
+	return false, p.err
+}
+
+type sequenceRetryScannerProcesses struct {
+	alive []bool
+	calls int
+}
+
+func (p *sequenceRetryScannerProcesses) IsAttemptAlive(context.Context, string, ir.DAGRunRef, string) (bool, error) {
+	alive := p.alive[min(p.calls, len(p.alive)-1)]
+	p.calls++
+	return alive, nil
 }
 
 type retryScannerStoreEntry struct {

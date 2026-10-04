@@ -21,4 +21,7 @@ type Store interface {
 	WriteValue(ctx context.Context, id string, input WriteValueInput) (*Secret, error)
 	GetCurrentVersion(ctx context.Context, id string) (*VersionMetadata, error)
 	ResolveValue(ctx context.Context, id string) (string, *VersionMetadata, error)
+	// ReadValue returns the current plaintext value like ResolveValue, but
+	// leaves the secret's resolution metadata unchanged.
+	ReadValue(ctx context.Context, id string) (string, *VersionMetadata, error)
 }

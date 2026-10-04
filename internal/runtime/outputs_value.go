@@ -4,13 +4,13 @@
 package runtime
 
 import (
-	"encoding/json"
 	"maps"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // OutputValuesFromNodes extracts typed DAG/action outputs from runtime nodes.
+// Payloads that are not objects are skipped; see NodeData.OutputsValueMap.
 func OutputValuesFromNodes(nodes []NodeData) map[string]any {
 	outputs := make(map[string]any)
 	for _, node := range nodes {
@@ -22,7 +22,9 @@ func OutputValuesFromNodes(nodes []NodeData) map[string]any {
 	return outputs
 }
 
-// OutputValuesFromExecNodes extracts typed DAG/action outputs from persisted nodes.
+// OutputValuesFromExecNodes extracts typed DAG/action outputs from persisted
+// nodes. Payloads that are not objects are skipped; see
+// NodeData.OutputsValueMap.
 func OutputValuesFromExecNodes(nodes []*ir.Node) map[string]any {
 	outputs := make(map[string]any)
 	for _, node := range nodes {
@@ -30,7 +32,7 @@ func OutputValuesFromExecNodes(nodes []*ir.Node) map[string]any {
 			continue
 		}
 		var values map[string]any
-		if err := json.Unmarshal([]byte(*node.OutputsValue), &values); err != nil {
+		if err := decodeOutputJSON(*node.OutputsValue, &values); err != nil {
 			continue
 		}
 		maps.Copy(outputs, values)

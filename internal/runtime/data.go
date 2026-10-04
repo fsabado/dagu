@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/collections"
+	"github.com/dagucloud/dagu/v2/internal/cmn/jsonutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -243,6 +244,13 @@ func (d *Data) SetScript(script string) {
 	d.inner.Step.Script = script
 }
 
+func (d *Data) SetStdin(stdin string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.inner.Step.Stdin = stdin
+}
+
 func (s *Data) SetStep(step ir.Step) {
 	// TODO: refactor to avoid modifying the step
 	s.mu.Lock()
@@ -378,30 +386,33 @@ func (d *Data) setBuild(value ir.BuildExecution) {
 	d.inner.State.Build = &copy
 }
 
-// OpenHumanTask records the resolved prompt and transitions the node to waiting.
-func (d *Data) OpenHumanTask(prompt string, startedAt time.Time) {
+// OpenHumanTask records the resolved prompt and artifact paths and transitions
+// the node to waiting.
+func (d *Data) OpenHumanTask(prompt string, artifacts []string, startedAt time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.setHumanTaskPrompt(prompt)
+	d.setHumanTask(prompt, artifacts)
 	d.inner.State.StartedAt = startedAt
 	d.inner.State.DoneCount++
 	d.inner.State.Status = ir.NodeWaiting
 }
 
-// CompleteHumanTaskDryRun records the resolved prompt and completes a dry-run task.
-func (d *Data) CompleteHumanTaskDryRun(prompt string) {
+// CompleteHumanTaskDryRun records the resolved prompt and artifact paths and
+// completes a dry-run task.
+func (d *Data) CompleteHumanTaskDryRun(prompt string, artifacts []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.setHumanTaskPrompt(prompt)
+	d.setHumanTask(prompt, artifacts)
 	d.inner.State.DoneCount++
 	d.inner.State.Status = ir.NodeSucceeded
 }
 
-func (d *Data) setHumanTaskPrompt(prompt string) {
+func (d *Data) setHumanTask(prompt string, artifacts []string) {
 	task := *d.inner.Step.HumanTask
 	task.Prompt = prompt
+	task.Artifacts = artifacts
 	d.inner.Step.HumanTask = &task
 }
 
@@ -440,12 +451,16 @@ func (d *Data) StepInfo() cmnvalue.StepInfo {
 	return info
 }
 
+// OutputsValueMap returns the step's published outputs as name and value
+// pairs. A step that publishes a payload which is not an object, such as the
+// array of per-child outputs a parallel step publishes, contributes nothing:
+// such a payload has no names to merge under.
 func (d NodeData) OutputsValueMap() map[string]any {
 	if d.State.OutputsValue == nil {
 		return nil
 	}
 	var values map[string]any
-	if err := json.Unmarshal([]byte(*d.State.OutputsValue), &values); err != nil {
+	if err := decodeOutputJSON(*d.State.OutputsValue, &values); err != nil {
 		return nil
 	}
 	return values
@@ -471,7 +486,7 @@ func (d NodeData) StepOutputsValueMap() map[string]string {
 		return nil
 	}
 	var values map[string]any
-	if err := json.Unmarshal([]byte(*d.State.StepOutputsValue), &values); err != nil {
+	if err := decodeOutputJSON(*d.State.StepOutputsValue, &values); err != nil {
 		return nil
 	}
 	if len(values) == 0 {
@@ -491,7 +506,7 @@ func outputValueToString(value any) string {
 	case string:
 		return v
 	default:
-		data, err := json.Marshal(v)
+		data, err := jsonutil.MarshalUnescaped(v)
 		if err != nil {
 			return fmt.Sprint(v)
 		}
@@ -796,6 +811,23 @@ func (d *Data) ClearState(s ir.Step) {
 	d.inner.State = NodeState{}
 
 	// Reset the state of the step
+	d.inner.Step = s
+}
+
+// clearStateForRetry resets the step for another execution but keeps its
+// push-back context. A retry re-runs the step within the same push-back cycle,
+// so the reviewer feedback still applies.
+func (d *Data) clearStateForRetry(s ir.Step) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	previous := d.inner.State
+	d.inner.State = NodeState{
+		ApprovalIteration:      previous.ApprovalIteration,
+		PushBackInputs:         previous.PushBackInputs,
+		PushBackHistory:        previous.PushBackHistory,
+		PushBackPreviousStdout: previous.PushBackPreviousStdout,
+	}
 	d.inner.Step = s
 }
 

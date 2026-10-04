@@ -41,9 +41,10 @@ var (
 )
 
 type blockingSignalExecutor struct {
-	ready   chan struct{}
-	killed  chan os.Signal
-	stopped chan cmdutil.TerminationIntent
+	ready       chan struct{}
+	killed      chan os.Signal
+	stopped     chan cmdutil.TerminationIntent
+	runContinue chan struct{}
 	// Optional test hooks for controlling Kill ordering.
 	killStarted  chan struct{}
 	killContinue chan struct{}
@@ -67,6 +68,9 @@ func (e *blockingSignalExecutor) Run(ctx context.Context) error {
 
 	select {
 	case sig := <-e.killed:
+		if e.runContinue != nil {
+			<-e.runContinue
+		}
 		return fmt.Errorf("signal: %s", sig.String())
 	case <-ctx.Done():
 		return ctx.Err()
@@ -217,6 +221,55 @@ func TestNode(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "signal: interrupt")
 		require.Equal(t, ir.NodeAborted.String(), node.State().Status.String())
+	})
+	t.Run("StopDuringCleanup", func(t *testing.T) {
+		execCh, restore := withNodeSignalExecutorFactory(t, func() *blockingSignalExecutor {
+			exec := newBlockingSignalExecutor()
+			exec.stopped = make(chan cmdutil.TerminationIntent, 2)
+			exec.runContinue = make(chan struct{})
+			return exec
+		})
+		defer restore()
+		node := setupNode(t, withNodeExecutorType(nodeSignalExecutorType))
+		node.SetStatus(ir.NodeRunning)
+		plan, err := runtime.NewPlanFromNodes(node.Node)
+		require.NoError(t, err)
+		errCh := make(chan error, 1)
+		go func() { errCh <- node.Node.Execute(node.execContext(uuid.Must(uuid.NewV7()).String())) }()
+		exec := <-execCh
+		<-exec.ready
+		defer func() {
+			select {
+			case <-exec.runContinue:
+			default:
+				close(exec.runContinue)
+			}
+		}()
+		node.Stop(node.Context, cmdutil.TerminationFromSignal(syscall.SIGTERM), false)
+		require.Equal(t, cmdutil.TerminationModeGraceful, (<-exec.stopped).Mode)
+		require.Equal(t, ir.NodeAborted, node.State().Status)
+		require.True(t, plan.HasActiveNodes(), "aborted execution still needs cleanup")
+		node.Stop(node.Context, cmdutil.TerminationFromSignal(syscall.SIGTERM), false)
+		select {
+		case intent := <-exec.stopped:
+			t.Fatalf("cleanup received another graceful stop: %v", intent)
+		default:
+		}
+		node.Stop(node.Context, cmdutil.ForceTermination(), false)
+		select {
+		case intent := <-exec.stopped:
+			require.Equal(t, cmdutil.TerminationModeForce, intent.Mode)
+		case <-time.After(time.Second):
+			t.Fatal("forced stop did not reach the cleaning executor")
+		}
+		close(exec.runContinue)
+		select {
+		case err := <-errCh:
+			require.Error(t, err)
+		case <-time.After(time.Second):
+			t.Fatal("executor did not finish cleanup")
+		}
+		require.False(t, plan.HasActiveNodes())
 	})
 	t.Run("SignalBeforeExecutorRunPreventsStart", func(t *testing.T) {
 		execCh, restore := withNodeSignalExecutor(t)
@@ -1739,6 +1792,86 @@ func TestNodeOutputRedirectWithWorkingDir(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, string(content), "nested output")
 	})
+}
+
+// Inline retries and repeats execute a prepared node again, and a dag-run
+// retry prepares a new node over the same artifact directory. Either way an
+// artifact redirect holds only the latest attempt's output, and a node that
+// never executes, such as one skipped by a precondition, leaves it intact.
+func TestNodeArtifactRedirectLatestAttempt(t *testing.T) {
+	t.Parallel()
+
+	artifactDir := t.TempDir()
+	logDir := t.TempDir()
+	step := ir.Step{
+		Name: "report",
+		Commands: []ir.CommandEntry{{
+			Command: "sh",
+			Args:    []string{"-c", "echo out; echo err >&2"},
+		}},
+		StdoutArtifact: "report.out",
+		StderrArtifact: "report.err",
+	}
+	ctx := runtime.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1",
+		filepath.Join(logDir, "dag.log"), runtime.WithArtifactDir(artifactDir))
+	ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, step))
+
+	assertArtifacts := func(t *testing.T) {
+		t.Helper()
+		stdout, err := os.ReadFile(filepath.Join(artifactDir, "report.out"))
+		require.NoError(t, err)
+		assert.Equal(t, "out\n", string(stdout))
+		stderr, err := os.ReadFile(filepath.Join(artifactDir, "report.err"))
+		require.NoError(t, err)
+		assert.Equal(t, "err\n", string(stderr))
+	}
+
+	node := runtime.NewNode(step, runtime.NodeState{})
+	node.Init()
+	require.NoError(t, node.Prepare(ctx, logDir, "run-1"))
+	require.NoError(t, node.Execute(ctx))
+	require.NoError(t, node.Execute(ctx))
+	require.NoError(t, node.Teardown())
+	assertArtifacts(t)
+
+	retried := runtime.NewNode(step, runtime.NodeState{})
+	retried.Init()
+	require.NoError(t, retried.Prepare(ctx, logDir, "run-1"))
+	require.NoError(t, retried.Execute(ctx))
+	require.NoError(t, retried.Teardown())
+	assertArtifacts(t)
+
+	skipped := runtime.NewNode(step, runtime.NodeState{})
+	skipped.Init()
+	require.NoError(t, skipped.Prepare(ctx, logDir, "run-1"))
+	require.NoError(t, skipped.Teardown())
+	assertArtifacts(t)
+}
+
+// Spec validation compares the literal paths, so equivalent spellings reach
+// the runtime, which must still refuse to point both streams at one artifact.
+func TestNodeArtifactRedirectRejectsSharedFile(t *testing.T) {
+	t.Parallel()
+
+	logDir := t.TempDir()
+	step := ir.Step{
+		Name: "report",
+		Commands: []ir.CommandEntry{{
+			Command: "sh",
+			Args:    []string{"-c", "echo out; echo err >&2"},
+		}},
+		StdoutArtifact: "./report.txt",
+		StderrArtifact: "report.txt",
+	}
+	ctx := runtime.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1",
+		filepath.Join(logDir, "dag.log"), runtime.WithArtifactDir(t.TempDir()))
+	ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, step))
+
+	node := runtime.NewNode(step, runtime.NodeState{})
+	node.Init()
+	err := node.Prepare(ctx, logDir, "run-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "same artifact file")
 }
 
 func TestLogOutputMode(t *testing.T) {

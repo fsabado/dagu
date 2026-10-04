@@ -22,6 +22,8 @@ import (
 )
 
 const (
+	// auditDirName is the audit log directory under the admin logs directory.
+	auditDirName = "audit"
 	// auditFileExtension is the file extension for audit log files.
 	auditFileExtension = ".jsonl"
 	// auditDirPermissions is the permission mode for the audit logs directory.
@@ -31,6 +33,11 @@ const (
 	// dateFormat is the format used for daily log file names.
 	dateFormat = "2006-01-02"
 )
+
+// Dir returns the audit log directory under adminLogsDir.
+func Dir(adminLogsDir string) string {
+	return filepath.Join(adminLogsDir, auditDirName)
+}
 
 // Store implements audit.Store using the local filesystem.
 // Audit entries are stored as JSON lines in daily log files.
